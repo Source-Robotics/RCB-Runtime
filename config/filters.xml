@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================================
+   RT-LOOP SIGNAL FILTERS  |  config/filters.xml
+  ============================================================================
+
+  Assigns a filter to each derived joint/gripper signal. HOT-RELOADABLE: edit
+  this file, click "Reload Filters" in the GUI (RT Diagnostics tab), and RTI
+  rebuilds the filters on its next tick. No restart, no re-home. Each filter's
+  internal state resets on reload, so expect a brief transient right after.
+
+  If this file is missing or invalid, RTI logs a warning and falls back to the
+  built-in defaults, so a typo here can never stop the robot from booting.
+
+
+  ============================================================================
+   1. SIGNALS  (the elements allowed inside <filters>)
+  ============================================================================
+  Each element is a SIGNAL, not a joint. Its filter applies to every joint of
+  that signal (see section 4 for treating one joint differently).
+
+    <speed>          filters joint_speed          into joint_speed_filtered
+    <accel>          filters joint_acceleration   into joint_acceleration_filtered
+    <jerk>           filters joint_jerk           into joint_jerk_filtered
+    <torque>         filters joint_torque         into joint_torque_filtered
+    <gripper_speed>  filters gripper_joint_speed  into gripper_joint_speed_filtered
+
+  The no-suffix signals (joint_speed, joint_acceleration, ...) stay RAW and
+  unfiltered; only the _filtered twins are produced here. TCP velocity /
+  acceleration and torque_external are computed from the FILTERED signals.
+
+  Any signal you omit uses its built-in default (shown in the active block at
+  the bottom). gripper_speed is a single channel, so per-joint overrides do not
+  apply to it.
+
+
+  ============================================================================
+   2. FILTER TYPES  (the "type" attribute)
+  ============================================================================
+    none      needs nothing.   Passthrough. Also the honest choice when a
+                               signal is already clean enough.
+    ema       needs tau.       1-pole low-pass. Cheapest. The old default.
+    ema2      needs tau.       2-pole (two ema stages). The jerk fix.
+    dema      needs tau.       Lag-REDUCED ema. NOT a 2-pole low-pass, will
+                               NOT clean jerk. Use when lag hurts, not noise.
+    sma       needs window.    Moving average. Linear (constant) phase.
+    butter2   needs tau.       2-pole Butterworth. Flatter passband than ema2
+                               for the same lag; cutoff = 1/(2*pi*tau) Hz.
+    savgol    needs window     Fits a polynomial over the window. Purpose-built
+              plus poly.       for noisy derivatives; linear phase.
+    median    needs window.    The ONLY non-linear one: removes a lone encoder
+                               spike instead of smearing it. Great vs glitches.
+
+
+  ============================================================================
+   3. PARAMETER NOMENCLATURE  (the attributes)
+  ============================================================================
+    type="ema2"    Which filter (section 2). Required on every signal / joint.
+
+    tau="0.03"     TIME CONSTANT in SECONDS. Bigger tau = smoother = more lag.
+                   Used by ema, ema2, dema, butter2. The window kinds (sma,
+                   savgol, median) also accept tau and derive a window from it.
+                   tau is delta_t independent: the same tau is the same real
+                   filter at 250 Hz and at 100 Hz (RTI converts it per robot).
+
+    window="7"     Number of samples. Must be an ODD integer, 3 or greater.
+                   Used by sma, savgol, median. Bigger window = smoother = more
+                   lag. Roughly, window is about 2*tau/delta_t.
+
+    poly="2"       Polynomial order for savgol ONLY. Must be less than window.
+                   Higher poly tracks curvature better but smooths less.
+
+    idx="4"        Joint index (0 to joint_num minus 1) for a per-joint override.
+                   Numbering matches the CAN nodes: 0 = base ... 5 = wrist 3.
+
+
+  ============================================================================
+   4. PER-JOINT OVERRIDES  (tutorial)
+  ============================================================================
+  A signal's attributes are the DEFAULT for all its joints. To treat one joint
+  differently, nest a <joint idx="N"> inside the signal. The override INHERITS
+  the signal's settings and REPLACES ONLY the attributes it names. All 8 types
+  are allowed on a per-joint basis.
+
+  Example A. Same filter type on every joint, one joint smoothed harder:
+
+      <jerk type="ema2" tau="0.03">
+          <joint idx="5" tau="0.06"/>
+      </jerk>
+
+      Result: J0 to J4 = ema2 tau=0.03  (the default)
+              J5        = ema2 tau=0.06  (inherited ema2, only tau changed)
+
+  Example B. A different filter TYPE on one joint (say a flaky encoder that
+  throws single-sample spikes needs median, the rest are fine on ema2):
+
+      <jerk type="ema2" tau="0.03">
+          <joint idx="4" type="median" window="5"/>
+      </jerk>
+
+      Result: J0..J3, J5 = ema2 tau=0.03
+              J4          = median window=5
+
+  Example C. Several joints, each independent:
+
+      <accel type="none">
+          <joint idx="0" type="ema"     tau="0.02"/>
+          <joint idx="3" type="butter2" tau="0.03"/>
+          <joint idx="4" type="savgol"  window="9" poly="2"/>
+      </accel>
+
+      Result: J1, J2, J5 = none        (the default: passthrough)
+              J0          = ema tau=0.02
+              J3          = butter2 tau=0.03
+              J4          = savgol window=9 poly=2
+
+  WHEN TO USE PER-JOINT: for a single joint with a genuinely PERSISTENT hardware
+  problem (a bad encoder or cable). NOT for routine tuning. Measured on this arm,
+  the at-rest noise is encoder LSB dithering, and WHICH joint is noisy reshuffles
+  between power cycles, so a per-joint tune done today can land on the wrong joint
+  after the next boot. The stable default is one uniform tau per signal, sized
+  for the worst-case joint. You will rarely need <joint> at all.
+
+
+  ============================================================================
+   5. THE RULE THAT MATTERS  (choosing type per signal)
+  ============================================================================
+  A signal needs as many filter POLES as it has DIFFERENTIATIONS. Each derivative
+  amplifies high-frequency noise; each 1-pole filter stage removes one octave of
+  that amplification. No amount of tau tuning substitutes for a missing pole.
+
+    speed, torque   measured directly (0 differentiations): 1 pole (ema) or none
+    accel           1 differentiation: 1 pole. Its input is already the FILTERED
+                    speed, which supplies that pole, so the default is "none"
+                    (a 2nd filter here measured WORSE, not better).
+    jerk            2 differentiations: 2 poles (ema2 / butter2 / savgol). A
+                    single ema CANNOT clean jerk at ANY tau.
+
+  TUNING WORKFLOW: the tau values below are starting points from a rest-noise
+  measurement. To refine, jog the arm, watch the live filtered signal in the GUI,
+  edit tau here, click Reload Filters, repeat. No re-home between iterations.
+  ============================================================================
+-->
+<filters>
+    <speed type="butter2" tau="0.0101"/>   <!-- measured (0 diffs): 1 pole is plenty -->
+    <accel type="dema" tau="0.0051"/>   <!-- input already carries speed's pole; "none" measured BEST -->
+    <jerk type="ema" tau="0.1351"/>   <!-- 2 diffs: needs 2 POLES (ema2/butter2/savgol) - 1-pole ema cannot fix it at any tau -->
+    <torque type="ema" tau="0.1001"/>   <!-- measured (0 diffs): 1 pole. Also cleans torque_external/force_external -->
+    <tcp_accel type="ema" tau="0.0246"/>   <!-- Cartesian accel; its Jdot*qdot term is quadratic in velocity -->
+    <gripper_speed type="ema" tau="0.02"/>   <!-- measured (0 diffs): 1 pole -->
+</filters>

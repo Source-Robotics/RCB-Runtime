@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Filename: process_manager.py
+Description: Script lifecycle management for supervisor.
+    Handles starting, stopping, restarting, and monitoring of managed scripts.
+
+    Key robustness rules (learned the hard way):
+    - Each script runs in its OWN session/process group (start_new_session=True)
+      so we can kill the whole tree on stop/restart. Without this, a restart can
+      leave the old process alive holding its port -> the new one fails to bind
+      (e.g. GUI: "Errno 98 Address already in use") -> crash/restart spiral.
+    - Child stdout/stderr go to logs/<NAME>.out.log. Previously they went to
+      PIPE and were never read, so crash tracebacks were silently swallowed
+      (and a chatty child could deadlock when the 64 KB pipe buffer filled).
+    - kill_stale() clears leftovers from a previous supervisor run on boot.
+"""
+
+import os
+import signal
+import subprocess
+import psutil
+import logging
+from project_paths import PROJECT_ROOT
+from utility.system_temperature import get_raspberry_pi_temperature
+
+logger = logging.getLogger(__name__)
+
+LOG_DIR = PROJECT_ROOT / "logs"
+_TERM_TIMEOUT = 5  # seconds to wait for graceful exit before SIGKILL
+
+
+# ==========================================================================
+# Low-level process helpers
+# ==========================================================================
+def _spawn(name, cmd):
+    """Launch one script in its own process group, output -> logs/<name>.out.log."""
+    logf = open(LOG_DIR / f"{name}.out.log", "ab", buffering=0)
+    proc = subprocess.Popen(
+        cmd,
+        shell=True,
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,  # new pgid so we can kill the whole tree later
+    )
+    proc._logf = logf  # keep a reference so the file handle isn't GC'd
+    logger.info(f"✅ Started {name} (PID: {proc.pid})")
+    return proc
+
+
+def _signal_group(proc, sig):
+    """Send a signal to the process's whole group; fall back to the process."""
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except ProcessLookupError:
+        pass  # already gone
+    except Exception:
+        try:
+            proc.send_signal(sig)
+        except Exception:
+            pass
+
+
+def _close_log(proc):
+    logf = getattr(proc, "_logf", None)
+    if logf:
+        try:
+            logf.close()
+        except Exception:
+            pass
+
+
+def _terminate(name, proc):
+    """Kill a process and its entire group; SIGTERM then SIGKILL. Reap it."""
+    if proc.poll() is not None:
+        _close_log(proc)
+        return
+
+    logger.info(f"🛑 Stopping {name} (PID: {proc.pid})...")
+    _signal_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=_TERM_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"{name} did not exit on SIGTERM, sending SIGKILL")
+        _signal_group(proc, signal.SIGKILL)
+        try:
+            proc.wait(timeout=_TERM_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            logger.error(f"{name} survived SIGKILL (zombie?)")
+    _close_log(proc)
+    logger.info(f"✅ {name} stopped.")
+
+
+# ==========================================================================
+# Public API
+# ==========================================================================
+def kill_stale(SCRIPTS):
+    """Kill leftover instances of managed scripts from a previous supervisor run.
+
+    Matches a process only if its executable is python AND its command line
+    contains one of the managed script paths — so it won't kill an editor that
+    merely has the file open.
+    """
+    paths = [cmd.split()[-1] for cmd in SCRIPTS.values()]  # full .py paths
+    me = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.pid == me:
+                continue
+            cmd = proc.info["cmdline"] or []
+            if not cmd:
+                continue
+            is_python = "python" in os.path.basename(cmd[0])
+            joined = " ".join(cmd)
+            if is_python and any(p in joined for p in paths):
+                logger.info(f"🧹 Killing stale process {proc.pid}: {joined}")
+                proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+
+def start_scripts(SCRIPTS, processes):
+    """Start all scripts and store process references."""
+    logger.info("Starting all managed scripts")
+    for name, cmd in SCRIPTS.items():
+        processes[name] = _spawn(name, cmd)
+
+
+def stop_scripts(processes):
+    """Stop all running scripts safely (does not touch supervisor.py itself)."""
+    logger.info("Stopping all managed scripts")
+    for name, proc in list(processes.items()):
+        _terminate(name, proc)
+        del processes[name]
+    logger.info("✅ All managed scripts stopped.")
+
+
+def stop_specific_script(name, processes):
+    """Stop a single running script safely."""
+    proc = processes.get(name)
+    if proc is None:
+        logger.info(f"❌ Script {name} not found.")
+        return
+    _terminate(name, proc)
+    del processes[name]
+
+
+def restart_script(name, processes, SCRIPTS):
+    """Restart a stalled or crashed script — old tree is fully killed first."""
+    logger.info(f"♻️ Restarting {name}...")
+    proc = processes.get(name)
+    if proc is not None:
+        _terminate(name, proc)
+    processes[name] = _spawn(name, SCRIPTS[name])
+    logger.info(f"✅ Restarted {name} (PID: {processes[name].pid})")
+
+
+def monitor_scripts(emergency_stop, processes, SCRIPTS):
+    """
+    Monitor running scripts, check responsiveness, and restart if necessary.
+    Also reads the Raspberry Pi temperature.
+
+    Returns:
+        dict: {script_name: {"status": <state>}, ..., "temperature_C": float|None}
+    """
+    status_dict = {}
+
+    # Emergency stop: kill everything and report.
+    if emergency_stop:
+        stop_scripts(processes)
+        logger.info("🛑 Emergency stop activated! All processes terminated.")
+        for name in SCRIPTS:
+            status_dict[name] = {"status": "stopped (emergency)"}
+        return status_dict
+
+    # Recover after an emergency stop was lifted.
+    if not processes and not emergency_stop:
+        logger.info("🔁 Emergency stop lifted. Restarting all scripts...")
+        start_scripts(SCRIPTS=SCRIPTS, processes=processes)
+        for name in SCRIPTS:
+            status_dict[name] = {"status": "restarted after estop"}
+        return status_dict
+
+    # Normal health check.
+    for name in SCRIPTS:
+        process = processes.get(name)
+
+        if process is None:
+            logger.info(f"⚠️ {name} not in process list! Restarting...")
+            restart_script(name, processes, SCRIPTS)
+            status_dict[name] = {"status": "restarted (missing)"}
+            continue
+
+        if process.poll() is not None:
+            logger.info(f"❌ {name} stopped unexpectedly (exit {process.returncode})! "
+                        f"See logs/{name}.out.log")
+            restart_script(name, processes, SCRIPTS)
+            status_dict[name] = {"status": "restarted (crashed)"}
+        else:
+            status_dict[name] = {"status": "running"}
+
+    # Raspberry Pi temperature.
+    temp = get_raspberry_pi_temperature()
+    status_dict["temperature_C"] = round(temp, 2) if temp is not None else None
+    if temp is None:
+        logger.info("❌ Could not read Raspberry Pi temperature.")
+
+    return status_dict

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: full
+    Complete robot state — all joint, TCP, gripper fields.
+    Use for recording sessions, diagnostics, or any application
+    that needs the entire robot state in every packet.
+-->
+<recipe name="full">
+    <field tag="j_p"       precision="4"/>
+    <field tag="j_s"       precision="3"/>
+    <field tag="j_t"       precision="3"/>
+    <field tag="j_a"       precision="3"/>
+    <field tag="j_err"/>
+    <field tag="tick"/>
+    <field tag="exec_t"    precision="6"/>
+    <field tag="TCP_p"     precision="4"/>
+    <field tag="TCP_s"     precision="3"/>
+    <field tag="t_ext"     precision="3"/>
+    <field tag="TCP_f_ext" precision="3"/>
+    <field tag="g_p"       precision="3"/>
+    <field tag="g_c"       precision="2"/>
+    <field tag="g_err"/>
+</recipe>

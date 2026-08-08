@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: minimal
+    Lightest possible packet. Good for high-frequency logging or
+    bandwidth-limited links. Only joint positions and tick counter.
+-->
+<recipe name="minimal">
+    <field tag="j_p"  precision="2"/>
+    <field tag="tick"/>
+</recipe>

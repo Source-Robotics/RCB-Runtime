@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: standard
+    Default recipe. Position, speed, TCP pose, errors and tick.
+    Covers most monitoring and replay needs without excess bandwidth.
+-->
+<recipe name="standard">
+    <field tag="j_p"   precision="3"/>
+    <field tag="j_s"   precision="2"/>
+    <field tag="j_err"/>
+    <field tag="tick"/>
+    <field tag="TCP_p" precision="4"/>
+    <!-- Command-sequence echo, so any PC streaming against the DEFAULT recipe can measure
+         its own loop delay without switching recipes. ~22 bytes; rti_ok / rti_miss are
+         left to the diagnostics recipe. Zero outside RTI mode. -->
+    <field tag="rti_seq"/>
+    <!-- rti_state lets the PC detect that control was revoked; without it a dropped claim
+         is invisible and the PC streams into an open loop it thinks is closed. `mode`
+         catches the wider case (E-stop, operator forcing IDLE) that rti_state cannot see.
+         period_ms is the MEASURED tick duration a controller needs to integrate with. -->
+    <field tag="rti_state"/>
+    <field tag="mode"/>
+    <field tag="period_ms" precision="3"/>
+</recipe>

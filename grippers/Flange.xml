@@ -1,0 +1,25 @@
+<gripper name="Flange">
+    <CAN_gripper>0</CAN_gripper>   <!-- 0 = not a CAN-driven gripper -->
+
+  <!-- Per-arm-joint home_offset overrides. Used for joints whose home_offset depends on the
+         gripper geometry (home_offset_gripper_dependent=1 in robot XML). Add one <joint> entry
+         per dependent joint, using the robot joint id (0-based). -->
+    <arm_joint_home_offsets>
+        <joint id="4">-2.258</joint>   <!-- J5: homes against gripper lower arm — offset depends on gripper dimensions -->
+    </arm_joint_home_offsets>
+
+    <!-- Kinematic / dynamics parameters — used by PAR6.py to build the DH tool link -->
+    <kinematics>
+        <d>-0.0571</d>                                                                     <!-- DH link offset [m] TODO: verify -->
+        <a>0.0</a>                                                                         <!-- DH link length [m] -->
+        <alpha>3.141592653589793</alpha>                                                   <!-- DH twist angle [rad] -->
+        <mass>0.0555</mass>                                                                <!-- total mass [kg] -->
+        <com>0.0 0.0 0.0</com>                                                            <!-- center of mass x y z [m] -->
+        <inertia>0.0 0.0 0.0 0.0 0.0 0.0</inertia>                                       <!-- Ixx Iyy Izz Ixy Iyz Ixz[kg·m²] -->
+        <Jm>1.5e-6</Jm>                                                                   <!-- motor inertia [kg·m²] -->
+        <G>10</G>                                                                          <!-- gear ratio -->
+        <B>1e-4</B>                                                                        <!-- viscous friction [N·m·s/rad] -->
+        <Tc>0.02 -0.02</Tc>                                                               <!-- Coulomb friction [+, -] [N·m] -->
+        <qlim_deg>-48.7014 409.0919</qlim_deg>                                            <!-- J6 soft limits for flange [deg] -->
+    </kinematics>
+</gripper>

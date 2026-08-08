@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Python syntax check without bytecode output
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          failed = False
+          for path in sorted(Path('.').rglob('*.py')):
+              if any(part in {'.venv', 'venv', '__pycache__'} for part in path.parts):
+                  continue
+              try:
+                  ast.parse(path.read_text(encoding='utf-8'))
+              except SyntaxError as exc:
+                  failed = True
+                  print(f'{path}:{exc.lineno}:{exc.offset}: {exc.msg}')
+          raise SystemExit(1 if failed else 0)
+          PY
+      - name: Check generated files are not committed
+        run: |
+          test -z "$(find . -type d -name __pycache__ -print -quit)"
+          test -z "$(find . -type f \( -name '*.pyc' -o -name '*.pyo' -o -name '*.log' -o -name '*.out.log' \) -print -quit)"

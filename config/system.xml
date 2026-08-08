@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<system>
+
+    <!-- ====================================================================
+         Active robot selection
+         Must match a filename in the robots/ folder.
+         Example: PAR6  ->  robots/PAR6.xml
+                  INDIGO ->  robots/INDIGO.xml
+                  SKAR   ->  robots/SKAR.xml
+         ==================================================================== -->
+    <active_robot>PAR6</active_robot>
+    <!-- BENCH RIG (2026-08-03): temporarily SSG48 because the test stack's node 6 is a
+         Spectral BLDC board, and SSG48.xml is the gripper that declares
+         driver_type=spectral-bldc. RESTORE TO MSG_small_motor_150mm_rail BEFORE USING THE
+         REAL ARM — this also selects gripper kt/stroke/homing offsets, not just driver type. -->
+    <active_gripper>MSG_small_motor_150mm_rail</active_gripper> <!--  MSG_small_motor_150mm_rail Name of the active gripper. Must match a filename in the grippers/ folder (e.g. SSG48 -> grippers/SSG48.xml) -->
+
+    <!-- ====================================================================
+         Kt source selection
+         auto : try to read Kt from each motor over CAN at startup;
+                fall back to the value in the robot XML if a motor does not respond.
+         xml  : always use the Kt values from the robot XML, skip CAN fetch.
+         ==================================================================== -->
+    <kt_source>auto</kt_source>
+
+    <!-- ====================================================================
+         JOG defaults — initial slider/toggle values for the GUI and for the
+         JogHandler at startup. Live state lives in shared memory rti[] and
+         may diverge from these as the user adjusts the controls.
+         ==================================================================== -->
+    <jog_defaults>
+        <speed_pct>0.20</speed_pct>      <!-- 0.0-1.0, fraction of max joint speed -->
+        <accel_time>0.55</accel_time>    <!-- seconds, ramp from 0 to full speed -->
+        <profile>scurve</profile>        <!-- trapezoidal | scurve -->
+        <jerk_factor>3.0</jerk_factor>   <!-- jerk = accel * factor (S-curve only) -->
+        <control_mode>pid</control_mode> <!-- pid | pd -->
+    </jog_defaults>
+
+
+    <!-- ==================================================================
+         RTI mode policy. Robot-INDEPENDENT tuning that used to live as module
+         constants in motion/rti_handler.py. Physical limits do NOT belong here —
+         velocity/acceleration/jerk/torque-rate and the soft joint limits are
+         per-joint properties and live in robots/<robot>.xml. This block is for
+         "how should RTI behave", not "what can this arm do".
+         Any field omitted falls back to the constant of the same name in
+         motion/rti_handler.py, so deleting this block changes nothing.
+         ================================================================== -->
+    <rti_defaults>
+        <!-- Silence this long and the robot stops itself and latches an error.
+             40 ms is 10 ticks at 250 Hz, chosen because 20 ms would be only 5 ticks
+             and a single non-RT scheduling hiccup on the controlling PC would then be
+             indistinguishable from a dead link.
+             Also acts as a MINIMUM COMMAND RATE: 1/0.040 = 25 Hz. -->
+        <command_timeout_s>0.040</command_timeout_s>
+        <!-- Hold position this long after any stop, clean or error. -->
+        <stopping_hold_s>0.5</stopping_hold_s>
+        <!-- How far the PC's FIRST setpoint after rti_claim may sit from where the
+             arm actually is. 0.1 rad ~= 5.7 deg: larger than any tracking error,
+             far smaller than a controller that initialised its target to zeros. -->
+        <start_pose_tol_rad>0.1</start_pose_tol_rad>
+        <!-- Command low-pass cutoff. 0 = OFF by default: at 250 Hz a rate-matched
+             25 Hz cutoff costs ~4x the absolute phase lag the same cutoff ratio would
+             cost on a 1 kHz loop, and the PC is closing that loop.
+             25.0 is the recommended value if you turn it on. -->
+        <lowpass_cutoff_hz>0</lowpass_cutoff_hz>
+        <!-- Success rate is a moving window of this many ticks. 100 gives the ratio
+             1% resolution. Shorter windows cannot carry the thresholds below: at 25
+             samples, two dropped packets already reads as "unreliable". -->
+        <success_window_ticks>100</success_window_ticks>
+        <!-- Warning thresholds on that rate. Chosen here, not derived from anything.
+             Only applied in robot-clocked mode; in PC-clocked mode the rate is a duty
+             cycle, not a loss rate. -->
+        <success_warn>0.95</success_warn>
+        <success_bad>0.90</success_bad>
+    </rti_defaults>
+
+    <maintenance_defaults>
+        <!-- Entering FLASHING makes the motors go limp (their watchdogs fire into
+             shorted-phase brake) so an external flasher can own the CAN bus while
+             RTI keeps ticking. The arm must therefore already be resting in a pose
+             that survives losing torque.
+
+             joint_gravity_torque IS the torque needed to hold the current pose up,
+             so this is a direct measure of "is this pose self-supporting". If ANY
+             joint needs more than this, the mode request is refused.
+
+             MEASURE AND TUNE THIS ON THE REAL ARM at the standby pose (robots/PAR6.py
+             `qs`). The shipped value is deliberately strict; an operator who has
+             physically supported the arm can always override with
+             `set_mode:FLASHING:FORCE`. -->
+        <flash_park_max_gravity_nm>1.0</flash_park_max_gravity_nm>
+    </maintenance_defaults>
+</system>

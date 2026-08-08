@@ -1,0 +1,89 @@
+<homing_sequence>
+
+  <!-- Step 0: home J1 -->
+
+  
+  <step>
+    <pre_moves>
+      <idle joint="1" duration_s="4.0" />
+      <idle joint="2" duration_s="4.0" />
+      <nudge joint="4" speed="-7000" duration_s="2.8" />
+    </pre_moves>
+    <home joints="0" />
+  </step>
+    <!-- Step 1: nudge J5 away from its mechanical stop at velocity for 0.8 s,
+       then home J2, J3 in parallel. A velocity nudge is used instead of a
+       position move because the joint is not yet calibrated at this point. -->
+  <step>
+    <home joints="1,2" />
+  </step>
+
+
+  <step>
+    <pre_moves>
+      <nudge joint="4" speed="5000" duration_s="1.9" />
+    </pre_moves>
+  </step>
+
+  <!-- Step 2: gripper firmware calibration — runs the gripper's built-in
+       activation/calibration sequence before motor homing. -->
+  <step>
+    <home joints="gripper" mode="firmware" />
+  </step>
+
+  <!-- Step 3: gripper motor homing — stall-detect against the endstop to
+       set the position reference (master_position). Requires homing_speed,
+       homing_direction and homing_current_ma to be set in grippers/SSG48.xml. -->
+  <step>
+    <home joints="gripper" mode="motor" />
+  </step>
+
+
+  <!-- Step 5: nudge J3 away from endstop (homed in step 1), then home J4.
+       Speed sign: positive = away from the J3 endstop (homing_direction=0 = positive motor dir,
+       so endstop was hit going positive — back off with negative speed). Tune duration_s. -->
+  <step>
+    <pre_moves>
+      <gripper_move position="252" speed="150" current="500"
+                activate="1" action="1" estop="0" release_dir="0"
+                    duration_s="2.5" />
+    </pre_moves>
+  </step>
+
+
+  <step>
+    <pre_moves>
+      <nudge joint="5" speed="-9000" duration_s="1.8" />
+    </pre_moves>
+    <move_to joint="1" position_rad="-1.85" duration_s="2.5" />
+    <move_to joint="2" position_rad="2.85"    duration_s="2.5" />
+  </step>
+
+  <step>
+      <home joints="3,5" />
+  </step>
+
+  <step>
+      <move_to joint="5" position_rad="3.141592654" duration_s="2.0" />
+  </step>
+
+
+  <!-- Step 6: home J5 -->
+  <step>
+    <home joints="4" />
+  </step>
+
+  <!-- Step 7: move all joints to ready position over 2 seconds.
+       Uses smooth cubic Hermite interpolation (zero velocity at start/end).
+       Each joint can have its own duration. Joints hold position after arrival. -->
+
+  <step>
+    <move_to joint="0" position_rad="1.57" duration_s="3.0" />
+    <move_to joint="3" position_rad="0"    duration_s="3.0" />
+    <move_to joint="4" position_rad="-0.5"    duration_s="3.0" />
+  </step>
+
+
+
+</homing_sequence>
+

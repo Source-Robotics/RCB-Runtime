@@ -1,0 +1,49 @@
+<gripper name="MSG_small_motor_200mm_rail">
+    <CAN_gripper>1</CAN_gripper>   <!-- 1 = CAN-driven motor gripper -->
+    <driver_type>stepfoc</driver_type>  <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+    <Stroke>200</Stroke>       <!-- Stroke in mm -->
+    <kt>0.111</kt>                 <!-- Torque constant in Nm/A TODO: verify for small motor -->
+    <Ilim>1700</Ilim>              <!-- Current limit in mA -->
+    <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+    <Velocity_limit>80000</Velocity_limit>
+    <watchdog_rate>5000</watchdog_rate>   <!-- Motor velocity limit in ticks/s -->
+    <KPP>5</KPP>
+    <KPV>0.015</KPV>
+    <KIV>0.0005</KIV>
+    <KIIQ>1</KIIQ>
+    <KPIQ>7</KPIQ>
+    <KP>0.12</KP>
+    <KD>0.002</KD>
+    <Gear_r>0.0083</Gear_r>
+
+    <arm_joint_home_offsets>
+        <joint id="4">-2.070</joint>   <!-- J5: homes against gripper lower arm — offset depends on gripper dimensions -->
+    </arm_joint_home_offsets>
+
+    <!-- Homing configuration -->
+    <homing_speed>7000</homing_speed>
+    <homing_direction>0</homing_direction>
+    <homing_current_ma>700</homing_current_ma>
+    <has_hall_sensor>0</has_hall_sensor>
+    <home_offset>0.0</home_offset>
+    <homing_timeout_s>8.0</homing_timeout_s>
+    <homing_two_pass>1</homing_two_pass>
+    <homing_two_pass_max_diff>200</homing_two_pass_max_diff>
+    <homing_backoff_s>0.8</homing_backoff_s>
+    <homing_order>7</homing_order>
+
+    <!-- Kinematic / dynamics parameters — used by PAR6.py to build the DH tool link -->
+    <kinematics>
+        <d>-0.11745</d>                                                                    <!-- DH link offset [m] TODO: measure for this variant -->
+        <a>0.0</a>                                                                         <!-- DH link length [m] -->
+        <alpha>3.141592653589793</alpha>                                                   <!-- DH twist angle [rad] -->
+        <mass>0.41484</mass>                                                               <!-- total mass [kg] TODO: measure -->
+        <com>0.00001 -0.00012 -0.03721</com>                                              <!-- center of mass x y z [m] TODO: measure -->
+        <inertia>3.2619e-4 2.2519e-4 2.8541e-4 -3.917e-7 -1.2089e-6 -2.998e-7</inertia> <!-- Ixx Iyy Izz Ixy Iyz Ixz[kg·m²] -->
+        <Jm>1.5e-6</Jm>                                                                   <!-- motor inertia [kg·m²] -->
+        <G>10</G>                                                                          <!-- gear ratio -->
+        <B>1e-4</B>                                                                        <!-- viscous friction [N·m·s/rad] -->
+        <Tc>0.02 -0.02</Tc>                                                               <!-- Coulomb friction [+, -] [N·m] -->
+        <qlim_deg>-160 160</qlim_deg>                                                     <!-- joint limits [deg] -->
+    </kinematics>
+</gripper>

@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rcb-runtime"
+version = "0.1.0"
+description = "Runtime control stack for the Source Robotics Robot Control Box"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-only" }
+authors = [{ name = "Source Robotics", email = "petar@source-robotics.com" }]
+keywords = ["robotics", "robot-arm", "CAN", "real-time", "raspberry-pi", "control-runtime"]
+
+# Runtime dependencies are intentionally not duplicated here with exact pins.
+# Deploy from requirements.txt, which records the versions verified on hardware.
+dependencies = [
+    "Spectral_BLDC",
+    "SourceRoboticsToolbox",
+    "roboticstoolbox-python-source-robotics",
+    "spatialmath-python",
+    "pin",
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "toppra",
+    "pyzmq",
+    "nicegui",
+    "python-can",
+    "gpiozero",
+    "lgpio",
+    "adafruit-circuitpython-ssd1306",
+    "adafruit-blinka",
+    "Pillow",
+    "pyserial",
+    "psutil",
+    "joblib",
+    "distro",
+]
+
+[project.urls]
+Homepage = "https://github.com/Source-Robotics/RCB-Runtime"
+Source = "https://github.com/Source-Robotics/RCB-Runtime"
+
+# This repo is run as cooperating process scripts rather than installed console
+# entry points. See README.md and scripts/install.sh for deployment.
+[tool.setuptools]
+py-modules = []

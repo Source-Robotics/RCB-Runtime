@@ -1,0 +1,430 @@
+<robot>
+
+    <name>PAR6</name> <!-- Name of the robot.-->
+    <active_gripper>MSG_small_motor_150mm_rail</active_gripper> <!-- FALLBACK only: config/system.xml takes precedence and is what normally selects the gripper. Must match a filename in the grippers/ folder (e.g. MSG_small_motor_150mm_rail -> grippers/MSG_small_motor_150mm_rail.xml). Keep it in step with system.xml — the gripper drives kt, stroke, homing offsets AND the driver_type that firmware flashing checks against. -->
+    <server_port>8080</server_port>
+    <network_mode>ethernet</network_mode> <!-- Options: ethernet, wifi, offline -->
+    <RTI_loop_time>0.004</RTI_loop_time>
+    <RTI_Joint_mode_loop_time>0.001</RTI_Joint_mode_loop_time> <!-- What rate to use for a Joint only mode, Ignore ALL Ik, FK, Jacobians; we need super fast loop -->
+    <base_transform>1</base_transform> <!-- Is the robot on horizontal table, ceiling, under specific angle  -->
+    <gravity_value>9.81</gravity_value> <!-- Gravity value to be used in dynamics calculations. Default is 9.81 m/s^2 -->
+    <homing_config>config/PAR6_homing.xml</homing_config> <!-- Separate homing sequence file defining parallel groups and pre-moves -->
+
+    <!-- Pose the arm is moved to before maintenance where the motors LOSE TORQUE
+         (firmware flashing). Joint angles in RADIANS, one per joint, in order.
+         This is the arm's standby pose: shoulder down, elbow folded back, so the
+         structure carries itself instead of the motors. Verified inside every
+         soft limit. Matches `qs` in robots/PAR6.py, which is model/test code and
+         is not read by anything in production — THIS is the value the runtime
+         and the dashboard use. -->
+    <park_pose>0.0 -1.5708 3.1416 0.0 0.0 3.1416</park_pose>
+
+    <joints count="6">
+        <joint id="0">
+            <name>joint1</name>
+            <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+            <kt>0.28</kt> <!-- Torque constant in Nm/A -->
+            <Ilim>1800</Ilim>  <!-- Current limit in mA -->
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit> <!-- (Motor) Velocity limit in ticks/s -->
+            <joint_velocity_limit>4.8</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
+            <joint_acceleration_limit>32.0</joint_acceleration_limit> <!-- (Joint) Acceleration limit in rad/s^2. **LIBERAL TEST VALUE 2026-08-06 — was 9.6.** Raised from the velocity/0.5s convention to velocity/0.15s (~3.3x) to open up headroom for finding the real numbers; the physically correct value is (available torque / effective inertia), is pose-dependent, and is still NOT MEASURED. SHARED FIELD: command_executor.py (every EXEC move) and robotics/jog.py (every jog) read this too, so raising it made those ~3.3x punchier as well — it is not RTI-only. Revert with robots/PAR6.xml.conservative-backup. -->
+            <joint_jerk_limit>16000.0</joint_jerk_limit> <!-- (Joint) Jerk limit in rad/s^3. **LIBERAL TEST VALUE 2026-08-06 — was 480.0.** Raised from 50x acceleration to 500x. READ THIS: jerk only binds while it is below acceleration_limit/dt, which is 8000.0 rad/s^3 here at 250 Hz — 16000.0 is ABOVE that, so THE JERK LIMIT NO LONGER BINDS AT ALL and acceleration can step to full scale in a single 4 ms tick. That is deliberate: jerk was the sole cause of the RTI tracking lag (0.5-3 deg on smooth streams). It also means jerk limiting is effectively OFF, so gearbox-friendly torque ramping is no longer enforced here. RTI-only field (nothing in EXEC or JOG reads it). Revert with robots/PAR6.xml.conservative-backup. -->
+            <torque_rate_limit>364.0</torque_rate_limit> <!-- (Joint) Max rate of change of commanded torque in Nm/s. **LIBERAL TEST VALUE 2026-08-06 — was 36.4.** Raised 10x (11.5x -> 115x peak joint torque). Still far below the electrical ceiling (V/L * kt * gear ~ 3500 Nm/s here), so this remains a motion-smoothness limit rather than a driver limit. RTI-only field. Revert with robots/PAR6.xml.conservative-backup. -->
+
+            <!-- ================= PER-MODE MOTION LIMITS =================
+                 The <joint_*_limit> fields above are the HARDWARE CEILING: what the arm
+                 survives. Nothing may exceed them — config/xml_parser.py clamps every block
+                 below to them on load and warns if one tries to go higher. A mode can only
+                 ask for LESS than the hardware allows, never more.
+
+                 Why these exist: acceleration used to be a single number shared by RTI,
+                 command_executor and jog, so opening it up for RTI testing made every queued
+                 EXEC move ~3.3x punchier as a side effect. Splitting them means the mode
+                 being tuned and the mode being used no longer move together.
+
+                 Omit a block, or any field in it, and that mode falls back to the ceiling —
+                 so a robot XML written before this still loads and behaves as it always did.
+            ============================================================ -->
+            <!-- Queued motion (command_executor / trajectory planner). PRE-LIBERAL
+                 VALUES: acceleration is velocity/0.5s, exactly what EXEC used before
+                 2026-08-06, so pick-and-place behaves as it always has while RTI is tuned.
+                 velocity + acceleration only — the planner reads nothing else. -->
+            <exec_limits>
+                <velocity>4.8</velocity>
+                <acceleration>9.6</acceleration>
+                <jerk>28.8</jerk> <!-- Jerk in rad/s^3. Was DERIVED in code as RUCKIG_JERK_FACTOR(3.0) x the
+                     acceleration limit (motion/planner_pipeline.py) — a limit computed from
+                     another limit in consumer code, the exact pattern CLAUDE.md forbids and
+                     the same shape as the old MAX_VEL/ACCEL_TIME bug. Stated here instead.
+                     This value IS 3.0 x the exec acceleration above, so the switch was
+                     behaviour-neutral; it is now a number you can edit rather than one you
+                     have to recompute. Only profile='ruckig' bounds jerk at all — trapezoid
+                     and toppra STEP acceleration, quintic/s_curve have a fixed shape. -->
+            </exec_limits>
+            <!-- Streamed external control (RTI / UDP). Currently the full ceiling:
+                 RTI is the mode being tuned, and its limiter is what the liberal values were
+                 raised for. Lower these rather than the ceiling if RTI alone needs softening. -->
+            <rti_limits>
+                <velocity>4.8</velocity>
+                <acceleration>32.0</acceleration>
+                <jerk>16000.0</jerk>
+                <torque_rate>364.0</torque_rate>
+            </rti_limits>
+            <watchdog_rate>5000</watchdog_rate>  <!-- (Motor) Watchdog rate in ms -->
+            <KPP>5</KPP> <!-- Kp value for Positon loop of cascade PID controller -->
+            <KPV>0.015</KPV> <!-- Kp value for Velocity loop of cascade PID controller -->
+            <KIV>0.0015</KIV> <!-- Ki value for Velocity loop of cascade PID controller -->
+            <KIIQ>0.9</KIIQ> <!-- Ki value for Current loop of cascade PID controller -->
+            <KPIQ>7</KPIQ> <!-- Kp value for Current loop of cascade PID controller -->
+            <KP>0.12</KP> <!-- KP (Stiffness) value of joint space impedance PD controller -->
+            <KD>0.002</KD> <!-- KD (Damping) value of joint space impedance PD controller -->
+            <joint_limit_negative>-2.952</joint_limit_negative> <!-- True Joint limits in radians. At this positions robot hits its mechanical limits / endstops-->
+            <joint_limit_positive>2.952</joint_limit_positive> <!-- True Joint limits in radians. At this positions robot hits its mechanical limits / endstops-->
+            <software_joint_limit_negative>-2.8647335</software_joint_limit_negative> <!-- Soft Joint limits in radians. These limits are imoposed on software to never actually touch the mechanical limits-->
+            <software_joint_limit_positive>2.8647335</software_joint_limit_positive> <!-- Soft Joint limits in radians. These limits are imoposed on software to never actually touch the mechanical limits-->
+            <encoder>14</encoder> <!-- Encoder resolution in bits.-->
+            <sector_home_master_position>3969 </sector_home_master_position> <!-- Encoder ticks the robot is at bootup at MASTER POSITIONS-->
+            <sector_home_offset>1.570796327 </sector_home_offset> <!-- Joint level position from master position to the one defined in kinematics chain-->
+            <home_offset>2.96279 </home_offset> <!-- joint level position from endstop to the one defined in kinematic chain TODO add another direction also-->
+            <home_offset_gripper_dependent>0</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
+            <homing_speed>4500</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>700</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <homing_timeout_s>13</homing_timeout_s>   <!-- Homing timeout in seconds — J0 travels furthest so needs more time -->
+            <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
+            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass_max_diff>3500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <homing_release_current_ma>0</homing_release_current_ma>   <!-- Current [mA] during release phase (0 = coast/relax gearbox) -->
+            <homing_release_duration_s>NaN</homing_release_duration_s>   <!-- NaN = skip release phase -->
+            <homing_release_sample_pct>0.8</homing_release_sample_pct>   <!-- When to latch position: 0.0=start, 0.5=midpoint, 1.0=end of release -->
+            <gear_ratio>6.4</gear_ratio> <!-- Gear ratio of the joint -->
+            <gear_efficiency>0.98</gear_efficiency> <!-- Gear efficiency of the joint -->
+            <dir>0</dir> <!-- is positive rotation of the joint matched to the one in kinematic definiton of the robot 0 yes 1 no -->
+            <joint_type>revolute</joint_type> <!-- Type of the joint. Options: revolute, prismatic, continuous_revolute -->
+        </joint>
+        <joint id="1">
+            <name>joint2</name>
+            <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+            <kt>0.31</kt>
+            <Ilim>2500</Ilim>  <!-- Current limit in mA -->
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <joint_velocity_limit>1.5</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
+            <joint_acceleration_limit>10.0</joint_acceleration_limit> <!-- (Joint) Acceleration limit in rad/s^2. LIBERAL TEST VALUE 2026-08-06 — was 3.0. See joint 0. Shared with EXEC and JOG. -->
+            <joint_jerk_limit>5000.0</joint_jerk_limit> <!-- (Joint) Jerk limit in rad/s^3. LIBERAL TEST VALUE 2026-08-06 — was 150.0. 500x accel; above accel/dt (2500.0) so it does not bind at 250 Hz. See joint 0. -->
+            <torque_rate_limit>2005.0</torque_rate_limit> <!-- (Joint) Max commanded-torque slew in Nm/s. LIBERAL TEST VALUE 2026-08-06 — was 200.5. 10x. See joint 0. -->
+
+            <!-- Queued motion — pre-liberal; see joint 0. -->
+            <exec_limits>
+                <velocity>1.5</velocity>
+                <acceleration>3.0</acceleration>
+                <jerk>9.0</jerk> <!-- Jerk in rad/s^3 — see joint 0. -->
+            </exec_limits>
+            <!-- Streamed external control — full ceiling; see joint 0. -->
+            <rti_limits>
+                <velocity>1.5</velocity>
+                <acceleration>10.0</acceleration>
+                <jerk>5000.0</jerk>
+                <torque_rate>2005.0</torque_rate>
+            </rti_limits>
+            <watchdog_rate>5000</watchdog_rate>  <!-- (Motor) Velocity limit in ticks/s -->
+            <KPP>3</KPP>
+            <KPV>0.01</KPV> 
+            <KIV>0.001</KIV> 
+            <KIIQ>0.5</KIIQ> 
+            <KPIQ>2</KPIQ> 
+            <KP>0.12</KP> 
+            <KD>0.002</KD> 
+            <joint_limit_negative>-2.528</joint_limit_negative>
+            <joint_limit_positive>-0.025</joint_limit_positive>
+            <software_joint_limit_negative>-2.4407335</software_joint_limit_negative>
+            <software_joint_limit_positive>-0.1122665</software_joint_limit_positive>
+            <encoder>14</encoder>
+            <sector_home_master_position>5707 </sector_home_master_position>
+            <sector_home_offset>-2.516096327 </sector_home_offset>
+            <home_offset>-2.5259796 </home_offset>  <!-- -2.5259796  -2.4359 -->
+            <home_offset_gripper_dependent>0</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
+            <homing_speed>6000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>250</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_backoff_s>1.5</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
+            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass_max_diff>2000</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <homing_release_current_ma>150</homing_release_current_ma>   <!-- Current [mA] during release phase (0 = coast/relax gearbox) -->
+            <homing_release_duration_s>1</homing_release_duration_s>   <!-- Release duration [s] — how long to hold current before latching position -->
+            <homing_release_sample_pct>0.8</homing_release_sample_pct>   <!-- When to latch position: 0.0=start, 0.5=midpoint, 1.0=end of release -->
+            <gear_ratio>25</gear_ratio>
+            <gear_efficiency>0.90</gear_efficiency>
+            <dir>0</dir>
+            <joint_type>revolute</joint_type>
+
+        </joint>
+        <joint id="2">
+            <name>joint3</name>
+            <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+            <kt>0.3</kt>
+            <Ilim>2500</Ilim>
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <joint_velocity_limit>1.7</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
+            <joint_acceleration_limit>11.3</joint_acceleration_limit> <!-- (Joint) Acceleration limit in rad/s^2. LIBERAL TEST VALUE 2026-08-06 — was 3.4. See joint 0. Shared with EXEC and JOG. -->
+            <joint_jerk_limit>5650.0</joint_jerk_limit> <!-- (Joint) Jerk limit in rad/s^3. LIBERAL TEST VALUE 2026-08-06 — was 170.0. 500x accel; above accel/dt (2825.0) so it does not bind at 250 Hz. See joint 0. -->
+            <torque_rate_limit>1483.0</torque_rate_limit> <!-- (Joint) Max commanded-torque slew in Nm/s. LIBERAL TEST VALUE 2026-08-06 — was 148.3. 10x. See joint 0. -->
+
+            <!-- Queued motion — pre-liberal; see joint 0. -->
+            <exec_limits>
+                <velocity>1.7</velocity>
+                <acceleration>3.4</acceleration>
+                <jerk>10.2</jerk> <!-- Jerk in rad/s^3 — see joint 0. -->
+            </exec_limits>
+            <!-- Streamed external control — full ceiling; see joint 0. -->
+            <rti_limits>
+                <velocity>1.7</velocity>
+                <acceleration>11.3</acceleration>
+                <jerk>5650.0</jerk>
+                <torque_rate>1483.0</torque_rate>
+            </rti_limits>
+            <watchdog_rate>5000</watchdog_rate>
+            <KPP>5</KPP>
+            <KPV>0.015</KPV>
+            <KIV>0.0015</KIV>
+            <KIIQ>0.9</KIIQ>
+            <KPIQ>7</KPIQ>
+            <KP>0.12</KP>
+            <KD>0.002</KD>
+            <joint_limit_negative>1.904</joint_limit_negative>
+            <joint_limit_positive>6.65</joint_limit_positive>
+            <software_joint_limit_negative>1.9912665</software_joint_limit_negative>
+            <software_joint_limit_positive>6.5627335</software_joint_limit_positive>
+            <encoder>14</encoder>
+            <sector_home_master_position>2838 </sector_home_master_position>
+            <sector_home_offset>1.913322625 </sector_home_offset>
+            <home_offset>1.90859 </home_offset>
+            <home_offset_gripper_dependent>0</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
+            <homing_speed>6000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>250</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_backoff_s>1.5</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
+            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <homing_release_current_ma>-150</homing_release_current_ma>   <!-- Current [mA] during release phase (0 = coast/relax gearbox) -->
+            <homing_release_duration_s>1</homing_release_duration_s>   <!-- Release duration [s] -->
+            <homing_release_sample_pct>0.8</homing_release_sample_pct>   <!-- When to latch position during release -->
+            <gear_ratio>18.0952381</gear_ratio>
+            <gear_efficiency>0.95</gear_efficiency> 
+            <dir>1</dir>
+            <joint_type>revolute</joint_type>
+
+        </joint>
+        <joint id="3">
+            <name>joint4</name>
+            <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+            <kt>0.183</kt>
+            <Ilim>2100</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <joint_velocity_limit>7.7</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
+            <joint_acceleration_limit>51.3</joint_acceleration_limit> <!-- (Joint) Acceleration limit in rad/s^2. LIBERAL TEST VALUE 2026-08-06 — was 15.4. See joint 0. Shared with EXEC and JOG. -->
+            <joint_jerk_limit>25650.0</joint_jerk_limit> <!-- (Joint) Jerk limit in rad/s^3. LIBERAL TEST VALUE 2026-08-06 — was 770.0. 500x accel; above accel/dt (12825.0) so it does not bind at 250 Hz. See joint 0. -->
+            <torque_rate_limit>173.0</torque_rate_limit> <!-- (Joint) Max commanded-torque slew in Nm/s. LIBERAL TEST VALUE 2026-08-06 — was 17.3. 10x. See joint 0. -->
+
+            <!-- Queued motion — pre-liberal; see joint 0. -->
+            <exec_limits>
+                <velocity>7.7</velocity>
+                <acceleration>15.4</acceleration>
+                <jerk>46.2</jerk> <!-- Jerk in rad/s^3 — see joint 0. -->
+            </exec_limits>
+            <!-- Streamed external control — full ceiling; see joint 0. -->
+            <rti_limits>
+                <velocity>7.7</velocity>
+                <acceleration>51.3</acceleration>
+                <jerk>25650.0</jerk>
+                <torque_rate>173.0</torque_rate>
+            </rti_limits>
+            <watchdog_rate>5000</watchdog_rate>
+            <KPP>5</KPP>
+            <KPV>0.015</KPV>
+            <KIV>0.0005</KIV>
+            <KIIQ>1</KIIQ>
+            <KPIQ>7</KPIQ>
+            <KP>0.12</KP>
+            <KD>0.002</KD>
+            <joint_limit_negative>-2.702</joint_limit_negative>
+            <joint_limit_positive>2.642</joint_limit_positive>
+            <software_joint_limit_negative>-2.6147335</software_joint_limit_negative>
+            <software_joint_limit_positive>2.5547335</software_joint_limit_positive>
+            <encoder>14</encoder>
+            <sector_home_master_position>6683 </sector_home_master_position>
+            <sector_home_offset>0 </sector_home_offset>
+            <home_offset>-2.717 </home_offset>   <!-- fallback value if no gripper XML override; normally overridden by active gripper -->
+            <home_offset_gripper_dependent>1</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
+            <homing_speed>13500</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>1200</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
+            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <homing_release_current_ma>0</homing_release_current_ma>
+            <homing_release_duration_s>NaN</homing_release_duration_s>   <!-- NaN = skip release phase -->
+            <homing_release_sample_pct>0.8</homing_release_sample_pct>
+            <gear_ratio>4</gear_ratio>
+            <gear_efficiency>0.98</gear_efficiency>
+            <dir>1</dir>
+            <joint_type>revolute</joint_type>
+
+        </joint>
+        <joint id="4">
+            <name>joint5</name>
+            <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+            <kt>0.183</kt>
+            <Ilim>2100</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <joint_velocity_limit>7.7</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
+            <joint_acceleration_limit>51.3</joint_acceleration_limit> <!-- (Joint) Acceleration limit in rad/s^2. LIBERAL TEST VALUE 2026-08-06 — was 15.4. See joint 0. Shared with EXEC and JOG. -->
+            <joint_jerk_limit>25650.0</joint_jerk_limit> <!-- (Joint) Jerk limit in rad/s^3. LIBERAL TEST VALUE 2026-08-06 — was 770.0. 500x accel; above accel/dt (12825.0) so it does not bind at 250 Hz. See joint 0. -->
+            <torque_rate_limit>173.0</torque_rate_limit> <!-- (Joint) Max commanded-torque slew in Nm/s. LIBERAL TEST VALUE 2026-08-06 — was 17.3. 10x. See joint 0. -->
+
+            <!-- Queued motion — pre-liberal; see joint 0. -->
+            <exec_limits>
+                <velocity>7.7</velocity>
+                <acceleration>15.4</acceleration>
+                <jerk>46.2</jerk> <!-- Jerk in rad/s^3 — see joint 0. -->
+            </exec_limits>
+            <!-- Streamed external control — full ceiling; see joint 0. -->
+            <rti_limits>
+                <velocity>7.7</velocity>
+                <acceleration>51.3</acceleration>
+                <jerk>25650.0</jerk>
+                <torque_rate>173.0</torque_rate>
+            </rti_limits>
+            <watchdog_rate>5000</watchdog_rate>
+            <KPP>5</KPP>
+            <KPV>0.015</KPV>
+            <KIV>0.0005</KIV>
+            <KIIQ>1</KIIQ>
+            <KPIQ>7</KPIQ>
+            <KP>0.12</KP>
+            <KD>0.002</KD>
+            <joint_limit_negative>-2.244</joint_limit_negative>
+            <joint_limit_positive>2.262</joint_limit_positive>
+            <software_joint_limit_negative>-1.73</software_joint_limit_negative>
+            <software_joint_limit_positive>1.6</software_joint_limit_positive>
+            <encoder>14</encoder>
+            <sector_home_master_position>15658 </sector_home_master_position>
+            <sector_home_offset>0 </sector_home_offset>
+            <home_offset>0 </home_offset>
+            <home_offset_gripper_dependent>1</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
+            <homing_speed>13500</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>1200</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
+            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <homing_release_current_ma>1500</homing_release_current_ma>
+            <homing_release_duration_s>1.5</homing_release_duration_s>   <!-- NaN = skip release phase -->
+            <homing_release_sample_pct>0.8</homing_release_sample_pct>
+            <gear_ratio>4</gear_ratio>
+            <gear_efficiency>0.98</gear_efficiency>
+            <dir>1</dir>
+            <joint_type>revolute</joint_type>
+
+        </joint>
+        <joint id="5">
+            <name>joint6</name>
+            <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+            <kt>0.151</kt>
+            <Ilim>1200</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <joint_velocity_limit>3.1</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
+            <joint_acceleration_limit>20.7</joint_acceleration_limit> <!-- (Joint) Acceleration limit in rad/s^2. LIBERAL TEST VALUE 2026-08-06 — was 6.2. See joint 0. Shared with EXEC and JOG. -->
+            <joint_jerk_limit>10350.0</joint_jerk_limit> <!-- (Joint) Jerk limit in rad/s^3. LIBERAL TEST VALUE 2026-08-06 — was 310.0. 500x accel; above accel/dt (5175.0) so it does not bind at 250 Hz. See joint 0. -->
+            <torque_rate_limit>198.0</torque_rate_limit> <!-- (Joint) Max commanded-torque slew in Nm/s. LIBERAL TEST VALUE 2026-08-06 — was 19.8. 10x. See joint 0. -->
+
+            <!-- Queued motion — pre-liberal; see joint 0. -->
+            <exec_limits>
+                <velocity>3.1</velocity>
+                <acceleration>6.2</acceleration>
+                <jerk>18.6</jerk> <!-- Jerk in rad/s^3 — see joint 0. -->
+            </exec_limits>
+            <!-- Streamed external control — full ceiling; see joint 0. -->
+            <rti_limits>
+                <velocity>3.1</velocity>
+                <acceleration>20.7</acceleration>
+                <jerk>10350.0</jerk>
+                <torque_rate>198.0</torque_rate>
+            </rti_limits>
+            <watchdog_rate>5000</watchdog_rate>
+            <KPP>3</KPP>
+            <KPV>0.009</KPV> 
+            <KIV>0.0006</KIV> 
+            <KIIQ>0.5</KIIQ> 
+            <KPIQ>2</KPIQ> 
+            <KP>0.012</KP> 
+            <KD>0.002</KD> 
+            <joint_limit_negative>-6.2831</joint_limit_negative>
+            <joint_limit_positive>6.2831</joint_limit_positive>
+            <software_joint_limit_negative>-0.85</software_joint_limit_negative>
+            <software_joint_limit_positive>7.14</software_joint_limit_positive>
+            <encoder>14</encoder>
+            <sector_home_master_position>3956 </sector_home_master_position>
+            <sector_home_offset>0 </sector_home_offset>
+            <home_offset>1.86159 </home_offset>  <!-- -1.28 -->
+            <home_offset_gripper_dependent>0</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
+            <homing_speed>12000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>800</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <homing_timeout_s>15</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
+            <homing_two_pass>0</homing_two_pass>   <!-- 0 = single pass (Hall sensor joints skip two-pass regardless) -->
+            <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
+            <has_hall_sensor>1</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <homing_release_current_ma>0</homing_release_current_ma>
+            <homing_release_duration_s>NaN</homing_release_duration_s>   <!-- NaN = skip release phase (Hall sensor joint always skips regardless) -->
+            <homing_release_sample_pct>0.8</homing_release_sample_pct>
+            <gear_ratio>10</gear_ratio>
+            <gear_efficiency>0.95</gear_efficiency>
+            <dir>1</dir>
+            <joint_type>revolute</joint_type>
+
+        </joint>
+    </joints>
+
+    <safety>
+        <max_joint_velocity>8.0</max_joint_velocity>
+        <joint_velocity_sustain_ticks>80</joint_velocity_sustain_ticks>
+        <warn_motor_temperature>90</warn_motor_temperature>
+        <max_motor_temperature>100</max_motor_temperature>
+        <current_spike_factor>4.0</current_spike_factor>
+        <current_spike_lookback>30</current_spike_lookback>
+        <collision_torque_threshold>15.0</collision_torque_threshold>
+        <vibration_speed_variance_threshold>100000000</vibration_speed_variance_threshold>
+        <vibration_lookback>40</vibration_lookback>
+        <loop_overrun_limit>200</loop_overrun_limit>
+        <can_error_limit>5</can_error_limit>
+        <warning_speed_scale>0.9</warning_speed_scale>
+        <!-- Per-check enable flags: 1 = active, 0 = disabled -->
+        <check_joint_position>0</check_joint_position>
+        <check_joint_velocity>0</check_joint_velocity>
+        <check_motor_temperature>0</check_motor_temperature>
+        <check_current_spike>0</check_current_spike>
+        <check_torque_discontinuity>0</check_torque_discontinuity>
+        <check_vibration>0</check_vibration>
+        <check_loop_overrun>0</check_loop_overrun>
+        <check_can_health>0</check_can_health>
+        <check_estop>0</check_estop>
+    </safety>
+
+</robot>
+

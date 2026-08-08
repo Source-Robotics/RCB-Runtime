@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: commanded
+    Commanded and target values alongside actual values.
+    Useful for trajectory verification and control debugging.
+-->
+<recipe name="commanded">
+    <field tag="j_p"     precision="4"/>
+    <field tag="j_pc"    precision="4"/>
+    <field tag="j_pt"    precision="4"/>
+    <field tag="TCP_p"   precision="4"/>
+    <field tag="TCP_p_c" precision="4"/>
+    <field tag="TCP_p_t" precision="4"/>
+    <field tag="tick"/>
+</recipe>

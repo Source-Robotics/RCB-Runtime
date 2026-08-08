@@ -1,0 +1,251 @@
+<robot>
+
+    <name>INDIGO</name>
+    <active_gripper>Flange</active_gripper>
+    <server_port>8080</server_port>
+    <network_mode>ethernet</network_mode> <!-- Options: ethernet, wifi, offline -->
+    <RTI_loop_time>0.01</RTI_loop_time>
+    <RTI_Joint_mode_loop_time>0.005</RTI_Joint_mode_loop_time>
+    <base_transform>1</base_transform> <!-- Is the robot on horizontal table, ceiling, under specific angle  -->
+    <gravity_value>9.81</gravity_value>
+
+    <joints count="7">
+        <joint id="0">
+            <name>joint1</name>
+            <kt>0.28</kt> <!-- Torque constant in Nm/A -->
+            <Ilim>2000</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <watchdog_rate>5000</watchdog_rate> 
+            <KPP>15</KPP> 
+            <KPV>0.012</KPV> 
+            <KIV>0.012</KIV> 
+            <KIIQ>0.012</KIIQ> 
+            <KPIQ>0.012</KPIQ> 
+            <KP>0.012</KP> 
+            <KD>0.0121</KD> 
+            <joint_limit_negative>0.0121</joint_limit_negative> 
+            <joint_limit_positive>0.0121</joint_limit_positive> 
+            <encoder>14</encoder>
+            <sector_home_master_position>3969 </sector_home_master_position> <!-- Encoder ticks the robot is at bootup at MASTER POSITIONS-->
+            <sector_home_offset>1.570796327 </sector_home_offset> <!-- Joint level position from master position to the one defined in kinematics chain-->
+            <home_offset>1.570796327 </home_offset> <!-- joint level position from endstop to the one defined in kinematic chain-->
+            <homing_speed>5000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>600</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <gear_ratio>6.4</gear_ratio>
+            <gear_efficiency>0.98</gear_efficiency>
+            <dir>0</dir> <!-- is positive rotation of the joint matched to the one in kinematic definiton of the robot 0 yes 1 no -->
+            <joint_type>revolute</joint_type>
+
+        </joint>
+        <joint id="1">
+            <name>joint2</name>
+            <kt>0.28</kt>
+            <Ilim>2000</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <watchdog_rate>5000</watchdog_rate> 
+            <KPP>15</KPP> 
+            <KPV>0.012</KPV> 
+            <KIV>0.012</KIV> 
+            <KIIQ>0.012</KIIQ> 
+            <KPIQ>0.012</KPIQ> 
+            <KP>0.012</KP> 
+            <KD>0.0122</KD> 
+            <joint_limit_negative>0.0121</joint_limit_negative> 
+            <joint_limit_positive>0.0121</joint_limit_positive> 
+            <encoder>14</encoder>
+            <sector_home_master_position>5707 </sector_home_master_position>
+            <sector_home_offset>-2.520796327 </sector_home_offset>
+            <home_offset>1.570796327 </home_offset>
+            <homing_speed>5000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>600</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <gear_ratio>20</gear_ratio>
+            <gear_efficiency>0.95</gear_efficiency>
+            <dir>0</dir>
+            <joint_type>differential</joint_type>
+
+        </joint>
+        <joint id="2">
+            <name>joint3</name>
+            <kt>0.183</kt>
+            <Ilim>2000</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <watchdog_rate>5000</watchdog_rate> 
+            <KPP>15</KPP> 
+            <KPV>0.012</KPV> 
+            <KIV>0.012</KIV> 
+            <KIIQ>0.012</KIIQ> 
+            <KPIQ>0.012</KPIQ> 
+            <KP>0.012</KP> 
+            <KD>0.0123</KD> 
+            <joint_limit_negative>0.0121</joint_limit_negative> 
+            <joint_limit_positive>0.0121</joint_limit_positive> 
+            <encoder>14</encoder>
+            <sector_home_master_position>5000 </sector_home_master_position>
+            <sector_home_offset>1.913322625 </sector_home_offset>
+            <home_offset>1.570796327 </home_offset>
+            <homing_speed>5000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>600</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <gear_ratio>18.0952381</gear_ratio>
+            <gear_efficiency>0.95</gear_efficiency> 
+            <dir>1</dir>
+            <joint_type>differential</joint_type>
+
+        </joint>
+        <joint id="3">
+            <name>joint4</name>
+            <kt>0.183</kt>
+            <Ilim>2000</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <watchdog_rate>5000</watchdog_rate> 
+            <KPP>15</KPP> 
+            <KPV>0.012</KPV> 
+            <KIV>0.012</KIV> 
+            <KIIQ>0.012</KIIQ> 
+            <KPIQ>0.012</KPIQ> 
+            <KP>0.012</KP> 
+            <KD>0.0124</KD> 
+            <joint_limit_negative>0.0121</joint_limit_negative> 
+            <joint_limit_positive>0.0121</joint_limit_positive> 
+            <encoder>14</encoder>
+            <sector_home_master_position>6683 </sector_home_master_position>
+            <sector_home_offset>0 </sector_home_offset>
+            <home_offset>1.570796327 </home_offset>
+            <homing_speed>5000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>600</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <gear_ratio>4</gear_ratio>
+            <gear_efficiency>0.98</gear_efficiency>
+            <dir>1</dir>
+            <joint_type>differential</joint_type>
+
+        </joint>
+        <joint id="4">
+            <name>joint5</name>
+            <kt>0.183</kt>
+            <Ilim>2000</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <watchdog_rate>5000</watchdog_rate> 
+            <KPP>15</KPP> 
+            <KPV>0.012</KPV> 
+            <KIV>0.012</KIV> 
+            <KIIQ>0.012</KIIQ> 
+            <KPIQ>0.012</KPIQ> 
+            <KP>0.012</KP> 
+            <KD>0.0125</KD> 
+            <joint_limit_negative>0.0121</joint_limit_negative> 
+            <joint_limit_positive>0.0121</joint_limit_positive> 
+            <encoder>14</encoder>
+            <sector_home_master_position>15658 </sector_home_master_position>
+            <sector_home_offset>0 </sector_home_offset>
+            <home_offset>1.570796327 </home_offset>       
+            <homing_speed>5000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>600</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <gear_ratio>4</gear_ratio>
+            <gear_efficiency>0.98</gear_efficiency>
+            <dir>1</dir>
+            <joint_type>differential</joint_type>
+
+        </joint>
+        <joint id="5">
+            <name>joint6</name>
+            <kt>0.183</kt>
+            <Ilim>2000</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <watchdog_rate>5000</watchdog_rate> 
+            <KPP>15</KPP> 
+            <KPV>0.012</KPV> 
+            <KIV>0.012</KIV> 
+            <KIIQ>0.012</KIIQ> 
+            <KPIQ>0.012</KPIQ> 
+            <KP>0.012</KP> 
+            <KD>0.0125</KD> 
+            <joint_limit_negative>0.0121</joint_limit_negative> 
+            <joint_limit_positive>0.0121</joint_limit_positive> 
+            <encoder>14</encoder>
+            <sector_home_master_position>15658 </sector_home_master_position>
+            <sector_home_offset>0 </sector_home_offset>
+            <home_offset>1.570796327 </home_offset>       
+            <homing_speed>5000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>600</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <gear_ratio>4</gear_ratio>
+            <gear_efficiency>0.98</gear_efficiency>
+            <dir>1</dir>
+            <joint_type>differential</joint_type>
+
+        </joint>
+        <joint id="6">
+            <name>joint7</name>
+            <kt>0.111</kt>
+            <Ilim>2000</Ilim> 
+            <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
+            <Velocity_limit>80000</Velocity_limit>
+            <watchdog_rate>5000</watchdog_rate> 
+            <KPP>15</KPP> 
+            <KPV>0.012</KPV> 
+            <KIV>0.012</KIV> 
+            <KIIQ>0.012</KIIQ> 
+            <KPIQ>0.012</KPIQ> 
+            <KP>0.012</KP> 
+            <KD>0.0126</KD> 
+            <joint_limit_negative>0.0121</joint_limit_negative> 
+            <joint_limit_positive>0.0121</joint_limit_positive> 
+            <encoder>14</encoder>
+            <sector_home_master_position>3956 </sector_home_master_position>
+            <sector_home_offset>0 </sector_home_offset>
+            <home_offset>1.570796327 </home_offset>
+            <homing_speed>5000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
+            <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
+            <homing_current_ma>600</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
+            <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
+            <gear_ratio>10</gear_ratio>
+            <gear_efficiency>0.95</gear_efficiency>
+            <dir>1</dir>
+            <joint_type>differential</joint_type>
+
+        </joint>
+    </joints>
+
+    <safety>
+        <max_joint_velocity>8.0</max_joint_velocity>
+        <joint_velocity_sustain_ticks>80</joint_velocity_sustain_ticks>
+        <warn_motor_temperature>90</warn_motor_temperature>
+        <max_motor_temperature>100</max_motor_temperature>
+        <current_spike_factor>4.0</current_spike_factor>
+        <current_spike_lookback>30</current_spike_lookback>
+        <collision_torque_threshold>15.0</collision_torque_threshold>
+        <vibration_speed_variance_threshold>100000000</vibration_speed_variance_threshold>
+        <vibration_lookback>40</vibration_lookback>
+        <loop_overrun_limit>200</loop_overrun_limit>
+        <can_error_limit>5</can_error_limit>
+        <warning_speed_scale>0.9</warning_speed_scale>
+        <!-- Per-check enable flags: 1 = active, 0 = disabled -->
+        <check_joint_position>1</check_joint_position>
+        <check_joint_velocity>1</check_joint_velocity>
+        <check_motor_temperature>1</check_motor_temperature>
+        <check_current_spike>1</check_current_spike>
+        <check_torque_discontinuity>1</check_torque_discontinuity>
+        <check_vibration>1</check_vibration>
+        <check_loop_overrun>1</check_loop_overrun>
+        <check_can_health>1</check_can_health>
+        <check_estop>1</check_estop>
+    </safety>
+
+</robot>
+

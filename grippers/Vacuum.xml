@@ -1,0 +1,11 @@
+<gripper name="Vacuum">
+    <CAN_gripper>0</CAN_gripper>   <!-- 0 = vacuum cup, not CAN-driven -->
+
+      <!-- Per-arm-joint home_offset overrides. Used for joints whose home_offset depends on the
+         gripper geometry (home_offset_gripper_dependent=1 in robot XML). Add one <joint> entry
+         per dependent joint, using the robot joint id (0-based). -->
+    <arm_joint_home_offsets>
+        <joint id="4">0</joint>   <!-- J5: homes against gripper lower arm — offset depends on gripper dimensions -->
+    </arm_joint_home_offsets>
+
+</gripper>

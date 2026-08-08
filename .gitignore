@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs (runtime output – don't commit these). Ignore EVERYTHING in logs/
+# (.log, rotated .log.1, child .out.log, etc.) but keep the folder via .gitkeep.
+logs/*
+!logs/.gitkeep
+
+# Runtime / temp data — ignore all generated artifacts, keep the folder.
+temp_data/*
+!temp_data/.gitkeep
+
+# Supervisor runtime state (user-tweaked settings persisted at runtime)
+config/supervisor_settings.json
+
+# Public repo cleanup: keep README public, keep internal markdown local
+*.md
+!/README.md
+
+# Local/internal docs, planning, assistant instructions, and manual test scripts
+docs/
+TODO/
+dummy_test_scripts/
+.github/copilot-instructions.md
+
+
+# Backup and local IPC/runtime artifacts
+*.bak
+.lgd-*
+
+# Numpy data files
+*.npy
+*.npz
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDEs
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local working artifacts: pre-change copies of robot configs kept for quick revert
+*.conservative-backup

@@ -1,0 +1,57 @@
+# RCB Control Runtime legacy Pi 4 pinned port baseline
+#
+# These are the EXACT versions running on the Pi 4 today (snapshot captured
+# 2026-05-19). Use this file for the Pi 5 install so the new machine inherits
+# a known-good runtime combination. After the port is verified, you can bump
+# selected packages on both Pis as a separate sweep.
+#
+# Install order matters — pinocchio's metadata pulls newer numpy, so we
+# install numpy FIRST and pinocchio's binary SECOND with the constraint
+# already in place. See pi5_porting_plan.md §3.
+#
+# Spectral-BLDC and SourceRoboticsToolbox are pinned strictly to mirror Pi 4.
+# Bump to PyPI's latest (Spectral-BLDC 1.19, SourceRoboticsToolbox 1.2) only
+# after the Pi 5 port is fully verified and stable.
+#
+# roboticstoolbox-python is intentionally LEFT FLOATING — the latest PyPI
+# release contains the C-extension memory-leak fixes that used to live as
+# uncommitted local patches in ~/Documents/robotics-toolbox-python/. Letting
+# pip pick the latest gives us those fixes baked in; pinning here would
+# require knowing which version contains them.
+
+
+# ── Numerics — install FIRST so pinocchio can't bump it ───────────────────
+numpy==1.26.4
+
+# ── Pinocchio (fast FK / Jacobian backend) ────────────────────────────────
+pin==3.9.0
+
+# ── Robotics ──────────────────────────────────────────────────────────────
+roboticstoolbox-python
+spatialmath-python==1.1.14
+
+# ── Custom in-house ───────────────────────────────────────────────────────
+Spectral-BLDC==1.18
+SourceRoboticsToolbox==1.1
+
+# ── Messaging & IPC ──────────────────────────────────────────────────────
+pyzmq==27.0.0
+
+# ── GUI ──────────────────────────────────────────────────────────────────
+nicegui==3.3.1
+
+# ── System utilities ─────────────────────────────────────────────────────
+psutil==7.0.0
+joblib==1.5.1
+
+# ── Raspberry Pi hardware ────────────────────────────────────────────────
+# RPi.GPIO is APT-installed on Pi 4 (python3-rpi.gpio) and lives in
+# /usr/lib/python3/dist-packages. On Pi 5 the RP1 chip needs `rpi-lgpio`
+# instead — see pi5_porting_plan.md §5.1. Don't pin RPi.GPIO here.
+gpiozero==2.0.1
+Adafruit-SSD1306==1.6.2
+Pillow==10.4.0
+pyserial==3.5
+
+# ── CAN bus ──────────────────────────────────────────────────────────────
+python-can==4.5.0

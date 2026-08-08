@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: diagnostics
+    Focused on errors, timing, and external forces.
+    Useful when debugging issues — minimal positional data, maximum diagnostic data.
+-->
+<recipe name="diagnostics">
+    <field tag="j_err"/>
+    <field tag="tick"/>
+    <field tag="exec_t"    precision="6"/>
+    <field tag="timestamp" precision="6"/>
+    <field tag="t_ext"     precision="3"/>
+    <field tag="g_err"/>
+    <!-- RTI link diagnostics. rti_seq is the command-sequence ECHO: a PC that timestamps
+         its sends can match this back to measure true loop delay, which is otherwise
+         unmeasurable without cross-machine clock sync. rti_ok / rti_miss are the robot's
+         own view of link health, which a REMOTE PC cannot read any other way (they live
+         in shared memory, which only exists on the robot). All zero outside RTI mode.
+         Cost: ~1.1 us and ~22 bytes each, measured. -->
+    <field tag="rti_seq"/>
+    <field tag="rti_ok"  precision="3"/>
+    <field tag="rti_miss"/>
+    <field tag="rti_state"/>
+    <field tag="mode"/>
+    <field tag="period_ms" precision="3"/>
+</recipe>

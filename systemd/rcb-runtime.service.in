@@ -1,0 +1,25 @@
+[Unit]
+Description=RCB Control Runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{USER}}
+Group={{GROUP}}
+WorkingDirectory={{REPO_ROOT}}
+Environment=PYTHONUNBUFFERED=1
+ExecStart={{REPO_ROOT}}/.venv/bin/python {{REPO_ROOT}}/supervisor.py
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+# Permit the RTI child process to request real-time priority itself. The service
+# does not force the supervisor into real-time scheduling.
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+LimitNICE=-20
+
+[Install]
+WantedBy=multi-user.target

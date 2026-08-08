@@ -1,0 +1,79 @@
+# RCB Control Runtime Python dependencies
+# Created: 2026-06-29 UTC; last reviewed: 2026-08-08 UTC.
+#
+# 2026-08-08 — audited every third-party import in the tree against this file. Added
+#   `pinokin` (see below): it was imported by motion/cartesian_paths.py and installed in
+#   .venv by hand, but never pinned — so a fresh `pip install -r requirements.txt` would
+#   have produced a robot that could not plan Cartesian motion. That is the SAME failure
+#   the 2026-07-12 note below describes for ruckig, two packages later. If you add an
+#   import, add the pin in the same commit.
+#   Verified all 24 existing pins match .venv exactly. NOTE the SYSTEM python (~/.local)
+#   has different versions (numpy 2.4.6 vs the pinned 2.3.5) — .venv is what runs the
+#   robot, so always check with `.venv/bin/python -m pip list`, never bare `python3`.
+#
+# 2026-07-12 — added ruckig. NOTE ruckig was already present in the SYSTEM python's
+#   ~/.local but NOT in .venv, which is what actually runs the robot — hence the explicit
+#   pin here. Since 2026-08-02 ruckig is no longer merely an opt-in EXEC profile: it is
+#   the RTI mode POSITION RATE LIMITER, and without it RTI silently falls back to a legacy
+#   cascade that does not converge. It is now load-bearing for safety, not a nicety.
+#
+# Pinned to the versions verified on the robot, in .venv.
+# Install with:  pip install -r requirements.txt
+#
+# Target: Raspberry Pi 5, Python 3.11+ (RT kernel, Ubuntu).
+# Versions are pinned (==) for reproducible installs. Bump deliberately.
+
+# ── Robot core (custom Source Robotics libraries, on PyPI) ───────────────────
+Spectral_BLDC==1.20                              # Spectral BLDC motor driver (CAN)
+SourceRoboticsToolbox==1.3                       # Source Robotics Toolbox
+
+# ── Robotics / kinematics / dynamics ─────────────────────────────────────────
+# NOTE: custom robotics-toolbox FORK; imports as `roboticstoolbox`, NOT the
+# upstream 'roboticstoolbox-python'.
+roboticstoolbox-python-source-robotics==1.3.0.post2
+spatialmath-python==1.1.16
+pin==3.9.0                                       # Pinocchio — default FK/Jacobian backend
+cmeel-urdfdom==4.0.1                             # ABI match for pin==3.9.0 (liburdfdom_sensor.so.4.0)
+cmeel-tinyxml2==10.0.0                           # ABI match for pin==3.9.0 (libtinyxml2.so.10)
+pinokin==0.1.6                                   # SE(3) helpers on top of Pinocchio; imported
+                                                 # by motion/cartesian_paths.py. Added to this
+                                                 # file 2026-08-08 — it had been installed by
+                                                 # hand in .venv and never pinned, so a clean
+                                                 # install could not plan Cartesian motion.
+
+# ── Numerics ─────────────────────────────────────────────────────────────────
+numpy==2.3.5
+scipy==1.17.1
+matplotlib==3.10.9
+toppra==0.6.3                                    # path time-parameterization for EXEC profiles
+                                                 # (the ONLY blend-capable one: path-following)
+ruckig==0.17.3                                   # jerk-limited 3rd-order point-to-point timing
+                                                 # (target-following: can NEVER zone-blend)
+
+# ── Messaging & IPC ──────────────────────────────────────────────────────────
+pyzmq==27.0.0                                    # ZMQ IPC between processes
+
+# ── GUI ──────────────────────────────────────────────────────────────────────
+nicegui==3.3.1                                   # web dashboard on :8081
+
+# ── CAN bus ──────────────────────────────────────────────────────────────────
+python-can==4.5.0                                # imports as `can`
+
+# ── Raspberry Pi hardware: GPIO / buttons / LEDs ─────────────────────────────
+gpiozero==2.0.1                                  # supervisor.py LEDs/buttons
+lgpio==0.2.2.0                                    # RTI.py isolated IO/E-stop backend on Pi 5
+
+# ── OLED display (128x64 I2C, CircuitPython stack) ───────────────────────────
+# CircuitPython lib (provides `adafruit_ssd1306`), NOT deprecated Adafruit-SSD1306.
+# adafruit-blinka provides `board` / `busio`.
+adafruit-circuitpython-ssd1306==2.12.21
+adafruit-blinka==8.62.0
+Pillow==12.2.0                                   # PIL — OLED frame rendering
+
+# ── Serial (mainboard PCB over UART) ─────────────────────────────────────────
+pyserial==3.5                                    # imports as `serial`
+
+# ── System utilities ─────────────────────────────────────────────────────────
+psutil==7.0.0                                    # process monitoring / CPU affinity
+joblib==1.5.3                                    # trajectory serialization / caching
+distro==1.7.0                                    # Linux distro info (system_config.py)

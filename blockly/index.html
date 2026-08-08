@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://unpkg.com/blockly/blockly.min.js"></script>
+    <title>Blockly in Streamlit</title>
+</head>
+<body>
+    
+    <div id="blocklyDiv" style="height: 680px; width: 1000px;"></div>
+
+    <!-- Define the toolbox with more basic blocks -->
+    <xml id="toolbox" style="display: none">
+        <!-- Control blocks -->
+        <block type="controls_if"></block>
+        <block type="controls_repeat_ext"></block>
+        
+        <!-- Logic blocks -->
+        <block type="logic_compare"></block>
+        <block type="logic_operation"></block>
+        <block type="logic_boolean"></block>
+        <block type="logic_null"></block>
+        <block type="logic_ternary"></block>
+        
+        <!-- Math blocks -->
+        <block type="math_number"></block>
+        <block type="math_arithmetic"></block>
+        <block type="math_single"></block>
+        <block type="math_trig"></block>
+        <block type="math_constant"></block>
+        <block type="math_number_property"></block>
+        
+        <!-- Variable blocks -->
+        <block type="variables_get"></block>
+        <block type="variables_set"></block>
+        
+        <!-- Loop blocks -->
+        <block type="controls_whileUntil"></block>
+        <block type="controls_for"></block>
+    </xml>
+
+    <script>
+        var workspace = Blockly.inject('blocklyDiv', {
+            toolbox: document.getElementById('toolbox')
+        });
+
+        function getBlocklyCode() {
+            var code = Blockly.JavaScript.workspaceToCode(workspace);
+            return code;
+        }
+    </script>
+</body>
+</html>
