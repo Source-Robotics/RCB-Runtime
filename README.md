@@ -16,11 +16,64 @@ multiple robot arms through XML files in `config/`, `robots/`, and `grippers/`.
 First public target:
 
 - Raspberry Pi 5
-- Ubuntu with a PREEMPT_RT capable kernel
-- Python 3.11+
+- Ubuntu 24.04 with a PREEMPT_RT kernel — see **OS image** below
+- Python **3.11** (see the note below; 24.04's default is 3.12)
 - SocketCAN interface exposed as `can0` at 1 Mbit
 - Mainboard/control PCB on `/dev/ttyAMA0`
 - Optional front-panel SSD1306 OLED, buttons, and LEDs
+
+### OS image
+
+The runtime needs a real-time kernel. The reference robot runs this prebuilt image:
+
+**https://github.com/ros-realtime/ros-realtime-rpi4-image/releases/tag/24.04.2_v6.8.4-rt11-raspi_ros2_jazzy**
+
+Ubuntu 24.04.2 LTS with kernel `6.8.4-rt11-raspi`. Two things about it that are not
+obvious from the name:
+
+- **It says `rpi4` but it runs on a Raspberry Pi 5.** That is the exact image on the
+  reference robot — a Pi 5 Model B, `uname -r` = `6.8.4-rt11-raspi`,
+  `/sys/kernel/realtime` = `1`. Do not skip it thinking it is for the wrong board.
+- **It bundles ROS 2 Jazzy, which this project does not use.** RCB Runtime has no ROS
+  dependency at all; the image is used purely for its RT kernel. The ROS packages can be
+  ignored or removed.
+
+Verify after flashing:
+
+```bash
+uname -r                    # expect 6.8.4-rt11-raspi
+cat /sys/kernel/realtime    # expect 1
+```
+
+`scripts/check_system.py` checks both, plus CAN, I2C, UART, GPIO and RT scheduling
+permission.
+
+### Python 3.11, not 3.12
+
+Ubuntu 24.04 ships **Python 3.12** as the default `python3`. The reference robot runs
+**3.11**, and every pinned version in `requirements.txt` was verified against it — the
+`.venv` is built on `/usr/bin/python3.11`.
+
+This is easy to miss and nothing warns you: `scripts/install.sh` builds its venv from
+whatever `python3` resolves to, and its version gate is `>= 3.11`, so **3.12 passes
+silently** and you end up with an environment nobody has tested.
+
+```bash
+sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
+sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+sudo update-alternatives --set python3 /usr/bin/python3.11
+python3 --version           # expect 3.11.x
+```
+
+Or leave the system default alone and point the installer at it explicitly:
+
+```bash
+PYTHON=/usr/bin/python3.11 ./scripts/install.sh
+```
+
+3.12 has not been tested. It will probably work, but you will be resolving a different
+set of binary wheels than the pins were verified against — which matters here, since
+several dependencies (pinocchio, roboticstoolbox, numpy) are ABI-sensitive.
 
 Desktop or no-hardware use is currently for development only. The installer can
 run without hardware, but `scripts/check_system.py` will report missing devices.
