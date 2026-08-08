@@ -308,13 +308,26 @@ class RTIModeHandler:
         #
         # Precomputed with SAFE substitutions so no inf*0 can appear — that is the arithmetic
         # behind open defect C, and it must not be reintroduced here.
+        # Acceleration alone, for the LEGACY cascade's stopping-speed term. Kept separate
+        # from _brake_ok below, which additionally needs finite jerk and joint limits: a
+        # robot with a real acceleration limit but no declared joint limits should still get
+        # a correct vstop, and folding the two masks together would silently compute it from
+        # the 1.0 placeholder instead.
+        self._accel_finite = np.isfinite(self.accel_limit) & (self.accel_limit > 0)
+        self._accel_safe = np.where(self._accel_finite, self.accel_limit, 1.0)
+
         _brake_ok = (np.isfinite(self.accel_limit) & np.isfinite(self.jerk_limit)
                      & np.isfinite(self.limit_neg) & np.isfinite(self.limit_pos)
                      & (self.accel_limit > 0) & (self.jerk_limit > 0))
         self._brake_ok = _brake_ok
+        # Substitute BEFORE the arithmetic, not after. `np.where(ok, a/j, 0)` still evaluates
+        # a/j for every joint, so an absent limit computes inf/inf = NaN and only then throws
+        # it away — the right answer via a NaN the interpreter warns about, which is precisely
+        # the shape of the bug being fixed a few lines below. Feed the operators finite
+        # numbers and there is nothing to discard.
         self._brake_a = np.where(_brake_ok, self.accel_limit, 1.0)
-        self._brake_r = np.where(_brake_ok, self.accel_limit / np.where(
-            self.jerk_limit > 0, self.jerk_limit, 1.0), 0.0)
+        self._brake_r = (np.where(_brake_ok, self.accel_limit, 0.0)
+                         / np.where(_brake_ok, self.jerk_limit, 1.0))
         self._brake_r2 = self._brake_r * self._brake_r
         self._bl_dup = np.zeros(joint_num, dtype=np.float64)   # distance to upper limit
         self._bl_ddn = np.zeros(joint_num, dtype=np.float64)   # distance to lower limit
@@ -771,10 +784,21 @@ class RTIModeHandler:
         np.clip(v, -self.vel_limit, self.vel_limit, out=v)
 
         # Layer 2: never travel faster than we can still stop from.
+        #
+        # _accel_safe, not accel_limit: with an absent (infinite) acceleration limit this
+        # computed 2*|d| * inf, which is NaN for any joint sitting exactly ON its target —
+        # i.e. HOLD POSITION, the commonest RTI operation there is. The NaN propagated
+        # through the clips into the emitted setpoint and on to int() in the motor-space
+        # conversion. The two conditions coincide by construction, because a missing limit is
+        # exactly what disables Ruckig and drops control onto this fallback in the first
+        # place: the safety net failed unsafely, and only in the case it was needed.
+        # Joints with no acceleration limit get vstop = inf, which is the honest answer —
+        # no limit means no stopping-distance constraint to enforce.
         np.abs(d, out=vstop)
         np.multiply(vstop, 2.0, out=vstop)
-        np.multiply(vstop, self.accel_limit, out=vstop)
+        np.multiply(vstop, self._accel_safe, out=vstop)
         np.sqrt(vstop, out=vstop)
+        np.copyto(vstop, np.inf, where=~self._accel_finite)
         np.clip(v, -vstop, vstop, out=v)
 
         np.subtract(v, self._rl_v, out=a)

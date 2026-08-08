@@ -240,6 +240,43 @@ installed on the development machine, which is exactly why nobody noticed.
 Check versions with `.venv/bin/python -m pip list`. A bare `python3` reads the system
 environment, which carries different versions and is **not** what runs the robot.
 
+## Security Model — read before exposing this to a network
+
+> ⚠️ **There is no authentication.** Not weak authentication — none. Access control is an
+> IP allowlist and nothing else: no keys, no HMAC, no session token, no TLS. Anyone who can
+> reach the robot's ports from a spoofable source address can command the arm.
+
+| service | port | binds | who may talk to it |
+|---|---|---|---|
+| command hub (TCP, JSON) | 29000 | `0.0.0.0` | source IP must be in `ALLOWED_IPS` |
+| RTI command stream (UDP) | 30001 | `0.0.0.0` | source IP must match the paired PC |
+| RTI state stream (UDP) | → 30002 | — | unicast to the paired PC |
+| telemetry broadcast (UDP) | → 30003 | — | **the entire subnet**, unauthenticated |
+
+Consequences worth stating plainly:
+
+- **UDP source addresses are trivially spoofed.** The RTI filter checks the sender's IP,
+  which stops accidents and stops nothing else. An attacker on the same L2 segment can
+  inject motion commands.
+- **Telemetry is broadcast in the clear** to `255.255.255.255` by default — full robot
+  state to every device on the network. Set `TELEMETRY_DESTINATION` in
+  `config/networking.py` to your dashboard's IP to make it unicast (this also fixes the
+  WiFi degradation documented there).
+- **`ALLOWED_IPS` gates the TCP hub only.** The RTI UDP return path follows whatever
+  address the PC's TCP socket reports, so it needs no entry.
+
+**Run this on an isolated or trusted network segment.** Do not expose port 29000 or 30001
+to an untrusted LAN, and never to the internet. If you need real authentication, the
+natural place is an HMAC over the command packet plus a session key issued at
+`rti_connect` — not built, and there is a note in `config/networking.py` where it would go.
+
+`ALLOWED_IPS` ships with the development addresses. Add your own control PC without
+editing tracked source:
+
+```bash
+RCB_ALLOWED_IPS=192.168.0.42 python3 command_executor.py
+```
+
 ## Public Repo Notes
 
 For the first public release, internal planning markdown files and manual dummy
