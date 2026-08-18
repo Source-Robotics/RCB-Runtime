@@ -21,8 +21,14 @@ config/supervisor_settings.json
 *.md
 !/README.md
 
-# Local/internal docs, planning, assistant instructions, and manual test scripts
-docs/
+# Local/internal docs, planning, assistant instructions, and manual test scripts.
+#
+# `docs/*` rather than `docs/`: git never descends into an excluded DIRECTORY, so a
+# `!docs/<file>` exception below would silently do nothing with the bare form. Excluding
+# the directory's CONTENTS instead keeps individual files re-includable.
+# Negations must also come after `*.md` above — last matching pattern wins.
+docs/*
+!docs/pin_map.md
 TODO/
 dummy_test_scripts/
 .github/copilot-instructions.md

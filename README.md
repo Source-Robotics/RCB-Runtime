@@ -127,6 +127,16 @@ sudo visudo -c                 # must print "parsed OK" before you log out
 Check paths with `command -v ip` first — they differ between distributions, and a rule
 naming a path that does not exist grants nothing.
 
+### Wiring and pin map
+
+[docs/pin_map.md](docs/pin_map.md) maps every GPIO signal on the control box end to end:
+the numbered terminal you wire into, the Pi header pin, the BCM number, and the constant
+the code imports. Photo of the connector panel included.
+
+Read it before wiring anything. Two things in there are not guessable: the top terminal row
+runs **8 down to 1 left to right**, so terminal 1 is the rightmost, and each E-stop is a
+**pair** of terminals rather than one.
+
 ### Python 3.11, not 3.12
 
 Ubuntu 24.04 ships **Python 3.12** as the default `python3`. The reference robot runs
