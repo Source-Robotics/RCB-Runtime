@@ -48,6 +48,85 @@ cat /sys/kernel/realtime    # expect 1
 `scripts/check_system.py` checks both, plus CAN, I2C, UART, GPIO and RT scheduling
 permission.
 
+### Boot configuration
+
+**`can0`, `/dev/i2c-1` and `/dev/ttyAMA0` do not exist until you edit
+`/boot/firmware/config.txt` and reboot.** Nothing in the runtime can create them, and
+nothing points at that file when they are missing — you get a CAN init failure, or an
+lgpio "GPIO busy", and no clue why.
+
+`system_setup/boot_config.txt` is a reference copy of that file from the development
+robot, with a header explaining which lines matter and why. Merge the lines you need
+into your own config (do not overwrite it wholesale — the rest of the file is display
+and audio settings for a specific Pi), then reboot.
+
+The four that are not optional:
+
+```
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=12   # creates can0
+dtoverlay=spi0-1cs                                        # SPI for it, CS0 only
+dtparam=i2c_arm=on                                        # OLED
+enable_uart=1                                             # mainboard PCB link
+```
+
+`oscillator=` must match the crystal on your CAN board. 16 MHz here; 8 MHz boards are
+common and give a silently wrong bitrate rather than an error.
+
+### Free the UART from the console
+
+`supervisor.py` owns `/dev/ttyAMA0` exclusively, at **256000 baud**, to talk to the
+mainboard PCB. A stock Pi also puts the kernel console and a login prompt on that same
+port at 115200. Nothing reports an error — the PCB just receives boot messages and getty
+banners mixed into its protocol at the wrong baud, so the link reads as flaky hardware.
+
+Two settings, neither of them in `config.txt`:
+
+```bash
+# 1. no serial console — remove console=serial0,115200 (or console=ttyAMA0,115200)
+#    from /boot/firmware/cmdline.txt, leaving the rest of the line untouched.
+#    That file must stay ONE line and has no comment syntax.
+cat /proc/consoles                 # expect tty1 only
+
+# 2. no login prompt on the port
+sudo systemctl disable --now serial-getty@ttyAMA0.service
+```
+
+`system_setup/boot_cmdline.txt` is this robot's `cmdline.txt`, verbatim, for comparison.
+Pi 5 does not create `/dev/serial0`, so the code opens `ttyAMA0` directly.
+
+### Device permissions and sudo
+
+Two more things the repo cannot give you. Both fail quietly rather than loudly.
+
+**Group membership.** The runtime opens `/dev/ttyAMA0` (`root:dialout`), `/dev/i2c-1`
+(`i2c`) and `/dev/gpiochip*` (`gpio`) as your normal user:
+
+```bash
+sudo usermod -aG dialout,i2c,gpio "$USER"   # then log out and back in
+```
+
+`scripts/check_system.py` reports these as **warnings, not failures**, so an install
+without them still says it passed — and then the UART, OLED and GPIO silently do not work.
+
+**Passwordless sudo for the CAN interface.** `start_can_interface()` in
+`hardware/can_hardware.py` shells out to `sudo ip link set can0 ...` with `check=True`.
+Under systemd there is no tty, so without a password-free rule that call fails and `can0`
+never comes up; run by hand it stops to prompt in the middle of startup. The OLED menu's
+reboot / shutdown actions use `sudo -n`, which simply does nothing without it.
+
+The development robot has blanket `NOPASSWD: ALL`. A scoped rule is enough:
+
+```bash
+sudo tee /etc/sudoers.d/10-rcb-runtime >/dev/null <<'EOF'
+%gpio ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/ifconfig, /usr/sbin/reboot, /usr/sbin/poweroff
+EOF
+sudo chmod 0440 /etc/sudoers.d/10-rcb-runtime
+sudo visudo -c                 # must print "parsed OK" before you log out
+```
+
+Check paths with `command -v ip` first — they differ between distributions, and a rule
+naming a path that does not exist grants nothing.
+
 ### Python 3.11, not 3.12
 
 Ubuntu 24.04 ships **Python 3.12** as the default `python3`. The reference robot runs

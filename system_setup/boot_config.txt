@@ -1,0 +1,133 @@
+# =============================================================================
+# REFERENCE COPY of /boot/firmware/config.txt from the development PAR6 robot.
+#
+# Captured 2026-08-18 from a Raspberry Pi 5 running Ubuntu 24.04 with the
+# 6.8.4-rt11-raspi kernel. Everything below the separator line is byte-identical
+# to the file on that machine.
+#
+# Nothing reads this file. It is here so a fresh install can be diffed against a
+# known-good boot configuration, because none of the interfaces the runtime
+# needs — CAN, I2C, UART — exist until the overlays below are set, and no error
+# message points at this file when they are missing.
+#
+# Do NOT blind-copy it over your own /boot/firmware/config.txt: the rest of the
+# file carries display/audio settings for THIS Pi. Merge the lines you need, then
+# REBOOT — overlays only take effect at boot.
+#
+# What the runtime actually depends on:
+#
+#   dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=12
+#       Creates can0. Without it there is no CAN bus and nothing reaches a motor.
+#       `oscillator=` MUST match the crystal on your CAN board — 16 MHz here,
+#       but 8 MHz boards are common and produce a silently wrong bitrate.
+#       `interrupt=` is the BCM pin wired to the MCP2515 INT line.
+#
+#   dtoverlay=spi0-1cs
+#       SPI for the MCP2515, exposing ONLY CS0 (BCM 8). Deliberately not
+#       `dtparam=spi=on`: that also claims CS1 (BCM 7), which this robot uses as
+#       ISOLATED_INPUT_3, and RTI.py then dies with lgpio "GPIO busy".
+#       See docs/gpio_changes.md.
+#
+#   dtparam=i2c_arm=on
+#       /dev/i2c-1, for the front-panel SSD1306 OLED.
+#
+#   enable_uart=1 + dtparam=uart0 + dtoverlay=uart0-pi5 + dtoverlay=disable-bt
+#       Together these give /dev/ttyAMA0, the UART link to the mainboard PCB.
+#       Pi 5 does not create the /dev/serial0 symlink, so the code opens
+#       ttyAMA0 directly. `disable-bt` keeps the Bluetooth modem off that UART.
+#
+# THE UART NEEDS TWO MORE THINGS, AND NEITHER OF THEM LIVES IN THIS FILE.
+# supervisor.py owns /dev/ttyAMA0 exclusively at 256000 baud. By default a Pi
+# also puts the KERNEL CONSOLE and a LOGIN PROMPT on that same port, both at
+# 115200. Nothing errors — the PCB just receives boot messages and getty banners
+# interleaved with its protocol, at the wrong baud rate, and the link looks
+# flaky rather than misconfigured.
+#
+#   1. No serial console in /boot/firmware/cmdline.txt.
+#      This robot boots with `console=tty1` and NOTHING else; /proc/consoles
+#      lists only tty1. If your image ships `console=serial0,115200` or
+#      `console=ttyAMA0,115200`, delete that ONE token and leave the rest alone.
+#      See system_setup/boot_cmdline.txt for this robot's exact line — that file
+#      is verbatim and unannotated on purpose: cmdline.txt has NO comment
+#      syntax and must stay a single line, so anything you add to it is passed
+#      to the kernel as a boot parameter.
+#
+#   2. No login prompt on the port:
+#          sudo systemctl disable --now serial-getty@ttyAMA0.service
+#      Verify: `systemctl is-enabled serial-getty@ttyAMA0.service` -> disabled.
+#
+# Both are checked by the same reboot as the overlays above.
+#
+# Present because this is a desktop-image Pi, not because the runtime wants it:
+# vc4-kms-v3d, dwc2, camera/display auto-detect, audio, overscan.
+#
+# Verify after rebooting:  ./scripts/check_system.py
+# =============================================================================
+
+[all]
+arm_64bit=1
+kernel=vmlinuz
+cmdline=cmdline.txt
+initramfs initrd.img followkernel
+
+# Enable the audio output, I2C and SPI interfaces on the GPIO header. As these
+# parameters related to the base device-tree they must appear *before* any
+# other dtoverlay= specification
+dtparam=audio=on
+dtparam=i2c_arm=on
+dtoverlay=spi0-1cs
+dtparam=uart0
+dtoverlay=mcp2515-can0,oscillator=16000000,interrupt=12
+dtoverlay=spi-bcm2835-overlay
+dtoverlay=dwc2
+dtoverlay=disable-bt
+dtoverlay=uart0-pi5
+
+
+# Comment out the following line if the edges of the desktop appear outside
+# the edges of your display
+disable_overscan=1
+
+# If you have issues with audio, you may try uncommenting the following line
+# which forces the HDMI output into HDMI mode instead of DVI (which doesn't
+# support audio output)
+#hdmi_drive=2
+
+# Enable the KMS ("full" KMS) graphics overlay, leaving GPU memory as the
+# default (the kernel is in control of graphics memory with full KMS)
+dtoverlay=vc4-kms-v3d
+disable_fw_kms_setup=1
+
+# Enable the serial pins
+enable_uart=1
+
+# Autoload overlays for any recognized cameras or displays that are attached
+# to the CSI/DSI ports. Please note this is for libcamera support, *not* for
+# the legacy camera stack
+camera_auto_detect=1
+display_auto_detect=1
+
+# Config settings specific to arm64
+dtoverlay=dwc2
+
+[pi4]
+max_framebuffers=2
+arm_boost=1
+
+[pi3+]
+# Use a smaller contiguous memory area, specifically on the 3A+ to avoid an
+# OOM oops on boot. The 3B+ is also affected by this section, but it shouldn't
+# cause any issues on that board
+dtoverlay=vc4-kms-v3d,cma-128
+
+[pi02]
+# The Zero 2W is another 512MB board which is occasionally affected by the same
+# OOM oops on boot.
+dtoverlay=vc4-kms-v3d,cma-128
+
+[cm4]
+# Enable the USB2 outputs on the IO board (assuming your CM4 is plugged into
+# such a board)
+dtoverlay=dwc2,dr_mode=host
+
+[all]
