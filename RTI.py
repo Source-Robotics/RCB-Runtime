@@ -68,7 +68,7 @@ from hardware.can_hardware import scan_can_bus, initialize_can_communication
 # ==========================================================================
 from config.networking import zmq_listener, zmq_sender_setup, UDP_socket_receive_setup, UDP_socket_send_setup, broadcast_UDP_telemetry, init_rti_receive_socket, drain_rti_udp, RTI_PORT_SENDER
 from communication.can_message_handlers import receive_and_process_can_messages, handle_polling_and_overrides, update_can_connection_status, drain_can_discard
-from communication.can_message_handlers import send_gripper_commands, send_motor_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared
+from communication.can_message_handlers import send_gripper_commands, send_motor_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
 from utility.kt_init import resolve_and_preload_kt
 from utility.tick_types import TickContext, TickResult
 from utility.mode_dispatch import build_mode_dispatch, dispatch_step
@@ -371,6 +371,9 @@ _gripper_fw_state = {
 _gripper_calibrate_pending = False
 _gripper_calibrate_running = False
 _gripper_calibrate_ticks   = 0
+# Tracks the gripper CAN slot changing hands, so RTI can tell the firmware to release
+# when homing gives it back. See the handover block in the superloop.
+_gripper_was_owned = False
 _GRIPPER_CALIBRATE_MAX_TICKS = max(1, round(30.0 / delta_t))  # safety timeout
 
 
@@ -1516,7 +1519,25 @@ while True:
     # reloads). See utility/state_machine.py MAINTENANCE_MODES.
     _bus_silent = (current_mode == RobotMode.FLASHING)
 
-    if not _tick_result.gripper_owned:
+    if _tick_result.gripper_owned:
+        _gripper_was_owned = True
+    else:
+        if _gripper_was_owned:
+            # HANDOVER: homing (or FLASHING) just gave the gripper CAN slot back.
+            #
+            # Homing sends its own full packs — _send_idle REPLAYS the last
+            # <gripper_move> every tick to hold the jaws through later phases — so the
+            # firmware can be left with action_status=1 holding a position that RTI
+            # never issued and does not know about. Empty polls cannot correct that:
+            # only a len==5 frame assigns action_status.
+            #
+            # So force idle and let the announcement below transmit it. Homing ends with
+            # the arm in IDLE, and this makes the gripper match: no active command on
+            # either. It also repairs Stop, which would otherwise do nothing until the
+            # operator had issued one Open/Close to arm the handshake.
+            _gripper_was_owned = False
+            _gripper_fw_state['action'] = 0
+            _gripper_fw_state['_idle_repeats'] = GRIPPER_IDLE_PACK_REPEATS
         if _gripper_calibrate_pending and active_CAN_gripper:
             Motor[joint_num].Send_gripper_calibrate()
             logger.info("[Gripper] firmware calibrate sent")
@@ -1538,6 +1559,7 @@ while True:
                 Motor, dummy_device, active_CAN_gripper, joint_num,
                 ctrl_mode=int(shared_data.rti['gripper_ctrl_mode'][0]),
                 gripper_state=_gripper_fw_state,
+                calibrated=bool(shared_data.gripper['gripper_calibrated'][0]),
             )
     _profile_last = _profile_mark(_profile_last, "gripper_send")
     if not _bus_silent:

@@ -230,8 +230,14 @@ def send_motor_commands_pd(motors, joint_num, positions, speeds, currents=None):
         )
 
 
+# How many consecutive action=0 packs announce "go idle" to the gripper firmware before
+# we fall back to silent empty polls. More than one because the send layer swallows TX
+# errors, and a single lost frame would strand the gripper holding position.
+GRIPPER_IDLE_PACK_REPEATS = 3
+
+
 def send_gripper_commands(motors, dummy_device, active_gripper, joint_num,
-                          ctrl_mode=1, gripper_state=None):
+                          ctrl_mode=1, gripper_state=None, calibrated=True):
     """2. Handles gripper CAN messages or dummy timing messages.
 
     Args:
@@ -246,7 +252,69 @@ def send_gripper_commands(motors, dummy_device, active_gripper, joint_num,
     latched firmware errors.
     """
     if active_gripper == 1:
-        if ctrl_mode == 2 and gripper_state is not None:
+        # Mirror the firmware's OWN gate, do not guess at it. motor_control.cpp runs the
+        # position/velocity path only when
+        #     action_status == 1 && calibrated && activated && I_AM_GRIPPER
+        # so BOTH action=0 and an uncalibrated gripper land in its "Idle or disabled"
+        # else-branch. Keying only on `action` would leave the boot case buzzing, because
+        # at boot the gripper has not calibrated yet and no value of `action` changes that.
+        _gripper_idle = (gripper_state is None
+                         or not int(gripper_state.get('action', 0))
+                         or not calibrated)
+        if ctrl_mode == 2 and gripper_state is not None and _gripper_idle \
+                and gripper_state.get('_idle_repeats', 0) > 0:
+            # GOING idle: the firmware must be TOLD once, then left alone.
+            #
+            # The empty pack below cannot carry action=0 — communication_CAN.cpp only
+            # assigns Gripper.action_status inside its len==5 branch, and nothing else
+            # in the firmware ever clears it. So if we dropped straight to empty polls
+            # after a move, the driver would keep action_status=1, keep running
+            # Gripper_mode() (Controller_mode stays 6) and HOLD POSITION FOREVER —
+            # Stop would silently stop working.
+            #
+            # So send a real pack with action forced to 0. That puts the firmware in
+            # its "Idle or disabled" branch: velocity 0, SLEEP and RESET LOW, output
+            # stage disabled — a genuinely limp gripper. Repeated a few ticks because
+            # a lost frame here would strand it holding (the send layer swallows TX
+            # errors), and a handful of ticks is a click, not an audible tone.
+            motors[joint_num].Send_gripper_data_pack(
+                position_=int(gripper_state.get('position', 0)) & 0xFF,
+                speed_=int(gripper_state.get('speed', 0)) & 0xFF,
+                current_=int(gripper_state.get('current', 0)),
+                activate_=1,
+                action_=0,
+                ESTOP_=int(gripper_state.get('estop', 0)) & 0x1,
+                Release_dir_=int(gripper_state.get('release_dir', 0)) & 0x1,
+            )
+            gripper_state['_idle_repeats'] = gripper_state.get('_idle_repeats', 0) - 1
+        elif ctrl_mode == 2 and gripper_state is not None and _gripper_idle:
+            # ALREADY idle — the firmware knows. Hold with the empty poll.
+            #
+            # Streaming a full 5-byte pack with action=0 makes the driver BUZZ, and
+            # the firmware shows exactly why. Two places fight each other at the
+            # loop rate:
+            #   communication_CAN.cpp IN_GRIPPER_DATA_PACK, len==5 branch: on every
+            #     pack it drives SLEEP and RESET HIGH — the driver stage is ENABLED.
+            #   motor_control.cpp gripper control, the `else` at "Idle or disabled"
+            #     (action_status==0): sets velocity 0 then drives SLEEP and RESET
+            #     LOW — the driver stage is DISABLED.
+            # So at 250 Hz the output stage is enabled by the CAN handler and
+            # disabled by the control loop, over and over. That toggle is the buzz.
+            # It stops the instant a real Open/Close arrives because action becomes
+            # 1 and the control loop takes the position/velocity path instead.
+            #
+            # The empty (zero-length) pack is the firmware's own designed no-op for
+            # this: its len==0 branch still sets watchdog_reset=1 (so the watchdog
+            # stays fed), leaves Controller_mode alone, touches no setpoint, marks
+            # Same_command=true so At_position is not reset, and still replies via
+            # Gripper_pack_data() so telemetry keeps flowing. Critically it does NOT
+            # raise SLEEP/RESET, so the stage stays quietly disabled — which is the
+            # state action=0 was always asking for.
+            motors[joint_num].Send_gripper_data_pack()
+        elif ctrl_mode == 2 and gripper_state is not None:
+            # Active command. Re-arm the idle handshake so that whenever this command
+            # ends, the firmware is told once rather than left holding.
+            gripper_state['_idle_repeats'] = GRIPPER_IDLE_PACK_REPEATS
             motors[joint_num].Send_gripper_data_pack(
                 position_=int(gripper_state.get('position', 0)) & 0xFF,
                 speed_=int(gripper_state.get('speed', 0)) & 0xFF,
