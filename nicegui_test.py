@@ -740,9 +740,39 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             _gripper_cmd_state['action']   = 1
             _send_gripper_cmd(target)
 
-        def _gr_stop():
+        def _gr_idle():
+            # RELEASE. action=0 drops the firmware into its "Idle or disabled" branch:
+            # velocity setpoint 0, and on a Spectral BLDC board the output stage is
+            # switched off as well (SLEEP/RESET LOW), so the jaws go limp and can be
+            # moved by hand. A STEPFOC board has no such lines and settles into a
+            # velocity-0 hold instead — no active command either way, but only the
+            # Spectral one is genuinely draggable. RTI announces this to the firmware
+            # and then holds the bus quiet with empty polls.
+            _gripper_cmd_state['last_dir'] = 0
             _gripper_cmd_state['action'] = 0
             _send_gripper_cmd(_gripper_cmd_state['position'])
+
+        def _gr_stop():
+            # HALT IN PLACE — hold the jaws exactly where they are.
+            #
+            # The firmware has no graceful stop primitive. Its only stop is the ESTOP
+            # bit, and that LATCHES A FAULT (motor_control.cpp sets estop_error = 1 and
+            # controller.Error = 1), which would then need clearing before the gripper
+            # worked again. Not what a Stop button should do.
+            #
+            # So stop is done host-side: re-target the position the jaws are at RIGHT
+            # NOW, keeping action=1. The firmware is already within tolerance of that
+            # target, so it holds there instead of continuing to the old one.
+            here = int(shared_data.gripper['gripper_position'][0])
+            if not 1 <= here <= 254:
+                # No trustworthy reading (an uncalibrated gripper reports 0). Releasing
+                # is the safe fallback — commanding 0 would be read as FULLY OPEN and
+                # drive the jaws instead of stopping them.
+                _gr_idle()
+                return
+            _gripper_cmd_state['last_dir'] = 0
+            _gripper_cmd_state['action'] = 1
+            _send_gripper_cmd(here)
 
         def _on_gripper_ctrl_mode(e):
             mode = 2 if e.value == 'firmware' else 1
@@ -758,7 +788,10 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 ui.button("Open",  icon="open_in_full",  on_click=lambda: _gr_move(1)  ).props("color=primary outline size=sm")
                 ui.button("Close", icon="close_fullscreen",on_click=lambda: _gr_move(254)).props("color=primary outline size=sm")
                 ui.button("Goto",  icon="play_arrow",    on_click=lambda: _gr_move(_gripper_cmd_state['position'])).props("color=primary outline size=sm")
-                ui.button("Stop",  icon="stop",          on_click=_gr_stop      ).props("color=warning outline size=sm")
+                ui.button("Stop",  icon="stop",          on_click=_gr_stop      ).props("color=warning outline size=sm") \
+                    .tooltip("Halt in place — holds the jaws where they are (still gripping)")
+                ui.button("Idle",  icon="power_settings_new", on_click=_gr_idle ).props("color=warning outline size=sm") \
+                    .tooltip("Release — no active command. Limp on SSG48, velocity-0 hold on MSG")
                 ui.separator().props("vertical")
                 ui.button("Calibrate", icon="straighten", on_click=lambda: _exec(lambda r: r.gripper_calibrate(), "gripper_calibrate")).props("color=secondary outline size=sm")
 
