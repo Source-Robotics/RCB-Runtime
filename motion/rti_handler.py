@@ -360,21 +360,24 @@ class RTIModeHandler:
         # places would add a hot-path error return (ErrorPositionalLimits) for a bound that
         # is already enforced.
         self._rk = None
+        self._rk_unavailable = ""     # why, for the rti_claim refusal message
         self._rk_errors = 0
         self._rk_tv = np.zeros(joint_num, dtype=np.float64)   # clamped feedforward
         if not _RUCKIG_AVAILABLE:
-            logger.error("[RTI] ruckig is not installed — the position rate limiter falls "
-                         "back to the legacy cascade, which does NOT converge on a "
-                         "constant target. Soft joint limits are still enforced.")
+            self._rk_unavailable = ("the ruckig package is not importable (it is a pinned "
+                                    "requirement: `pip install -r requirements.txt`)")
+            logger.error("[RTI] %s — RTI mode cannot claim control with the rate limiter "
+                         "enabled.", self._rk_unavailable)
         elif not (np.all(np.isfinite(self.vel_limit)) and
                   np.all(np.isfinite(self.accel_limit)) and
                   np.all(np.isfinite(self.jerk_limit))):
             # Ruckig rejects a non-finite limit. Rather than substitute an invented
-            # ceiling, say so and let the cascade handle it — an XML missing a limit is a
-            # config problem to fix, not one to paper over with a made-up number.
-            logger.error("[RTI] velocity/acceleration/jerk limits are not all finite in "
-                         "the robot XML — Ruckig disabled, falling back to the legacy "
-                         "cascade. Fix the XML rather than relying on this path.")
+            # ceiling, say so — an XML missing a limit is a config problem to fix, not one
+            # to paper over with a made-up number.
+            self._rk_unavailable = ("velocity/acceleration/jerk limits are not all finite "
+                                    "in the robot XML")
+            logger.error("[RTI] %s — RTI mode cannot claim control with the rate limiter "
+                         "enabled. Fix the XML.", self._rk_unavailable)
         else:
             self._rk = Ruckig(joint_num, delta_t)
             self._rk_in = InputParameter(joint_num)
@@ -470,13 +473,44 @@ class RTIModeHandler:
         self.link_lost_event = False
         return ev
 
+    def can_claim(self):
+        """(ok, reason) — may control be claimed right now?
+
+        Refuses when the rate limiter is ON but has no working planner. There used to be a
+        fallback here (a hand-rolled derivative cascade) and it was removed 2026-08-08,
+        because it was a trap rather than a safety net:
+
+          - It converges ONLY when the jerk limit is loose enough to be inert. At PAR6's
+            pre-liberal jerk (310 rad/s^3, 50x accel) it oscillates +/-0.58 deg on a
+            CONSTANT target, forever, straight to the motors. So it was correct today and
+            would silently become wrong the moment jerk is tightened — a config change in
+            an unrelated XML field, with no connection to this code path.
+          - It could not be exercised, so it rotted. A NaN bug sat in it undetected until
+            someone went looking (see defect C).
+
+        Failing loudly at claim time is strictly safer than moving badly: an operator gets a
+        named error before anything moves, instead of a wrist that will not settle.
+        """
+        if self.rate_limit_enabled and self._rk is None:
+            return False, (self._rk_unavailable or "rate limiter has no planner")
+        return True, ""
+
     def claim_control(self, current_tick, measured_pos=None):
         """TCP rti_claim: connected → control_active. Timing rules start now.
+
+        Returns True if control was claimed, False if refused — see can_claim().
 
         measured_pos seeds the rate limiter so the first limited command is relative to
         where the arm actually is. Without it the limiter would ramp from 0 rad and yank
         the arm toward the origin — the exact failure the limiter exists to prevent.
         """
+        ok, why = self.can_claim()
+        if not ok:
+            logger.error("[RTI] rti_claim REFUSED — %s. Fix the install or the robot XML, "
+                         "or stream with the rate limiter explicitly disabled "
+                         "(rti_set_rate_limiter(False)) and accept unfiltered commands.", why)
+            return False
+
         self.sub_state = 'control_active'
         self.last_cmd_tick = current_tick
         self.last_cmd_type = None
@@ -512,6 +546,7 @@ class RTIModeHandler:
                     self.timeout_ticks,
                     "ON" if self.rate_limit_enabled else "OFF",
                     "ON" if self.start_pose_check_enabled else "OFF")
+        return True
 
     def request_release(self):
         """TCP rti_release: begin a CLEAN stop. Returns True if it was accepted."""
@@ -772,60 +807,12 @@ class RTIModeHandler:
             self._rl_a[:] = 0.0
             return tgt
 
-        if self._rk is not None:
-            return self._limit_position_ruckig(tgt)
-
-        dt = self.delta_t
-        v, a, j, out = self._rl_tmp_v, self._rl_tmp_a, self._rl_tmp_j, self._rl_out
-        d, vstop = self._rl_dist, self._rl_vstop
-
-        np.subtract(tgt, self._rl_q, out=d)
-        np.divide(d, dt, out=v)
-        np.clip(v, -self.vel_limit, self.vel_limit, out=v)
-
-        # Layer 2: never travel faster than we can still stop from.
-        #
-        # _accel_safe, not accel_limit: with an absent (infinite) acceleration limit this
-        # computed 2*|d| * inf, which is NaN for any joint sitting exactly ON its target —
-        # i.e. HOLD POSITION, the commonest RTI operation there is. The NaN propagated
-        # through the clips into the emitted setpoint and on to int() in the motor-space
-        # conversion. The two conditions coincide by construction, because a missing limit is
-        # exactly what disables Ruckig and drops control onto this fallback in the first
-        # place: the safety net failed unsafely, and only in the case it was needed.
-        # Joints with no acceleration limit get vstop = inf, which is the honest answer —
-        # no limit means no stopping-distance constraint to enforce.
-        np.abs(d, out=vstop)
-        np.multiply(vstop, 2.0, out=vstop)
-        np.multiply(vstop, self._accel_safe, out=vstop)
-        np.sqrt(vstop, out=vstop)
-        np.copyto(vstop, np.inf, where=~self._accel_finite)
-        np.clip(v, -vstop, vstop, out=v)
-
-        np.subtract(v, self._rl_v, out=a)
-        np.divide(a, dt, out=a)
-
-        np.subtract(a, self._rl_a, out=j)
-        np.divide(j, dt, out=j)
-        np.clip(j, -self.jerk_limit, self.jerk_limit, out=j)
-
-        np.multiply(j, dt, out=a)
-        np.add(self._rl_a, a, out=a)
-        np.clip(a, -self.accel_limit, self.accel_limit, out=a)
-
-        np.multiply(a, dt, out=v)
-        np.add(self._rl_v, v, out=v)
-        np.clip(v, -self.vel_limit, self.vel_limit, out=v)
-
-        np.multiply(v, dt, out=out)
-        np.add(self._rl_q, out, out=out)
-        # Layer 1b: the backstop. Whatever the cascade produced, it does not leave the
-        # workspace. Writing the clamped value back into _rl_q keeps the integrator honest.
-        np.clip(out, self.limit_neg, self.limit_pos, out=out)
-
-        self._rl_q[:] = out
-        self._rl_v[:] = v
-        self._rl_a[:] = a
-        return out
+        # No fallback. claim_control() refuses when the limiter is enabled without a
+        # working planner, so reaching here with _rk unset means something bypassed that
+        # check — hold the last limited position rather than emit an unlimited setpoint.
+        if self._rk is None:
+            return self._rl_q
+        return self._limit_position_ruckig(tgt)
 
     def _limit_position_ruckig(self, tgt):
         """One Ruckig tick. `tgt` is already clamped to the soft joint limits.

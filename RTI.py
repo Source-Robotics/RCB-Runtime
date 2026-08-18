@@ -1045,10 +1045,14 @@ def _handle_rti_claim(cmd_msg, cmd_dict):
         return
     # Seed the rate limiter from the live arm, so its first output ramps from where the
     # robot actually is rather than from 0 rad.
-    rti_handler.claim_control(
-        current_tick=int(shared_data.rti["loop_tick"][0]),
-        measured_pos=shared_data.joint['joint_position'][:joint_num],
-    )
+    #
+    # Can be REFUSED: with the rate limiter enabled there is no fallback planner, so a
+    # missing ruckig or a robot XML without finite limits means control is not granted.
+    # The handler logs why. Refusing before anything moves beats moving badly.
+    if not rti_handler.claim_control(
+            current_tick=int(shared_data.rti["loop_tick"][0]),
+            measured_pos=shared_data.joint['joint_position'][:joint_num]):
+        logger.warning("[RTI] rti_claim rejected — see the error above")
 
 
 def _handle_rti_set_rate_limiter(cmd_msg, cmd_dict):
