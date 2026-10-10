@@ -15,6 +15,12 @@ WHAT IS MEASURED, per move and joint (error = commanded - measured position, pos
   pid               RMS of measured torque - commanded torque while moving: the torque the drive's own loops had to add
                     beyond our feedforward (gravity today) — what a dynamics feedforward would take over
   others            the largest error on the joints that were NOT commanded to move (coupling)
+  delay             the time shift (0-20 ms) that best lines the measured motion up with the command
+  rms_d / peak_d    the error LEFT after that shift — the path error. The plain error is dominated by a constant
+                    ~6 ms (first run 2026-10-10: lag / speed = 6.1 ms on every joint, both gain sets): the measured
+                    position is ~2.4 ms old CAN data and the command reaches the drive at the end of the tick. A pure
+                    delay (and any lag proportional to speed) only shifts the motion in time; what remains — error
+                    while accelerating, friction at reversals, ripple, overshoot — is what control changes can improve.
 Each speed's value is the median of its four moves (out, back, out the other way, back).
 
 WHY TELEMETRY. Shared memory sampled from Python pairs values from different ticks (TODO/servo_mode_options.md §15.4);
@@ -33,6 +39,7 @@ the XML's), and the XML gains are ALWAYS put back at the end, whatever happens. 
     python3 api_tests/66_tracking.py --go                       # new, old, new (the 2nd new = repeatability)
     python3 api_tests/66_tracking.py --go --sets new --joints 4,5,6 --speeds 30,60
     python3 api_tests/66_tracking.py --compare temp_data/tracking/A.json temp_data/tracking/B.json
+    python3 api_tests/66_tracking.py --reanalyse temp_data/tracking/A.json   # recompute a saved run (no robot)
 
 Results: printed, and saved to temp_data/tracking/<time>.npz (raw ticks) + .json (every metric).
 """
@@ -64,7 +71,9 @@ ACC_FRACTION = 0.1                # |commanded accel| above this x the move's pe
 SETTLE_DEG = 0.05
 FINAL_S = 0.1
 NEED = ("j_p", "j_pc", "j_s", "j_sc", "j_ac", "j_t", "j_tc", "tick")
-METRICS = ("rms", "peak", "acc", "cru", "dec", "lag", "overshoot", "settle_ms", "final", "pid", "others", "vpeak")
+DELAY_MAX_S, DELAY_STEP_S = 0.020, 0.00025   # the time shift searched for each move
+METRICS = ("rms", "peak", "acc", "cru", "dec", "lag", "overshoot", "settle_ms", "final", "pid", "others", "vpeak",
+           "delay_ms", "rms_d", "peak_d")
 
 
 # ----------------------------------------------------------------------------- gains
@@ -179,10 +188,24 @@ def move_metrics(s, j, direction, dt):
     others = [k for k in range(s["j_p"].shape[1]) if k != j and not (np.abs(s["j_sc"][:, k]) > MOVING).any()]
     oth = float(np.degrees(np.abs(s["j_pc"][moving][:, others] - s["j_p"][moving][:, others])).max()) if others else None
     pid = s["j_t"][:, j] - s["j_tc"][:, j]
-    return {"rms": rms(moving), "peak": float(np.abs(err[moving]).max()), "acc": rms(acc), "cru": rms(cru),
+    delay, res = best_delay(s["tick"] * dt, s["j_pc"][:, j], s["j_p"][:, j], moving)
+    return {"delay_ms": 1000.0 * delay, "rms_d": float(np.sqrt(np.mean(res ** 2))), "peak_d": float(np.abs(res).max()),
+            "rms": rms(moving), "peak": float(np.abs(err[moving]).max()), "acc": rms(acc), "cru": rms(cru),
             "dec": rms(dec), "lag": float(along[cru].mean()) if cru.any() else None, "overshoot": over,
             "settle_ms": settle, "final": float(err[-nfin:].mean()), "pid": float(np.sqrt(np.mean(pid[moving] ** 2))),
             "others": oth, "vpeak": float(np.degrees(np.abs(sc).max()))}
+
+
+def best_delay(t, cmd, meas, mask):
+    """The shift D (0..DELAY_MAX_S) minimising the RMS of cmd(t - D) - meas(t) over `mask`, and that residual (deg)."""
+    tm = t[mask]
+    best = (np.inf, 0.0, None)
+    for D in np.arange(0.0, DELAY_MAX_S + 1e-12, DELAY_STEP_S):
+        r = np.degrees(np.interp(tm - D, t, cmd) - meas[mask])
+        e = float(np.mean(r ** 2))
+        if e < best[0]:
+            best = (e, float(D), r)
+    return best[1], best[2]
 
 
 def analyse(d, records, dt):
@@ -229,9 +252,11 @@ def _fmt(v, nd=3):
 def print_report(summ, set_names, title=""):
     if title:
         print(title)
-    cols = [("rms", 3), ("peak", 3), ("lag", 3), ("overshoot", 3), ("settle_ms", 0), ("pid", 3), ("others", 3)]
+    cols = [("rms", 3), ("delay_ms", 1), ("rms_d", 3), ("peak_d", 3), ("overshoot", 3), ("settle_ms", 0), ("pid", 3),
+            ("others", 3)]
     head = "  ".join(f"{c[0][:7]:>7s}" for c in cols)
-    print("  (degrees, ms, Nm; median of the moves at that speed; error = commanded - measured)")
+    print("  (degrees, ms, Nm; median of the moves at that speed; error = commanded - measured;"
+          " rms_d / peak_d = after the best time shift 'delay')")
     joints = sorted({j for s in set_names for j in summ.get(s, {})}, key=lambda x: int(x[1:]))
     for jn in joints:
         for grp in ("alone", "all"):
@@ -246,18 +271,19 @@ def print_report(summ, set_names, title=""):
                     if v is None:
                         continue
                     print(f"    {sp + '%':>6s} {s:>8s} {_fmt(v['vpeak'], 1)}  " + "  ".join(_fmt(v[c], nd) for c, nd in cols))
-    # one line per joint: the mean over speeds of the RMS error, each set relative to the first
+    # one line per joint and metric: the mean over speeds, each set relative to the first
     if len(set_names) > 1:
-        print("\n  Mean RMS tracking error over all speeds (joint moving alone), relative to the first set:")
-        for jn in joints:
-            vals = []
-            for s in set_names:
-                g = summ.get(s, {}).get(jn, {}).get("alone", {})
-                xs = [g[sp]["rms"] for sp in g if g[sp]["rms"] is not None]
-                vals.append(float(np.mean(xs)) if xs else None)
-            if vals[0]:
-                print(f"    {jn}: " + "   ".join(f"{s} {v:.3f}" + ("" if i == 0 or v is None else f" ({v / vals[0]:.2f}x)")
-                                                 for i, (s, v) in enumerate(zip(set_names, vals)) if v is not None))
+        for key, what in (("rms", "RMS tracking error"), ("rms_d", "RMS path error after the time shift")):
+            print(f"\n  Mean {what} over all speeds (joint moving alone), relative to the first set:")
+            for jn in joints:
+                vals = []
+                for s in set_names:
+                    g = summ.get(s, {}).get(jn, {}).get("alone", {})
+                    xs = [g[sp][key] for sp in g if g[sp].get(key) is not None]
+                    vals.append(float(np.mean(xs)) if xs else None)
+                if vals[0]:
+                    print(f"    {jn}: " + "   ".join(f"{s} {v:.3f}" + ("" if i == 0 or v is None else f" ({v / vals[0]:.2f}x)")
+                                                     for i, (s, v) in enumerate(zip(set_names, vals)) if v is not None))
 
 
 def label_sets(names):
@@ -347,6 +373,21 @@ def selftest():
     chk("drive torque beyond the feedforward = 0.3 Nm", abs(x["pid"] - 0.3) < 1e-3, x["pid"])
     chk("coupling: J4 sat 0.02 deg off", abs(x["others"] - 0.02) < 1e-4, x["others"])
     chk("commanded peak speed 40 deg/s", abs(x["vpeak"] - 40.0) < 0.01, x["vpeak"])
+    # a pure 6 ms delay plus an error proportional to the ACCELERATION (what inertia does): the shift finds 6 ms, the
+    # residual is exactly the acceleration part, the plain error is much larger (the delay x the speed)
+    ta_ = np.arange(0, 1.2, dt)
+    cm = np.where(ta_ < 0.4, 0.5 * 100 * ta_ ** 2, np.where(ta_ < 0.8, 8 + 40 * (ta_ - 0.4), 24 + 40 * (ta_ - 0.8)
+                  - 0.5 * 100 * (ta_ - 0.8) ** 2))
+    cm = np.where(ta_ < 1.2, cm, cm[-1])
+    vv = np.gradient(cm, dt); aa = np.gradient(vv, dt)
+    me = np.interp(ta_ - 0.006, ta_, cm) - 0.0005 * np.interp(ta_ - 0.006, ta_, aa)
+    D, r = best_delay(ta_, np.radians(cm), np.radians(me), vv > 0.5)
+    want = np.sqrt(np.mean((0.0005 * np.interp(ta_ - 0.006, ta_, aa))[vv > 0.5] ** 2))
+    chk("time shift: a pure 6 ms delay is found (0.25 ms steps)", abs(D - 0.006) <= 0.00026, D)
+    chk("after the shift only the acceleration-proportional error is left", abs(np.sqrt(np.mean(r ** 2)) - want) < 0.003,
+        (np.sqrt(np.mean(r ** 2)), want))
+    chk("a lag of 0.004 deg per deg/s IS a 4 ms shift: the first move's delay ~4 ms, almost nothing left after it",
+        abs(x["delay_ms"] - 4.0) <= 0.25 + 1e-9 and x["rms_d"] < 0.005, (x["delay_ms"], x["rms_d"]))
     s = summarise([x] * 4)
     chk("summary: median per speed", s["A"]["J3"]["alone"]["30"]["lag"] == x["lag"] and s["A"]["J3"]["alone"]["30"]["n"] == 4,
         s["A"]["J3"]["alone"]["30"])
@@ -554,9 +595,24 @@ def main():
     ap.add_argument("--speeds", default=",".join(f"{s:g}" for s in DEFAULT_SPEEDS), help="percent of the EXEC limits")
     ap.add_argument("--amp-scale", type=float, default=1.0, help="scale the default amplitudes (<= 1 to be gentler)")
     ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"), help="put two saved runs side by side")
+    ap.add_argument("--reanalyse", metavar="RUN.json", help="recompute a saved run's metrics from its .npz (no robot)")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
+    if args.reanalyse:
+        run = json.load(open(args.reanalyse))
+        raw = np.load(args.reanalyse[:-5] + ".npz")
+        d = {k: raw[k] for k in raw.files}
+        moves = analyse(d, run["records"], 0.004)
+        summ = summarise(moves)
+        names = [n for n in run["set_names"] if n in summ]
+        print_report(summ, names, f"=== {args.reanalyse} (re-analysed) ===")
+        run.update({"summary": summ, "moves": moves, "set_names": names})
+        out = args.reanalyse[:-5] + "_reanalysed.json"
+        with open(out, "w") as fh:
+            json.dump(run, fh, indent=1)
+        print(f"\nSaved {out}")
+        return 0
     if args.compare:
         a, b = (json.load(open(p)) for p in args.compare)
         merged, order = {}, []
