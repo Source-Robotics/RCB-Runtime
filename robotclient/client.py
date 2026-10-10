@@ -321,6 +321,20 @@ class RobotClient:
         """
         return self._immediate("gravity_comp", [1 if enabled else 0])
 
+    def set_inertia_comp(self, enabled: bool) -> Any:
+        """Robot-wide INERTIA feedforward: the torque M(q)·qdd that the commanded acceleration needs (the links and the
+        motor rotors behind the gearboxes), added to the current the drives get — in EXEC, JOG and RTI / SOFT_RTI
+        position and velocity commands. Computed from the COMMANDED motion of the tick, never a measured one; not
+        added in freedrive, holds, homing or RTI torque commands. OFF at every RTI start; status() reports
+        "inertia_comp". Separate from set_coriolis_comp and set_gravity_comp."""
+        return self._immediate("inertia_comp", [1 if enabled else 0])
+
+    def set_coriolis_comp(self, enabled: bool) -> Any:
+        """Robot-wide CORIOLIS / centripetal feedforward: the torque C(q, qd)·qd the joints exert on each other when
+        several move at once, from the commanded motion — same modes as set_inertia_comp. OFF at every RTI start;
+        status() reports "coriolis_comp"."""
+        return self._immediate("coriolis_comp", [1 if enabled else 0])
+
     def set_friction_comp(self, enabled: bool) -> Any:
         """Friction compensation in FREEDRIVE (IDLE with gravity comp ON): a push in the direction each joint is
         already moving — a fraction of its measured friction minus its measured gravity-model error (robot XML

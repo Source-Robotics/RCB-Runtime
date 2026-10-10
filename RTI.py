@@ -538,6 +538,8 @@ def main():
     for _k in ("payload_mass", "payload_com_x", "payload_com_y", "payload_com_z"):
         shared_data.rti[_k][0] = 0.0
     shared_data.rti["friction_comp_enabled"][0]     = 0.0   # operator switch: OFF at every start (utility/friction_comp.py)
+    shared_data.rti["inertia_comp_enabled"][0]      = 0.0   # inertia / Coriolis feedforward: OFF at every start
+    shared_data.rti["coriolis_comp_enabled"][0]     = 0.0   # (utility/mode_dispatch.py _add_dynamics_ff)
 
     # ==========================================================================
     # Data queue. Allows us to save previous x points of data for safety, filtering, 
@@ -1152,6 +1154,27 @@ def main():
             logger.info(f"[RTI] friction compensation {'ON' if new_val else 'OFF'} (freedrive)")
 
 
+    def _dynamics_switch(cmd_msg, key, label):
+        """inertia_comp:1|0 / coriolis_comp:1|0 — the operator switches of the inertia and Coriolis feedforward on the
+        commanded motion (EXEC, JOG, RTI / SOFT_RTI position and velocity commands; utility/mode_dispatch.py)."""
+        parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
+        if len(parts) != 2:
+            return
+        new_val = 1.0 if parts[1].strip() == "1" else 0.0
+        old_val = shared_data.rti[key][0]
+        shared_data.rti[key][0] = new_val
+        if new_val != old_val:
+            log_activity(_rti_activity_logger, "RTI", "info", "COMPENSATION_CHANGED",
+                         message=f"{label} comp: {'ON' if new_val else 'OFF'}")
+            logger.info(f"[RTI] {label} feedforward {'ON' if new_val else 'OFF'}")
+
+    def _handle_inertia_comp(cmd_msg, cmd_dict):
+        _dynamics_switch(cmd_msg, 'inertia_comp_enabled', "inertia")
+
+    def _handle_coriolis_comp(cmd_msg, cmd_dict):
+        _dynamics_switch(cmd_msg, 'coriolis_comp_enabled', "Coriolis")
+
+
     def _handle_set_mode(cmd_msg, cmd_dict):
         parts = cmd_msg.split(":")  # see _handle_gravity_comp for why this is guarded
         if len(parts) < 2:
@@ -1755,6 +1778,8 @@ def main():
         "clear_errors":      _handle_clear_errors,
         "gravity_comp":      _handle_gravity_comp,
         "friction_comp":     _handle_friction_comp,
+        "inertia_comp":      _handle_inertia_comp,
+        "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
         "jog_stop":          _handle_jog_stop,
@@ -2428,6 +2453,9 @@ def main():
                            # handler so the value is whatever was published this tick, and so
                            # this call site does not care which mode is active. All zero
                            # outside RTI mode (RTI.py zeroes them at startup and on disconnect).
+                           # inertia / Coriolis feedforward added this tick (0 when off; mode_dispatch._add_dynamics_ff)
+                           torque_inertia=shared_data.joint['joint_inertia_torque'],
+                           torque_coriolis=shared_data.joint['joint_coriolis_torque'],
                            rti_seq=shared_data.rti["rti_seq_rx_last"][0],
                            rti_ok=shared_data.rti["control_success_rate"][0],
                            rti_miss=shared_data.rti["rti_consecutive_misses"][0],

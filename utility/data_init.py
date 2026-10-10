@@ -150,6 +150,8 @@ def get_default_joint_data(num_joints: int) -> dict:
         "j_st": np.full(num_joints, -99999999, dtype=float),
         "j_at": np.full(num_joints, -99999999, dtype=float),
         "j_tt": np.full(num_joints, -99999999, dtype=float),
+        "j_t_inertia": np.full(num_joints, -99999999, dtype=float),     # inertia / Coriolis feedforward (2026-10-10)
+        "j_t_coriolis": np.full(num_joints, -99999999, dtype=float),
         "TCP_p_t": np.full(6, -99999999, dtype=float),
         "TCP_s_t": np.full(6, -99999999, dtype=float),
         "timestamp": -1,
@@ -224,7 +226,8 @@ def process_joint_data(Joint_data: deque, position: np.ndarray, speed: np.ndarra
                        torque_target: np.ndarray, TCP_pose_target: np.ndarray, TCP_speed_target: np.ndarray,
                        timestamp: float, exec_time: float, tick: float, error: np.ndarray,
                        rti_seq: float = 0, rti_ok: float = 0.0, rti_miss: float = 0,
-                       rti_state: float = 0, mode: str = "", period_ms: float = 0.0) -> None:
+                       rti_state: float = 0, mode: str = "", period_ms: float = 0.0,
+                       torque_inertia: np.ndarray | None = None, torque_coriolis: np.ndarray | None = None) -> None:
     Joint_data.append({
         "j_p":    position.copy(),
         "j_s":    speed.copy(),
@@ -258,6 +261,9 @@ def process_joint_data(Joint_data: deque, position: np.ndarray, speed: np.ndarra
         "j_st":   speed_target.copy(),
         "j_at":   acceleration_target.copy(),
         "j_tt":   torque_target.copy(),
+        # Inertia / Coriolis feedforward added this tick (2026-10-10; zeros when off or not passed).
+        "j_t_inertia":  torque_inertia.copy() if torque_inertia is not None else np.zeros_like(torque_target),
+        "j_t_coriolis": torque_coriolis.copy() if torque_coriolis is not None else np.zeros_like(torque_target),
         "TCP_p_t": TCP_pose_target.copy(),
         "TCP_s_t": TCP_speed_target.copy(),
         "timestamp": timestamp,

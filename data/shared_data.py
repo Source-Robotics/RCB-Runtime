@@ -376,6 +376,8 @@ def setup(joints: int = 6, force_reinit: bool = False):
         ("joint_torque_target",     np.float64, joint_num),
         ("joint_gravity_torque", np.float64, joint_num),  # gravity compensation torque in Nm (joint space)
         ("joint_friction_comp_torque", np.float64, joint_num),  # friction compensation added this tick, Nm (0 when off)
+        ("joint_inertia_torque",   np.float64, joint_num),  # inertia feedforward M(q)·qdd added this tick, Nm (0 when off)
+        ("joint_coriolis_torque",  np.float64, joint_num),  # Coriolis feedforward C(q, qd)·qd added this tick, Nm (0 when off)
         ("compensation_torque",  np.int32,   joint_num),  # gravity compensation current in motor mA (motor space)
         ("jog_blocked",          np.int8,    joint_num),
     ]:
@@ -577,6 +579,10 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "robot_can_connected",      # 1.0 if all motor joints have no CAN errors, 0.0 otherwise
         "gravity_comp_enabled",     # 1.0 = gravity compensation active, 0.0 = zeroed (hold with vel=0 in IDLE)
         "friction_comp_enabled",    # 1.0 = friction compensation in freedrive (utility/friction_comp.py); starts 0
+        # Inertia M(q)·qdd and Coriolis C(q, qd)·qd feedforward on the COMMANDED motion (utility/mode_dispatch.py
+        # _add_dynamics_ff, 2026-10-10) — two separate operator switches, OFF at every RTI start.
+        "inertia_comp_enabled",
+        "coriolis_comp_enabled",
         # Runtime payload (utility/payload.py, set_payload): the part the gripper holds — mass [kg] and its centre
         # of mass [m] in the tool link's frame. 0 at every RTI start (not persisted). Read by status() and the GUI.
         "payload_mass",

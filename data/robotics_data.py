@@ -30,6 +30,8 @@ TAGS = {
     "j_st":      {"src": "joint",   "prec": 3, "desc": "target joint speeds (rad/s)"},
     "j_at":      {"src": "joint",   "prec": 3, "desc": "target joint accelerations (rad/s²)"},
     "j_tt":      {"src": "joint",   "prec": 3, "desc": "target joint torques (Nm)"},
+    "j_t_inertia":  {"src": "joint", "prec": 3, "desc": "inertia feedforward M(q)·qdd added (Nm; 0 when off)"},
+    "j_t_coriolis": {"src": "joint", "prec": 3, "desc": "Coriolis feedforward C(q, qd)·qd added (Nm; 0 when off)"},
     "j_err":     {"src": "joint",   "prec": 0, "desc": "joint error flags"},
     "TCP_p":     {"src": "joint",   "prec": 4, "desc": "TCP pose [x,y,z,rx,ry,rz] (m, rad)"},
     # The same measured pose in its other two forms. Pick by need:

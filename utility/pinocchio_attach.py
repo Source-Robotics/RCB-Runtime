@@ -216,6 +216,33 @@ def _make_pinocchio_gravity(model, data):
     return gravity
 
 
+def make_pinocchio_dynamics_ff(rtb_robot: Any):
+    """fn(q, v, a, inertia, coriolis) -> (tau_inertia, tau_coriolis), Nm, joint space (2026-10-10,
+    TODO/dynamics_feedforward_plan.md): tau_inertia = M(q)·a — the links AND the motor rotors (the model's armature
+    Jm*G^2) — and tau_coriolis = C(q, v)·v, each from rnea on a GRAVITY-FREE copy of the dynamics model (gravity has
+    its own model and switch). Equal to rtb's inertia(q) @ a and coriolis(q, v) @ v to ~1e-16 Nm (net
+    test_dynamics_ff). A term that is switched off is returned as zeros without computing it. The two arrays are the
+    closure's own buffers: use them within the tick. ~2.7 us per term on the Pi."""
+    import pinocchio as pin
+    model, data = build_pinocchio_dynamics(rtb_robot)
+    model.gravity.setZero()
+    zero = np.zeros(model.nv, dtype=np.float64)
+    tau_i = np.zeros(model.nv, dtype=np.float64)
+    tau_c = np.zeros(model.nv, dtype=np.float64)
+
+    def dynamics_ff(q, v, a, inertia, coriolis):
+        if inertia:
+            np.copyto(tau_i, pin.rnea(model, data, q, zero, a))
+        else:
+            tau_i.fill(0.0)
+        if coriolis:
+            np.copyto(tau_c, pin.rnea(model, data, q, v, zero))
+        else:
+            tau_c.fill(0.0)
+        return tau_i, tau_c
+    return dynamics_ff
+
+
 def attach_pinocchio(rtb_robot: Any) -> Any:
     """Attach Pinocchio model/data and FK/Jacobian helpers to rtb_robot."""
     model, data, ee_frame_id = _build_pinocchio_model(rtb_robot)
@@ -241,5 +268,11 @@ def attach_pinocchio(rtb_robot: Any) -> Any:
         rtb_robot.pinocchio_gravity = _make_pinocchio_gravity(dyn_model, dyn_data)
     except Exception as exc:
         logging.getLogger(__name__).warning("[pinocchio] no dynamics model for gravity (%s) — rtb rne stays", exc)
+    # Inertia + Coriolis feedforward (2026-10-10): its own gravity-free model and Data. No model -> no feedforward
+    # (mode_dispatch._add_dynamics_ff adds nothing), never a fallback to something slower in the tick.
+    try:
+        rtb_robot.pinocchio_dynamics_ff = make_pinocchio_dynamics_ff(rtb_robot)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("[pinocchio] no dynamics model for inertia / Coriolis feedforward (%s)", exc)
 
     return rtb_robot

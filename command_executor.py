@@ -1395,6 +1395,8 @@ IMMEDIATE_HANDLERS = {
     "jog_control_mode": _forward_fmt("jog_control_mode", "jog_control_mode", 1),
     "gravity_comp":     _forward_fmt("gravity_comp", "gravity_comp", 1),
     "friction_comp":    _forward_fmt("friction_comp", "friction_comp", 1),
+    "inertia_comp":     _forward_fmt("inertia_comp", "inertia_comp", 1),
+    "coriolis_comp":    _forward_fmt("coriolis_comp", "coriolis_comp", 1),
     "set_pid_gains":    _handle_set_pid_gains,
     # --- RTI mode handshake (TODO/RTI_mode_plan.md §4d). The UDP setpoint stream
     # bypasses this process entirely and goes straight to RTI's socket; only the
@@ -1532,6 +1534,9 @@ def current_status():
         # The two freedrive switches (IDLE): gravity comp (the arm floats) and friction compensation on top of it.
         "gravity_comp": bool(shared_data.rti["gravity_comp_enabled"][0] > 0.5),
         "friction_comp": bool(shared_data.rti["friction_comp_enabled"][0] > 0.5),
+        # Inertia / Coriolis feedforward on the commanded motion (OFF after every RTI start).
+        "inertia_comp": bool(shared_data.rti["inertia_comp_enabled"][0] > 0.5),
+        "coriolis_comp": bool(shared_data.rti["coriolis_comp_enabled"][0] > 0.5),
         # The declared payload RTI's gravity model carries (set_payload; 0 after every RTI start).
         "payload": {"mass": float(shared_data.rti["payload_mass"][0]),
                     "com": [float(shared_data.rti["payload_com_x"][0]), float(shared_data.rti["payload_com_y"][0]),

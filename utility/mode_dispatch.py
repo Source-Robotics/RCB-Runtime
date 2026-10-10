@@ -460,6 +460,63 @@ class _HomingDispatch:
 # Dispatch — single per-tick entry point.
 # ---------------------------------------------------------------------------
 
+# Inertia + Coriolis feedforward (2026-10-10, TODO/dynamics_feedforward_plan.md). The sum is written into
+# dispatch's OWN buffer — never into the handler's torque buffer, which a handler may hand back next tick
+# without recomputing it. One buffer pair per joint count, allocated on the first call.
+_dyn_bufs: dict = {}
+
+
+def _dyn_buffers(n):
+    """(sum, zeros) for n joints — allocated ONCE per joint count (build_mode_dispatch does it before the loop; a
+    caller that skips the factory gets them on its first call), then only looked up."""
+    bufs = _dyn_bufs.get(n)
+    if bufs is None:
+        bufs = _dyn_bufs[n] = (np.zeros(n, dtype=np.float64), np.zeros(n, dtype=np.float64))
+    return bufs
+
+
+def _add_dynamics_ff(ctx, output):
+    """Add M(q)·qdd (inertia) and C(q, qd)·qd (Coriolis) to the tick's commanded torque, each behind its own switch
+    (rti inertia_comp_enabled / coriolis_comp_enabled), and publish both in joint_inertia_torque /
+    joint_coriolis_torque (Nm; dispatch_step clears them every tick).
+
+    From the COMMANDED motion only (user decision 2026-10-10): the handler's acc_rad declares that it has one —
+    EXEC (the planned velocity's change per tick), JOG (its profile), RTI / SOFT_RTI position and velocity commands
+    (the generator / limiter state, with the rate limiter on). Without a commanded acceleration (freedrive, holds of
+    RTI, error / stop outputs, RTI torque commands) nothing is added. q = the commanded position, or the measured one
+    where the mode commands none (velocity commands: M and C only need the configuration); qd = the commanded
+    velocity (no Coriolis without one). Gravity stays the handlers' own, at the measured pose. A non-finite result
+    adds nothing."""
+    if output.acc_rad is None:
+        return
+    rti = ctx.shared_data.rti
+    use_i = rti['inertia_comp_enabled'][0] > 0.5
+    use_c = rti['coriolis_comp_enabled'][0] > 0.5 and output.vel_rad is not None
+    if not (use_i or use_c):
+        return
+    fn = getattr(ctx.robot, 'pinocchio_dynamics_ff', None)
+    if fn is None:
+        return
+    n = ctx.joint_num
+    total, zeros = _dyn_buffers(n)
+    j = ctx.shared_data.joint
+    q = output.pos_rad if output.pos_rad is not None else j['joint_position'][:n]
+    v = output.vel_rad if output.vel_rad is not None else zeros
+    tau_i, tau_c = fn(q, v, output.acc_rad, use_i, use_c)
+    check = float(tau_i.sum()) + float(tau_c.sum())
+    if check != check or check in (float('inf'), float('-inf')):
+        return
+    if output.trq_nm is None:
+        total.fill(0.0)
+    else:
+        np.copyto(total, output.trq_nm)
+    np.add(total, tau_i, out=total)
+    np.add(total, tau_c, out=total)
+    j['joint_inertia_torque'][:n] = tau_i
+    j['joint_coriolis_torque'][:n] = tau_c
+    output.trq_nm = total
+
+
 def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
     """Run one tick of the active mode handler.
 
@@ -476,6 +533,8 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
     # The friction compensation applied this tick: 0 unless freedrive (handle_idle) sets it — every mode, so a
     # value from the last freedrive tick never lingers.
     ctx.shared_data.joint['joint_friction_comp_torque'].fill(0.0)
+    ctx.shared_data.joint['joint_inertia_torque'].fill(0.0)
+    ctx.shared_data.joint['joint_coriolis_torque'].fill(0.0)
 
     if not _MODE_PROFILE_ENABLED:
         result, output = step_fn(ctx)
@@ -486,6 +545,7 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
             ctx.shared_data.rti['motor_pack_mode_sent'][0] = float('nan')
             return result
 
+        _add_dynamics_ff(ctx, output)
         _commit_joint_state(ctx, output)
         _fk_commanded(ctx)
         _commit_tcp_target(ctx, output)
@@ -505,9 +565,12 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
         _mode_profile_record(samples)
         return result
 
+    _add_dynamics_ff(ctx, output)
+    t1b = time.perf_counter_ns()
+    samples.append(("dynamics_ff", t1b - t1))
     _commit_joint_state(ctx, output)
     t2 = time.perf_counter_ns()
-    samples.append(("commit_joint", t2 - t1))
+    samples.append(("commit_joint", t2 - t1b))
 
     _fk_commanded(ctx)
     t3 = time.perf_counter_ns()
@@ -564,6 +627,7 @@ def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn:
     Returns:
         dict mapping RobotMode → handler (plain function or class instance).
     """
+    _dyn_buffers(joint_num)                        # the inertia / Coriolis feedforward's buffers, before the loop
     global _zeros_rad, _motor_pos_buf, _motor_vel_buf, _motor_curr_buf, _torque_to_mA_factor
     global _output_vel_zero, _output_torque_zero, _idle_trq_buf
 

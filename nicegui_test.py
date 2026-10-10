@@ -555,9 +555,26 @@ with ui.card().classes("w-full mb-2"):
         _grav_comp_btn = ui.button("Grav Comp ON", icon="downhill_skiing",
                                    on_click=_handle_grav_comp_toggle).props("color=positive outline size=sm")
 
+        # Inertia / Coriolis feedforward on the commanded motion (2026-10-10, utility/mode_dispatch._add_dynamics_ff):
+        # two switches, OFF at every RTI start. The buttons read the ROBOT's state (synced in update_tables), so they
+        # stay right when a script toggles them.
+        def _dyn_toggle(key, cmd, call):
+            enabled = not (shared_data.rti[key][0] > 0.5)
+            _exec(lambda r: call(r, enabled), cmd)
+        _inertia_btn = ui.button("Inertia OFF", icon="speed",
+                                 on_click=lambda: _dyn_toggle("inertia_comp_enabled", "inertia_comp",
+                                                              lambda r, e: r.set_inertia_comp(e))).props("color=grey outline size=sm")
+        _inertia_btn.tooltip("Inertia feedforward M(q)·q̈ on the commanded motion — EXEC, JOG, RTI position/velocity. "
+                             "Not in freedrive, holds, homing or RTI torque commands. OFF at every RTI start.")
+        _coriolis_btn = ui.button("Coriolis OFF", icon="sync_alt",
+                                  on_click=lambda: _dyn_toggle("coriolis_comp_enabled", "coriolis_comp",
+                                                               lambda r, e: r.set_coriolis_comp(e))).props("color=grey outline size=sm")
+        _coriolis_btn.tooltip("Coriolis / centripetal feedforward C(q, q̇)·q̇ on the commanded motion — same modes as "
+                              "Inertia. OFF at every RTI start.")
+
         # Friction compensation (utility/friction_comp.py): PARKED 2026-10-02 (user: no real effect felt). RTI starts
         # it OFF and the dashboard has no button for it; to bring it back, see TODO/friction_compensation_plan.md.
-        _owned_btns = [_grav_comp_btn]   # greyed while someone else holds control (see below)
+        _owned_btns = [_grav_comp_btn, _inertia_btn, _coriolis_btn]   # greyed while someone else holds control (see below)
 
         ui.separator().props("vertical")
         # Runtime payload (utility/payload.py, 2026-10-04): the part the gripper holds — mass + centre of mass in
@@ -3563,6 +3580,14 @@ def update_tables():
     _limped = shared_data.robot_mode.get() == "SAFETY_STOP"
     _limp_btn.text = "RESTORE MOTORS" if _limped else "MOTORS OFF"
     _limp_btn.props(f"color={'positive' if _limped else 'deep-orange'} size=sm")
+    # Inertia / Coriolis feedforward buttons: the robot's real state (RTI starts both OFF; a script may toggle them).
+    for _dbtn, _dkey, _dname in ((_inertia_btn, "inertia_comp_enabled", "Inertia"),
+                                 (_coriolis_btn, "coriolis_comp_enabled", "Coriolis")):
+        _don = shared_data.rti[_dkey][0] > 0.5
+        _dtext = f"{_dname} {'ON' if _don else 'OFF'}"
+        if _dbtn.text != _dtext:
+            _dbtn.set_text(_dtext)
+            _dbtn.props(f"color={'positive' if _don else 'grey'} outline size=sm")
 
     # ── Robot CAN connection ──────────────────────────────────
     _robot_can_ok = bool(shared_data.rti["robot_can_connected"][0])

@@ -981,10 +981,14 @@ class RTIModeHandler:
             out.pos_rad = self._limit_position(payload, ctx)
             out.vel_rad = self._feedforward
             out.trq_nm = self._add_gravity(ctx, None)
+            # The generator's (ruckig / ruckig_advancing / tracker) commanded acceleration: what dispatch's inertia
+            # feedforward uses (2026-10-10). With the rate limiter OFF there is no bounded acceleration — none.
+            out.acc_rad = self._rl_a if self.rate_limit_enabled else None
         elif ct == CMD_JOINT_VELOCITY:
             out.pos_rad = None
             out.vel_rad = self._limit_velocity(payload, q_meas, ctx)
             out.trq_nm = self._add_gravity(ctx, self._limit_torque(self._feedforward, q_meas))
+            out.acc_rad = self._rl_a if self.rate_limit_enabled else None      # the limiter's (see above)
         elif ct == CMD_JOINT_TORQUE:
             out.pos_rad = None
             out.vel_rad = None
