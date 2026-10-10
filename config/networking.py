@@ -173,6 +173,11 @@ def zmq_sender_setup():
 
     ctx = background_zmq_context()
     status_socket = ctx.socket(zmq.PUSH)
+    # LINGER 0: nothing binds ZMQ_STATUS_SOCKET since the executor rewrite, so every "done" RTI pushes stays queued,
+    # and with the default LINGER (-1, forever) the context's term() waited for them when SystemExit left main():
+    # 15 of 20 service stops hung until the 10 s shutdown watchdog (the dumps in RTI.out.log, 2026-10-06..10).
+    # Pending status messages are worthless once RTI stops; the other PUSH sockets set 0 too (2026-10-10).
+    status_socket.setsockopt(zmq.LINGER, 0)
     #status_socket.setsockopt(zmq.SNDHWM, 10) #Default is 1000! The sender can queue 10 messages for that connection, the 11th blocks or fails
     #tatus_socket.setsockopt(zmq.IMMEDIATE, 1) # detect disconnected receiver
     #status_socket.setsockopt(zmq.SNDTIMEO, 0) # add timeout instead of pure non-block
