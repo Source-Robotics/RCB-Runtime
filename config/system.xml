@@ -148,6 +148,15 @@
          gravity-model error while sliding) — robot XML <friction_sliding_nm> / <gravity_error_nm>, from
          api_tests/54. Zero at rest (never breaks a joint loose), full beyond band_dps, fading out between
          fade_start_dps and fade_end_dps. -->
+    <!-- Inertia M(q)·q̈ and Coriolis C(q, q̇)·q̇ feedforward on the COMMANDED motion (2026-10-10,
+         utility/mode_dispatch._add_dynamics_ff; TODO/dynamics_feedforward_plan.md): the state both switches START in at
+         every RTI start (the dashboard's Inertia / Coriolis buttons, set_inertia_comp / set_coriolis_comp switch them at
+         runtime). Measured on the arm: inertia cuts J1's path error 59 % at full speed; Coriolis is harmless but not
+         measurable at normal speeds. 1 = on, 0 = off; missing = on. -->
+    <dynamics_feedforward>
+        <inertia>1</inertia>
+        <coriolis>1</coriolis>
+    </dynamics_feedforward>
     <friction_comp>
         <fraction>0.5</fraction>
         <sliding_ratio>0.7</sliding_ratio>   <!-- a joint with no <friction_sliding_nm>: sliding = this x its breakaway

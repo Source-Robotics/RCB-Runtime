@@ -580,7 +580,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "gravity_comp_enabled",     # 1.0 = gravity compensation active, 0.0 = zeroed (hold with vel=0 in IDLE)
         "friction_comp_enabled",    # 1.0 = friction compensation in freedrive (utility/friction_comp.py); starts 0
         # Inertia M(q)·qdd and Coriolis C(q, qd)·qd feedforward on the COMMANDED motion (utility/mode_dispatch.py
-        # _add_dynamics_ff, 2026-10-10) — two separate operator switches, OFF at every RTI start.
+        # _add_dynamics_ff, 2026-10-10) — two separate operator switches; RTI sets their start state from system.xml.
         "inertia_comp_enabled",
         "coriolis_comp_enabled",
         # Runtime payload (utility/payload.py, set_payload): the part the gripper holds — mass [kg] and its centre

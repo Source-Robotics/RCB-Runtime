@@ -538,8 +538,13 @@ def main():
     for _k in ("payload_mass", "payload_com_x", "payload_com_y", "payload_com_z"):
         shared_data.rti[_k][0] = 0.0
     shared_data.rti["friction_comp_enabled"][0]     = 0.0   # operator switch: OFF at every start (utility/friction_comp.py)
-    shared_data.rti["inertia_comp_enabled"][0]      = 0.0   # inertia / Coriolis feedforward: OFF at every start
-    shared_data.rti["coriolis_comp_enabled"][0]     = 0.0   # (utility/mode_dispatch.py _add_dynamics_ff)
+    # inertia / Coriolis feedforward (utility/mode_dispatch.py _add_dynamics_ff): the start state from system.xml
+    # <dynamics_feedforward> (2026-10-10, user: both ON by default)
+    _dff = _sys.get("dynamics_feedforward", {"inertia": True, "coriolis": True})
+    shared_data.rti["inertia_comp_enabled"][0]      = 1.0 if _dff.get("inertia", True) else 0.0
+    shared_data.rti["coriolis_comp_enabled"][0]     = 1.0 if _dff.get("coriolis", True) else 0.0
+    logger.info(f"[RTI] dynamics feedforward at start: inertia {'ON' if _dff.get('inertia', True) else 'off'}, "
+                f"Coriolis {'ON' if _dff.get('coriolis', True) else 'off'} (system.xml <dynamics_feedforward>)")
 
     # ==========================================================================
     # Data queue. Allows us to save previous x points of data for safety, filtering, 

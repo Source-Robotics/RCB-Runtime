@@ -69,6 +69,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
     safety_monitor = _parse_safety_monitor(root.find("safety_monitor"))
     self_collision = _parse_self_collision(root.find("self_collision"))
     friction_comp = _parse_friction_comp(root.find("friction_comp"))
+    dynamics_feedforward = _parse_dynamics_feedforward(root.find("dynamics_feedforward"))
     # <realtime_required>: 1 (default) = RTI refuses to start without SCHED_FIFO on its core (as industrial
     # real-time interfaces do); 0 = log and run degraded (a development box without the RT kernel or caps).
     _rt_text = (root.findtext("realtime_required") or "1").strip()
@@ -108,6 +109,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         "safety_monitor": safety_monitor,
         "self_collision": self_collision,
         "friction_comp":  friction_comp,
+        "dynamics_feedforward": dynamics_feedforward,
         "display_timezone": display_timezone,
     }
 
@@ -221,6 +223,26 @@ _FRICTION_COMP_BOUNDS = {
     "fade_start_dps": (5.0, 360.0),
     "fade_end_dps":   (10.0, 720.0),
 }
+
+
+def _parse_dynamics_feedforward(elem: ET.Element | None) -> dict:
+    """<dynamics_feedforward><inertia>1</inertia><coriolis>1</coriolis></dynamics_feedforward> — the START state of the two
+    switches (2026-10-10, user: both ON by default; the dashboard / set_inertia_comp / set_coriolis_comp still switch
+    them at runtime). Missing block, missing key or a value that is not 0/1 -> ON (with a warning for the bad value)."""
+    out = {"inertia": True, "coriolis": True}
+    if elem is None:
+        return out
+    for key in out:
+        text = (elem.findtext(key) or "").strip().lower()
+        if not text:
+            continue
+        if text in ("1", "true", "on", "yes"):
+            out[key] = True
+        elif text in ("0", "false", "off", "no"):
+            out[key] = False
+        else:
+            logging.warning("[system.xml] <dynamics_feedforward><%s> is not 0/1 (%r) — ON", key, text)
+    return out
 
 
 def _parse_friction_comp(elem: ET.Element | None) -> dict:

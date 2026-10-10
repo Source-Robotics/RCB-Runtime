@@ -325,14 +325,14 @@ class RobotClient:
         """Robot-wide INERTIA feedforward: the torque M(q)·qdd that the commanded acceleration needs (the links and the
         motor rotors behind the gearboxes), added to the current the drives get — in EXEC, JOG and RTI / SOFT_RTI
         position and velocity commands. Computed from the COMMANDED motion of the tick, never a measured one; not
-        added in freedrive, holds, homing or RTI torque commands. OFF at every RTI start; status() reports
-        "inertia_comp". Separate from set_coriolis_comp and set_gravity_comp."""
+        added in freedrive, holds, homing or RTI torque commands. Starts as system.xml <dynamics_feedforward> says
+        (ON as shipped); status() reports "inertia_comp". Separate from set_coriolis_comp and set_gravity_comp."""
         return self._immediate("inertia_comp", [1 if enabled else 0])
 
     def set_coriolis_comp(self, enabled: bool) -> Any:
         """Robot-wide CORIOLIS / centripetal feedforward: the torque C(q, qd)·qd the joints exert on each other when
-        several move at once, from the commanded motion — same modes as set_inertia_comp. OFF at every RTI start;
-        status() reports "coriolis_comp"."""
+        several move at once, from the commanded motion — same modes as set_inertia_comp. Starts as system.xml
+        <dynamics_feedforward> says (ON as shipped); status() reports "coriolis_comp"."""
         return self._immediate("coriolis_comp", [1 if enabled else 0])
 
     def set_friction_comp(self, enabled: bool) -> Any:
