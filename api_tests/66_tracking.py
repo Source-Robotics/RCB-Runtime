@@ -47,7 +47,12 @@ the XML's), and the XML gains are ALWAYS put back at the end, whatever happens. 
     python3 api_tests/66_tracking.py --compare temp_data/tracking/A.json temp_data/tracking/B.json
     python3 api_tests/66_tracking.py --reanalyse temp_data/tracking/A.json   # recompute a saved run (no robot)
 
-Results: printed, and saved to temp_data/tracking/<time>.npz (raw ticks) + .json (every metric).
+Results: the RAW packets are saved the moment the moves end (temp_data/tracking/<time>.raw + .json) — before any
+parsing, which is heavy for the Pi: the end of a run slowed RTI's loop twice on 2026-10-10 (LOOP_DEGRADED, then a
+LOOP_CRITICAL with the full delay fit, and a dropped SSH session lost that run). With the arm still ENABLED the script
+stops there and prints the --reanalyse command to run after disabling it; --reanalyse refuses while the arm is enabled.
+Run long sessions inside tmux (`tmux`, then the command; Ctrl+B D detaches, `tmux attach` comes back) so a dropped
+connection does not kill them.
 """
 import argparse
 import json
@@ -80,7 +85,7 @@ NEED = ("j_p", "j_pc", "j_s", "j_sc", "j_ac", "j_t", "j_tc", "tick")
 OPTIONAL = ("j_t_inertia", "j_t_coriolis")      # 2026-10-10; zeros in runs recorded before them
 COMP_SETS = {"off": (False, False), "inertia": (True, False), "coriolis": (False, True), "inertia+coriolis": (True, True)}
 START_S = 0.04                                  # "from rest": the first 40 ms of a move
-DELAY_MAX_S, DELAY_STEP_S = 0.020, 0.00025   # the time shift searched for each move
+DELAY_MAX_S, DELAY_STEP_S, DELAY_COARSE_S = 0.020, 0.00025, 0.001   # the time shift searched for each move
 METRICS = ("rms", "peak", "acc", "cru", "dec", "lag", "overshoot", "settle_ms", "final", "pid", "others", "vpeak",
            "delay_ms", "rms_d", "peak_d", "d_acc", "d_dec", "d_start", "ff")
 
@@ -231,14 +236,22 @@ def move_metrics(s, j, direction, dt):
 
 
 def best_delay(t, cmd, meas, mask):
-    """The shift D (0..DELAY_MAX_S) minimising the RMS of cmd(t - D) - meas(t) over `mask`, and that residual (deg)."""
-    tm = t[mask]
-    best = (np.inf, 0.0, None)
-    for D in np.arange(0.0, DELAY_MAX_S + 1e-12, DELAY_STEP_S):
-        r = np.degrees(np.interp(tm - D, t, cmd) - meas[mask])
+    """The shift D (0..DELAY_MAX_S) minimising the RMS of cmd(t - D) - meas(t) over `mask`, and that residual (deg).
+    Coarse 1 ms grid, then the 0.25 ms grid within +/-0.75 ms of the coarse best: 28 evaluations instead of 81 (the
+    full grid made the analysis heavy enough to slow RTI's loop, 2026-10-10)."""
+    tm, mm = t[mask], meas[mask]
+    best = [np.inf, 0.0, None]
+
+    def try_at(D):
+        r = np.degrees(np.interp(tm - D, t, cmd) - mm)
         e = float(np.mean(r ** 2))
         if e < best[0]:
-            best = (e, float(D), r)
+            best[:] = [e, float(D), r]
+    for D in np.arange(0.0, DELAY_MAX_S + 1e-12, DELAY_COARSE_S):
+        try_at(D)
+    c = best[1]
+    for D in np.arange(max(0.0, c - 0.00075), min(DELAY_MAX_S, c + 0.00075) + 1e-12, DELAY_STEP_S):
+        try_at(D)
     return best[1], best[2]
 
 
@@ -660,19 +673,10 @@ def main():
     if args.selftest:
         return selftest()
     if args.reanalyse:
-        run = json.load(open(args.reanalyse))
-        raw = np.load(args.reanalyse[:-5] + ".npz")
-        d = {k: raw[k] for k in raw.files}
-        moves = analyse(d, run["records"], 0.004)
-        summ = summarise(moves)
-        names = [n for n in run["set_names"] if n in summ]
-        print_report(summ, names, f"=== {args.reanalyse} (re-analysed) ===")
-        run.update({"summary": summ, "moves": moves, "set_names": names})
-        out = args.reanalyse[:-5] + "_reanalysed.json"
-        with open(out, "w") as fh:
-            json.dump(run, fh, indent=1)
-        print(f"\nSaved {out}")
-        return 0
+        if robot_enabled(args.host, args.port):
+            print("The arm is ENABLED: the analysis is heavy for the Pi and would slow RTI's loop. Disable it first.")
+            return 2
+        return analyse_saved(args.reanalyse)
     if args.compare:
         a, b = (json.load(open(p)) for p in args.compare)
         merged, order = {}, []
@@ -699,20 +703,59 @@ def main():
     if got is None:
         return rc
     packets, records, names = got
-    dt = float(cfg.get("delta_t", 0.004))
-    d = to_arrays(packets)
-    moves = analyse(d, records, dt)
-    summ = summarise(moves)
-    print_report(summ, [n for n in names if n in summ], "\n=== tracking (commanded - measured) ===")
     out_dir = os.path.join(_ROOT, "temp_data", "tracking")
     os.makedirs(out_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    np.savez_compressed(os.path.join(out_dir, f"{stamp}.npz"), **d)
-    with open(os.path.join(out_dir, f"{stamp}.json"), "w") as fh:
-        json.dump({"set_names": [n for n in names if n in summ], "summary": summ, "moves": moves, "records": records,
-                   "gains": {k: v for k, v in gain_sets.items()}, "args": vars(args)}, fh, indent=1)
-    print(f"\nSaved temp_data/tracking/{stamp}.npz and .json")
-    return rc
+    base = os.path.join(out_dir, stamp)
+    with open(base + ".raw", "wb") as fh:                 # cheap: no parsing on the Pi while the arm may be enabled
+        fh.write(b"\n".join(packets))
+    with open(base + ".json", "w") as fh:
+        json.dump({"set_names": names, "records": records, "gains": dict(gain_sets), "args": vars(args),
+                   "delta_t": float(cfg.get("delta_t", 0.004)), "analysed": False}, fh, indent=1)
+    rel = os.path.relpath(base, _ROOT)
+    print(f"\nRaw recording saved: {rel}.raw + .json ({len(packets)} packets).")
+    if robot_enabled(args.host, args.port) is not False:
+        print("Not analysed yet: the analysis is heavy for the Pi while the arm is enabled. Disable the arm, then:\n"
+              f"  cd ~/Desktop/RCB-Runtime && .venv/bin/python api_tests/66_tracking.py --reanalyse {rel}.json")
+        return rc
+    return analyse_saved(base + ".json") or rc
+
+
+def robot_enabled(host, port):
+    """True / False from the executor's status(); None when it cannot be reached (an analysis on another machine)."""
+    try:
+        from robotclient import RobotClient
+        r = RobotClient(sync=False)
+        r.connect(host, port)
+        try:
+            return r.status().get("state") == "ENABLED"
+        finally:
+            r.disconnect()
+    except Exception:
+        return None
+
+
+def analyse_saved(json_path):
+    """Parse (.raw -> .npz once), analyse and report a saved run; the metrics go into <run>_reanalysed.json."""
+    run = json.load(open(json_path))
+    stem = json_path[:-5]
+    if os.path.exists(stem + ".npz"):
+        raw = np.load(stem + ".npz")
+        d = {k: raw[k] for k in raw.files}
+    else:
+        with open(stem + ".raw", "rb") as fh:
+            d = to_arrays(fh.read().split(b"\n"))
+        np.savez_compressed(stem + ".npz", **d)
+    moves = analyse(d, run["records"], float(run.get("delta_t", 0.004)))
+    summ = summarise(moves)
+    names = [n for n in run["set_names"] if n in summ]
+    print_report(summ, names, f"=== {json_path} ===")
+    run.update({"summary": summ, "moves": moves, "set_names": names, "analysed": True})
+    out = stem + "_reanalysed.json"
+    with open(out, "w") as fh:
+        json.dump(run, fh, indent=1)
+    print(f"\nSaved {out}")
+    return 0
 
 
 if __name__ == "__main__":
