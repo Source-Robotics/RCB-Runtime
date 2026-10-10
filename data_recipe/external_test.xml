@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: external_test
+    Everything the OFF-ROBOT test suite (api_tests/external/) needs, and nothing else.
+
+    WHY THIS EXISTS. Those tests run on a separate PC, where /dev/shm does not exist, so
+    every metric must come from this stream. No shipped recipe carried the full set:
+    `standard` has rti_seq but no torque, `full` has torque but no rti_seq or rti_state.
+
+    j_p        measured joint position   -> tracking accuracy against the commanded path
+    j_t        measured joint torque     -> high-frequency vibration
+    tick       the robot's own loop tick -> an ATOMIC (tick, data) pair. This is the thing
+               shared-memory sampling cannot give: the packet is built and sent INSIDE the
+               tick, so unlike /dev/shm there is no window where the tick has advanced and
+               the data has not (servo_mode_options.md 15.4). Per-tick differencing is
+               therefore valid from off-robot and invalid on-robot, which is backwards from
+               what you would guess.
+    rti_seq    echo of the last accepted command seq -> round-trip loop delay
+    rti_state  so a revoked claim is visible rather than silently streaming into an open loop
+    mode       catches E-stop / operator-forced IDLE, which rti_state alone cannot see
+    period_ms  the MEASURED tick duration, for anything that needs the real loop rate
+-->
+<recipe name="external_test">
+    <field tag="j_p"   precision="4"/>
+    <field tag="j_t"   precision="4"/>
+    <field tag="tick"/>
+    <field tag="rti_seq"/>
+    <field tag="rti_state"/>
+    <field tag="mode"/>
+    <field tag="period_ms" precision="3"/>
+</recipe>

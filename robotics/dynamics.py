@@ -17,6 +17,8 @@ Contact: petar@source-robotics.com
 
 import numpy as np
 
+from utility.kinematics_backend import should_use_pinocchio
+
 
 # ==========================================================================
 # Inverse Dynamics
@@ -56,6 +58,19 @@ def calculate_gravity_compensation(robot, q):
 # ==========================================================================
 # Motor Torque Conversion
 # ==========================================================================
+
+def gravity_torque_rt(robot, q):
+    """The per-tick gravity torque for the RT loop (data/update_shared_data.py, 2026-10-03).
+
+    The Pinocchio dynamics model's g(q) when attach_pinocchio() could build it (1.3 us; equal to rne(q, 0, 0) to
+    1e-15 — net test_gravity_pinocchio), else rtb's rne. The planner keeps calculate_gravity_compensation() so the
+    trajectory goldens stay bit-identical. The returned array is the helper's own buffer: use it within the tick.
+    """
+    fn = getattr(robot, "pinocchio_gravity", None)
+    if fn is not None and should_use_pinocchio(robot):
+        return fn(q)
+    return calculate_gravity_compensation(robot, q)
+
 
 def build_torque_to_ma_factor(gear_ratio, gear_efficiency, motor_kt, motor_signs):
     """Build the per-joint scaling factor for joint Nm → motor mA.
@@ -132,45 +147,6 @@ def motor_current_to_joint_torque(motor_current, gear_ratio, gear_efficiency, mo
 # ==========================================================================
 # Compensation Torque Calculation
 # ==========================================================================
-
-def calculate_compensation_current(robot, q, qd_cmd, qdd_cmd, gear_ratio, 
-                                   gear_efficiency, motor_kt, motor_signs,
-                                   compensate_gravity=True, compensate_dynamics=False):
-    """
-    Calculate motor compensation currents for gravity and/or dynamics.
-    
-    Args:
-        robot: Robot object
-        q (np.array): Current joint positions (rad)
-        qd_cmd (np.array): Commanded joint velocities (rad/s)
-        qdd_cmd (np.array): Commanded joint accelerations (rad/s²)
-        gear_ratio (np.array): Gear ratios
-        gear_efficiency (np.array): Gear efficiencies
-        motor_kt (np.array): Motor torque constants
-        motor_signs (np.array): Motor direction signs
-        compensate_gravity (bool): Include gravity compensation (default: True)
-        compensate_dynamics (bool): Include full dynamics (default: False)
-    
-    Returns:
-        np.array: Motor compensation currents in mA
-    """
-    joint_num = len(q)
-    
-    if compensate_dynamics:
-        # Full inverse dynamics compensation
-        compensation_torque = calculate_inverse_dynamics(robot, q, qd_cmd, qdd_cmd)
-    elif compensate_gravity:
-        # Gravity compensation only
-        compensation_torque = calculate_gravity_compensation(robot, q)
-    else:
-        # No compensation
-        compensation_torque = np.zeros(joint_num)
-    
-    # Convert to motor current
-    return torque_to_motor_current(
-        compensation_torque, gear_ratio, gear_efficiency, motor_kt, motor_signs
-    )
-
 
 # ==========================================================================
 # External Force/Torque Estimation
@@ -287,45 +263,6 @@ def calculate_all_dynamics(robot, q, qd, qdd, motor_current, J,
 # ==========================================================================
 # Simplified Interface for RTI Main Loop
 # ==========================================================================
-
-def calculate_rti_dynamics(robot, joint_position, motor_current, J,
-                           gear_ratio, gear_efficiency, motor_kt, motor_signs):
-    """
-    Simplified dynamics calculation for RTI main loop (gravity compensation only).
-    
-    Args:
-        robot: Robot object
-        joint_position (np.array): Current joint positions (rad)
-        motor_current (np.array): Motor currents (mA)
-        J (np.array): Jacobian matrix
-        gear_ratio, gear_efficiency, motor_kt, motor_signs: Motor parameters
-    
-    Returns:
-        tuple: (compensation_current, external_joint_torque, external_tcp_force)
-    """
-    joint_num = len(joint_position)
-    
-    # Gravity compensation
-    gravity_torque = calculate_gravity_compensation(robot, joint_position)
-    
-    # Convert to motor current
-    compensation_current = torque_to_motor_current(
-        gravity_torque, gear_ratio, gear_efficiency, motor_kt, motor_signs
-    )
-    
-    # Measured torque from motors
-    measured_torque = motor_current_to_joint_torque(
-        motor_current, gear_ratio, gear_efficiency, motor_kt, motor_signs
-    )
-    
-    # External torque (measured - gravity compensation)
-    external_joint_torque = measured_torque - gravity_torque
-    
-    # External force at TCP
-    external_tcp_force = estimate_external_force_tcp(external_joint_torque, J)
-    
-    return compensation_current, external_joint_torque, external_tcp_force
-
 
 if __name__ == "__main__":
     """Test dynamics functions"""

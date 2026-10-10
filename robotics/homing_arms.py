@@ -1,0 +1,355 @@
+"""Which arm is this, and did every joint home where THIS arm's joint always homes? (2026-10-09, TODO/homing_plan.md H1)
+
+One control box drives several arms (user: grey, light_grey, black, ...) and the drivers all report SERIAL_NUMBER 1, so
+nothing tells the box which arm is connected. Homing does: each joint's motor stops at its endstop at a spot within one
+motor revolution that is fixed by how that arm was built (where the encoder magnet sat when the motor was mounted) —
+it repeats within a few motor ticks on one arm (±0.01-0.05 deg at the joint, measured 2026-10-09) and differs by
+thousands of ticks between arms. So after homing, the latches recognise the arm — and a joint that latched somewhere
+else on an arm that is otherwise recognised is a FAULT: a false stall both passes repeated (the black arm's J2 stopped
+4.8 deg short of its endstop), a skipped belt (grey J3 moved ~0.48 motor revolution) or a slipping coupling. Those
+references would be wrong by degrees and nothing else notices.
+
+User decisions (2026-10-09): such a joint FAILS homing; arms are LEARNED automatically (known after 3 homings that
+agree); the tolerance is 1 deg at the joint.
+
+The table (temp_data/homing_arms.json, machine-specific):
+    {"version": 1, "arms": [{"id": "arm-1", "uid": "PAR6-7F3A9C", "name": "grey", "known": true, "homings": 7,
+                             "joints": {"J1": [latches...], "J4@MSG_small_motor_150mm_rail": [...], ...},
+                             "first_utc": "...", "last_utc": "...",
+                             "history": [{"utc", "kind", "duration_s", "devs": {"J1": deg}, "two_pass": {"J2": ticks},
+                                          "relaxed": {"J2": ticks}}, ...  the newest HISTORY homings]}],
+     "last_failed": {"arm": "arm-1", "gripper": "...", "latches": {"1": ...}, "utc": "..."} | null}
+A joint whose home offset depends on the gripper (`home_offset_gripper_dependent`: PAR6 J4 / J5 — J5 homes against the
+gripper) is stored per gripper, so a new gripper is learned instead of failing. The newest WINDOW latches per joint are
+kept; the reference is their circular mean within one motor revolution. A shift of a WHOLE motor revolution cannot be
+told apart from the multi-turn count after a power cycle and is not caught.
+
+RTI: the table is read at start; RTI's real-time thread only touches the dict in memory — a worker thread that moves
+itself off RTI's core (as utility/incident_dump does) re-reads the file when a homing starts (to see `tools/homing_arms.py`
+edits) and writes it after one ends. `tools/homing_arms.py`: list, name, forget, accept the last failed homing.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import logging
+import math
+import os
+import queue
+import threading
+import time
+
+TOL_DEG = 1.0          # a joint further than this (at the joint) from its usual spot is off (user, 2026-10-09)
+KNOWN_AFTER = 3        # homings that agree before an arm counts as known (user, 2026-10-09)
+SAME_ARM_MIN = 4       # joints that must agree with a known arm for "this IS that arm" (6 joints; by chance ~1e-4)
+WINDOW = 10            # latches kept per joint
+HISTORY = 100          # homings kept per arm (the dashboard's history, 2026-10-09)
+
+
+def make_uid(prefix: str, seed: str) -> str:
+    """An arm's ID, e.g. 'PAR6-7F3A9C' (user, 2026-10-09: a random ID on top of the editable name). Derived from the
+    arm's first homing so every program that sees the table derives the same one; stored once made, never changed."""
+    return f"{prefix}-{hashlib.sha256(seed.encode()).hexdigest()[:6].upper()}"
+
+
+def ensure_uids(table: dict, prefix: str) -> bool:
+    """Give every arm without one its ID (arms learned before IDs existed). True when the table changed (save it)."""
+    changed = False
+    taken = {a.get("uid") for a in table["arms"]}
+    for arm in table["arms"]:
+        if not arm.get("uid"):
+            seed = f"{arm['id']}|{json.dumps(arm['joints'], sort_keys=True)}"      # no clock: every reader derives the same
+            uid = make_uid(prefix, seed)
+            while uid in taken:
+                seed += "+"
+                uid = make_uid(prefix, seed)
+            arm["uid"], changed = uid, True
+            taken.add(uid)
+    return changed
+
+
+def empty_table() -> dict:
+    return {"version": 1, "arms": [], "last_failed": None}
+
+
+def joint_key(j: int, gripper_dependent, gripper: str) -> str:
+    return f"J{j + 1}@{gripper}" if gripper_dependent[j] else f"J{j + 1}"
+
+
+def circular_centre(latches, counts: int) -> float:
+    """The circular mean of latches within one motor revolution, in [0, counts)."""
+    s = sum(math.sin(2 * math.pi * (x % counts) / counts) for x in latches)
+    c = sum(math.cos(2 * math.pi * (x % counts) / counts) for x in latches)
+    return (math.atan2(s, c) % (2 * math.pi)) / (2 * math.pi) * counts
+
+
+def off_deg(latch, centre: float, counts: int, gear: float) -> float:
+    """How far a latch is from a centre within one motor revolution, in degrees at the joint (signed)."""
+    d = (latch % counts - centre + counts / 2.0) % counts - counts / 2.0
+    return d / counts / abs(gear) * 360.0
+
+
+def compare(arm: dict, latches: dict, keys: dict, counts, gears) -> tuple[int, int, list, dict]:
+    """(joints that agree, joints compared, [(j, deg) for the ones that do not], {j: deg} for every compared joint) for
+    one stored arm — deg = how far this latch is from the joint's usual spot."""
+    agree, compared, off, devs = 0, 0, [], {}
+    for j, latch in latches.items():
+        stored = arm["joints"].get(keys[j])
+        if not stored:
+            continue
+        compared += 1
+        d = off_deg(latch, circular_centre(stored, counts[j]), counts[j], gears[j])
+        devs[j] = d
+        if abs(d) <= TOL_DEG:
+            agree += 1
+        else:
+            off.append((j, d))
+    return agree, compared, off, devs
+
+
+def judge(table: dict, latches: dict, gripper: str, gears, gripper_dependent, counts) -> dict:
+    """What this homing's latches ({joint index: motor ticks}) say. kind:
+      "known"    — a known arm, every compared joint within TOL_DEG (it is that arm, homed right)
+      "fault"    — a known arm by >= SAME_ARM_MIN joints, but `off` joints elsewhere -> homing FAILS
+      "learning" — an arm still being learned, every compared joint agrees (one more agreeing homing)
+      "relearn"  — an arm being learned, recognised but some joints disagree (it starts over from this homing)
+      "new"      — no stored arm matches"""
+    keys = {j: joint_key(j, gripper_dependent, gripper) for j in latches}
+    best = None
+    for arm in table["arms"]:
+        agree, compared, off, devs = compare(arm, latches, keys, counts, gears)
+        rank = (agree, arm["known"])
+        if best is None or rank > best[0]:
+            best = (rank, arm, agree, compared, off, devs)
+    if best is None or best[2] < SAME_ARM_MIN:
+        return {"kind": "new", "arm": None, "agree": 0 if best is None else best[2], "compared": 0, "off": [], "devs": {},
+                "keys": keys}
+    _, arm, agree, compared, off, devs = best
+    if arm["known"]:
+        kind = "known" if not off else "fault"
+    else:
+        kind = "learning" if not off else "relearn"
+    return {"kind": kind, "arm": arm["id"], "agree": agree, "compared": compared, "off": off, "devs": devs, "keys": keys}
+
+
+def history_entry(verdict: dict, utc: str, stats: dict | None) -> dict:
+    """One homing in an arm's history: when, the verdict, how long, each joint's distance from its usual spot (deg), and
+    from homing itself each joint's two-pass difference and release relaxation (motor ticks)."""
+    stats = stats or {}
+    return {"utc": utc, "kind": verdict["kind"], "duration_s": stats.get("duration_s"),
+            "devs": {f"J{j + 1}": round(float(d), 4) for j, d in sorted(verdict.get("devs", {}).items())},
+            "two_pass": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("two_pass") or {}).items()) if v is not None},
+            "relaxed": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("relaxed") or {}).items()) if v is not None}}
+
+
+def apply(table: dict, verdict: dict, latches: dict, gripper: str, utc: str, stats: dict | None = None,
+          prefix: str = "ARM") -> None:
+    """Fold this homing into the table (in place) according to `verdict`; every homing joins its arm's history."""
+    keys = verdict["keys"]
+    entry = history_entry(verdict, utc, stats)
+    if verdict["kind"] == "fault":
+        table["last_failed"] = {"arm": verdict["arm"], "gripper": gripper, "utc": utc,
+                                "latches": {str(j): int(v) for j, v in latches.items()}}
+        arm = next(a for a in table["arms"] if a["id"] == verdict["arm"])
+        arm["history"] = (arm.get("history", []) + [entry])[-HISTORY:]
+        return
+    if verdict["kind"] == "new":
+        n = 1 + max([int(a["id"].split("-")[1]) for a in table["arms"] if a["id"].startswith("arm-")] or [0])
+        joints = {keys[j]: [int(v)] for j, v in latches.items()}
+        table["arms"].append({"id": f"arm-{n}", "name": "", "known": False, "homings": 1, "first_utc": utc, "last_utc": utc,
+                              "joints": joints, "history": [entry]})
+        ensure_uids(table, prefix)
+        verdict["arm"] = f"arm-{n}"
+        return
+    arm = next(a for a in table["arms"] if a["id"] == verdict["arm"])
+    arm["history"] = (arm.get("history", []) + [entry])[-HISTORY:]
+    if verdict["kind"] == "relearn":
+        arm["joints"] = {keys[j]: [int(v)] for j, v in latches.items()}
+        arm["homings"] = 1
+    else:
+        for j, v in latches.items():
+            arm["joints"].setdefault(keys[j], []).append(int(v))
+            arm["joints"][keys[j]] = arm["joints"][keys[j]][-WINDOW:]
+        arm["homings"] += 1
+        if not arm["known"] and arm["homings"] >= KNOWN_AFTER:
+            arm["known"] = True
+    arm["last_utc"] = utc
+
+
+def describe(table: dict, verdict: dict) -> str:
+    """The log line for a verdict (after apply)."""
+    arm = next((a for a in table["arms"] if a["id"] == verdict["arm"]), None)
+    label = arm_label(arm) if arm else "?"
+    kind = verdict["kind"]
+    if kind == "known":
+        return f"[Homing] arm recognised: {label} — {verdict['agree']}/{verdict['compared']} joints within {TOL_DEG:g} deg of their usual spot"
+    if kind == "fault":
+        off = ", ".join(f"J{j + 1} {d:+.2f} deg" for j, d in verdict["off"])
+        return (f"[Homing] FAILED: {off} away from where arm {label} always homes "
+                f"(a false stall, a skipped belt or a slipping coupling?) — home again; if that joint's mechanics were "
+                f"changed on purpose: .venv/bin/python tools/homing_arms.py --accept-last")
+    if kind == "learning":
+        return (f"[Homing] arm {label} — learning its homing spots, {arm['homings']}/{KNOWN_AFTER}"
+                + (" — now KNOWN: a joint more than 1 deg off fails homing from now on" if arm["known"] else ""))
+    if kind == "relearn":
+        off = ", ".join(f"J{j + 1} {d:+.2f} deg" for j, d in verdict["off"])
+        return f"[Homing] arm {label} — homed differently than before ({off}) while still learning: learning starts over, 1/{KNOWN_AFTER}"
+    return (f"[Homing] no known arm matches — learning a new one, {label}, 1/{KNOWN_AFTER} "
+            f"(name it: .venv/bin/python tools/homing_arms.py --name {verdict['arm']} NAME)")
+
+
+# ---- editing the table (tools/homing_arms.py and the dashboard's System Info card share these) ------------------------
+
+def arm_label(arm: dict) -> str:
+    """'grey [PAR6-7F3A9C]' — the name (or, unnamed, the table's id 'arm-1') and the arm's ID."""
+    base = arm["name"] if arm.get("name") else arm["id"]
+    return f"{base} [{arm['uid']}]" if arm.get("uid") else base
+
+
+def joint_spots(arm: dict, gears, counts) -> list:
+    """[(key, centre ticks, homings, spread deg)] per stored joint of one arm, sorted by key."""
+    out = []
+    for key, lat in sorted(arm["joints"].items()):
+        j = int(key.split("@")[0][1:]) - 1
+        c = circular_centre(lat, counts[j])
+        out.append((key, c, len(lat), max(abs(off_deg(x, c, counts[j], gears[j])) for x in lat)))
+    return out
+
+
+def last_failed_offs(table: dict, gears, gripper_dependent, counts) -> list:
+    """[(joint index, deg)] of the stored last failed homing that were off its arm's usual spots ([] if none)."""
+    lf = table.get("last_failed")
+    arm = next((a for a in table["arms"] if lf and a["id"] == lf["arm"]), None)
+    if arm is None:
+        return []
+    latches = {int(j): v for j, v in lf["latches"].items()}
+    keys = {j: joint_key(j, gripper_dependent, lf["gripper"]) for j in latches}
+    return compare(arm, latches, keys, counts, gears)[2]
+
+
+def joint_stats(arm: dict, gears, counts) -> list[dict]:
+    """Per stored joint of one arm: homings in the window, how far the window's latches spread (max, sd, deg), the
+    largest distance from the usual spot over the history, and the mean two-pass difference / release relaxation."""
+    hist = arm.get("history", [])
+    rows = []
+    for key, lat in sorted(arm["joints"].items()):
+        j = int(key.split("@")[0][1:]) - 1
+        name = f"J{j + 1}"
+        c = circular_centre(lat, counts[j])
+        dev = [off_deg(x, c, counts[j], gears[j]) for x in lat]
+        hd = [abs(h["devs"][name]) for h in hist if name in h.get("devs", {})]
+        tp = [h["two_pass"][name] for h in hist if name in h.get("two_pass", {})]
+        rx = [h["relaxed"][name] for h in hist if name in h.get("relaxed", {})]
+        rows.append({"joint": key, "homings": len(lat), "within_deg": max(abs(d) for d in dev),
+                     "sd_deg": math.sqrt(sum(d * d for d in dev) / len(dev)),
+                     "worst_seen_deg": max(hd) if hd else None,
+                     "two_pass_ticks": sum(tp) / len(tp) if tp else None, "relaxed_ticks": sum(rx) / len(rx) if rx else None})
+    return rows
+
+
+def rename(table: dict, arm_id: str, name: str) -> str:
+    arm = next((a for a in table["arms"] if a["id"] == arm_id), None)
+    if arm is None:
+        raise KeyError(f"no arm {arm_id}")
+    arm["name"] = name.strip()
+    return f"{arm_id} is now '{arm['name']}'"
+
+
+def forget(table: dict, arm_id: str) -> str:
+    before = len(table["arms"])
+    table["arms"] = [a for a in table["arms"] if a["id"] != arm_id]
+    if len(table["arms"]) == before:
+        raise KeyError(f"no arm {arm_id}")
+    if (table.get("last_failed") or {}).get("arm") == arm_id:
+        table["last_failed"] = None
+    return f"forgot {arm_id} — it is learned again from scratch the next time it homes"
+
+
+def accept_last(table: dict, gears, gripper_dependent, counts) -> str:
+    """After a DELIBERATE mechanical change: the joints of the last failed homing that were off take its spot as their
+    reference (the others keep their history). Returns a report line."""
+    lf = table.get("last_failed")
+    if not lf:
+        return "nothing to accept: no failed homing stored"
+    arm = next((a for a in table["arms"] if a["id"] == lf["arm"]), None)
+    if arm is None:
+        table["last_failed"] = None
+        return f"arm {lf['arm']} no longer exists — cleared"
+    changed = []
+    for j, d in last_failed_offs(table, gears, gripper_dependent, counts):
+        arm["joints"][joint_key(j, gripper_dependent, lf["gripper"])] = [int(lf["latches"][str(j)])]
+        changed.append(f"J{j + 1} ({d:+.2f} deg)")
+    table["last_failed"] = None
+    return (f"{arm_label(arm)}: new reference for " + ", ".join(changed)) if changed else "nothing was off — cleared"
+
+
+def load_table(path) -> dict:
+    try:
+        with open(path) as fh:
+            t = json.load(fh)
+        return t if isinstance(t, dict) and isinstance(t.get("arms"), list) else empty_table()
+    except (OSError, ValueError):
+        return empty_table()
+
+
+def save_table(path, table: dict) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(table, fh, indent=1)
+    os.replace(tmp, path)
+
+
+class HomingArms:
+    """RTI's holder: the table in memory, judged on the real-time thread at the end of a homing; the file read and
+    written by a worker thread off RTI's core. path=None: memory only (the nets)."""
+
+    def __init__(self, path, gears, gripper_dependent, counts, gripper: str, prefix: str = "ARM"):
+        self.path = None if path is None else str(path)
+        self.gears = [float(g) for g in gears]
+        self.gripper_dependent = [bool(int(f)) for f in gripper_dependent]
+        self.counts = [int(c) for c in counts]
+        self.gripper = str(gripper)
+        self.prefix = str(prefix)
+        self.table = load_table(self.path) if self.path else empty_table()
+        self._fresh = None
+        self._q: queue.Queue = queue.Queue()
+        self._thread = None
+
+    def start(self) -> None:
+        if self.path and self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="homing-arms", daemon=True)
+            self._thread.start()
+
+    def on_homing_start(self) -> None:
+        """Pick up `tools/homing_arms.py` edits made since the last homing (read off the RT thread)."""
+        if self._thread is not None:
+            self._q.put(("load", None))
+
+    def judge_and_learn(self, latches: dict, stats: dict | None = None, utc: str | None = None) -> dict:
+        """Called on the real-time thread when the homing sequence is complete: judge, fold in (with homing's own stats
+        for the history), queue the save. Returns the verdict with its log line under "text"."""
+        fresh, self._fresh = self._fresh, None
+        if fresh is not None:
+            self.table = fresh
+        ensure_uids(self.table, self.prefix)
+        utc = utc or time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        verdict = judge(self.table, latches, self.gripper, self.gears, self.gripper_dependent, self.counts)
+        apply(self.table, verdict, latches, self.gripper, utc, stats, self.prefix)
+        verdict["text"] = describe(self.table, verdict)
+        if self._thread is not None:
+            self._q.put(("save", copy.deepcopy(self.table)))
+        return verdict
+
+    def _run(self) -> None:
+        from utility.incident_dump import _leave_the_rt_core
+        _leave_the_rt_core()
+        while True:
+            what, table = self._q.get()
+            try:
+                if what == "load":
+                    self._fresh = load_table(self.path)
+                elif what == "save":
+                    save_table(self.path, table)
+            except Exception as exc:                       # never take homing down over a file
+                logging.getLogger(__name__).warning("[Homing] arm table %s failed: %s", what, exc)

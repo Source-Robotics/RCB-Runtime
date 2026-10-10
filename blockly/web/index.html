@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Block program</title>
+<style>
+  :root { --line: #d9dde3; --muted: #667085; --accent: #1976d2; --bad: #c62828; --good: #2e7d32; --warn: #b26a00;
+          --panel: #f7f8fa; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: #fff; color: #1f2933;
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 10px;
+           border-bottom: 1px solid var(--line); }
+  header .group { display: flex; align-items: center; gap: 6px; }
+  header .sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 4px; }
+  select, input[type=text] { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--accent); border-radius: 4px;
+           background: #fff; color: var(--accent); cursor: pointer; white-space: nowrap; }
+  button.primary { background: var(--accent); color: #fff; }
+  button.stop { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  #dirty { color: var(--warn); font-size: 12px; min-width: 60px; }
+  #badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: #eef1f5; }
+  #badge.running { background: #e3f0ff; color: var(--accent); }
+  #badge.paused { background: #fff4e0; color: var(--warn); }
+  #badge.done { background: #e7f5e9; color: var(--good); }
+  #badge.error, #badge.stopped { background: #fdecea; color: var(--bad); }
+  #where { font-size: 12px; color: var(--muted); }
+  main { flex: 1; display: flex; min-height: 0; }
+  #workspace { flex: 1; min-width: 0; position: relative; }
+  aside { width: min(40%, 480px); display: flex; flex-direction: column; border-left: 1px solid var(--line);
+          min-height: 0; }
+  .tabs { display: flex; border-bottom: 1px solid var(--line); }
+  .tabs button { border: 0; border-radius: 0; padding: 7px 14px; color: var(--muted); background: none; }
+  .tabs button.on { color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
+  .pane { flex: 1; overflow: auto; display: none; min-height: 0; }
+  .pane.on { display: block; }
+  #message { padding: 6px 12px; font-size: 13px; border-bottom: 1px solid var(--line); min-height: 18px; }
+  #message.bad { color: var(--bad); }
+  #message.good { color: var(--good); }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  td.nums { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: #444; }
+  td.acts button { padding: 1px 6px; font-size: 12px; margin: 1px; }
+  .pane-bar { display: flex; gap: 6px; padding: 8px; border-bottom: 1px solid var(--line); align-items: center; }
+  .hint { color: var(--muted); font-size: 12px; padding: 8px; }
+  #log { margin: 0; padding: 8px 10px; font-size: 12px; white-space: pre-wrap;
+         font-family: ui-monospace, Menlo, Consolas, monospace; }
+  #log .error { color: var(--bad); } #log .warning { color: var(--warn); } #log .state { color: var(--muted); }
+  #log .block { color: #3f6fc9; }
+  #python { margin: 0; padding: 10px 12px; background: var(--panel); font-size: 12px; white-space: pre;
+            font-family: ui-monospace, Menlo, Consolas, monospace; min-height: 100%; box-sizing: border-box; }
+  @media (max-width: 800px) {
+    main { flex-direction: column; }
+    aside { width: auto; height: 40%; border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="group">
+    <select id="program" title="Programs saved on the robot"></select>
+    <button id="btn-new" title="A new, empty program">New</button>
+    <button id="btn-save" title="Save on the robot">Save</button>
+    <button id="btn-saveas">Save as…</button>
+    <button id="btn-delete" title="Delete this program from the robot">Delete</button>
+    <span id="dirty"></span>
+  </div>
+  <span class="sep"></span>
+  <div class="group">
+    <button id="btn-check" title="Plan every move with the robot's own planner, from where the arm is now — nothing moves. Assumes inputs arrive and grips catch the part.">✓ Check</button>
+    <button id="btn-run" class="primary" title="Save, then run this program on the robot">▶ Run</button>
+    <button id="btn-pause" title="Freeze the arm where it is; the program holds">⏸ Pause</button>
+    <button id="btn-step" title="While paused: run the highlighted block and hold at the next">Step</button>
+    <button id="btn-stop" class="stop" title="Stop the arm and the program — always works">■ Stop</button>
+    <span id="badge">idle</span>
+    <span id="where"></span>
+  </div>
+</header>
+<main>
+  <div id="workspace"></div>
+  <aside>
+    <div id="message"></div>
+    <div class="tabs">
+      <button data-pane="points" class="on">Points</button>
+      <button data-pane="log">Log</button>
+      <button data-pane="code">Python</button>
+    </div>
+    <div class="pane on" id="pane-points">
+      <div class="pane-bar">
+        <button id="btn-add-point" class="primary" title="Move the arm (freedrive / jog), then add where it is">+ Add from the arm</button>
+      </div>
+      <table><thead><tr><th>Point</th><th>Joints (°) / pose (mm, °)</th><th></th></tr></thead><tbody id="points"></tbody></table>
+      <div class="hint" id="points-hint">No points yet. Move the arm to a position, then “Add from the arm”.
+        Blocks use a point by name; re-teach it once and every block follows.</div>
+    </div>
+    <div class="pane" id="pane-log"><pre id="log"></pre></div>
+    <div class="pane" id="pane-code">
+      <div class="pane-bar">
+        <button id="btn-python">Show Python</button>
+        <button id="btn-download" title="The script, to read or run with RCB's blockly/runtime.py">Download .py</button>
+      </div>
+      <pre id="python"></pre>
+    </div>
+  </aside>
+</main>
+
+<script src="vendor/blockly-13.3.0/blockly_compressed.js"></script>
+<script src="vendor/blockly-13.3.0/blocks_compressed.js"></script>
+<script src="vendor/blockly-13.3.0/msg/en.js"></script>
+<script src="blocks/program.js"></script>
+<script src="blocks/motion.js"></script>
+<script src="blocks/positions.js"></script>
+<script src="blocks/gripper_io.js"></script>
+<script src="toolbox.js"></script>
+<script src="demo.js"></script>
+<script src="editor.js"></script>
+<script>
+'use strict';
+// The editor page — TODO/blockly_plan.md §4, §6. Everything it does goes through the server's API (blockly/server.py);
+// the robot runs the SAVED program file, so Run saves first.
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$/;
+const POINT_RE = /^[A-Za-z0-9][A-Za-z0-9 _-]{0,31}$/;
+const EMPTY = {blocks: {languageVersion: 0, blocks: [{type: 'rcb_start', x: 40, y: 40}]}};
+const $ = (id) => document.getElementById(id);
+
+const page = {editor: null, name: null, points: {}, dirty: false, saved: null, seq: 0, run: null,
+              polling: false, polledOnce: false};
+
+async function api(method, path, body) {
+  const resp = await fetch('api/' + path, {
+    method, headers: body === undefined ? {} : {'Content-Type': 'application/json'},
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await resp.json(); } catch (e) { data = {ok: false, message: 'HTTP ' + resp.status}; }
+  return data;
+}
+
+function say(text, kind) {
+  $('message').textContent = text || '';
+  $('message').className = kind || '';
+}
+
+// `t`: the ROBOT's time (epoch seconds) of the event, so the log matches the robot's own logs whatever this
+// computer's clock says; without it, now.
+function log(text, kind, t) {
+  const line = document.createElement('div');
+  line.className = kind || '';
+  line.textContent = new Date(t ? t * 1000 : Date.now()).toLocaleTimeString() + '  ' + text;
+  const box = $('log');
+  box.appendChild(line);
+  while (box.childElementCount > 1000) box.firstElementChild.remove();
+  $('pane-log').scrollTop = $('pane-log').scrollHeight;
+}
+
+function setDirty(on) {
+  page.dirty = on;
+  $('dirty').textContent = on ? '● unsaved' : '';
+}
+
+// "Unsaved" = the program differs from what was last saved or opened — compared, not inferred from events: Blockly 13
+// delivers change events a frame LATER (requestAnimationFrame, then setTimeout), so a program's own loading events
+// arrived after the page had stopped ignoring them and every program opened "unsaved" (seen 2026-10-05).
+function current() {
+  return JSON.stringify(page.editor.save()) + '\n' + JSON.stringify(page.points);
+}
+
+function checkDirty() {
+  setDirty(current() !== page.saved);
+  keepDraft();
+}
+
+// Unsaved work survives a reload, kept in THIS browser: the dashboard reloads its page by itself (after a GUI
+// restart, NiceGUI retries until it can), and a "leave the page?" prompt in here turned that into a loop of
+// "Reload site?" dialogs (2026-10-05). A convenience only — Save is what keeps a program.
+const DRAFT = 'rcb-blocks-draft';
+
+function keepDraft() {
+  try {
+    if (page.dirty) {
+      localStorage.setItem(DRAFT, JSON.stringify(
+        {name: page.name, workspace: page.editor.save(), points: page.points, saved: page.saved}));
+    } else {
+      localStorage.removeItem(DRAFT);
+    }
+  } catch (e) { /* storage blocked: no draft, nothing else changes */ }
+}
+
+async function restoreDraft() {
+  let draft = null;
+  try { draft = JSON.parse(localStorage.getItem(DRAFT)); } catch (e) { draft = null; }
+  if (!draft || typeof draft.workspace !== 'object') return false;
+  try {
+    await loadInto(draft.name || null, draft.workspace, draft.points || {}, false);
+  } catch (e) {
+    try { localStorage.removeItem(DRAFT); } catch (e2) { /* nothing */ }
+    return false;
+  }
+  page.saved = draft.saved || null;
+  checkDirty();
+  await refreshList(page.name || '');
+  say('Restored your unsaved changes' + (page.name ? ` to "${page.name}"` : '') + ' from before the page reloaded. ' +
+      'Save to keep them; open the program again to drop them.', 'good');
+  return true;
+}
+
+function showPane(name) {
+  for (const b of document.querySelectorAll('.tabs button')) b.classList.toggle('on', b.dataset.pane === name);
+  for (const p of document.querySelectorAll('.pane')) p.classList.toggle('on', p.id === 'pane-' + name);
+}
+
+// ── programs ──────────────────────────────────────────────────────────────────────────────────────────────────
+async function refreshList(select) {
+  const r = await api('GET', 'programs');
+  const sel = $('program');
+  sel.innerHTML = '';
+  const names = (r.programs || []).map((p) => p.name);
+  if (page.name && !names.includes(page.name)) names.unshift(page.name);
+  for (const n of names) sel.add(new Option(n + (n === page.name && page.dirty ? ' *' : ''), n));
+  if (!names.length) sel.add(new Option('(no programs)', ''));
+  sel.value = select || page.name || '';
+}
+
+// `clean` false: a program that was never saved (the demo) — "unsaved" until it is.
+async function loadInto(name, workspace, points, clean = true) {
+  page.name = name;
+  page.points = points || {};
+  page.editor.setPoints(Object.keys(page.points));
+  page.editor.clearErrors();
+  page.editor.load(workspace);
+  renderPoints();
+  page.saved = clean ? current() : null;
+  checkDirty();
+  applyRunLock();
+}
+
+async function openProgram(name) {
+  if (page.dirty && !confirm(`Discard the unsaved changes to "${page.name}"?`)) {
+    $('program').value = page.name || '';
+    return;
+  }
+  const r = await api('GET', 'programs/' + encodeURIComponent(name));
+  if (!r.ok) return say(r.message, 'bad');
+  await loadInto(name, r.program.workspace, r.program.points);
+  await refreshList(name);
+  say(`Opened "${name}".`);
+}
+
+async function save(name) {
+  const body = {workspace: page.editor.save(), points: page.points};
+  const sent = JSON.stringify(body.workspace) + '\n' + JSON.stringify(body.points);
+  const r = await api('PUT', 'programs/' + encodeURIComponent(name), body);
+  if (!r.ok) {
+    say('Not saved: ' + r.message, 'bad');
+    return false;
+  }
+  page.name = name;
+  page.saved = sent;          // an edit made while saving still counts as unsaved
+  checkDirty();
+  await refreshList(name);
+  say(`Saved "${name}".`, 'good');
+  return true;
+}
+
+function askName(text, fallback) {
+  const name = (prompt(text, fallback || '') || '').trim();
+  if (!name) return null;
+  if (!NAME_RE.test(name)) {
+    alert('A program name is letters, digits, spaces, "_" or "-" (up to 64), starting with a letter or digit.');
+    return null;
+  }
+  return name;
+}
+
+// ── points ────────────────────────────────────────────────────────────────────────────────────────────────────
+function fmt(values, scale, digits) {
+  return values.map((v) => (v * scale).toFixed(digits)).join(', ');
+}
+
+function renderPoints() {
+  const body = $('points');
+  body.innerHTML = '';
+  const names = Object.keys(page.points).sort();
+  $('points-hint').style.display = names.length ? 'none' : '';
+  for (const n of names) {
+    const p = page.points[n];
+    const tr = document.createElement('tr');
+    const used = usesOf(n).length;
+    tr.innerHTML = '<td></td><td class="nums"></td><td class="acts"></td>';
+    tr.children[0].textContent = n + (used ? '' : ' (unused)');
+    tr.children[1].textContent = 'J ' + fmt(p.joints_deg, 1, 1) + '\nP ' + fmt(p.pose.slice(0, 3), 1000, 1) +
+                                 ' | ' + fmt(p.pose.slice(3), 180 / Math.PI, 1);
+    tr.children[1].style.whiteSpace = 'pre';
+    const busy = !!(page.run && page.run.running);
+    for (const [label, fn, tip, off] of [
+      ['Move here', movePointHere, 'Move the arm to this point: a joint move at 10 % speed (Stop stops it)', busy],
+      ['Update', updatePoint, 'Set it to where the arm is now', locked()],
+      ['Rename', renamePoint, '', locked()], ['Delete', deletePoint, '', locked()]]) {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.title = tip;
+      b.disabled = off;
+      b.onclick = () => fn(n);
+      tr.children[2].appendChild(b);
+    }
+    body.appendChild(tr);
+  }
+}
+
+function usesOf(name) {
+  return page.editor.workspace.getAllBlocks(false)
+    .filter((b) => b.type === 'rcb_point' && b.getFieldValue('NAME') === name);
+}
+
+function pointsChanged() {
+  page.editor.setPoints(Object.keys(page.points));
+  renderPoints();
+  checkDirty();
+}
+
+async function addPoint() {
+  const name = (prompt('Name of the new point (e.g. "above pick"):') || '').trim();
+  if (!name) return;
+  if (!POINT_RE.test(name)) return alert('A point name is letters, digits, spaces, "_" or "-" (up to 32).');
+  if (page.points[name] && !confirm(`"${name}" exists. Replace it with where the arm is now?`)) return;
+  try {
+    const pos = await RCBBlocks.fetchPosition();
+    page.points[name] = {joints_deg: pos.joints_deg, pose: pos.pose};
+  } catch (e) {
+    return say('Could not read the arm\'s position: ' + e.message, 'bad');
+  }
+  pointsChanged();
+  say(`Point "${name}" taught from the arm.`, 'good');
+}
+
+async function updatePoint(name) {
+  if (!confirm(`Set "${name}" to where the arm is now? Every block that uses it will go there.`)) return;
+  try {
+    const pos = await RCBBlocks.fetchPosition();
+    page.points[name] = {joints_deg: pos.joints_deg, pose: pos.pose};
+  } catch (e) {
+    return say('Could not read the arm\'s position: ' + e.message, 'bad');
+  }
+  pointsChanged();
+  say(`Point "${name}" updated.`, 'good');
+}
+
+// One click, then a confirm (2026-10-05: the user chose one click; some industrial cobots move only while a
+// button is held). The SERVER builds the one-block program from the point's numbers; it runs like any program.
+async function movePointHere(name) {
+  if (!confirm(`Move the arm to "${name}"?\n\nA joint move at 10 % speed — the tool's path is not a straight line, ` +
+               'so check the way is clear. Stop (or the E-stop) stops it.')) return;
+  const r = await api('POST', 'run/move_here', {name, point: page.points[name]});
+  if (!r.ok) return say('Not moved: ' + r.message, 'bad');
+  say(`Moving to "${name}" at 10 %…`, 'good');
+  showPane('log');
+  await poll();
+}
+
+function renamePoint(name) {
+  const to = (prompt(`New name for "${name}":`, name) || '').trim();
+  if (!to || to === name) return;
+  if (!POINT_RE.test(to)) return alert('A point name is letters, digits, spaces, "_" or "-" (up to 32).');
+  if (page.points[to]) return alert(`"${to}" exists already.`);
+  page.points[to] = page.points[name];
+  delete page.points[name];
+  page.editor.setPoints(Object.keys(page.points));
+  Blockly.Events.setGroup(true);
+  for (const b of usesOf(name)) b.setFieldValue(to, 'NAME');
+  Blockly.Events.setGroup(false);
+  pointsChanged();
+}
+
+function deletePoint(name) {
+  const used = usesOf(name).length;
+  if (!confirm(used ? `${used} block(s) use "${name}"; they will show "(missing)" and the program will not run ` +
+                      'until they get another point. Delete it?' : `Delete "${name}"?`)) return;
+  delete page.points[name];
+  pointsChanged();
+}
+
+// ── running ───────────────────────────────────────────────────────────────────────────────────────────────────
+function locked() {
+  return !!(page.run && page.run.running && page.run.program === page.name);
+}
+
+function applyRunLock() {
+  const lock = locked();
+  page.editor.setReadOnly(lock);
+  const running = !!(page.run && page.run.running);
+  $('btn-run').disabled = running;
+  $('btn-check').disabled = running;
+  $('btn-pause').disabled = !running;
+  $('btn-step').disabled = !running || page.run.state !== 'paused';
+  $('btn-pause').textContent = running && page.run.state === 'paused' ? '▶ Resume' : '⏸ Pause';
+  for (const id of ['btn-save', 'btn-delete', 'btn-add-point']) $(id).disabled = lock;
+  if (!lock) page.editor.highlight(null);
+  renderPoints();
+}
+
+function showRun(r) {
+  page.run = r;
+  const state = r.running ? r.state : (r.program ? r.state : 'idle');
+  $('badge').textContent = state || 'idle';
+  $('badge').className = state || '';
+  $('where').textContent = r.program ? `"${r.program}"` + (r.running && r.block ? ' — block highlighted' : '') : '';
+}
+
+async function poll() {
+  if (page.polling) return;              // one request at a time: two with the same `since` would log twice
+  page.polling = true;
+  try {
+    await pollOnce();
+  } finally {
+    page.polling = false;
+  }
+}
+
+async function pollOnce() {
+  let r;
+  try {
+    r = await api('GET', 'run/events?since=' + page.seq);
+  } catch (e) {
+    return;
+  }
+  if (!r.ok) return;
+  const ours = r.program === page.name;
+  const history = !page.polledOnce;      // the first poll after loading replays the buffer: log it, do not re-show it
+  page.polledOnce = true;
+  for (const e of r.events) {
+    if (e.type === 'run') {
+      log(`program "${e.program}" started`, 'state', e.t);
+      if (ours && !history) page.editor.clearErrors();
+    } else if (e.type === 'state') {
+      log('→ ' + e.state, 'state', e.t);
+    } else if (e.type === 'block') {
+      const b = ours ? page.editor.workspace.getBlockById(e.id) : null;
+      log('▸ ' + (b ? b.toString(70) : e.id === 'move_here' ? 'move to the point (10 %)' : e.id), 'block', e.t);
+      if (ours) page.editor.highlight(e.id);
+    } else if (e.type === 'log') {
+      log(e.text, e.level, e.t);
+    } else if (e.type === 'error') {
+      log(`${e.code}: ${e.message}`, 'error', e.t);
+      if (e.arm === 'holding') log('the arm holds where it is (EXEC), as an EXEC program leaves it', 'state', e.t);
+      if (e.arm === 'stopped') log('the robot was stopped', 'state', e.t);
+      if (!history) say(e.message, 'bad');
+      if (ours && !history) page.editor.markError(e.block, e.message);
+    } else if (e.type === 'run_end') {
+      log(`program ended (exit ${e.exit})`, 'state', e.t);
+    }
+  }
+  page.seq = r.seq;
+  const wasLocked = locked();
+  showRun(r);
+  if (wasLocked !== locked() || r.events.length) applyRunLock();
+  if (locked() && r.block) page.editor.highlight(r.block);
+}
+
+async function run() {
+  if (!page.name) {
+    const name = askName('Save the program as:', 'program');
+    if (!name || !(await save(name))) return;
+  } else if (page.dirty && !(await save(page.name))) {
+    return;
+  }
+  page.editor.clearErrors();
+  const check = await page.editor.generate(page.name, page.points);
+  if (!check.ok) {
+    page.editor.markError(check.block, check.message);
+    return say('Cannot run: ' + check.message, 'bad');
+  }
+  const r = await api('POST', 'run', {name: page.name});
+  if (!r.ok) return say(r.message, 'bad');
+  say(`Running "${page.name}".`, 'good');
+  showPane('log');
+  await poll();
+}
+
+// Check: the robot's planner plans every move offline, from where the arm is now (blockly/check.py) — nothing moves.
+async function check() {
+  page.editor.clearErrors();
+  $('btn-check').disabled = true;
+  say('Checking — the planner plans every move from where the arm is now (a few seconds; nothing moves)…');
+  let r;
+  try {
+    r = await api('POST', 'check', {name: page.name || 'program', workspace: page.editor.save(), points: page.points});
+  } catch (e) {
+    r = {ok: false, message: 'the robot could not be reached'};
+  } finally {
+    applyRunLock();
+  }
+  if (!r.ok) return say('Check: ' + r.message, 'bad');
+  if (r.result === 'failed') {
+    page.editor.markError(r.error.block, r.error.message);
+    log(`Check: ${r.error.code}: ${r.error.message}`, 'error');
+    return say(`Check: ${r.error.code} — ${r.error.message}`, 'bad');
+  }
+  const s = r.summary || {};
+  const text = `Check passed: ${s.moves} move(s), about ${s.motion_s} s of motion` +
+    (s.wait_s ? ` + ${s.wait_s} s of waits` : '') +
+    (r.result === 'limited' ? ` — only the first ${s.blocks} blocks (the program may not end)` : '') +
+    '. Assumed: inputs arrive, grips catch the part.';
+  log(text, 'state');
+  say(text, 'good');
+}
+
+async function pauseOrResume() {
+  const action = page.run && page.run.state === 'paused' ? 'resume' : 'pause';
+  const r = await api('POST', 'run/' + action);
+  if (!r.ok) say(r.message, 'bad');
+}
+
+// ── wiring ────────────────────────────────────────────────────────────────────────────────────────────────────
+(async () => {
+  page.editor = await RCBBlocks.mount($('workspace'));
+  page.editor.onChange(checkDirty);
+  for (const b of document.querySelectorAll('.tabs button')) b.onclick = () => showPane(b.dataset.pane);
+  $('program').onchange = (e) => e.target.value && openProgram(e.target.value);
+  $('btn-new').onclick = async () => {
+    if (page.dirty && !confirm('Discard the unsaved changes?')) return;
+    await loadInto(null, EMPTY, {});
+    await refreshList('');
+    say('A new program: save it to give it a name.');
+  };
+  $('btn-save').onclick = async () => {
+    const name = page.name || askName('Save the program as:', 'program');
+    if (name) await save(name);
+  };
+  $('btn-saveas').onclick = async () => {
+    const name = askName('Save the program as:', page.name || 'program');
+    if (name) await save(name);
+  };
+  $('btn-delete').onclick = async () => {
+    if (!page.name || !confirm(`Delete "${page.name}" from the robot?`)) return;
+    const r = await api('DELETE', 'programs/' + encodeURIComponent(page.name));
+    if (!r.ok) return say(r.message, 'bad');
+    say(`Deleted "${page.name}".`);
+    await loadInto(null, EMPTY, {});
+    await refreshList('');
+  };
+  $('btn-add-point').onclick = addPoint;
+  $('btn-run').onclick = run;
+  $('btn-check').onclick = check;
+  $('btn-pause').onclick = pauseOrResume;
+  $('btn-step').onclick = () => api('POST', 'run/step');
+  $('btn-stop').onclick = async () => {
+    const r = await api('POST', 'run/stop');
+    say(r.robot_stopped === false ? 'The robot did not answer the stop — use the E-stop if it is moving.'
+                                  : 'Stopped.', r.robot_stopped === false ? 'bad' : '');
+  };
+  $('btn-python').onclick = async () => {
+    const r = await page.editor.generate(page.name || 'program', page.points);
+    page.editor.clearErrors();
+    $('python').textContent = r.ok ? r.python : '';
+    if (!r.ok) {
+      page.editor.markError(r.block, r.message);
+      say('Cannot run: ' + r.message, 'bad');
+    }
+  };
+  $('btn-download').onclick = async () => {
+    const r = await page.editor.generate(page.name || 'program', page.points);
+    if (!r.ok) return say('Cannot run: ' + r.message, 'bad');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([r.python], {type: 'text/x-python'}));
+    a.download = (page.name || 'program').replace(/ /g, '_') + '.py';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  const list = await api('GET', 'programs');
+  const first = list.programs && list.programs.length ? list.programs[0].name : null;
+  if (await restoreDraft()) {
+    // the work from before the reload is back
+  } else if (first) {
+    await openProgram(first);
+  } else {
+    await loadInto(null, RCB_DEMO, {}, false);
+    await refreshList('');
+    say('No programs on the robot yet — here is a demo. Save it to keep it.');
+  }
+  await poll();
+  setInterval(poll, 400);
+})();
+</script>
+</body>
+</html>

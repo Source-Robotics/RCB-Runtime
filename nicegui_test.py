@@ -10,6 +10,7 @@ import os
 import queue
 import json
 import gc
+import logging
 import sys       # Firmware tab: spawns the flasher CLI with this interpreter
 import signal    # Firmware tab: SIGINT to cancel a running flash
 
@@ -22,7 +23,7 @@ import signal    # Firmware tab: SIGINT to cancel a running flash
 # smoothness. Reference counting still frees everything promptly regardless.
 gc.set_threshold(50_000, 500, 1000)   # default is (700, 10, 10)
 
-from gui_command_sender import ExecCommandSender
+from gui_command_sender import ExecCommandSender, GUI_IDLE_RELEASE_S, auto_release_due
 from config.xml_parser import load_system_config, load_full_robot_config
 from config.system_config import publish_static_system_info, publish_memory_info, publish_disk_info
 from project_paths import SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, ACTIVITY_RTI_LOG, ACTIVITY_EXEC_LOG, CONFIG_DIR
@@ -49,6 +50,9 @@ publish_disk_info(shared_data)
 JOINTS = 6
 
 _sys_cfg = load_system_config(SYSTEM_XML, ROBOTS_DIR)
+# Times shown in the box's chosen zone (config/system.xml <display_timezone>, the System Info tab's "Time" card)
+import utility.display_time as display_time  # noqa: E402
+display_time.set_zone(_sys_cfg.get("display_timezone"))
 _xml_cfg = load_full_robot_config(
     str(_sys_cfg['robot_xml_path']),
     grippers_dir=GRIPPERS_DIR,
@@ -148,8 +152,7 @@ def _tail_activity_log(name, path):
 def _fmt_activity_row(e, idx):
     ts = e.get("timestamp")
     if isinstance(ts, (int, float)):
-        t_struct = time.localtime(ts)
-        time_str = f"{time.strftime('%H:%M:%S', t_struct)}.{int((ts % 1) * 1000):03d}"
+        time_str = f"{display_time.fmt(ts, '%H:%M:%S')}.{int((ts % 1) * 1000):03d}"
     else:
         time_str = "?"
     detail = e.get("message") or ""
@@ -190,15 +193,82 @@ _gui_toasts = queue.Queue()   # (message, type) pending toasts → drained in th
 
 
 def _on_exec_error(label, exc):
+    if label and label.endswith("_poll"):         # a background poll (Walls tab): log it, never toast it
+        logging.debug("[GUI] %s failed: %s", label, exc)
+        return
     _gui_toasts.put((f"{label or 'command'}: {exc}", "negative"))
 
 
 _exec_sender = ExecCommandSender(on_error=_on_exec_error)
 
 
+# When this dashboard last sent the executor anything. The dashboard is ONE permanent connection,
+# so without an idle release a single click would own the robot until the executor's 30 s timeout —
+# long enough to make every script started after "Clear Errors, Enable" fail with CONTROL_HELD
+# (three times in one session, 2026-09-30). See auto_release_due() for exactly when it lets go.
+_gui_last_cmd = [time.monotonic()]
+_gui_release_sent = [False]
+
+
 def _exec(fn, label=""):
     """Submit a RobotClient call to the executor. Non-blocking; never raises into the UI."""
+    if label != "release_control":
+        _gui_last_cmd[0] = time.monotonic()
+        _gui_release_sent[0] = False
     _exec_sender.submit(fn, label=label)
+
+
+# ─────────────────────────────────────────────────────────────
+# Control ownership (TODO/control_arbitration_plan.md §4.3)
+# ─────────────────────────────────────────────────────────────
+# The executor decides who holds control, per TCP CONNECTION. This dashboard is ONE connection
+# (the sender's RobotClient) shared by every browser tab, so it is one holder: whoever clicks
+# Enable or jogs first claims control for all of them, and it frees itself after 30 s idle.
+# That is display-level only — the executor enforces regardless of what is greyed here.
+#
+# Written by _refresh_control_state() on a timer, read by handlers. Stale by up to the timer
+# period, which is fine: a wrong guess here costs a refused command and a toast, never motion.
+_ctl_view = {"holder": None, "mine": False, "other": False}
+
+
+async def handle_take_control():
+    """Take control from whoever holds it — a deliberate act, so it asks first.
+
+    Taking control does NOT stop what the previous holder already queued: ownership gates
+    NEW commands only. The dialog says so, because "take control" reads as "and stop them".
+    """
+    holder = _ctl_view["holder"] or "another client"
+    gate = bool(float(shared_data.rti["force_confirm_enabled"][0]) >= 0.5)
+    with ui.dialog() as dlg, ui.card().classes("max-w-xl"):
+        ui.label("Take control?").classes("text-lg font-bold")
+        ui.markdown(
+            f"**{holder}** holds control and may be running a program.\n\n"
+            "Taking control does **not** stop anything it already queued — press Stop "
+            "first if that matters."
+            + ("\n\nThe **control box will ask for confirmation**: hold B2 to allow, "
+               "tap B1 to deny. This waits up to 20 s." if gate else
+               "\n\nTakeover approval is OFF, so this takes effect immediately.")
+        ).classes("text-sm")
+        with ui.row().classes("gap-2 justify-end w-full mt-2"):
+            ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("outline")
+            ui.button("Take control", on_click=lambda: dlg.submit(True)).props("color=orange")
+    if not await dlg:
+        return
+    ui.notify("Waiting for approval at the control box…" if gate else "Taking control…",
+              type="info")
+
+    def _take(r):
+        r.take_control(force=True)
+        _gui_last_cmd[0] = time.monotonic()      # a takeover that waited 20 s is not "5 s idle"
+        _gui_release_sent[0] = False
+        _gui_toasts.put(("This dashboard now holds control.", "positive"))
+    # Own thread, NOT the ordered queue: this can block for the whole confirmation window,
+    # and Disable / jog-stop must never sit behind it.
+    _exec_sender.submit_async(_take, "take_control")
+
+
+def handle_release_control():
+    _exec(lambda r: r.release_control(), "release_control")
 
 
 def handle_enable():       _exec(lambda r: r.enable(), "enable")
@@ -208,8 +278,15 @@ def handle_enter_exec():   _exec(lambda r: r.enter_exec_mode(), "enter_exec_mode
 def handle_exit_exec():    _exec(lambda r: r.enter_idle_mode(), "enter_idle_mode")
 
 def handle_clear_errors():
-    """Signal RTI to wipe the error latch. Any still-active errors re-latch next tick."""
+    """Signal RTI to wipe the error latch. Any still-active errors re-latch next tick.
+
+    Also sent through command_executor, whose clear_errors is the only thing that clears a
+    MOTION ABORT (a failed queued move stops the program until cleared). The shared-memory
+    write stays: it works even when the executor is down, which is the point of it. RTI may
+    therefore see two clears in a row — harmless, the second only restarts the settle wait.
+    """
     shared_data.clear_error_signal.set("1")
+    _exec_sender.submit(lambda r: r.clear_errors(wait=False), "clear_errors")
 
 def handle_reset_loop_stats():
     """Signal RTI to zero the since-start loop-timing peaks (max period/exec/jitter,
@@ -221,11 +298,12 @@ def handle_reset_loop_stats():
 
 
 def handle_reload_filters():
-    """Signal RTI to rebuild the signal filters from config/filters.xml — hot reload, no
-    restart, no re-home. Edit the tau/type in the XML, click this, see it live. RTI rebuilds
-    the filter banks on its next tick; each filter's internal state resets, so a brief
-    (~one filter window) transient is expected right after."""
-    shared_data.filter_reload_signal.set("1")
+    """Rebuild the signal filters from config/filters.xml — hot reload, no restart, no re-home. Edit the tau/type
+    in the XML, click this, see it live. Since 2026-10-04 this goes through command_executor (`reload_filters`):
+    the executor parses the file and hands RTI the spec table, so RTI reads no file in its loop; each filter's
+    internal state resets, so a brief (~one filter window) transient is expected right after. A malformed file is
+    refused and the filters in force stay."""
+    _exec(lambda r: r.reload_filters(), "reload_filters")
     ui.notify("Reloading signal filters from config/filters.xml", type="info")
 
 _sw_estop_btn = None  # set after UI is built
@@ -435,6 +513,28 @@ with ui.card().classes("w-full mb-2"):
         safety_badge      = ui.badge("SAFETY: OK").props("color=positive outline")
         rti_process_badge = ui.badge("RTI: ---").props("color=grey outline")
         robot_can_badge   = ui.badge("ROBOT: ---").props("color=grey outline")
+        # Self-collision: is the worker watching, and how close is the arm to where a jog stops (gui_self_collision.py)
+        try:
+            from gui_self_collision import add_self_collision_badge
+            add_self_collision_badge(shared_data, _sys_cfg["self_collision"], int(_sys_cfg["joint_num"]))
+        except Exception:
+            logging.exception("self-collision badge unavailable")
+        # Who holds control. Shown on every tab: the failure it prevents is a colleague's
+        # script and this dashboard both believing they are driving.
+        control_badge     = ui.badge("CONTROL: ---").props("color=grey outline")
+        _take_btn = ui.button("Take control", icon="pan_tool", on_click=handle_take_control) \
+            .props("color=orange size=sm")
+        _take_btn.set_visibility(False)
+        _release_btn = ui.button("Release", icon="lock_open", on_click=handle_release_control) \
+            .props("color=grey outline size=sm")
+        _release_btn.set_visibility(False)
+        _release_btn.tooltip("Free the robot now instead of waiting for the 30 s idle timeout.")
+        # A running block program (blockly/), on every tab: its name (click: the Blocks tab) and a Stop for it.
+        try:
+            from blockly.nicegui_tab import add_program_badge
+            add_program_badge(open_blocks=lambda: tabs.set_value('Blocks'))
+        except Exception:
+            logging.exception("block program badge unavailable")
         ui.separator().props("vertical")
         robot_cmd_label = ui.label("CMD: ---").classes("font-mono text-sm text-gray-500")
         recipe_label    = ui.label("Recipe: ---").classes("font-mono text-sm text-gray-500")
@@ -455,12 +555,88 @@ with ui.card().classes("w-full mb-2"):
         _grav_comp_btn = ui.button("Grav Comp ON", icon="downhill_skiing",
                                    on_click=_handle_grav_comp_toggle).props("color=positive outline size=sm")
 
+        # Friction compensation (utility/friction_comp.py): PARKED 2026-10-02 (user: no real effect felt). RTI starts
+        # it OFF and the dashboard has no button for it; to bring it back, see TODO/friction_compensation_plan.md.
+        _owned_btns = [_grav_comp_btn]   # greyed while someone else holds control (see below)
+
         ui.separator().props("vertical")
-        ui.button("Enable",      icon="power",          on_click=handle_enable).props("color=positive outline size=sm")
+        # Runtime payload (utility/payload.py, 2026-10-04): the part the gripper holds — mass + centre of mass in
+        # the TOOL frame (mm here, metres on the wire). An OWNED command: the gravity model and the freedrive
+        # walls' dynamics change with it. The live label shows what RTI has (shared memory), not the fields.
+        with ui.row().classes("items-center gap-1"):
+            _pl_mass = ui.number("Payload kg", value=0.0, min=0.0, step=0.05, format="%.3f").props("dense outlined").classes("w-28")
+            _pl_x = ui.number("COM x mm", value=0.0, step=1, format="%.0f").props("dense outlined").classes("w-24")
+            _pl_y = ui.number("y mm", value=0.0, step=1, format="%.0f").props("dense outlined").classes("w-20")
+            _pl_z = ui.number("z mm", value=0.0, step=1, format="%.0f").props("dense outlined").classes("w-20")
+
+            def _apply_payload():
+                m = float(_pl_mass.value or 0.0)
+                com = tuple(float(v.value or 0.0) / 1000.0 for v in (_pl_x, _pl_y, _pl_z))
+                _exec(lambda r: r.set_payload(m, com), "set_payload")
+                ui.notify(f"Payload {m:.3f} kg at ({com[0]*1000:.0f}, {com[1]*1000:.0f}, {com[2]*1000:.0f}) mm requested", type="info")
+
+            _pl_btn = ui.button("Apply", icon="fitness_center", on_click=_apply_payload).props("size=sm outline") \
+                .tooltip("Declare the part the gripper holds (tool frame: +z out of the flange). 0 = gripper alone. "
+                         "Refused above the robot XML's <max_payload_kg>. Not persisted — 0 after every RTI start.")
+            _pl_live = ui.label("RTI: 0.000 kg").classes("text-xs text-gray-500 font-mono") \
+                .tooltip("What RTI's gravity model carries right now (shared memory payload_mass / payload_com_*)")
+        _owned_btns.append(_pl_btn)
+
+        ui.separator().props("vertical")
+
+        # Physical confirmation for a FORCED control takeover (arbitration plan 4.4).
+        # Reads its initial state from shared memory rather than assuming, so the button
+        # never shows OFF while the robot is actually enforcing it.
+        _fc_state = [bool(float(shared_data.rti["force_confirm_enabled"][0]) >= 0.5)]
+
+        def _fc_label(on):
+            return "Takeover approval ON" if on else "Takeover approval OFF"
+
+        def _handle_force_confirm_toggle():
+            _fc_state[0] = not _fc_state[0]
+            on = _fc_state[0]
+            _exec(lambda r: r.set_force_confirm(on), "set_force_confirm")
+            _fc_btn.props(f"color={'positive' if on else 'grey'}")
+            _fc_btn.set_text(_fc_label(on))
+            ui.notify(
+                "Takeover approval ON: taking control away from a program that holds it now needs "
+                "B2 held on the control box."
+                if on else
+                "Takeover approval OFF: any program or PC on the network can take control away "
+                "from another at once, without anyone at the robot agreeing.",
+                type="positive" if on else "warning")
+
+        _fc_btn = ui.button(_fc_label(_fc_state[0]), icon="touch_app",
+                            on_click=_handle_force_confirm_toggle) \
+            .props(f"color={'positive' if _fc_state[0] else 'grey'} outline size=sm")
+        _fc_btn.tooltip("Click to switch. The ? next to it explains what it does.")
+        with ui.icon("help_outline").classes("text-gray-400 cursor-help text-sm"):
+            with ui.tooltip().classes("max-w-sm"), ui.column().classes("gap-1 py-1"):
+                ui.label("Takeover approval: can someone take the robot away from a program "
+                         "that is using it?").classes("font-semibold")
+                ui.label("Only one program or PC controls the robot at a time (this dashboard, "
+                         "a script, a remote PC). Another one can take control away from it — "
+                         "\"Take control\", e.g. to rescue a stuck script.")
+                ui.label("ON: someone AT THE ROBOT must agree. The control box shows who is "
+                         "asking; HOLD B2 for 1 s to allow, PRESS B1 to refuse. No answer in "
+                         "20 s = refused.")
+                ui.label("OFF: any program or PC on the network takes control at once — "
+                         "nobody at the robot is asked.")
+                ui.label("Never affected: taking a robot nobody controls, and Stop, Disable, "
+                         "Clear Errors, E-stop — those always work for everyone.") \
+                    .classes("italic")
+                ui.label("Anyone may switch it ON; only whoever controls the robot (or anyone, "
+                         "when nobody does) may switch it OFF.").classes("italic")
+
+        ui.separator().props("vertical")
+        _owned_btns.append(ui.button("Enable",      icon="power",       on_click=handle_enable).props("color=positive outline size=sm"))
+        # Disable is NEVER greyed: it is ALWAYS_OPEN in the executor, and "lock the queue,
+        # never lock the stop" applies to the display too. Same for Clear Errors, SW E-STOP
+        # and MOTORS OFF — none of them is in _owned_btns.
         ui.button("Disable",     icon="power_off",      on_click=handle_disable).props("color=grey outline size=sm")
-        ui.button("Home",        icon="home",           on_click=handle_home).props("color=primary outline size=sm")
-        ui.button("Enter EXEC",  icon="play_circle",    on_click=handle_enter_exec).props("color=secondary outline size=sm")
-        ui.button("Exit EXEC",   icon="stop_circle",    on_click=handle_exit_exec).props("color=grey outline size=sm")
+        _owned_btns.append(ui.button("Home",        icon="home",        on_click=handle_home).props("color=primary outline size=sm"))
+        _owned_btns.append(ui.button("Enter EXEC",  icon="play_circle", on_click=handle_enter_exec).props("color=secondary outline size=sm"))
+        _owned_btns.append(ui.button("Exit EXEC",   icon="stop_circle", on_click=handle_exit_exec).props("color=grey outline size=sm"))
         ui.button("Clear Errors", icon="cancel",        on_click=handle_clear_errors).props("color=negative outline size=sm")
 
 # ─────────────────────────────────────────────────────────────
@@ -493,13 +669,19 @@ _jog_state = {
 }
 
 def _jog_start(joint_idx, direction):
+    # Gate the START only. The release path (_jog_stop) must ALWAYS go through, and this is
+    # why the card is dimmed with opacity and not pointer-events:none — a card that stopped
+    # receiving the mouse-up because control changed hands mid-press would leave the arm
+    # jogging with no way for its own button to end it.
+    if _ctl_view["other"]:
+        return
     speed = _jog_state['speed_pct']
     _exec(lambda r: r.jog(joint_idx, direction, speed), "jog_set")
 
 def _jog_stop():
     _exec(lambda r: r.jog_stop(), "jog_stop")
 
-with ui.card().classes("w-full mb-2"):
+with ui.card().classes("w-full mb-2") as _jog_card:
     with ui.row().classes("items-center gap-3 flex-wrap px-3 py-2"):
         ui.label("Jog").classes("font-bold text-sm text-gray-500 uppercase tracking-wide")
         ui.button("Enter JOG", icon="open_with",
@@ -616,11 +798,23 @@ with ui.card().classes("w-full mb-2"):
 
     _JOYSTICK_DEADZONE = 0.04  # ignore x within this fraction of full range
 
+    # A joystick held at a FIXED deflection sends no move events but the joint keeps jogging, so
+    # "no recent command" is not "idle" for it: the idle release must see it as active.
+    _joystick_active = [False]
+
+    def _joystick_end(e):
+        _joystick_active[0] = False
+        _exec(lambda r: r.jog_stop(), "jog_stop")
+
     def _on_joystick_move(e, joint_idx):
         x = e.x  # nipplejs vector component: -1.0 (full left) … +1.0 (full right)
         if abs(x) < _JOYSTICK_DEADZONE:
+            _joystick_active[0] = False
             _exec(lambda r: r.jog_stop(), "jog_stop")
             return
+        _joystick_active[0] = True
+        if _ctl_view["other"]:
+            return          # start/continue is gated; the stop above and on_end never are
         direction = 1 if x > 0 else -1
         speed_pct = min(abs(x), 1.0)
         _exec(lambda r: r.jog(joint_idx, direction, speed_pct), "jog_set")
@@ -636,7 +830,7 @@ with ui.card().classes("w-full mb-2"):
                     mode='static',
                     lockX=True,
                     on_move=lambda e, j=_ji: _on_joystick_move(e, j),
-                    on_end=lambda e: _exec(lambda r: r.jog_stop(), "jog_stop"),
+                    on_end=_joystick_end,
                     throttle=0.05,
                 ).style("width:90px; height:90px;")
                 ui.label("← speed →").classes("text-xs text-gray-400")
@@ -659,6 +853,8 @@ with ui.tabs().classes("w-full") as tabs:
     tab_preview = ui.tab('Plan Preview',   icon='play_circle')
     tab_plots   = ui.tab('Plots',          icon='show_chart')
     tab_firmware = ui.tab('Firmware',      icon='memory')
+    tab_walls   = ui.tab('Walls',          icon='fence')     # TEMPORARY freedrive wall tuner (gui_walls_tab.py)
+    tab_blocks  = ui.tab('Blocks',         icon='extension')  # block programming (blockly/); no panel, see below
 tabs.set_value('Joints & TCP')
 
 with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
@@ -881,6 +1077,13 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             grp_pos_cmd_lbl = ui.label("---")
             grp_spd_cmd_lbl = ui.label("---")
             grp_frc_cmd_lbl = ui.label("---")
+
+        # The jaws where the collision check puts them: the CAD, live from the gripper's report (gui_jaw_view.py)
+        try:
+            from gui_jaw_view import add_jaw_view
+            add_jaw_view(shared_data, _xml_cfg, int(_sys_cfg["joint_num"]))
+        except Exception:
+            logging.exception("jaw view unavailable")
 
     # ─── RT Diagnostics ─────────────────────────────────────
     with ui.tab_panel(tab_diag):
@@ -1111,6 +1314,9 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                     ui.label("SW Version");  cb_sw_label    = ui.label("---")
                     ui.label("Batch Date");  cb_batch_label = ui.label("---")
                     ui.label("Serial No.");  cb_sn_label    = ui.label("---")
+                    # Declared in config/system.xml (the board does not report it): what the E-stop policy assumes.
+                    from hardware.control_box import describe as _describe_pcb
+                    ui.label("PCB (config)"); ui.label(f"v{_sys_cfg.get('pcb_version', 1)}").tooltip(_describe_pcb(_sys_cfg.get('pcb_version', 1)))
 
     # ─── I/O ────────────────────────────────────────────────
     with ui.tab_panel(tab_io):
@@ -1174,6 +1380,13 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                     ui.label("Used");         sysinfo_mem_used_lbl  = ui.label("---")
                     ui.label("Usage");        sysinfo_mem_usage_lbl = ui.label("---")
 
+            # The zone times are shown in, and whether the robot's clock is right (gui_time_card.py, 2026-10-09)
+            try:
+                from gui_time_card import add_time_card
+                add_time_card(str(SYSTEM_XML))
+            except Exception:
+                logging.exception("time card unavailable")
+
             with ui.card().classes("flex-1 min-w-48"):
                 ui.label("Disk").classes("text-sm font-semibold mb-2 text-gray-600 uppercase tracking-wide")
                 with ui.grid(columns=2).classes("gap-x-6 gap-y-1 font-mono text-sm"):
@@ -1200,6 +1413,13 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 ui.label("(RTI = real-time, others normal)").classes("text-xs text-gray-400")
             process_table = ui.table(columns=process_columns, rows=[], row_key="name") \
                 .classes("w-full").props("dense flat")
+
+        # Which arm homing recognised, the learned arms, rename / forget / accept (gui_homing_arms.py, 2026-10-09)
+        try:
+            from gui_homing_arms import add_homing_arms_card
+            add_homing_arms_card(shared_data, _xml_cfg, int(_sys_cfg["joint_num"]))
+        except Exception:
+            logging.exception("homing arms card unavailable")
 
     # ─── Errors ───────────────────────────────────────────────
     with ui.tab_panel(tab_errors):
@@ -1474,7 +1694,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 # silently drop RTI to default filters on its next reload.
                 _FET.fromstring(text)
                 _FILT_PATH.write_text(text, encoding='utf-8')
-                shared_data.filter_reload_signal.set("1")
+                _exec(lambda r: r.reload_filters(), "reload_filters")   # the executor parses it, RTI applies it
                 _filt_status.text = 'Saved and asked RTI to reload — no restart needed'
                 ui.notify('Filters saved & reload requested', type='positive')
             except Exception as e:
@@ -1538,6 +1758,12 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         from robotclient.dry_run_preview_ui import add_dry_run_preview
 
         add_dry_run_preview(is_visible=lambda: _active_tab_name(tabs.value) == 'Plan Preview')
+
+    # ─── Walls (TEMPORARY freedrive joint-wall tuner, gui_walls_tab.py) ───
+    with ui.tab_panel(tab_walls):
+        from gui_walls_tab import add_walls_tab
+        add_walls_tab(_exec, shared_data, JOINTS, is_visible=lambda: _active_tab_name(tabs.value) == 'Walls',
+                      poll_fn=lambda fn, label: _exec_sender.submit(fn, label=label))   # not "activity"
 
     # ─── Plots ────────────────────────────────────────────────
     with ui.tab_panel(tab_plots):
@@ -2669,6 +2895,15 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 "the board waits in its bootloader; flash it again."
             ).classes("text-xs text-gray-500")
 
+# ─── Blocks (block programming, blockly/nicegui_tab.py) ───
+# An iframe AFTER the panels, not inside one: the panels' keep-alive would reload it on every tab switch.
+# Guarded: the dashboard must start even if the block editor cannot.
+try:
+    from blockly.nicegui_tab import add_blockly_tab
+    add_blockly_tab(app, tabs, 'Blocks')
+except Exception:
+    logging.exception("Blocks tab unavailable")
+
 
 # ─────────────────────────────────────────────────────────────
 # FIRMWARE TAB — subprocess driver
@@ -2693,7 +2928,7 @@ def _fw_busy():
 
 
 def _fw_log(line):
-    fw_log.push(f"{time.strftime('%H:%M:%S')}  {line}")
+    fw_log.push(f"{display_time.fmt(time.time(), '%H:%M:%S')}  {line}")
 
 
 def _fw_park_state():
@@ -3337,6 +3572,8 @@ def update_tables():
     # ── Status bar ───────────────────────────────────────────
     mode = shared_data.robot_mode.get()
     robot_mode_badge.text = f"MODE: {mode}"
+    _pl_live.text = (f"RTI: {shared_data.rti['payload_mass'][0]:.3f} kg @ ({shared_data.rti['payload_com_x'][0]*1000:.0f}, "
+                     f"{shared_data.rti['payload_com_y'][0]*1000:.0f}, {shared_data.rti['payload_com_z'][0]*1000:.0f}) mm")
     robot_mode_badge.props(
         f"color={'positive' if mode in ('running', 'rti', 'active') else 'negative' if 'error' in mode.lower() else 'grey'}"
     )
@@ -4277,6 +4514,59 @@ async def _on_tab_change():
         await asyncio.sleep(0.25)   # let the tab's charts mount
         await _connect_plot_crosshair()
 
+_ctl_last = [None]
+
+
+def _refresh_control_state():
+    """Mirror the executor's control holder into the status bar. Only touches the UI when
+    something changed — a 0.5 s timer that rewrote every prop every tick would flood the
+    websocket for no visible effect."""
+    st = _exec_sender.control_state()
+    _ctl_view.update(holder=st["holder"], mine=st["mine"], other=st["other"])
+    # Hand control back once the dashboard has been idle. Never mid-jog, mid-programme or during a
+    # live RTI session (auto_release_due), and only what THIS connection actually holds.
+    if not st["mine"]:
+        _gui_release_sent[0] = False
+    elif not _gui_release_sent[0]:
+        try:
+            # Sub-state is only meaningful while the robot is IN an RTI mode: it is published only
+            # while the RTI handler steps, so after a link-loss stop it stays at 4 (stopping_error)
+            # for minutes. Reading it alone locked the dashboard's claim in place.
+            rti_active = (shared_data.robot_mode.get() in ("RTI", "SOFT_RTI")
+                          and float(shared_data.rti["rti_substate"][0]) >= 2.0)
+        except Exception:
+            rti_active = True          # cannot tell -> do not release on a guess
+        if auto_release_due(st, time.monotonic() - _gui_last_cmd[0],
+                            jog_active=bool(_jog_btn_pressed['active'] or _joystick_active[0]),
+                            rti_active=rti_active):
+            _gui_release_sent[0] = True
+            _exec_sender.submit(lambda r: r.release_control(), label="release_control")
+    key = (st["connected"], st["holder"], st["mine"])
+    if key == _ctl_last[0]:
+        return
+    _ctl_last[0] = key
+    if not st["connected"]:
+        control_badge.text = "CONTROL: —"
+        control_badge.props("color=grey outline")
+    elif st["holder"] is None:
+        control_badge.text = "CONTROL: free"
+        control_badge.props("color=grey outline")
+    elif st["mine"]:
+        control_badge.text = "CONTROL: YOU"
+        control_badge.props("color=positive")
+    else:
+        control_badge.text = f"CONTROL: {st['holder']}"
+        control_badge.props("color=orange")
+    _take_btn.set_visibility(st["other"])
+    _release_btn.set_visibility(st["mine"])
+    for b in _owned_btns:
+        b.props(add="disable") if st["other"] else b.props(remove="disable")
+    if st["other"]:
+        _jog_card.classes(add="opacity-50")
+    else:
+        _jog_card.classes(remove="opacity-50")
+
+
 def _drain_exec_toasts():
     """Surface command failures the background sender queued (runs in the UI context, so
     ui.notify is legal here — the sender thread cannot call it directly)."""
@@ -4295,6 +4585,7 @@ ui.timer(PLOT_REFRESH_S, refresh_plots)    # plots — smooth, independent rate
 ui.timer(1.0, refresh_processes)           # slow panel (System Info tab)
 ui.timer(0.5, refresh_firmware_tab)        # park verdict + mode badge (Firmware tab)
 ui.timer(0.3, _drain_exec_toasts)          # command failures from the sender thread
+ui.timer(0.5, _refresh_control_state)       # who holds control (status bar, greyed controls)
 # Memory and disk move, but slowly — 5 s is plenty, and it keeps the shared strings fresh for any
 # other consumer too. Platform/CPU/disk-device are published once at startup (they cannot change
 # without a reboot). Both calls are cheap: one virtual_memory() and one statvfs.

@@ -17,6 +17,8 @@ Enable/disable is handled separately from mode changes:
 Mode changes require robot_state == ENABLED (except IDLE which is always allowed).
 """
 
+from __future__ import annotations
+
 from enum import Enum
 
 
@@ -27,6 +29,20 @@ class RobotMode(str, Enum):
     HOMING       = "HOMING"
     JOG          = "JOG"
     RTI          = "RTI"
+    # Soft real-time streaming, the soft half of the hard / soft real-time split of industrial interfaces.
+    # RTI: the PC closes the loop, one setpoint per 4 ms tick, hard real-time, UDP.
+    # SOFT_RTI: the PC sends targets at ITS own rate (5-50 Hz) and the robot interpolates.
+    #
+    # A separate mode rather than a flag on RTI because the difference is not settings:
+    # the transport can differ (UDP or TCP), and the link diagnostics mean different things
+    # -- control_success_rate is packet loss when the PC sends once per tick and is
+    # meaningless at 20 Hz, where a perfectly healthy link scores 8%. An unnamed contract
+    # makes every metric need a mental asterisk.
+    #
+    # Both modes dispatch to the SAME RTIModeHandler, so every safety layer (soft joint
+    # limits, brake-at-limits, the TCP velocity cap, gravity comp, start-pose validation)
+    # is shared by construction and cannot be forgotten in one of them.
+    SOFT_RTI     = "SOFT_RTI"
     EXEC         = "EXEC" # AUTO?
     HAND_GUIDING = "HAND_GUIDING"
     IMPEDANCE    = "IMPEDANCE"
@@ -38,6 +54,7 @@ class RobotMode(str, Enum):
 REQUIRES_HOMED = frozenset({
     RobotMode.JOG,
     RobotMode.RTI,
+    RobotMode.SOFT_RTI,
     RobotMode.EXEC,
     RobotMode.HAND_GUIDING,
     RobotMode.IMPEDANCE,
@@ -63,7 +80,8 @@ MAINTENANCE_MODES = frozenset({
 VALID_TRANSITIONS = {
     RobotMode.BOOTING:      [RobotMode.IDLE,    RobotMode.SAFETY_STOP],
     RobotMode.IDLE:         [RobotMode.HOMING,  RobotMode.JOG,
-                             RobotMode.RTI,     RobotMode.EXEC,
+                             RobotMode.RTI,     RobotMode.SOFT_RTI,
+                             RobotMode.EXEC,
                              RobotMode.HAND_GUIDING, RobotMode.IMPEDANCE,
                              RobotMode.SAFETY_STOP, RobotMode.FLASHING],
     # ACTIVE_ERROR → FLASHING is the RECOVERY path: a driver left in its
@@ -77,6 +95,11 @@ VALID_TRANSITIONS = {
     RobotMode.HOMING:       [RobotMode.IDLE,    RobotMode.SAFETY_STOP],
     RobotMode.JOG:          [RobotMode.IDLE,    RobotMode.SAFETY_STOP],
     RobotMode.RTI:          [RobotMode.IDLE,    RobotMode.SAFETY_STOP],
+    # Deliberately NOT RTI <-> SOFT_RTI directly. They are different contracts with
+    # different timeouts and different transports; swapping between them under a live
+    # claim would leave the PC streaming into a link whose rules changed underneath it.
+    # Via IDLE means the claim is dropped and re-made, which is the honest sequence.
+    RobotMode.SOFT_RTI:     [RobotMode.IDLE,    RobotMode.SAFETY_STOP],
     RobotMode.EXEC:         [RobotMode.IDLE,    RobotMode.SAFETY_STOP],
     RobotMode.HAND_GUIDING: [RobotMode.IDLE,    RobotMode.SAFETY_STOP],
     RobotMode.IMPEDANCE:    [RobotMode.IDLE,    RobotMode.SAFETY_STOP],
@@ -85,7 +108,7 @@ VALID_TRANSITIONS = {
 }
 
 
-def request_enable(errors_active, safety_active):
+def request_enable(errors_active: bool, safety_active: bool) -> tuple[bool, str]:
     """
     Validate an enable request.
 
@@ -99,8 +122,8 @@ def request_enable(errors_active, safety_active):
     return True, "OK"
 
 
-def request_mode_change(current_mode, requested_mode, robot_enabled, homed,
-                        errors_active, park_ok=True):
+def request_mode_change(current_mode: RobotMode | str, requested_mode: RobotMode | str, robot_enabled: bool, homed: bool,
+                        errors_active: bool, park_ok: bool = True) -> tuple[bool, RobotMode, str]:
     """
     Validate and approve a mode transition.
 

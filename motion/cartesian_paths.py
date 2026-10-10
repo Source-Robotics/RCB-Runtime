@@ -5,6 +5,10 @@ not solve IK, time-parameterize, or send anything to RTI.  The planner can use t
 samples for dry-run validation first and later for real Cartesian execution.
 """
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -27,7 +31,7 @@ class CartesianPath:
         return len(self.poses)
 
 
-def pose_from_xyz_rpy(args, label="pose"):
+def pose_from_xyz_rpy(args: Sequence[float], label: str = "pose") -> SE3:
     """Build SE3 from [x, y, z, rx, ry, rz], using meters and radians."""
     if len(args) < 6:
         raise ValueError(f"{label} needs [x, y, z, rx, ry, rz], got {len(args)} values")
@@ -56,8 +60,8 @@ def sample_count_for_line(start_pose, target_pose, max_translation_step=0.01,
     return int(np.clip(max(2, by_translation, by_rotation), 2, int(max_samples)))
 
 
-def cartesian_line(start_pose, target_pose, samples=None, max_translation_step=0.01,
-                   max_rotation_step=np.deg2rad(2.0), max_samples=500):
+def cartesian_line(start_pose: SE3, target_pose: SE3, samples: int | None = None, max_translation_step: float = 0.01,
+                   max_rotation_step: float = np.deg2rad(2.0), max_samples: int = 500) -> CartesianPath:
     """Sample a straight Cartesian line with spherical orientation interpolation."""
     if samples is None:
         samples = sample_count_for_line(
@@ -87,7 +91,7 @@ def cartesian_line(start_pose, target_pose, samples=None, max_translation_step=0
 # buffers; the hot-path allocation rules in CLAUDE.md don't apply here.
 # ---------------------------------------------------------------------------
 
-def _pose_from_R_t(R, t):
+def _pose_from_rot_trans(R, t):
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = R
     T[:3, 3] = t
@@ -101,10 +105,10 @@ def _linear_segment_poses(start_pose, end_pose, samples, s_start=0.0, s_end=1.0,
     translations = (1.0 - s)[:, None] * start_pose.t + s[:, None] * end_pose.t
     rotations = Rotation.from_matrix([start_pose.A[:3, :3], end_pose.A[:3, :3]])
     interp_rotations = Slerp([0.0, 1.0], rotations)(s).as_matrix()
-    return [_pose_from_R_t(R, t) for R, t in zip(interp_rotations, translations)]
+    return [_pose_from_rot_trans(R, t) for R, t in zip(interp_rotations, translations)]
 
 
-def interp_pose(start_pose, end_pose, s):
+def interp_pose(start_pose: SE3, end_pose: SE3, s: float) -> SE3:
     """Single-point SE3 interpolation at fraction s — used for blend-zone endpoints."""
     return _linear_segment_poses(start_pose, end_pose, 1, s, s)[0]
 
@@ -191,7 +195,7 @@ def _positive_angle(start_vector, end_vector, normal):
     return angle if angle >= 0.0 else angle + 2.0 * np.pi
 
 
-def cartesian_arc_3point(start_pose, via_pose, end_pose, samples=None):
+def cartesian_arc_3point(start_pose: SE3, via_pose: SE3, end_pose: SE3, samples: int | None = None) -> CartesianPath:
     """Sample the unique circular arc passing through start, via, and end.
 
     Translation follows the arc. Orientation uses SLERP from start to end; the
@@ -220,10 +224,11 @@ def cartesian_arc_3point(start_pose, via_pose, end_pose, samples=None):
     rotations = Rotation.from_rotvec(np.outer(fractions * end_angle, normal))
     positions = center + rotations.apply(start_pose.t - center)
     orient = _slerp_matrices(start_pose, end_pose, fractions)
-    return _curve_path([_pose_from_R_t(R, p) for R, p in zip(orient, positions)])
+    return _curve_path([_pose_from_rot_trans(R, p) for R, p in zip(orient, positions)])
 
 
-def cartesian_circle(start_pose, center, normal, turns=1.0, samples=None):
+def cartesian_circle(start_pose: SE3, center: Sequence[float] | np.ndarray, normal: Sequence[float] | np.ndarray,
+                     turns: float = 1.0, samples: int | None = None) -> CartesianPath:
     """Sample a full circular TCP path around an explicit center and plane normal.
 
     The TCP orientation stays fixed. A negative turn count reverses direction.
@@ -262,10 +267,10 @@ def cartesian_circle(start_pose, center, normal, turns=1.0, samples=None):
     rotations = Rotation.from_rotvec(np.outer(fractions * total_angle, normal))
     positions = center + rotations.apply(radial)
     fixed_R = start_pose.A[:3, :3]
-    return _curve_path([_pose_from_R_t(fixed_R, p) for p in positions])
+    return _curve_path([_pose_from_rot_trans(fixed_R, p) for p in positions])
 
 
-def cartesian_spline(start_pose, waypoint_poses, samples=None):
+def cartesian_spline(start_pose: SE3, waypoint_poses: Sequence[SE3], samples: int | None = None) -> CartesianPath:
     """Sample an interpolating cubic position spline through Cartesian waypoints.
 
     Positions use a chord-length parameterization and pass through every waypoint.
@@ -308,8 +313,8 @@ def cartesian_spline(start_pose, waypoint_poses, samples=None):
     orientations_dense = orientation_spline(parameter_dense).as_matrix()
     dense_translation = np.linalg.norm(np.diff(positions_dense, axis=0), axis=1)
     dense_rotation = np.array([
-        _rotation_angle(_pose_from_R_t(orientations_dense[i], positions_dense[i]),
-                        _pose_from_R_t(orientations_dense[i + 1], positions_dense[i + 1]))
+        _rotation_angle(_pose_from_rot_trans(orientations_dense[i], positions_dense[i]),
+                        _pose_from_rot_trans(orientations_dense[i + 1], positions_dense[i + 1]))
         for i in range(len(parameter_dense) - 1)
     ], dtype=np.float64)
     metric_dense = np.concatenate((
@@ -320,7 +325,7 @@ def cartesian_spline(start_pose, waypoint_poses, samples=None):
     parameter_eval = np.interp(metric_targets, metric_dense, parameter_dense)
     positions = np.asarray(position_spline(parameter_eval), dtype=np.float64)
     orient = orientation_spline(parameter_eval).as_matrix()
-    return _curve_path([_pose_from_R_t(R, p) for R, p in zip(orient, positions)])
+    return _curve_path([_pose_from_rot_trans(R, p) for R, p in zip(orient, positions)])
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +395,8 @@ def _bezier_positions(entry_pose, waypoint_pose, exit_pose, t, continuity="c1"):
             + np.outer(t * t, exit_pose.t))
 
 
-def blend_zone_poses(entry_pose, waypoint_pose, exit_pose, spacing, continuity="c1"):
+def blend_zone_poses(entry_pose: SE3, waypoint_pose: SE3, exit_pose: SE3, spacing: float,
+                     continuity: str = "c1") -> tuple[list[SE3], float]:
     """Sample a quadratic-Bezier corner-blend zone at uniform path length.
 
     Position follows P(t) = (1-t)^2*E + 2t(1-t)*W + t^2*X — tangent to the
@@ -418,7 +424,7 @@ def blend_zone_poses(entry_pose, waypoint_pose, exit_pose, spacing, continuity="
 
     positions = _bezier_positions(entry_pose, waypoint_pose, exit_pose, t_at, continuity)
     rotations = _slerp_matrices(entry_pose, exit_pose, t_at)
-    return [_pose_from_R_t(R, p) for R, p in zip(rotations, positions)], total
+    return [_pose_from_rot_trans(R, p) for R, p in zip(rotations, positions)], total
 
 
 def linear_segment_arclen(start_pose, end_pose, spacing, s_start=0.0, s_end=1.0):
@@ -460,9 +466,9 @@ def _capped_spacing(spacing, waypoints):
     return max(spacing, approx / MAX_PATH_SAMPLES)
 
 
-def build_composite_cartesian_path(waypoints, blend_radii_mm, arclen_spacing=None,
-                                   samples_per_segment=None, start_trim=0.0,
-                                   continuity="c1", return_blend_zones=False):
+def build_composite_cartesian_path(waypoints: Sequence[SE3], blend_radii_mm: Sequence[float], arclen_spacing: float | None = None,
+                                   samples_per_segment: int | None = None, start_trim: float = 0.0,
+                                   continuity: str = "c1", return_blend_zones: bool = False) -> tuple:
     """Build a composite Cartesian path with Bezier blend zones at intermediate waypoints.
 
     Concatenates linear Cartesian segments connected by quadratic-Bezier blend

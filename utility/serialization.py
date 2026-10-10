@@ -1,5 +1,10 @@
 """Serialise Joint_data deques to compact strings for telemetry / logging."""
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+from collections import deque
+
 import numpy as np
 
 DEFAULT_PRECISION = 3
@@ -45,7 +50,7 @@ def serialize_joint_data(Joint_data, fields, precision_map=None):
     return ",".join(parts)
 
 
-def serialize_optimized(Joint_data, fields, precision_map=None):
+def serialize_optimized(Joint_data: deque, fields: Sequence[str], precision_map: dict | None = None) -> str:
     """Faster serialiser — avoids np.array2string overhead for arrays."""
     if not Joint_data:
         return ""
@@ -150,7 +155,7 @@ def _serialize_motor_tag(motor_buffers, tag, precision, node_ids):
     return f"{tag}:" + ",".join(formatted)
 
 
-def serialize_motor_data(motor_buffers, fields, precision_map, joint_num):
+def serialize_motor_data(motor_buffers: dict, fields: Sequence[str], precision_map: dict, joint_num: int) -> str:
     """Serialise the latest raw motor sample per arm joint to "tag:v0,v1,...".
 
     motor_buffers is a dict of {"data", "temperature", "voltage"} → per-node
@@ -197,7 +202,7 @@ _CONFIG_TAG_KEY = {
 }
 
 
-def serialize_motor_config(motor_buffers, fields, precision_map, joint_num):
+def serialize_motor_config(motor_buffers: dict, fields: Sequence[str], precision_map: dict, joint_num: int) -> str:
     """Serialise arm motor PID/limit config — one value per joint per tag.
 
     Reads from motor_buffers["config"], which is the shared_data.motor_config
@@ -220,7 +225,7 @@ def serialize_motor_config(motor_buffers, fields, precision_map, joint_num):
     return ",".join(parts)
 
 
-def serialize_gripper_config(motor_buffers, fields, precision_map):
+def serialize_gripper_config(motor_buffers: dict, fields: Sequence[str], precision_map: dict) -> str:
     """Serialise gripper PID/limit config — single value per tag.
 
     Reads from motor_buffers["config"]. Gripper config arrays are length 1.
@@ -241,7 +246,7 @@ def serialize_gripper_config(motor_buffers, fields, precision_map):
     return ",".join(parts)
 
 
-def serialize_gripper_motor_data(motor_buffers, fields, precision_map, gripper_id):
+def serialize_gripper_motor_data(motor_buffers: dict, fields: Sequence[str], precision_map: dict, gripper_id: int) -> str:
     """Serialise raw motor-side data for the gripper CAN node.
 
     Same motor_buffers dict as serialize_motor_data, but iterates only the

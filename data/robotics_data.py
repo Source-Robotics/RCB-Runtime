@@ -36,7 +36,7 @@ TAGS = {
     #   TCP_p       — human-readable, but its RPY has GIMBAL LOCK at pitch = +/-90 deg
     #   TCP_p_SE3   — full 4x4, no singularity, 16 values (the widest on the wire)
     #   TCP_p_quat  — orientation only, no singularity, 4 values. Use for orientation
-    #                 error / SLERP. (w, x, y, z) — SCALAR FIRST, w >= 0. ROS/SciPy want
+    #                 error / SLERP. (w, x, y, z) — SCALAR FIRST, w >= 0. Many libraries want
     #                 (x, y, z, w): reorder at the consumer with q[[1, 2, 3, 0]].
     "TCP_p_SE3":  {"src": "joint",   "prec": 6, "desc": "TCP pose as flattened 4x4 SE(3) matrix, row-major (16 values)"},
     "TCP_p_quat": {"src": "joint",   "prec": 6, "desc": "TCP orientation as unit quaternion [w,x,y,z] — SCALAR FIRST, w>=0 (4 values)"},

@@ -16,11 +16,21 @@ import numpy as np
 from multiprocessing import shared_memory, resource_tracker
 import json
 import argparse
+import os
+
+# Test namespace (2026-10-02, TODO/refactor_plan.md Phase 0.2). Segment names are fixed, so any process that calls
+# setup() on the robot attaches to RTI's LIVE memory — including an offline test net, which then reads or WRITES
+# the running robot's state (test_kt_source.py wrote motor_Kt_source[:] = 9). With RCB_SHM_PREFIX set, every
+# segment name gets that prefix: a net creates its own private segments and cannot reach the robot's. tools/run_nets.py
+# sets it per net; dummy_test_scripts/_shm_sandbox.py sets it for a net run by hand. Unset (the robot's processes,
+# the dashboard, the api_tests) = the names are exactly what they always were.
+_SHM_PREFIX = os.environ.get("RCB_SHM_PREFIX", "")
 
 # ======================= SharedString Class ==========================
 class SharedString:
     """A wrapper for string shared memory with 4-byte length prefix."""
     def __init__(self, name: str, size: int = 256):
+        name = _SHM_PREFIX + name
         self.size = size
         try:
             self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
@@ -62,6 +72,15 @@ class SharedString:
         pad_len = self.size - end
         self.shm.buf[end:end+pad_len] = b"\x00" * pad_len
 
+    def set_truncated(self, value: str):
+        """set(), cut to fit the block at a character boundary — for DISPLAY strings that must never raise.
+        RTI.py copies every received command into robot_command (256 bytes) before handling it; a 1.1 kB
+        set_joint_walls message made set() raise there and killed RTI (2026-10-01)."""
+        data = value.encode("utf-8")
+        if len(data) > self.size - 4:
+            value = data[:self.size - 4].decode("utf-8", "ignore")
+        self.set(value)
+
     def get(self) -> str:
         length = int.from_bytes(self.shm.buf[:4], "little")
         return bytes(self.shm.buf[4:4+length]).decode("utf-8")
@@ -80,6 +99,8 @@ _initialized = False
 # Global containers – filled by setup()
 robot_mode = robot_state = error_state = None
 homed_state = sim_mode = robot_command = None  # SharedString globals
+force_confirm_who = None                   # SharedString: who is asking to force a control
+                                            # takeover ("ip:port"), for the OLED prompt
 motor_shms = motor_arrays = joint_shms = joint_arrays = None
 tcp_shms = tcp_arrays = ext_shms = ext_arrays = None
 shm_GPIO = gpio_states = None
@@ -101,6 +122,7 @@ motor_config = {}  # Per-joint PID gains and limits currently loaded to motor dr
 
 # ======================= Helper ==========================
 def _attach_or_create(name: str, dtype, count: int):
+    name = _SHM_PREFIX + name
     try:
         shm = shared_memory.SharedMemory(name=name)
         # --- FIX FOR LINUX ---
@@ -147,6 +169,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
     """
     global joint_num, _initialized
     global robot_mode, robot_state, error_state, homed_state, sim_mode, robot_command
+    global force_confirm_who
     global motor_shms, motor, joint_shms, joint
     global tcp_shms, tcp
     global shm_GPIO, gpio_states
@@ -179,13 +202,18 @@ def setup(joints: int = 6, force_reinit: bool = False):
     error_state = SharedString("error_state", 4096)
     homed_state = SharedString("homed_state", 256)
     robot_command = SharedString("robot_command", 256)
+    # Who is asking to take control, e.g. "192.168.1.50:51377". The OLED must NAME them:
+    # granting blind is how the wrong session ends up with the arm.
+    force_confirm_who = SharedString("force_confirm_who", 256)
 
     strings_created = force_reinit or any(
-        ref.created for ref in (robot_mode, sim_mode, robot_state, error_state, homed_state, robot_command)
+        ref.created for ref in (robot_mode, sim_mode, robot_state, error_state, homed_state,
+                                robot_command, force_confirm_who)
     )
     if strings_created:
         sim_mode.set("ON")
         robot_command.set("HOME")
+        force_confirm_who.set("")
         robot_mode.set("IDLE")
         robot_state.set("DISABLED") # 2 States: "DISABLED" and "ENABLED"
         homed_state.set("NOT HOMED") # 2 States: "HOMED" and "NOT HOMED"
@@ -196,7 +224,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
     """
                 [
             {
-                "key": "J0:WATCHDOG",
+                "key": "J1:WATCHDOG",
                 "timestamp": 1711468800.123456,
                 "tick": 21,
                 "description": "watchdog error — motor did not receive a command in time."
@@ -347,6 +375,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
         ("joint_acceleration_target", np.float64, joint_num),
         ("joint_torque_target",     np.float64, joint_num),
         ("joint_gravity_torque", np.float64, joint_num),  # gravity compensation torque in Nm (joint space)
+        ("joint_friction_comp_torque", np.float64, joint_num),  # friction compensation added this tick, Nm (0 when off)
         ("compensation_torque",  np.int32,   joint_num),  # gravity compensation current in motor mA (motor space)
         ("jog_blocked",          np.int8,    joint_num),
     ]:
@@ -363,7 +392,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
         ("robot_pose_matrix",          np.float64, 16),
         # Same measured orientation as the two above, as a unit quaternion.
         # ⚠️ ORDER IS (w, x, y, z) — SCALAR FIRST (spatialmath/Eigen/MATLAB convention,
-        # which is what this stack already uses). ROS/tf2 and SciPy want (x, y, z, w) —
+        # which is what this stack already uses). Many other libraries want (x, y, z, w) —
         # reorder with q[[1, 2, 3, 0]]. Mixing them up yields a wrong rotation, not an error.
         # Canonicalized to w >= 0. Unlike robot_pose's RPY this has no gimbal lock, so it is
         # the channel to use for orientation error / SLERP. Measured only: the commanded and
@@ -547,6 +576,54 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "software_estop",           # GUI sets to 1 to assert software e-stop; 0 to release
         "robot_can_connected",      # 1.0 if all motor joints have no CAN errors, 0.0 otherwise
         "gravity_comp_enabled",     # 1.0 = gravity compensation active, 0.0 = zeroed (hold with vel=0 in IDLE)
+        "friction_comp_enabled",    # 1.0 = friction compensation in freedrive (utility/friction_comp.py); starts 0
+        # Runtime payload (utility/payload.py, set_payload): the part the gripper holds — mass [kg] and its centre
+        # of mass [m] in the tool link's frame. 0 at every RTI start (not persisted). Read by status() and the GUI.
+        "payload_mass",
+        "payload_com_x",
+        "payload_com_y",
+        "payload_com_z",
+        # --- Self-collision (utility/self_collision.py, self_collision_worker.py; TODO/self_collision_plan.md 2026-10-06) ---
+        # Written by the collision WORKER process (another core, ~100 Hz) from the measured pose; read by RTI's safety
+        # monitor and jog handler each tick. Frames: 0 = base, 1-5 = the links after joints 1-5, 6 = the tool.
+        "sc_heartbeat",             # monotonic counter, +1 per worker cycle; RTI treats a stalled one as SELF_COLLISION_STALE
+        "sc_hit",                   # 1.0 = two links are within the MONITOR margin on the measured pose (-> SELF_COLLISION)
+        "sc_pair_a",                # the deepest flagged pair's frames (0-6), valid while sc_hit
+        "sc_pair_b",
+        "sc_min_gap",               # m: the flagged pair's gap (the deepest, negative = overlap) while sc_hit, else the planner margin
+        # The jog's ray (robotics/jog.py, 2026-10-07): the jog handler publishes its session (rti['jog_ref'] /
+        # rti['jog_dir'] arrays below, then this number); the worker answers with the free length along it.
+        "jog_session",              # written by RTI's jog handler: +1 per new jog direction (a "session" = one ray)
+        "sc_ray_session",           # the session the worker's answer is for (written AFTER sc_ray_free / sc_ray_done)
+        "sc_ray_free",              # rad along the ray from jog_ref: free of the jog margin (a frontier, then the exact entry)
+        "sc_ray_done",              # 1.0 = sc_ray_free is final (the margin's entry, or the scan reached the soft limits)
+        # The worker's state for the dashboard (2026-10-07, S3f / S3g) — written by the worker only, read by the GUI and
+        # api_tests; RTI never reads them.
+        "sc_near_a",                # the link pair nearest its own JOG margin (frames 0-6), -1 when none within readout_mm
+        "sc_near_b",
+        "sc_near_gap",              # m: that pair's gap (+inf when none); refreshed every 20th worker cycle (5 Hz)
+        "sc_near_margin",           # m: that pair's jog margin (where a jog stops)
+        "sc_jaw_closed",            # the closing fraction (0 open .. 1 closed) the worker places the jaws at; -1 = swept
+        "sc_cycle_ms",              # the worker's slowest recent cycle (ms; decays over ~1 s)
+        # --- Physical confirmation for a FORCED control takeover (arbitration plan 4.4) ---
+        # Industrial arms commonly require a physical action at the robot (a button on the arm, a
+        # pendant's enabling device) before one session can take control from another. We have neither, so without
+        # this any machine on the network can seize control from any other — which matters
+        # more now that the IP allowlist can be turned off entirely.
+        #
+        # Only a FORCED takeover is gated. A first claim on an idle robot needs no press, and
+        # should not: ownership attaches on the first owned command so a single-client setup
+        # behaves exactly as it always did.
+        "force_confirm_enabled",    # 1.0 = a forced takeover needs a button press. Operator
+                                    #   toggle, set from the GUI. Ships 0 so behaviour does
+                                    #   not change under anyone until it has run on the arm.
+        "force_confirm_pending",    # 1.0 = the executor is WAITING for a press right now.
+                                    #   Supervisor draws the OLED prompt while this is set;
+                                    #   the executor clears it on grant, refusal or timeout.
+        "force_confirm_deadline",   # time.monotonic() (system-wide on Linux; NOT time.time(),
+                                    #   which NTP can step) by which the press must arrive, so the OLED
+                                    #   can count down and a crashed executor's stale pending
+                                    #   flag is visibly expired rather than prompting forever.
         # JOG live state — mirror of JogHandler config (see int32 block above for profile/control_mode)
         "jog_speed_pct",            # 0.0–1.0, last speed-slider value
         "jog_accel_time",           # seconds, ramp duration from 0 to full speed
@@ -609,6 +686,15 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "rti_discard_pct",
     ]:
         shm, arr = _attach_or_create(name, np.float64, 1)  # only 1 entry
+        rti_shms[name] = shm
+        rti[name] = arr
+
+    # Self-collision per link pair (2026-10-07, the escape rule): sc_pair_gaps[a * 7 + b] = that pair's gap (m,
+    # negative = overlap) while it is within the MONITOR margin on the measured pose, +inf otherwise. Written by the
+    # collision worker; RTI's monitor keeps what was already within the margin when an active mode began and
+    # stops only if a pair gets closer than that, or another pair comes within the margin.
+    for name, count in [("sc_pair_gaps", 49), ("jog_ref", joint_num), ("jog_dir", joint_num)]:
+        shm, arr = _attach_or_create(name, np.float64, count)
         rti_shms[name] = shm
         rti[name] = arr
 

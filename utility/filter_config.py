@@ -23,6 +23,8 @@ raises on a bad kind / missing tau / even window etc. — so a broken config fai
 load, never silently at runtime.
 """
 
+from __future__ import annotations
+
 import logging
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -48,7 +50,7 @@ def _channels(signal, joint_num):
     return joint_num
 
 
-def default_filter_config():
+def default_filter_config() -> dict:
     """The starting recommendation, used when no filter XML is present.
 
     Grounded in the 2026-07-17 rest-noise measurement + the poles==differentiations rule:
@@ -113,7 +115,7 @@ def _parse_signal(el, channels):
     return specs
 
 
-def parse_filter_config(source, joint_num):
+def parse_filter_config(source: str | Path | ET.Element, joint_num: int) -> dict:
     """Parse a <filters> config into {signal: [spec per channel]}.
 
     `source` may be a path (str/Path) or an already-parsed ElementTree Element. Any signal
@@ -139,7 +141,7 @@ def parse_filter_config(source, joint_num):
     return config
 
 
-def build_filter_banks(config, joint_num, dt):
+def build_filter_banks(config: dict, joint_num: int, dt: float) -> dict:
     """Turn a parsed config into ready-to-run banks: {signal: bank}. STARTUP/RELOAD only.
 
     Delegates every spec to create_filter_bank, so an invalid combination (median with an
@@ -152,7 +154,7 @@ def build_filter_banks(config, joint_num, dt):
     return banks
 
 
-def load_filter_banks(path, joint_num, dt):
+def load_filter_banks(path: str | Path, joint_num: int, dt: float) -> tuple[dict, str]:
     """Best-effort load: parse `path` if it exists and is valid, else fall back to defaults.
 
     Never raises — a missing or broken filter file must not stop the robot from booting; it

@@ -28,6 +28,30 @@ _QUEUE_MAX = 256          # bound the backlog so a wedged executor can't grow it
 _POLL_TIMEOUT = 0.5       # s; how often the idle worker re-checks the stop flag
 
 
+# How long the DASHBOARD may sit idle holding control before it lets go. The executor's own idle
+# timeout (30 s) exists mainly because of the dashboard — one permanent connection that would
+# otherwise own the robot forever after a single click — and 30 s is a long time to be locked out
+# after clicking Enable. A person is idle between clicks by nature; a script is not.
+GUI_IDLE_RELEASE_S = 5.0
+
+
+def auto_release_due(state, idle_s, jog_active=False, rti_active=False,
+                     threshold=GUI_IDLE_RELEASE_S):
+    """Should the dashboard hand control back now? Pure, so the rules can be tested.
+
+    Only ever releases what THIS connection holds, and never while anything it started is still
+    running: a queued program (the executor would keep the claim anyway; releasing would let a
+    second client interleave commands into the same queue), a held jog button, or a live RTI
+    session. Releasing is otherwise harmless: `jog_stop`, `stop`, `disable` and `safety_stop` are
+    never gated, so nothing that is already moving depends on holding control to be stopped.
+    """
+    if not state.get("mine"):
+        return False
+    if state.get("busy") or jog_active or rti_active:
+        return False
+    return idle_s >= threshold
+
+
 class ExecCommandSender:
     """Single-threaded, ordered, self-reconnecting command channel to command_executor.
 
@@ -55,6 +79,55 @@ class ExecCommandSender:
         except queue.Full:
             logging.warning("[GUI] command '%s' dropped: sender backlog full", label)
             self._on_error(label, RuntimeError("command sender backlog full"))
+
+    def submit_async(self, fn, label=""):
+        """Run fn(robot) on its OWN thread, outside the ordered queue.
+
+        For a call that blocks for a long time ON PURPOSE. A forced takeover waits up to 30 s
+        for someone to answer at the control box; on the ordered worker that would hold every
+        later command behind it — including Disable — for the whole wait. This shares the same
+        connection (ownership is per connection, so it must) but not the worker: RobotClient
+        serialises its sends and matches replies by id, so concurrent calls are safe, and the
+        executor now answers a takeover from a helper thread so it does not stall the
+        connection either.
+
+        Do NOT use this for commands whose ORDER matters (jog_set / jog_stop): submit() exists
+        precisely so a stop can never overtake the start that preceded it.
+        """
+        def _one():
+            if not (self._connected and self._robot.connected):
+                self._on_error(label, RuntimeError("command_executor unreachable"))
+                return
+            try:
+                fn(self._robot)
+            except Exception as exc:
+                logging.warning("[GUI] command '%s' failed: %s", label, exc)
+                self._on_error(label, exc)
+        threading.Thread(target=_one, name=f"gui-exec-{label or 'async'}", daemon=True).start()
+
+    def control_state(self):
+        """Who holds control, from this connection's point of view — for a status display.
+
+        {"connected", "holder", "mine", "other"}. `other` is True only when SOMEONE ELSE
+        demonstrably holds it: not connected, or nobody holding, both read as False, so a UI
+        built on this can never grey itself out just because the link is down. Reads the
+        status stream the executor already pushes on every change; no polling of the robot.
+        """
+        r = self._robot
+        if not (self._connected and r.connected):
+            return {"connected": False, "holder": None, "mine": False, "busy": False, "other": False}
+        try:
+            holder = r.control_holder()
+            mine = holder is not None and holder == r.local_label()
+        except Exception:
+            return {"connected": False, "holder": None, "mine": False, "busy": False, "other": False}
+        try:
+            pl = r.status().get("planner") or {}
+            busy = bool((pl.get("queue_depth") or 0) > 0 or pl.get("active_command"))
+        except Exception:
+            busy = True            # cannot tell -> assume busy: never release on a guess
+        return {"connected": True, "holder": holder, "mine": mine, "busy": busy,
+                "other": holder is not None and not mine}
 
     def close(self):
         self._stop.set()

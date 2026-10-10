@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: monitor_baseline
+    What the step-2 safety monitor will look at, one packet per RTI tick: measured vs commanded
+    position (tracking error), raw and filtered speed, commanded speed, TCP speed, motor
+    temperature, tick and mode. Used by api_tests/46_monitor_baseline.py to measure normal
+    values before any threshold is chosen (TODO/safety_stack_research.md §8, step 2a).
+    j_p / j_pc at 5 decimals (1e-5 rad = 0.0006 deg): tracking errors of a few hundredths of a
+    degree must not be lost to rounding.
+-->
+<recipe name="monitor_baseline">
+    <field tag="j_p"     precision="5"/>
+    <field tag="j_pc"    precision="5"/>
+    <field tag="j_s"     precision="4"/>
+    <field tag="j_s_f"   precision="4"/>
+    <field tag="j_sc"    precision="4"/>
+    <field tag="TCP_s"   precision="4"/>
+    <field tag="TCP_s_f" precision="4"/>
+    <field tag="m_temp"  precision="1"/>
+    <field tag="tick"/>
+    <field tag="mode"/>
+</recipe>

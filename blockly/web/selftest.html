@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Block editor self-test</title>
+<style>
+  body { margin: 16px; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #1f2933; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  #summary { font-weight: 600; margin: 8px 0 12px; }
+  .pass { color: #2e7d32; } .fail { color: #c62828; } .info { color: #667085; }
+  li { margin: 2px 0; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+  #box { width: 800px; height: 420px; border: 1px solid #d9dde3; margin-top: 16px; display: none; }
+</style>
+</head>
+<body>
+<h1>Block editor self-test (TODO/blockly_plan.md B0)</h1>
+<div class="info">Runs in YOUR browser — the Pi has none. Open it with the robot's internet access blocked as it
+  normally is; everything must still pass.</div>
+<div id="summary">running…</div>
+<ul id="results"></ul>
+<div id="box"></div>
+
+<script src="vendor/blockly-13.3.0/blockly_compressed.js"></script>
+<script src="vendor/blockly-13.3.0/blocks_compressed.js"></script>
+<script src="vendor/blockly-13.3.0/msg/en.js"></script>
+<script src="blocks/program.js"></script>
+<script src="blocks/motion.js"></script>
+<script src="blocks/positions.js"></script>
+<script src="blocks/gripper_io.js"></script>
+<script src="toolbox.js"></script>
+<script src="demo.js"></script>
+<script src="editor.js"></script>
+<script>
+'use strict';
+const results = [];
+function check(name, ok, detail) {
+  results.push({name, ok: !!ok, detail});
+  const li = document.createElement('li');
+  li.className = ok ? 'pass' : 'fail';
+  li.textContent = (ok ? 'PASS  ' : 'FAIL  ') + name + (detail !== undefined ? '   [' + detail + ']' : '');
+  document.getElementById('results').appendChild(li);
+}
+function info(text) {
+  const li = document.createElement('li');
+  li.className = 'info';
+  li.textContent = 'info  ' + text;
+  document.getElementById('results').appendChild(li);
+}
+const frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+(async () => {
+  try {
+    info(navigator.userAgent);
+    check('Blockly is the vendored 13.3.0', Blockly.VERSION === '13.3.0', Blockly.VERSION);
+    const types = [];
+    (function walk(items) {
+      for (const item of items) {
+        if (item.kind === 'block') types.push(item.type);
+        if (item.contents) walk(item.contents);
+      }
+    })(RCB_TOOLBOX.contents);
+    const missing = types.filter((t) => !Blockly.Blocks[t]);
+    check('every toolbox block is defined', missing.length === 0, missing.join(', ') || types.length + ' types');
+
+    // 1. mounted into a HIDDEN container (a dashboard tab that is not shown): waits until it has a size.
+    const box = document.getElementById('box');
+    let editor = null;
+    const mounted = RCBBlocks.mount(box).then((e) => { editor = e; });
+    await sleep(300);
+    check('a hidden container is not injected yet', editor === null);
+    box.style.display = 'block';
+    await Promise.race([mounted, sleep(3000)]);
+    check('shown: the editor injects', editor !== null);
+    if (!editor) throw new Error('no editor');
+    const ws = editor.workspace;
+    const svgWidth = () => Math.round(ws.getParentSvg().getBoundingClientRect().width);
+    check('the workspace fills the container', Math.abs(svgWidth() - box.clientWidth) <= 2,
+          svgWidth() + ' vs ' + box.clientWidth);
+    const tb = ws.getToolbox();
+    check('the toolbox is laid out', tb && tb.getWidth() > 0, tb ? tb.getWidth() : 'none');
+
+    // 2. hidden again and resized while hidden, then shown: follows the container.
+    box.style.display = 'none';
+    await frame();
+    box.style.width = '600px';
+    box.style.display = 'block';
+    await frame(); await sleep(100);
+    check('shown again at a new size: the workspace follows', Math.abs(svgWidth() - 600) <= 2, svgWidth());
+
+    // 3. save -> load -> save is identical.
+    editor.load(RCB_DEMO);
+    const s1 = editor.save();
+    editor.load(s1);
+    const s2 = editor.save();
+    check('save -> load -> save is identical (ids kept)', JSON.stringify(s1) === JSON.stringify(s2),
+          JSON.stringify(s1).length + ' chars');
+    const statements = ws.getAllBlocks(false).filter((b) => b.previousConnection);
+    check('the demo has 5 statement blocks', statements.length === 5, statements.length);
+
+    // 4. read-only, switched while running.
+    editor.setReadOnly(true);
+    const any = statements[0];
+    check('read-only on: the workspace says so', editor.isReadOnly() === true);
+    check('read-only on: a block cannot be edited', any.isEditable() === false);
+    info('read-only on: block movable=' + any.isMovable() + ' deletable=' + any.isDeletable());
+    editor.setReadOnly(false);
+    check('read-only off: editable again', editor.isReadOnly() === false && any.isEditable() === true);
+
+    // 5. the Pi writes the Python.
+    const r = await editor.generate('selftest');
+    check('the Pi generates Python for the demo', r.ok === true, r.ok ? '' : r.message);
+    if (r.ok) {
+      const unmarked = statements.filter((b) => !r.python.includes("rt.block('" + b.id + "')"));
+      check('every statement block is marked for the highlight', unmarked.length === 0,
+            unmarked.map((b) => b.type).join(', ') || 'all 5');
+      check('20 % is sent as the fraction 0.2', r.python.includes('speed=0.2)'));
+    }
+    let threw = null;
+    try { editor.highlight(statements[1].id); editor.highlight(null); } catch (e) { threw = e; }
+    check('highlight a block and clear it', threw === null, threw ? String(threw) : '');
+
+    // 6. a refused program names its block, and the editor shows it.
+    const move = statements.find((b) => b.type === 'rcb_move_joints');
+    move.getInputTargetBlock('TARGET').dispose(false);
+    const bad = await editor.generate('selftest');
+    check('an empty target is refused, naming its block', bad.ok === false && bad.block === move.id,
+          bad.message);
+    check('the refused block is marked', editor.markError(bad.block, bad.message) === true);
+    editor.clearErrors();
+
+    // 7a. the point dropdown never re-targets a block by itself.
+    editor.setPoints(['a']);
+    editor.load({blocks: {languageVersion: 0, blocks: [
+      {type: 'rcb_point', id: 'pt', x: 10, y: 10, fields: {NAME: 'ghost'}}]}});
+    const pf = ws.getBlockById('pt').getField('NAME');
+    check('a point that does not exist keeps its name', pf.getValue() === 'ghost', pf.getValue());
+    check('... and says it is missing', /missing/.test(pf.getText()), pf.getText());
+    editor.setPoints(['a', 'ghost']);
+    check('taught again: the same block shows it plainly', pf.getValue() === 'ghost' && !/missing/.test(pf.getText()),
+          pf.getText());
+
+    // 7b. every toolbox block, as Blockly itself serialises it, is understood by the Pi — the block shapes
+    //     (web/blocks) and the generator (codegen.py) agree on every field name and dropdown value.
+    RCB_POINTS.names = ['p'];
+    const points = {p: {joints_deg: [90, -105, 165, 0, -30, 180], pose: [0.25, 0, 0.2, 3.14, 0, 0]}};
+    const items = [];
+    (function walk(list) {
+      for (const it of list) {
+        if (it.kind === 'block') items.push(it);
+        if (it.contents) walk(it.contents);
+      }
+    })(RCB_TOOLBOX.contents);
+    items.push({type: 'variables_set', inputs: {VALUE: {block: {type: 'math_number', fields: {NUM: 3}}}}});
+    const wrong = [];
+    const acceptable = /is empty|inside a loop/;
+    for (const item of items) {
+      const scratch = new Blockly.Workspace();
+      const variable = scratch.getVariableMap().createVariable('n', '', 'nid');
+      const state = Object.assign({}, item);
+      delete state.kind;
+      if (item.type === 'variables_set') state.fields = {VAR: {id: variable.getId()}};
+      const start = Blockly.serialization.blocks.append({type: 'rcb_start'}, scratch);
+      const b = Blockly.serialization.blocks.append(state, scratch);
+      if (b.outputConnection) {
+        const check_ = b.outputConnection.getCheck() || [];
+        const wrapper = check_.some((c) => ['Point', 'Joints', 'Pose'].includes(c))
+          ? Blockly.serialization.blocks.append({type: 'rcb_move_joints'}, scratch)
+          : check_.includes('Boolean') ? Blockly.serialization.blocks.append({type: 'controls_if'}, scratch)
+            : Blockly.serialization.blocks.append({type: 'rcb_log'}, scratch);
+        const socket = wrapper.getInput('TARGET') || wrapper.getInput('IF0') || wrapper.getInput('TEXT');
+        socket.connection.connect(b.outputConnection);
+        start.nextConnection.connect(wrapper.previousConnection);
+      } else {
+        start.nextConnection.connect(b.previousConnection);
+      }
+      const resp = await fetch('api/codegen', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({workspace: Blockly.serialization.workspaces.save(scratch), name: 'each', points})});
+      const r = await resp.json();
+      if (!r.ok && !acceptable.test(r.message)) wrong.push(item.type + ': ' + r.message);
+      scratch.dispose();
+    }
+    check(`every toolbox block (${items.length}) is understood by the Pi`, wrong.length === 0, wrong.join(' | '));
+
+    // 7. nothing came from outside this robot.
+    await sleep(300);
+    const foreign = performance.getEntriesByType('resource').map((e) => e.name)
+      .filter((u) => !u.startsWith(location.origin));
+    check('nothing loaded from outside the robot', foreign.length === 0, foreign.join(' ') || 'none');
+    check('Blockly media comes from the vendored folder',
+          ws.options.pathToMedia === RCBBlocks.MEDIA, ws.options.pathToMedia);
+  } catch (e) {
+    check('the self-test ran to the end', false, String(e && e.stack || e));
+  }
+  const failed = results.filter((x) => !x.ok).length;
+  const summary = document.getElementById('summary');
+  summary.textContent = failed ? `${failed} FAILED of ${results.length}` : `ALL ${results.length} PASS`;
+  summary.className = failed ? 'fail' : 'pass';
+  document.title = summary.textContent;
+})();
+</script>
+</body>
+</html>

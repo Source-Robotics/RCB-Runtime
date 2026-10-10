@@ -277,7 +277,7 @@ instead of a traceback.
 | `nicegui_test.py` | NiceGUI dashboard |
 | `supervisor.py` | OLED/buttons/LEDs, UART PCB IO, process supervision |
 
-`nicegui_test.py` is the current operator dashboard. `gui.py` is kept for now as a simpler legacy dashboard while the public runtime settles.
+`nicegui_test.py` is the operator dashboard (the earlier `gui.py` was removed on 2026-10-03; it was launched by nothing).
 
 Only `RTI.py` is intended to request real-time scheduling and a pinned core. The
 service grants permission for that child process but does not make every process

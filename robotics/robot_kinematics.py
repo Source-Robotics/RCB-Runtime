@@ -64,22 +64,6 @@ def get_tcp_pose_rpy(robot, joint_position, order='xyz'):
     return np.concatenate((translation_xyz, rpy_angles))
 
 
-def get_tcp_pose_matrix(robot, joint_position):
-    """
-    Get TCP pose as flattened 4x4 transformation matrix.
-    
-    Args:
-        robot: Robot object
-        joint_position (np.array): Joint positions in radians
-    
-    Returns:
-        np.array: 16-element flattened 4x4 matrix
-    """
-    TT = calculate_forward_kinematics(robot, joint_position)
-    pose_matrix_4x4 = TT.A  # Convert to numpy format
-    return pose_matrix_4x4.flatten()
-
-
 # ==========================================================================
 # Inverse Kinematics
 # ==========================================================================
@@ -152,47 +136,9 @@ def calculate_jacobian(robot, joint_position, T=None):
     return robot.jacob0(q=joint_position, T=T)
 
 
-def calculate_analytical_jacobian(robot, joint_position, representation='rpy/xyz', T=None):
-    """
-    Calculate analytical Jacobian matrix.
-    
-    Args:
-        robot: Robot object
-        joint_position (np.array): Joint positions in radians
-        representation (str): Representation type (default: 'rpy/xyz')
-                             Options: 'rpy/xyz', 'rpy/zyx', 'eul', 'exp'
-        T (SE3): Transformation matrix (optional)
-    
-    Returns:
-        np.array: 6xN analytical Jacobian matrix
-    """
-    if T is None:
-        T = robot.fkine(joint_position)
-    
-    return robot.jacob0_analytical(q=joint_position, representation=representation, T=T)
-
-
 # ==========================================================================
 # TCP Velocity Calculations
 # ==========================================================================
-
-def calculate_tcp_velocity(robot, joint_position, joint_speed, T=None):
-    """
-    Calculate TCP velocity from joint velocities using Jacobian.
-    
-    Args:
-        robot: Robot object
-        joint_position (np.array): Joint positions in radians
-        joint_speed (np.array): Joint speeds in rad/s
-        T (SE3): Transformation matrix (optional)
-    
-    Returns:
-        np.array: 6x1 TCP velocity [vx, vy, vz, wx, wy, wz]
-                 Linear velocities in m/s, angular in rad/s
-    """
-    J = calculate_jacobian(robot, joint_position, T)
-    return J @ joint_speed
-
 
 # ==========================================================================
 # Manipulability
@@ -215,21 +161,6 @@ def calculate_manipulability_yoshikawa(robot, joint_position, J=None):
     
     w = np.sqrt(np.linalg.det(J @ J.T))
     return w
-
-
-def calculate_manipulability(robot, joint_position, J=None):
-    """
-    Calculate manipulability using robot's built-in method.
-    
-    Args:
-        robot: Robot object
-        joint_position (np.array): Joint positions
-        J (np.array): Jacobian matrix (optional)
-    
-    Returns:
-        float: Manipulability measure
-    """
-    return robot.manipulability(q=joint_position, J=J)
 
 
 def calculate_condition_number(J):

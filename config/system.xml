@@ -16,12 +16,40 @@
     <active_gripper>MSG_small_motor_150mm_rail</active_gripper> <!--  MSG_small_motor_150mm_rail Name of the active gripper. Must match a filename in the grippers/ folder (e.g. SSG48 -> grippers/SSG48.xml) -->
 
     <!-- ====================================================================
+         Safety zones: which CELL the robot stands in. A file name in config/cells/
+         without .xml (example -> config/cells/example.xml). EMPTY = no zones, and
+         the only position limits are the joint limits. Zones are in the robot base
+         frame, metres (what get_pose() reports). See docs/safety_zones.md.
+         After editing the cell file, `reload_zones` applies it without a restart.
+         ==================================================================== -->
+    <active_cell></active_cell>
+
+    <!-- ====================================================================
          Kt source selection
          auto : try to read Kt from each motor over CAN at startup;
                 fall back to the value in the robot XML if a motor does not respond.
          xml  : always use the Kt values from the robot XML, skip CAN fetch.
          ==================================================================== -->
     <kt_source>auto</kt_source>
+
+    <!-- Real-time scheduling is REQUIRED (1): RTI refuses to start when SCHED_FIFO 99 on its core is not
+         available, instead of logging "DEGRADED" and running a 4 ms control loop without guarantees
+         (2026-10-03, as industrial real-time interfaces do). 0 = run anyway (development box). -->
+    <realtime_required>1</realtime_required>
+
+    <!-- The time zone the dashboard and the tools SHOW times in (2026-10-09, user: "it is annoying that this shows UTC
+         while I am in Europe/Zagreb"). An IANA name (Europe/Zagreb, America/New_York, UTC) or "system" = the Pi's own
+         zone. Display only: logs keep their UTC timestamps (unambiguous, safe across the summer-time change). Set it in
+         the dashboard (System Info tab, "Time" card); the zone database is on the Pi, so no internet is needed. -->
+    <display_timezone>Europe/Zagreb</display_timezone>
+
+    <!-- The control-box PCB fitted. The board does not report its version over UART (yet — see
+         TODO/control_box_firmware_wishlist.md), so it is declared here and hardware/control_box.py says what each
+         version can do. v1: E-stop channel 2 is unusable (layout fault) — the software E-stop reads channel 1 only.
+         v2 (planned): both channels read and cross-checked. Wrong value = wrong E-stop policy: keep it right. -->
+    <control_box>
+        <pcb_version>1</pcb_version>
+    </control_box>
 
     <!-- ====================================================================
          JOG defaults — initial slider/toggle values for the GUI and for the
@@ -91,4 +119,158 @@
              `set_mode:FLASHING:FORCE`. -->
         <flash_park_max_gravity_nm>1.0</flash_park_max_gravity_nm>
     </maintenance_defaults>
+
+    <!-- ====================================================================
+         Haptic walls: in IDLE gravity-comp FREEDRIVE you FEEL limits instead of
+         crossing them (utility/haptic_walls.py, docs/safety_zones.md):
+           * every zone of <active_cell> with haptic="1" (the default) pushes back
+             like a spring-damper as you drag the TCP / a tool sphere into it;
+           * every JOINT gets the same wall in joint space, scaled by its inertia:
+             at its SOFT limit, J6 (no endstop) at its HARD limit (the cable
+             wind-up boundary). Per joint: <freedrive_wall> in the robot XML,
+             tuned live in the dashboard's Walls tab (docs/safety_zones.md 2b).
+         It cannot make a limit impassable: push harder and you go through. Past
+         <breakthrough> (zones) / a joint's breakthrough the reaction is a warning
+         by default (zone attribute freedrive="stop" / the joint's freedrive="stop").
+
+         STABILITY LIMITS THE STIFFNESS. At 250 Hz a stiff wall on a light arm
+         vibrates: along J5's direction of travel the arm weighs ~0.13 kg at the
+         TCP, and the first default (1000 N/m) buzzed on the arm. Settings are
+         checked against a simulated table (config/xml_parser/zones.py HAPTIC_STABLE);
+         outside it they fall back to these defaults with a warning. Stable for
+         stiffness 200 / 300 / 500 N/m with a 4 ms filter: damping 2-18 / 3-18 /
+         5-14 N.s/m. Tune it by feel: api_tests/51_haptic_wall.py, tune option.
+         reload_zones applies changes without a restart.
+         ==================================================================== -->
+    <!-- Friction compensation in FREEDRIVE (utility/friction_comp.py, TODO/friction_compensation_plan.md) — PARKED
+         2026-10-02 (no real effect felt): no dashboard button; the switch (set_friction_comp) starts OFF at every RTI
+         start. A push in the direction each joint is already moving: fraction x (its measured SLIDING friction - its
+         gravity-model error while sliding) — robot XML <friction_sliding_nm> / <gravity_error_nm>, from
+         api_tests/54. Zero at rest (never breaks a joint loose), full beyond band_dps, fading out between
+         fade_start_dps and fade_end_dps. -->
+    <friction_comp>
+        <fraction>0.5</fraction>
+        <sliding_ratio>0.7</sliding_ratio>   <!-- a joint with no <friction_sliding_nm>: sliding = this x its breakaway
+                                                  (1.0 trusts the breakaway: J5 could then glide, simulated ~28 deg/s) -->
+        <band_dps>2</band_dps>
+        <fade_start_dps>20</fade_start_dps>
+        <fade_end_dps>40</fade_end_dps>
+    </friction_comp>
+
+    <haptic_walls>
+        <enabled>1</enabled>
+        <stiffness>200</stiffness>             <!-- N/m: 0.2 N per mm past the wall -->
+        <damping>6</damping>                   <!-- N.s/m, both ways inside the wall; never pulls -->
+        <max_force>15</max_force>              <!-- N per robot sphere in contact -->
+        <breakthrough>0.03</breakthrough>      <!-- m past the zone's surface = pushed through -->
+        <velocity_tau>0.004</velocity_tau>     <!-- s, the wall's own filter on the RAW speed (0-8 ms): the zone walls', and every joint wall's unless its <freedrive_wall filter_ms> says otherwise -->
+        <zone_mass_scaled>1</zone_mass_scaled> <!-- 1: a zone wall's stiffness/damping above are for 0.1 kg (7.1 Hz, damping ratio 0.67) and are applied x the contact point's effective mass along the push / 0.1 kg — the same feel-dynamics in every direction and pose, up to ~10x stiffer where the arm is heavy (docs/safety_zones.md §2a). 0: the fixed N/m everywhere -->
+        <joint_walls>1</joint_walls>           <!-- every joint: a wall at its soft limit (J6: hard) -->
+        <joint_max_torque>20</joint_max_torque>         <!-- Nm: the CEILING for a joint wall's max torque setting (auto stays at most 5 Nm) -->
+        <joint_breakthrough>15</joint_breakthrough>     <!-- deg: auto breakthrough, at most (a soft wall: the margin to the hard limit) -->
+    </haptic_walls>
+
+    <safety_monitor>
+        <!-- utility/safety_monitor.py — the independent check on what the arm ACTUALLY does, every
+             tick, in every mode (not homing / flashing / booting / safety-stop, and only once homed).
+             A trip latches an error: the robot disables and holds, and needs Clear Errors.
+             Robot-independent POLICY lives here; the robot-specific numbers (tolerance, per-joint
+             tracking limits, TCP limit) live in the robot XML. Not a safety-rated function: the
+             physical E-stop is. See TODO/safety_stack_research.md. -->
+        <enabled>1</enabled>
+        <!-- OUT_OF_RANGE: measured position past a soft limit + tolerance. Trips when a joint
+             CROSSES out, never for already being out (an arm resting just outside must still start).
+             Only in ACTIVE modes (JOG/EXEC/RTI): in IDLE (freedrive) and ACTIVE_ERROR the robot commands
+             no motion, so a soft limit is only a live SOFT_LIMIT_WARNING there; J6 (no endstop) still
+             stops at its hard limit (HARD_LIMIT, the cable wind-up boundary). -->
+        <joint_limit>1</joint_limit>
+        <!-- BEYOND_ENDSTOP: measured position past a hard limit + the robot XML's endstop_tolerance_deg
+             (10 deg on PAR6), endstop joints only. Impossible unless the position reference is wrong, so
+             homing is invalidated. -->
+        <endstop>1</endstop>
+        <!-- How long a position must stay out before it counts: one impossible sample must not trip.
+             0.012 s = 3 ticks on PAR6. -->
+        <position_sustain_s>0.012</position_sustain_s>
+        <!-- The three speed-dependent checks below take a MODE: off | warn | stop (0/1 = off/stop).
+             warn = a live warning, and RTI.log gets the excursion's peak when it clears; never a stop.
+             Switch a check to stop once normal use shows no false warnings (2026-10-01).
+             OVERSPEED on the FILTERED speed (never raw: J6's raw speed reads 1.2x its ceiling in
+             normal motion) against the robot XML's <joint_velocity_limit> x margin, in every mode
+             including freedrive (there it is more likely the arm falling than a hand). -->
+        <overspeed>warn</overspeed>
+        <overspeed_margin>1.2</overspeed_margin>
+        <overspeed_sustain_s>0.020</overspeed_sustain_s>
+        <!-- TRACKING: |commanded - measured| above the robot XML's per-joint <tracking_limit_deg>, in
+             EXEC. Catches a bump, collision or stall. J1-J3 limits are provisional (5 deg) until measured. -->
+        <tracking>warn</tracking>
+        <tracking_sustain_s>0.040</tracking_sustain_s>
+        <!-- TCP_OVERSPEED: filtered TCP speed above <safety><max_tcp_velocity> x margin. Also needs
+             that limit to be non-zero (it ships 0, and the same number turns on RTI's TCP speed cap). -->
+        <tcp_speed>off</tcp_speed>
+        <tcp_speed_margin>1.1</tcp_speed_margin>
+        <tcp_speed_sustain_s>0.020</tcp_speed_sustain_s>
+        <!-- ZONE_VIOLATION / ZONE_WARNING: the measured TCP and tool spheres against the zones of
+             <active_cell> (none = nothing to check). Trips past the zone's surface + this tolerance
+             (metres; the zone's margin is for the planner's prevention, not counted here).
+             Edge-triggered like OUT_OF_RANGE, but it trips AGAIN if the robot is driven deeper
+             in by more than the tolerance (JOG does not stop at zone walls yet). -->
+        <zones>1</zones>
+        <zone_tolerance>0.005</zone_tolerance>
+        <!-- HOLD_OSCILLATION_WARNING (2026-10-06): a joint commanded to stand still whose motor current keeps
+             swinging fast — the drive fighting itself, the whine of too-high PID gains (J3: ~230 mA of ripple
+             buzzing, <= 25 mA quiet, api_tests/59_hold_noise.py). off | warn (warn-only, never a stop). The
+             current's part above hold_oscillation_hz, averaged over 0.1 s, above the robot XML's per-joint
+             <hold_oscillation_ma> for hold_oscillation_sustain_s, while the joint is commanded slower than
+             hold_still_dps. The sustain must outlast the kick a hold gives as it engages (0.25-0.5 s) — and a buzz
+             that dies out by itself: one did after ~0.8 s (2026-10-06), so 1.5 s, not 1.0 (user). -->
+        <hold_oscillation>warn</hold_oscillation>
+        <hold_oscillation_hz>25</hold_oscillation_hz>
+        <hold_oscillation_sustain_s>1.5</hold_oscillation_sustain_s>
+        <hold_still_dps>0.5</hold_still_dps>
+    </safety_monitor>
+
+    <self_collision>
+        <!-- Self-collision checking (TODO/self_collision_plan.md, docs/self_collision.md, 2026-10-06). The arm's convex
+             pieces are in robots/<robot>_collision.json, the gripper's in grippers/<gripper>_collision.json (fitted from
+             the meshes by tools/self_collision_capsules.py, proven never optimistic). Two margins, model distances:
+             planner_margin_mm — a planned move whose path brings two links closer than this is REFUSED before it starts
+               (SELF_COLLISION, like JOINT_LIMIT); the larger one: it keeps real distance for the tracking error and for
+               what the CAD lacks (cables, connectors);
+             monitor_margin_mm — the MEASURED pose closer than this -> the SELF_COLLISION error (stop); the smaller one,
+               "about to touch". Must be <= the planner's.
+             jog_margin_mm (2026-10-07, user: jogs stopped too soon at 15 mm) — a jog is blocked when the pose it would
+               STOP at (its stopping distance x the look-ahead) is closer than this; between the two others: above the
+               monitor's (the parser adds 3 mm if not — a jog must rest before the trip line), at most the planner's. With
+               15 / 8 / 5 a 20 % jog rested ~10-14 mm from real contact (15 mm: 12-20). Per pair it is clamped between
+               that pair's own monitor and planner margins.
+             Per-pair overrides (links that are close by design) live in the robot / gripper XML.
+             The check runs in the collision worker process (self_collision_worker.py, another core) at worker_hz:
+             100 Hz costs 3 mm of margin per cycle at jog speed, 14 mm with every joint at its ceiling. -->
+        <enabled>1</enabled>
+        <!-- 2026-10-07 (user, "5 mm for now and see how it goes"): planner 5 / jog 5 / monitor 2 mm — planned moves and
+             jogs come to 5 mm, the stop sits 3 mm below so legal motion never trips it. Was 15 / 8 / 5 (the parser's
+             fallback when this block is missing). Pairs close by design keep their own numbers (robot / gripper XML). -->
+        <planner_margin_mm>5</planner_margin_mm>
+        <monitor_margin_mm>2</monitor_margin_mm>
+        <jog_margin_mm>5</jog_margin_mm>
+        <worker_hz>100</worker_hz>
+        <reaction>stop</reaction>
+        <!-- 2026-10-07 (S3f): the gripper's jaws for the worker (the jog and the stop; the planner always uses swept).
+             swept    — each jaw over its whole stroke (MSG 52.5 mm, SSG48 23.5 mm): right for any opening.
+             measured — where the gripper says they are, fresh CAN data and: firmware mode, calibrated (its 0-255 position
+                        is linear between the two endstops it found when it calibrated: 0 open, 255 closed — read from the
+                        STEPFOC / Spectral firmware), or motor mode, homed toward its open end (<homing_direction> 0) with the
+                        robot HOMED (the opening in metres from that endstop); anything else -> swept. Widened by jaw_band_mm along the travel
+                        (calibration vs CAD, the jaws moving up to ~190 mm/s during one cycle).
+             2026-10-08: MEASURED — the user compared the dashboard's CAD jaw view (Gripper tab) with the real gripper at
+             several openings: they match. Swept was the default until then (a closed gripper rested 28-31 mm early). -->
+        <jaws>measured</jaws>
+        <!-- 2026-10-08 (user): 1 mm — 3 mm put jog stops 7.7 / 9.4 mm from the CAD (closed / open jaws) where the jog margin
+             is 5; 1 mm: ~6.2 / 7.4 mm (replayed through the worker's own scan). The mapping was checked on the arm; the
+             jaws moving during a cycle (<= ~2 mm at top speed) stay inside the 3 mm between the jog's rest and the stop line. -->
+        <jaw_band_mm>1</jaw_band_mm>
+        <!-- 2026-10-07 (S3g): the dashboard's readout names the pair nearest its own jog margin when it is within this
+             many mm above it (computed every 20th worker cycle, 5 Hz) -->
+        <readout_mm>30</readout_mm>
+    </self_collision>
 </system>

@@ -55,6 +55,10 @@ roll-off simply cannot catch a 2-differentiation noise climb). Two poles: 15%.
    commute — order matters for that one alone.)
 """
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 import math
 
 import numpy as np
@@ -107,7 +111,8 @@ def window_from_tau(tau: float, dt: float) -> int:
     return n if n % 2 else n + 1
 
 
-def create_filter(kind, joint_num, dt, tau=None, window=None, poly=2):
+def create_filter(kind: str, joint_num: int, dt: float, tau: float | None = None, window: int | None = None,
+                  poly: int = 2) -> dict:
     """Preallocate one filter's complete state. STARTUP ONLY — this allocates.
 
     Args:
@@ -204,7 +209,7 @@ def create_filter(kind, joint_num, dt, tau=None, window=None, poly=2):
     return f
 
 
-def apply_filter(f, x, out):
+def apply_filter(f: dict, x: np.ndarray, out: np.ndarray) -> None:
     """Run one tick of filter `f` over `x`, writing into `out`. Allocates nothing.
 
     `x` and `out` are (joint_num,) float64. `out` may alias `x`.
@@ -329,6 +334,90 @@ _STEP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Bank fast path (2026-10-03). A bank of N identical ema / ema2 / dema / butter2 / none filters is the SAME
+# arithmetic as one array op per bank — y1 += a * (x - y1) per element, in the same order of IEEE operations
+# as the scalar loops above, so the outputs are bit-identical (net test_filter_bank_vectorised). The per-joint
+# filters keep existing and keep their meaning: their state arrays become VIEWS into the bank's arrays, so the
+# slow path (first ticks, a non-finite input) and the fast path step one state. Measured: the five banks of a
+# PAR6 tick cost 77 us on the per-joint path, ~15 us here.
+# ---------------------------------------------------------------------------
+_VEC_KINDS = ("none", "ema", "ema2", "dema", "butter2")
+
+
+def _vectorise_bank(bank: dict) -> None:
+    """Give a uniform bank one set of state arrays (STARTUP ONLY — allocates). No-op for mixed or FIR banks."""
+    filters, n = bank["filters"], bank["n"]
+    kinds = {f["kind"] for f in filters}
+    if len(kinds) != 1 or next(iter(kinds)) not in _VEC_KINDS:
+        return
+    kind = next(iter(kinds))
+    v = {"kind": kind, "fin": np.zeros(n, dtype=bool), "t1": np.zeros(n), "t2": np.zeros(n)}
+    if kind in ("ema", "ema2", "dema"):
+        v["a"] = np.array([f["a"][0] for f in filters], dtype=np.float64)
+        v["y1"] = np.zeros(n)
+        for i, f in enumerate(filters):
+            f["y1"] = v["y1"][i:i + 1]
+        if kind != "ema":
+            v["y2"] = np.zeros(n)
+            for i, f in enumerate(filters):
+                f["y2"] = v["y2"][i:i + 1]
+    elif kind == "butter2":
+        b, a = filters[0]["b"], filters[0]["a_coef"]
+        if not all(np.array_equal(f["b"], b) and np.array_equal(f["a_coef"], a) for f in filters):
+            return
+        v["b"], v["a_coef"] = b, a
+        v["z1"], v["z2"] = np.zeros(n), np.zeros(n)
+        for i, f in enumerate(filters):
+            f["z1"] = v["z1"][i:i + 1]
+            f["z2"] = v["z2"][i:i + 1]
+    bank["vec"] = v
+    bank["warm"] = False
+
+
+def _vstep_none(v, x, out):
+    out[:] = x
+
+
+def _vstep_ema(v, x, out):
+    y1, a, t1 = v["y1"], v["a"], v["t1"]
+    np.subtract(x, y1, out=t1)              # x - y1
+    np.multiply(t1, a, out=t1)              # a * (x - y1)
+    np.add(y1, t1, out=y1)                  # y1 += ...
+    out[:] = y1
+
+
+def _vstep_ema2(v, x, out):
+    _vstep_ema(v, x, out)
+    y1, y2, a, t1 = v["y1"], v["y2"], v["a"], v["t1"]
+    np.subtract(y1, y2, out=t1)
+    np.multiply(t1, a, out=t1)
+    np.add(y2, t1, out=y2)
+    out[:] = y2
+
+
+def _vstep_dema(v, x, out):
+    _vstep_ema2(v, x, out)
+    np.multiply(v["y1"], 2.0, out=out)      # 2.0 * y1 - y2
+    np.subtract(out, v["y2"], out=out)
+
+
+def _vstep_butter2(v, x, out):
+    b, a, z1, z2, t1, t2 = v["b"], v["a_coef"], v["z1"], v["z2"], v["t1"], v["t2"]
+    np.multiply(x, b[0], out=out)           # y = b0*x + z1
+    np.add(out, z1, out=out)
+    np.multiply(x, b[1], out=t1)            # z1 = b1*x - a1*y + z2
+    np.multiply(out, a[1], out=t2)
+    np.subtract(t1, t2, out=t1)
+    np.add(t1, z2, out=z1)
+    np.multiply(x, b[2], out=t1)            # z2 = b2*x - a2*y
+    np.multiply(out, a[2], out=t2)
+    np.subtract(t1, t2, out=z2)
+
+
+_VEC_STEP = {"none": _vstep_none, "ema": _vstep_ema, "ema2": _vstep_ema2, "dema": _vstep_dema, "butter2": _vstep_butter2}
+
+
 def _tau_ms(tau) -> str:
     """Format a scalar or per-joint tau in ms for the startup log."""
     arr = np.atleast_1d(np.asarray(tau, dtype=np.float64))
@@ -351,7 +440,7 @@ def _tau_ms(tau) -> str:
 # special-cases "are all joints the same". Revisit only if profiling flags it.
 # ===========================================================================
 
-def create_filter_bank(specs, joint_num, dt):
+def create_filter_bank(specs: Sequence[dict], joint_num: int, dt: float) -> dict:
     """Build one independent filter per joint. STARTUP ONLY.
 
     Args:
@@ -372,7 +461,7 @@ def create_filter_bank(specs, joint_num, dt):
         kw = {k: s[k] for k in ("tau", "window", "poly") if k in s}
         filters.append(create_filter(s["kind"], 1, dt, **kw))
 
-    return {
+    bank = {
         "filters": filters,
         "n": joint_num,
         "si": np.zeros(1, dtype=np.float64),   # scratch in
@@ -380,9 +469,11 @@ def create_filter_bank(specs, joint_num, dt):
         "last": np.zeros(joint_num, dtype=np.float64),  # last finite output per joint (NaN guard)
         "specs": specs,
     }
+    _vectorise_bank(bank)
+    return bank
 
 
-def apply_filter_bank(bank, x, out):
+def apply_filter_bank(bank: dict, x: np.ndarray, out: np.ndarray) -> None:
     """Run one tick of a bank over x (joint_num,), writing into out. Allocates nothing.
 
     A non-finite input (NaN/inf) is NOT fed to the filter — a single NaN would otherwise
@@ -391,6 +482,19 @@ def apply_filter_bank(bank, x, out):
     one-tick freeze rather than a stuck-NaN channel.
     """
     si, so, filters, last = bank["si"], bank["so"], bank["filters"], bank["last"]
+    v = bank.get("vec")
+    if v is not None:
+        # Fast path once every per-joint filter has seeded itself and every input is finite — otherwise the
+        # per-joint path below handles seeding and the NaN guard exactly as before (one state, see _vectorise_bank).
+        if not bank["warm"]:
+            bank["warm"] = all(f["init"] for f in filters)
+        if bank["warm"]:
+            fin = v["fin"]
+            np.isfinite(x, out=fin)
+            if fin.all():
+                _VEC_STEP[v["kind"]](v, x, out)
+                last[:] = out
+                return
     for i in range(bank["n"]):
         xi = x[i]
         if math.isfinite(xi):
@@ -405,7 +509,7 @@ def describe_bank(bank) -> str:
     descs = [describe(f) for f in bank["filters"]]
     if all(d == descs[0] for d in descs):
         return f"all joints: {descs[0]}"
-    return " | ".join(f"J{i}:{d}" for i, d in enumerate(descs))
+    return " | ".join(f"J{i + 1}:{d}" for i, d in enumerate(descs))
 
 
 def describe(f) -> str:

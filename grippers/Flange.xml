@@ -22,4 +22,10 @@
         <Tc>0.02 -0.02</Tc>                                                               <!-- Coulomb friction [+, -] [N·m] -->
         <qlim_deg>-48.7014 409.0919</qlim_deg>                                            <!-- J6 soft limits for flange [deg] -->
     </kinematics>
+    <!-- Self-collision (2026-10-06): the flange plate's convex piece in grippers/Flange_collision.json (J6 joint frame).
+         The flange comes within 11.9 mm (2026-10-07 refit) of wrist 1 (frame 4) at its closest, by construction (tools/self_collision_capsules.py
+         map; refitted 2026-10-07 from the PAR6 description package 2.0, par6_flange.urdf). -->
+    <collision file="Flange_collision.json">
+        <pair with="4" planner_mm="6" monitor_mm="2"/>
+    </collision>
 </gripper>

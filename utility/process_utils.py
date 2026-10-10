@@ -19,6 +19,8 @@ Description:
     used both to apply the layout and to display it in the dashboard.
 """
 
+from __future__ import annotations
+
 import os
 import logging
 
@@ -45,7 +47,7 @@ def policy_name(policy):
 # ==========================================================================
 # SETTER — called once per process at startup
 # ==========================================================================
-def setup_process(core, rt=False, priority=0):
+def setup_process(core: int, rt: bool = False, priority: int = 0) -> bool:
     """
     Pin this process to `core`. If rt=True, also request SCHED_FIFO at `priority`
     (1-99); otherwise leave normal (SCHED_OTHER) scheduling.
@@ -89,7 +91,7 @@ def setup_process(core, rt=False, priority=0):
 # ==========================================================================
 # READER — called by the GUI to inspect all processes
 # ==========================================================================
-def process_info(patterns):
+def process_info(patterns: dict[str, str]) -> list[dict]:
     """
     Inspect managed processes for the dashboard.
 

@@ -48,4 +48,11 @@
         <Tc>0.02 -0.02</Tc>                                                               <!-- Coulomb friction [+, -] [N·m] -->
         <qlim_deg>-160 160</qlim_deg>                                                     <!-- joint limits [deg] -->
     </kinematics>
+    <!-- Self-collision (2026-10-06; refitted 2026-10-07 from Source Robotics' PAR6 description package 2.0, par6_msg.urdf):
+         the MSG gripper's convex pieces in grippers/MSG_collision.json, J6 joint frame, the jaws over their WHOLE stroke —
+         ONE geometry for every MSG rail length for now. The gripper comes within 2.1 mm of wrist 1 (frame 4) at its
+         closest, a function of J5/J6 alone, so it can never get closer inside the limits: that pair is not checked. -->
+    <collision file="MSG_collision.json">
+        <pair with="4" check="off"/>
+    </collision>
 </gripper>

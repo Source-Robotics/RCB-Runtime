@@ -154,19 +154,3 @@ def format_can_link_stats(stats):
             f"bus-errors={_counter(stats, 'bus_errors')} "
             f"arbitration-lost={_counter(stats, 'arbitration_lost')}")
 
-
-def check_can_link_health(stats):
-    """(ok, reason) — is the link in a state worth flagging right now?
-
-    Point-in-time only; it says nothing about history. BUS-OFF here with
-    restart-ms set means the sample landed inside a recovery window, which is
-    itself worth seeing.
-    """
-    if not stats:
-        return True, ""
-    state = (stats.get("state") or "").upper()
-    if state in ("BUS-OFF", "STOPPED"):
-        return False, f"CAN link is {state}"
-    if state == "ERROR-PASSIVE":
-        return False, "CAN link is ERROR-PASSIVE (controller is barely on the bus)"
-    return True, ""

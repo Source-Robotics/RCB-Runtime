@@ -1,5 +1,9 @@
 """Shared FK/Jacobian backend selection helpers."""
 
+from __future__ import annotations
+
+from typing import Any
+
 import math
 
 import numpy as np
@@ -9,7 +13,7 @@ _kinematics_backend = "auto"  # auto | pinocchio | rtb
 _RPY_SINGULAR_TOL = 20.0 * np.finfo(float).eps
 
 
-def set_kinematics_backend(backend):
+def set_kinematics_backend(backend: str) -> None:
     """Select the FK/Jacobian backend used by commanded and measured TCP paths.
 
     Valid values:
@@ -29,11 +33,7 @@ def set_kinematics_backend(backend):
     _kinematics_backend = normalized
 
 
-def get_kinematics_backend():
-    return _kinematics_backend
-
-
-def should_use_pinocchio(robot):
+def should_use_pinocchio(robot: Any) -> bool:
     """Return True when the selected backend should use attached Pinocchio helpers."""
     return (
         _kinematics_backend != "rtb"
@@ -41,7 +41,7 @@ def should_use_pinocchio(robot):
     )
 
 
-def require_selected_backend_available(robot):
+def require_selected_backend_available(robot: Any) -> None:
     """Raise if the selected backend is forced to Pinocchio but unavailable."""
     if _kinematics_backend == "pinocchio" and not should_use_pinocchio(robot):
         raise RuntimeError(
@@ -50,7 +50,7 @@ def require_selected_backend_available(robot):
         )
 
 
-def write_quaternion_wxyz(R, out, start=0):
+def write_quaternion_wxyz(R: np.ndarray, out: np.ndarray, start: int = 0) -> None:
     """Write the rotation in R into out as a unit quaternion, SCALAR-FIRST (w, x, y, z).
 
     R may be a 3x3 rotation matrix or a full 4x4 homogeneous transform — only the
@@ -58,9 +58,9 @@ def write_quaternion_wxyz(R, out, start=0):
 
     ⚠️ COMPONENT ORDER IS (w, x, y, z) — scalar FIRST. This matches spatialmath,
     roboticstoolbox, Eigen/Pinocchio and MATLAB, i.e. every library already in this
-    stack, so nothing here needs converting. ROS/tf2, SciPy and Bullet use the OPPOSITE
+    stack, so nothing here needs converting. many other libraries use the OPPOSITE
     order (x, y, z, w); feeding one to the other silently produces a plausible-looking
-    WRONG rotation rather than an error. Consumers that need the ROS layout reorder it
+    WRONG rotation rather than an error. Consumers that need the (x, y, z, w) layout reorder it
     themselves — q[[1, 2, 3, 0]] — no conversion belongs here.
 
     Writes in place into `out` (no allocation) — this runs every RT tick.
@@ -112,7 +112,7 @@ def write_quaternion_wxyz(R, out, start=0):
         out[start + 3] = -out[start + 3]
 
 
-def write_rpy_xyz(R, out, start=0):
+def write_rpy_xyz(R: np.ndarray, out: np.ndarray, start: int = 0) -> None:
     """Write SpatialMath-compatible tr2rpy(..., order='xyz') into out."""
     if abs(abs(R[0, 2]) - 1.0) < _RPY_SINGULAR_TOL:
         out[start] = 0.0

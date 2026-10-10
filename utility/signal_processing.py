@@ -1,29 +1,17 @@
 """Signal processing helpers: EMA timing, angle unwrap/normalise, moving-average filters."""
 
+from __future__ import annotations
+
 import numpy as np
-import time
 
 # Magic number constants
 ANGLE_CLAMP_LIMIT = np.pi * 2 - 0.2
 
 
-def update_loop_timing_ema(time_now, prev_time, loop_execution_time,
-                           avg_dur, avg_exec, alpha=0.1):
-    """Update loop duration and execution time using exponential moving average."""
-    loop_duration = time_now - prev_time
-    if avg_dur is None:
-        avg_dur  = loop_duration
-        avg_exec = loop_execution_time
-    else:
-        avg_dur  = alpha * loop_duration       + (1 - alpha) * avg_dur
-        avg_exec = alpha * loop_execution_time + (1 - alpha) * avg_exec
-    return time_now, avg_dur, avg_exec
-
-
-def update_rt_loop_stats(time_now, prev_time, loop_execution_time, delta_t,
-                         avg_dur, avg_exec, avg_jitter,
-                         max_loop_period, max_exec_time, max_jitter,
-                         overrun_count, alpha=0.05):
+def update_rt_loop_stats(time_now: float, prev_time: float, loop_execution_time: float, delta_t: float,
+                         avg_dur: float, avg_exec: float, avg_jitter: float,
+                         max_loop_period: float, max_exec_time: float, max_jitter: float,
+                         overrun_count: float, alpha: float = 0.05) -> tuple[float, ...]:
     """
     Compute all RT loop timing statistics for one tick.
 
@@ -70,10 +58,10 @@ def update_rt_loop_stats(time_now, prev_time, loop_execution_time, delta_t,
             jitter, avg_jitter, max_loop_period, max_exec_time, max_jitter, overrun_count)
 
 
-def update_rolling_percentiles(period_buf, exec_buf, buf_pos, buf_count,
-                               loop_period, loop_execution_time, loop_tick,
-                               p95_period, p99_period, p95_exec, p99_exec,
-                               stats_interval=50):
+def update_rolling_percentiles(period_buf: np.ndarray, exec_buf: np.ndarray, buf_pos: int, buf_count: int,
+                               loop_period: float, loop_execution_time: float, loop_tick: float,
+                               p95_period: float, p99_period: float, p95_exec: float, p99_exec: float,
+                               stats_interval: int = 50) -> tuple[int, int, float, float, float, float]:
     """
     Maintain a fixed-size circular buffer of recent loop_period/loop_execution_time
     samples and periodically recompute p95/p99 from it.
@@ -127,7 +115,7 @@ def update_rolling_percentiles(period_buf, exec_buf, buf_pos, buf_count,
     return buf_pos, buf_count, p95_period, p99_period, p95_exec, p99_exec
 
 
-def reset_rolling_stats():
+def reset_rolling_stats() -> tuple[int, int]:
     """Discard the rolling-percentile window (e.g. after loop_stats_reset_signal).
 
     Must reset BOTH buf_pos and buf_count to 0, not buf_count alone:
@@ -146,50 +134,24 @@ def reset_rolling_stats():
     return 0, 0
 
 
-def unwrap_angle(angle, previous_angle, clamp_limit=np.pi * 2 - 0.2):
-    """Unwrap angle to prevent discontinuities, then clamp to ±clamp_limit."""
-    while angle - previous_angle >  np.pi:
-        angle -= 2 * np.pi
-    while angle - previous_angle < -np.pi:
-        angle += 2 * np.pi
-    return max(min(angle, clamp_limit), -clamp_limit)
+def pace_deadline(deadline: float, now: float, delta_t: float) -> tuple[float, float]:
+    """Absolute-deadline pacing for the RT loop (2026-10-04): the next tick is due at the previous DEADLINE plus
+    delta_t, not at "now + delta_t - work". Returns (new_deadline, sleep_s).
 
+    Why: sleeping delta_t minus the work time, measured from when the work started, adds the wake-up latency and
+    the sleep's own error to every tick and never corrects them — the loop ran at ~249 Hz (period 4.024 ms), and
+    a PC pacing on the state stream inherited the drift. With an absolute deadline the average period is exactly
+    delta_t; the per-tick jitter is unchanged (it is the kernel's and time.sleep's).
 
-def normalize_angle(angle):
-    """Normalise angle to [-pi, pi]."""
-    while angle >  np.pi:
-        angle -= 2 * np.pi
-    while angle < -np.pi:
-        angle += 2 * np.pi
-    return angle
+    The overrun rule, explicit: a tick that finishes past its deadline sleeps 0 (the next tick starts at once —
+    one late tick is absorbed); more than one period behind is a STALL, and the deadline is re-based to `now`:
+    the lost time is lost, a burst of back-to-back catch-up ticks is the wrong reaction to a stall.
+    """
+    deadline += delta_t
+    sleep_s = deadline - now
+    if sleep_s >= 0.0:
+        return deadline, sleep_s
+    if -sleep_s > delta_t:
+        return now, 0.0
+    return deadline, 0.0
 
-
-def unwrap_angles(q_solution, q_current):
-    """Unwrap all joint angles in q_solution to be closest to q_current."""
-    q_unwrapped = q_solution.copy()
-    for i in range(len(q_solution)):
-        diff = q_solution[i] - q_current[i]
-        if diff >  np.pi:
-            q_unwrapped[i] = q_solution[i] - 2 * np.pi
-        elif diff < -np.pi:
-            q_unwrapped[i] = q_solution[i] + 2 * np.pi
-    return q_unwrapped
-
-
-def cartesian_moving_average(buffer):
-    """Simple moving average (mean) over a buffer of Cartesian samples."""
-    return np.mean(buffer, axis=0)
-
-
-def cartesian_moving_average_2(buffer, cart_window_size):
-    """Moving average via convolution — better for large data sets."""
-    window = np.ones(cart_window_size) / cart_window_size
-    return np.array([np.convolve(buffer[:, i], window, mode='valid')[-1]
-                     for i in range(6)])
-
-
-def cartesian_moving_average_EMA(new_data, last_ema, alpha=0.8):
-    """Exponential Moving Average for 6-DOF Cartesian data."""
-    if last_ema is None:
-        return new_data
-    return alpha * np.array(new_data) + (1 - alpha) * last_ema

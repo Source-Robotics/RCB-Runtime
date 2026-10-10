@@ -24,6 +24,8 @@ carry through that corner. See the module-level note above ``compute_corner_spee
 for the derivation.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -180,7 +182,7 @@ def _solve_duration(dist, max_vel, max_accel, dt, speed_scale, profile):
     return max(t_vel, t_acc) / speed_scale
 
 
-def _sample_boundary_trapezoid(tau, w0, w1, alpha):
+def _sample_boundary_trapezoid(tau: np.ndarray, w0: float, w1: float, alpha: float) -> tuple[np.ndarray, np.ndarray]:
     """Asymmetric trapezoid in normalized time: s(0)=0, s(1)=1, sd(0)=w0, sd(1)=w1,
     constant-magnitude acceleration ``alpha`` during the ramp phases. Reduces exactly
     to TrapezoidalProfile's own accel/cruise/decel shape when w0=w1=0.
@@ -254,7 +256,7 @@ def compute_corner_speed(dist_a, dist_b, max_vel, max_accel, dt, blend_scale,
     direction change happens across the one tick between them. ``v_c`` is capped so
     that implied one-tick direction change never asks any joint for more than
     max_accel*dt (conservative — this is the same "junction velocity" approximation
-    GRBL/Marlin/Klipper use for cornering, sized against our own RT tick instead of
+    CNC and 3D-printer firmware use for cornering, sized against our own RT tick instead of
     an idealized instant).
 
     Further capped by ``blend_scale`` (0..1, from set_blending()) and by how sharp

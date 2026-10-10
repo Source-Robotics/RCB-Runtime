@@ -91,6 +91,66 @@ class Screen:
         self._text(0, 2 * theme.LINE_H, "hold B2 = YES")
         self._text(0, 3 * theme.LINE_H, "B1 = cancel")
 
+    ALERT_BODY_W = theme.WIDTH - 8   # usable text width inside the alert border
+
+    def fits(self, text, width=ALERT_BODY_W):
+        return self._w(str(text)) <= width
+
+    def _clip(self, text, width):
+        """Shorten to `width` px with a visible ellipsis — never a silent chop. A cut-off
+        number that still looks whole (":65535" shown as ":655") is worse than no number."""
+        t = str(text)
+        if self._w(t) <= width:
+            return t
+        while t and self._w(t + "…") > width:
+            t = t[:-1]
+        return t + "…"
+
+    def alert_view(self, title, right, lines, keys, hints=("", "")):
+        """Full-screen modal: inverted title bar, two body lines, two soft keys.
+
+            ┌──────────────────────────┐
+            │ TAKE CONTROL?        17s │   inverted title + right-aligned `right`
+            │  Request from:           │   lines[0]
+            │  192.168.1.50:51234      │   lines[1]
+            │                  hold 1s │   hints  (small print ABOVE its key)
+            │ (B1 DENY)     (B2 ALLOW) │   keys   (left key sits over the LEFT button)
+            └──────────────────────────┘
+
+        Soft keys, not a sentence: each action is drawn over the button that does it, the
+        way a phone labels its soft keys, so reading the screen and finding the button are
+        the same glance. Deliberately not built from row()/body() — this pre-empts whatever
+        screen the operator was on and must not look like that screen with new words; the
+        border and the two key boxes are what say "this is not your menu".
+        """
+        W, H, L = theme.WIDTH, theme.HEIGHT, theme.LINE_H
+        self.clear()
+        self.d.rectangle((0, 0, W - 1, H - 1), outline=255)
+        self.d.rectangle((0, 0, W - 1, L - 1), fill=255)
+        r = str(right) if right else ""
+        self._text(2, 0, self._clip(title, W - 6 - (self._w(r) + 4 if r else 0)), fill=0)
+        if r:
+            self._text(int(W - self._w(r) - 2), 0, r, fill=0)
+
+        for i, text in enumerate(lines[:2]):
+            self._text(4, L + 2 + i * L, self._clip(text, self.ALERT_BODY_W))
+
+        key_top, pad, inset, gap = H - L - 2, 3, 2, 6
+        half = (W - 2 * inset - gap) // 2
+        # Budget the two keys TOGETHER: a short left key leaves room for a longer right one.
+        # Only when both cannot fit is each held to half — never clip a label that fits.
+        crowded = sum(self._w(str(k)) + 2 * pad for k in keys) > W - 2 * inset - gap
+        for side, (label, hint) in enumerate(zip(keys, hints)):
+            label = self._clip(label, (half if crowded else W) - 2 * pad)
+            kw = int(self._w(label)) + 2 * pad
+            x0 = inset if side == 0 else W - 1 - inset - kw
+            self.d.rounded_rectangle((x0, key_top, x0 + kw, H - 1 - inset), radius=3, fill=255)
+            self._text(x0 + pad, key_top, label, fill=0)
+            if hint:
+                hint = self._clip(hint, half)
+                hx = x0 if side == 0 else int(W - 1 - inset - self._w(hint))
+                self._text(hx, key_top - L, hint)
+
     def edit_view(self, label, value_text):
         """Centered '-  value  +' editor screen."""
         self.title_bar(label)

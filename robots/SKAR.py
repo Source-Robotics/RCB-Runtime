@@ -221,10 +221,6 @@ if __name__ == "__main__":
     print("flange")
     rne_test = par6.rne(q=par6.qs,qd=[0,0,0,0], qdd=[0,0,0,0])
     print(rne_test)
-    #par6.teach(par6.qz)
-    #robot_plot = par6.plot(par6.qz)
-    #robot_plot.hold()
-    #time.sleep(4)
 
     """
     par6 = SKAR(symbolic=False, gripper_name="SSG48")

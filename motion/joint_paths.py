@@ -50,6 +50,10 @@ the CHORDS, turning every original sample into a tiny kink — the same
 1/ds curvature blow-up by another route.
 """
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 import numpy as np
 
 # Bounds on the sampled path. The spacing itself is derived from the execution
@@ -65,7 +69,7 @@ DEFAULT_ARCLEN_SPACING_RAD = 0.01
 _BEZIER_QUADRATURE = 512
 
 
-def arclen_spacing_for(max_vel, dt):
+def arclen_spacing_for(max_vel: np.ndarray | float, dt: float) -> float:
     """Path resolution derived from the execution limits.
 
     One sample per control tick at full joint speed: the geometric path is
@@ -130,7 +134,8 @@ def _bezier(entry_q, corner_q, exit_q, t, continuity="c1"):
     return (omt * omt) * entry_q + (2.0 * omt * t) * corner_q + (t * t) * exit_q
 
 
-def blend_joint_zone(entry_q, waypoint_q, exit_q, spacing, continuity="c1"):
+def blend_joint_zone(entry_q: np.ndarray, waypoint_q: np.ndarray, exit_q: np.ndarray, spacing: float,
+                     continuity: str = "c1") -> tuple[np.ndarray, float]:
     """Sample a quadratic-Bezier joint-space corner at uniform ARC LENGTH.
 
     Walks a fine quadrature grid along the true curve, accumulates arc length,
@@ -173,9 +178,9 @@ def linear_joint_segment(start, end, spacing):
     return start[None, :] + t * (end - start)[None, :], length
 
 
-def build_composite_joint_path(waypoints, blend_fracs, arclen_spacing=None,
-                               samples_per_segment=None, start_trim=0.0,
-                               continuity="c1", return_blend_zones=False):
+def build_composite_joint_path(waypoints: np.ndarray, blend_fracs: Sequence[float], arclen_spacing: float | None = None,
+                               samples_per_segment: int | None = None, start_trim: float = 0.0,
+                               continuity: str = "c1", return_blend_zones: bool = False) -> tuple:
     """Build a composite joint-space path with Bezier blend zones.
 
     Blend-zone sizes are expressed as fractions of each adjacent segment

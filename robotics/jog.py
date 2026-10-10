@@ -1,4 +1,4 @@
-"""JOG mode handler — velocity-ramped joint jogging with gravity compensation.
+"""JOG mode handler — joint jogging along a direction in joint space, with PLANNED, exact stops at every limit.
 
 All internal state (position, velocity, limits, acceleration) is in joint space:
   position  — radians
@@ -13,71 +13,60 @@ the rest of the pipeline.
 set_jog() / stop_jog() are called from RTI.py's ZMQ command handler and write
 into plain Python attributes — no shared memory, no locking needed since RTI.py
 is single-threaded on the command-handling path.
+
+HOW A JOG MOVES (2026-10-07; TODO/self_collision_plan.md S3e, docs/self_collision.md). A jog is a DIRECTION in joint
+space — a unit vector; today's buttons and joysticks set one joint (set_jog), set_jog_vector() takes any mix of joints
+(multi-joint / joystick jogging, the user's requirement) — and a speed along it. It moves along the ray
+ref + s * direction (ref = the commanded pose when the jog session began) and BRAKES along the same ray, all moving
+joints together, so where it can stop is always on that line. The motion along the ray is one-dimensional and
+planned by Ruckig every tick (the jog's own acceleration and jerk, the speed slider as the speed): cruise, and brake
+so as to ARRIVE at the nearer limit with zero speed —
+  * the soft joint limits along the ray (exact, computed here once per session), and
+  * the self-collision limit along the ray: the collision worker scans the same ray and publishes how far it is free
+    (rti['sc_ray_free'] for rti['sc_ray_session'] — a verified frontier, then the exact entry into the jog margin by
+    bisection). Until the worker has answered for THIS session the free length is 0: the jog waits (~10-20 ms).
+So a jog comes to rest AT the limit at any speed and acceleration — the user's rule ("the stops and distance need
+to be consistent and respected"). Before this, limit stops were TRIGGERED (stop now, then the fixed ramp) and the
+rest point depended on the speed: soft limits early by up to half the stopping distance, self-collision 5-22 mm.
+A new direction waits until the previous motion has braked to rest, then starts a new session from where it stopped.
 """
 
+import math
+
 import numpy as np
-from utility.tick_types import TickResult, ControlOutput
+from ruckig import ControlInterface, InputParameter, OutputParameter, Result, Ruckig
+
 from utility.activity_log import get_rti_activity_logger, log_activity
+from utility.tick_types import ControlOutput, TickResult
 
-# Extra margin applied to the kinematic stopping distance before triggering deceleration.
-# Accounts for mechanical lag (motor current limiting, control loop latency, measurement noise).
-# 1.5 = start decelerating 50 % earlier than the theoretical minimum stopping distance.
-_LOOKAHEAD_SAFETY_FACTOR = 1.5
-
-# ---------------------------------------------------------------------------
-# Velocity ramp profile functions
-#
-# Signature: (vel, target_vel, accel_max, jerk_max, dt, current_accel) -> (new_vel, new_accel_state)
-#
-# current_accel / new_accel_state: per-joint acceleration tracking (S-curve jerk state).
-# Trapezoidal ignores it and always returns 0.0.
-# ---------------------------------------------------------------------------
-
-def _ramp_trapezoidal(vel, target_vel, accel_max, jerk_max, dt, current_accel):
-    error = target_vel - vel
-    new_vel = vel + float(np.clip(error, -accel_max * dt, accel_max * dt))
-    # Report the acceleration actually applied this tick. Trapezoidal does not NEED an accel
-    # state (unlike s-curve, which limits its rate of change), but the handler publishes this
-    # as joint_acceleration_commanded — returning a hardcoded 0.0 made that channel claim the
-    # arm was never accelerating while the ramp was plainly running.
-    return new_vel, (new_vel - vel) / dt if dt > 0 else 0.0
+_PROFILE_TO_IDX = {"trapezoidal": 0, "scurve": 1}   # trapezoidal = Ruckig with unlimited jerk
+_CONTROL_TO_IDX = {"pid": 0, "pd": 1}
+_REST = 1e-9            # rad/s along the ray: at rest
+_ARRIVED = 1e-6         # rad along the ray: at the planned limit
 
 
-def _ramp_scurve(vel, target_vel, accel_max, jerk_max, dt, current_accel):
-    """Jerk-limited velocity ramp. Tracks per-joint acceleration to limit its rate of change."""
-    vel_error = target_vel - vel
-
-    if abs(vel_error) > 1e-9:
-        accel_sign = 1.0 if vel_error > 0 else -1.0
-    else:
-        accel_sign = 0.0
-
-    # If accelerating toward target, check whether to start reducing acceleration to avoid
-    # velocity overshoot. Velocity gained while reducing current_accel to 0 at max jerk: a² / (2·j).
-    if jerk_max > 0 and accel_sign * current_accel > 0:
-        v_coast = (current_accel * current_accel) / (2.0 * jerk_max)
-        if abs(vel_error) <= v_coast:
-            accel_sign = 0.0
-
-    desired_accel = accel_sign * accel_max
-    max_delta     = jerk_max * dt
-    new_accel     = current_accel + float(np.clip(desired_accel - current_accel, -max_delta, max_delta))
-    new_accel     = float(np.clip(new_accel, -accel_max, accel_max))
-
-    # Snap to rest when both velocity error and remaining acceleration fit within one tick.
-    if abs(vel_error) < accel_max * dt and abs(new_accel) < jerk_max * dt:
-        return float(target_vel), 0.0
-
-    return float(vel + new_accel * dt), new_accel
+def ray_soft_free(ref, direction, lo, hi):
+    """rad: the path length from `ref` along the unit joint-space `direction` to the first soft limit (inf when no
+    moving joint has one). A joint already outside its range gives 0 for a direction that takes it further out and a
+    positive length for one that brings it back — never further out (the rule every motion source follows)."""
+    s = math.inf
+    for j in range(len(direction)):
+        dj = direction[j]
+        if dj > 1e-12 and hi is not None:
+            s = min(s, (hi[j] - ref[j]) / dj)
+        elif dj < -1e-12 and lo is not None:
+            s = min(s, (lo[j] - ref[j]) / dj)
+    return max(0.0, s)
 
 
-_PROFILE_MAP = {
-    "trapezoidal": _ramp_trapezoidal,
-    "scurve":      _ramp_scurve,
-}
-
-_PROFILE_TO_IDX = {"trapezoidal": 0, "scurve": 1}
-_CONTROL_TO_IDX = {"pid": 0,         "pd":     1}
+def ray_limits(direction, vmax, amax, jmax):
+    """(vel, accel, jerk) along the ray: every moving joint within its own limit (|dq_j/dt| = |ds/dt| * |d_j|)."""
+    v = a = j = math.inf
+    for k in range(len(direction)):
+        dk = abs(direction[k])
+        if dk > 1e-12:
+            v, a, j = min(v, vmax[k] / dk), min(a, amax[k] / dk), min(j, jmax[k] / dk)
+    return v, a, j
 
 
 class JogHandler:
@@ -89,7 +78,8 @@ class JogHandler:
                  jerk_factor: float = 3.0,
                  control_mode: str = "pid",
                  speed_pct: float = 0.20,
-                 shared_data=None):
+                 shared_data=None,
+                 self_collision: bool = False):
         """
         Args:
             joint_num:     Number of arm joints.
@@ -98,13 +88,16 @@ class JogHandler:
             limit_neg:     Per-joint negative soft limits in radians.
             limit_pos:     Per-joint positive soft limits in radians.
             accel_time:    Time (s) to ramp from 0 to full speed.
-            profile:       'trapezoidal' or 'scurve' velocity ramp.
+            profile:       'trapezoidal' or 'scurve' (jerk-limited) motion along the ray.
             jerk_factor:   jerk = accel * factor (S-curve only).
             control_mode:  'pid' (Send_data_pack_1) or 'pd' (Send_data_pack_PD).
             speed_pct:     Initial slider value 0.0–1.0 (no effect until set_jog).
             shared_data:   Optional reference to data.shared_data module. When
                            provided, the handler mirrors its config to
-                           shared_data.rti[] so new GUI tabs see live values.
+                           shared_data.rti[] so new GUI tabs see live values,
+                           and publishes the jog session for the collision worker.
+            self_collision: True when <self_collision><enabled> is on: the worker's free length along the ray
+                           limits the jog (and no answer yet = wait). False: soft limits only.
 
         Defaults match the <jog_defaults> example in config/system.xml. RTI.py
         seeds the real defaults from system.xml at startup.
@@ -112,6 +105,7 @@ class JogHandler:
         self.joint_num   = joint_num
         self._delta_t    = delta_t
         self._shared_data = shared_data
+        self._sc_enabled = bool(self_collision) and shared_data is not None
 
         self._max_vel_rad = np.asarray(max_vel_rad, dtype=np.float64)
         # The PHYSICAL ceiling from the robot XML (<joint_acceleration_limit>). accel_time is
@@ -131,35 +125,63 @@ class JogHandler:
         # Pre-allocated buffers — never reallocated inside step()
         self._target_pos_rad  = np.zeros(joint_num, dtype=np.float64)  # rad
         self._target_vel_rad  = np.zeros(joint_num, dtype=np.float64)  # rad/s
+        self._accel_state     = np.zeros(joint_num, dtype=np.float64)  # rad/s² (telemetry: the ray's acceleration per joint)
+        self._tmp             = np.zeros(joint_num, dtype=np.float64)
 
-        # Per-joint direction block: 0 = free, +1 = positive rad/s blocked, -1 = negative rad/s blocked.
-        # Stored in joint space so comparisons against jog_direction_rad are consistent for all joints.
-        # Set when lookahead or hard clamp fires. Cleared only when user presses the opposite direction.
+        # Per-joint direction block indicator for the GUI: 0 = free, +1 / -1 = that direction is at a limit.
+        # Set when a jog arrives at its limit (soft or self-collision); cleared when another direction is pressed.
         self._blocked_dir = np.zeros(joint_num, dtype=np.int8)
 
-        # Velocity ramp profile
-        self._jerk_factor = float(max(0.5, jerk_factor))
-        self._jerk_rad    = self._accel_rad * self._jerk_factor  # rad/s³
-        self._accel_state = np.zeros(joint_num, dtype=np.float64)  # per-joint current accel (S-curve state)
-
-        if profile not in _PROFILE_MAP:
+        # Motion profile along the ray
+        if profile not in _PROFILE_TO_IDX:
             profile = "scurve"
         self._profile_name = profile
-        self._ramp_fn      = _PROFILE_MAP[profile]
+        self._jerk_factor = float(max(0.5, jerk_factor))
+        self._jerk_rad    = self._accel_rad * self._jerk_factor  # rad/s³
 
         # Control mode: "pid" → Send_data_pack_1, "pd" → Send_data_pack_PD
         if control_mode not in ("pid", "pd"):
             control_mode = "pid"
         self._control_mode = control_mode
 
-        # Jog input state — written by ZMQ command handler, read by step()
-        self._jog_axis         = -1
-        self._jog_direction    = 0    # -1 or +1 (joint space: positive = increasing joint angle)
-        self._jog_speed_pct    = float(max(0.0, min(1.0, speed_pct)))
+        # The requested jog (written by set_jog / set_jog_vector / stop_jog)
+        self._want_dir    = np.zeros(joint_num, dtype=np.float64)    # unit vector, or zeros = no jog
+        self._want_on     = False
+        self._want_is_session = False                                # the request is the running session's direction
+        self._jog_axis    = -1                                       # the axis of a single-joint jog (logs, indicator)
+        self._jog_direction = 0
+        self._jog_speed_pct = float(max(0.0, min(1.0, speed_pct)))
 
-        # Activity log — session/limit edge tracking (see TODO/activity_log_design.md).
+        # The jog session: one ray. ref = the commanded pose it began at; s / sv / sa = the position, speed and
+        # acceleration along it (Ruckig's state); s_soft = the soft limits' free length along it.
+        self._dir     = np.zeros(joint_num, dtype=np.float64)
+        self._ref     = np.zeros(joint_num, dtype=np.float64)
+        self._session = 0
+        self._s = self._sv = self._sa = 0.0
+        self._s_soft  = 0.0
+        self._has_session = False
+        self._v_ray = self._a_ray = self._j_ray = 0.0
+        self._limits_dirty = True
+        self._limit_logged = False
+
+        # Ruckig along the ray, 1 DOF. ALLOCATION NOTE: new_position / new_velocity / new_acceleration return fresh
+        # one-element lists — the same deliberate exception to the hot-path rule as motion/rti_handler.py's Ruckig
+        # (no zero-copy view in the binding); the inputs are pre-allocated arrays. ~2 us per update (measured).
+        self._rk     = Ruckig(1, delta_t)
+        self._rk_in  = InputParameter(1)
+        self._rk_out = OutputParameter(1)
+        self._rk_x   = np.zeros(1); self._rk_v = np.zeros(1); self._rk_a = np.zeros(1)
+        self._rk_tx  = np.zeros(1); self._rk_zero = np.zeros(1)
+        self._rk_vmax = np.zeros(1); self._rk_amax = np.zeros(1); self._rk_jmax = np.zeros(1)
+        self._rk_in.target_velocity = self._rk_zero
+        self._rk_in.target_acceleration = self._rk_zero
+
+        # Activity log — session/limit edge tracking (see TODO/activity_log_design.md). Texts built once: nothing is
+        # formatted on the tick.
         self._activity_logger    = get_rti_activity_logger()
         self._jog_session_active = False
+        self._limit_msg = [(f"axis={i} direction=-1", f"axis={i} direction=+1") for i in range(joint_num)]
+        self._sc_msg = [(f"axis={i} direction=-1 self-collision", f"axis={i} direction=+1 self-collision") for i in range(joint_num)]
 
         # Mirror initial config to shared memory so the GUI sees XML defaults
         # immediately on the first page load.
@@ -184,36 +206,52 @@ class JogHandler:
     # -------------------------------------------------------------------------
 
     def set_jog(self, axis: int, direction: int, speed_pct: float):
-        # Switching to a different joint — clear the previous joint's block so its
-        # indicator resets. The new joint's block state is unaffected.
-        if axis != self._jog_axis and self._jog_axis >= 0:
-            if self._blocked_dir[self._jog_axis] != 0:
-                log_activity(self._activity_logger, "RTI", "info", "LIMIT_CLEARED",
-                             message=f"axis={self._jog_axis}")
-            self._blocked_dir[self._jog_axis] = 0
-        # Pressing the opposite direction on the same joint unblocks it.
-        # Pressing the same blocked direction keeps the block (no re-entry).
-        if self._blocked_dir[axis] != 0 and self._blocked_dir[axis] != direction:
-            log_activity(self._activity_logger, "RTI", "info", "LIMIT_CLEARED", message=f"axis={axis}")
-            self._blocked_dir[axis] = 0
-        self._jog_axis      = axis
-        self._jog_direction = direction
+        """Jog one joint: `direction` +1 / -1 (0 = stop), speed as a fraction of that joint's velocity limit."""
+        if direction == 0:
+            self.stop_jog()
+            return
+        vec = self._tmp
+        vec[:] = 0.0
+        vec[axis] = 1.0 if direction > 0 else -1.0
+        # the indicator: pressing anything but the blocked direction clears it
+        for i in range(self.joint_num):
+            if self._blocked_dir[i] != 0 and not (i == axis and self._blocked_dir[i] == (1 if direction > 0 else -1)):
+                log_activity(self._activity_logger, "RTI", "info", "LIMIT_CLEARED", message=f"axis={i}")
+                self._blocked_dir[i] = 0
+        self._jog_axis, self._jog_direction = axis, (1 if direction > 0 else -1)
+        self._request(vec, speed_pct, f"axis={axis} direction={self._jog_direction:+d}")
+
+    def set_jog_vector(self, direction, speed_pct: float):
+        """Jog several joints at once: `direction` is any joint-space vector (normalised here); the speed is a fraction
+        of the fastest speed along it that keeps every moving joint within its own velocity limit. Stops at the
+        nearer of the soft limits and the self-collision margin along that ray, exactly like a single-joint jog."""
+        d = np.asarray(direction, dtype=np.float64)[:self.joint_num]
+        norm = float(np.linalg.norm(d))
+        if norm < 1e-9:
+            self.stop_jog()
+            return
+        for i in range(self.joint_num):
+            if self._blocked_dir[i] != 0:
+                log_activity(self._activity_logger, "RTI", "info", "LIMIT_CLEARED", message=f"axis={i}")
+                self._blocked_dir[i] = 0
+        self._jog_axis, self._jog_direction = -1, 0
+        self._request(d / norm, speed_pct, "vector=" + np.array2string(d / norm, precision=3, separator=","))
+
+    def _request(self, unit_dir, speed_pct, what):
+        self._want_is_session = self._has_session and bool(np.array_equal(unit_dir, self._dir))
+        self._want_dir[:] = unit_dir
+        self._want_on = True
         self._jog_speed_pct = max(0.0, min(1.0, speed_pct))
         if self._shared_data is not None:
             self._shared_data.rti['jog_speed_pct'][0] = self._jog_speed_pct
-
-        if direction != 0 and not self._jog_session_active:
+        if not self._jog_session_active:
             self._jog_session_active = True
             log_activity(self._activity_logger, "RTI", "info", "JOG_STARTED",
-                         message=f"axis={axis} direction={direction:+d} speed_pct={self._jog_speed_pct:.2f}")
-        elif direction == 0 and self._jog_session_active:
-            self._jog_session_active = False
-            log_activity(self._activity_logger, "RTI", "info", "JOG_STOPPED", message=f"axis={axis}")
+                         message=f"{what} speed_pct={self._jog_speed_pct:.2f}")
 
     def stop_jog(self):
-        self._jog_direction = 0
-        # Intentionally do NOT clear _blocked_dir — block persists across button releases
-        # so the user cannot wiggle past the soft limit by rapidly tapping.
+        self._want_on = False
+        # The indicator stays (a release does not unblock: pressing the same direction again stays at the limit).
         if self._jog_session_active:
             self._jog_session_active = False
             log_activity(self._activity_logger, "RTI", "info", "JOG_STOPPED",
@@ -228,16 +266,16 @@ class JogHandler:
         self._accel_time = float(accel_time)
         self._accel_rad  = self._compute_accel(accel_time)
         self._jerk_rad   = self._accel_rad * self._jerk_factor
+        self._limits_dirty = True
         if self._shared_data is not None:
             self._shared_data.rti['jog_accel_time'][0] = self._accel_time
 
     def set_profile(self, name: str):
-        """Switch velocity ramp profile. Options: 'trapezoidal', 'scurve'."""
-        if name not in _PROFILE_MAP:
-            raise ValueError(f"Unknown jog profile {name!r}. Choose from: {list(_PROFILE_MAP)}")
-        self._profile_name   = name
-        self._ramp_fn        = _PROFILE_MAP[name]
-        self._accel_state[:] = 0.0
+        """Switch the motion profile along the ray. Options: 'trapezoidal' (unlimited jerk), 'scurve' (jerk-limited)."""
+        if name not in _PROFILE_TO_IDX:
+            raise ValueError(f"Unknown jog profile {name!r}. Choose from: {list(_PROFILE_TO_IDX)}")
+        self._profile_name = name
+        self._limits_dirty = True
         if self._shared_data is not None:
             self._shared_data.rti['jog_profile_idx'][0] = _PROFILE_TO_IDX[name]
 
@@ -245,6 +283,7 @@ class JogHandler:
         """Set jerk as a multiple of accel (default 3.0). Higher = snappier S-curve corners."""
         self._jerk_factor = max(0.5, factor)
         self._jerk_rad    = self._accel_rad * self._jerk_factor
+        self._limits_dirty = True
         if self._shared_data is not None:
             self._shared_data.rti['jog_jerk_factor'][0] = self._jerk_factor
 
@@ -257,112 +296,130 @@ class JogHandler:
             self._shared_data.rti['jog_control_mode'][0] = _CONTROL_TO_IDX[mode]
 
     # -------------------------------------------------------------------------
+    # The jog session (cold: once per new direction)
+    # -------------------------------------------------------------------------
+
+    def _start_session(self):
+        """A new ray from where the jog stands: the commanded pose, the requested direction, its soft-limit free
+        length and limits; published for the collision worker (ref and direction BEFORE the session number)."""
+        self._ref[:] = self._target_pos_rad
+        self._dir[:] = self._want_dir
+        self._has_session = self._want_is_session = True
+        self._session += 1
+        self._s = self._sv = self._sa = 0.0
+        self._s_soft = ray_soft_free(self._ref, self._dir, self._limit_neg, self._limit_pos)
+        self._limits_dirty = True
+        self._limit_logged = False
+        if self._shared_data is not None:
+            rti = self._shared_data.rti
+            rti['jog_ref'][:self.joint_num] = self._ref
+            rti['jog_dir'][:self.joint_num] = self._dir
+            rti['jog_session'][0] = self._session
+
+    def _refresh_limits(self):
+        jerk = self._jerk_rad if self._profile_name == "scurve" else np.full(self.joint_num, np.inf)
+        self._v_ray, self._a_ray, self._j_ray = ray_limits(self._dir, self._max_vel_rad, self._accel_rad, jerk)
+        self._rk_amax[0], self._rk_jmax[0] = self._a_ray, self._j_ray
+        self._limits_dirty = False
+
+    # -------------------------------------------------------------------------
     # Mode handler interface — called by mode_dispatch
     # -------------------------------------------------------------------------
 
     def enter(self, ctx, **kwargs):
-        """Capture current joint position as starting point; clear velocity."""
+        """Capture current joint position as starting point; no motion, no session."""
         self._target_pos_rad[:] = ctx.shared_data.joint['joint_position'][:self.joint_num]
         self._target_vel_rad[:] = 0.0
         self._accel_state[:]    = 0.0
         self._blocked_dir[:] = 0
-        self._jog_axis      = -1
-        self._jog_direction = 0
+        self._want_on = self._want_is_session = self._has_session = False
+        self._want_dir[:] = 0.0
+        self._dir[:] = 0.0
+        self._ref[:] = self._target_pos_rad                          # no session: the targets stay where the arm is
+        self._s = self._sv = self._sa = 0.0
+        self._jog_axis, self._jog_direction = -1, 0
         self._jog_speed_pct = 0.0
+        if self._shared_data is not None:
+            self._shared_data.rti['jog_dir'][:self.joint_num] = 0.0
 
     def step(self, ctx):
-        dt        = self._delta_t
-        joint_pos = ctx.shared_data.joint['joint_position']  # rad, read-only view
+        rti = ctx.shared_data.rti
 
-        for i in range(self.joint_num):
-            pos   = joint_pos[i]
-            vel_i = self._target_vel_rad[i]  # rad/s
+        # 1. the session: a new direction starts once the previous motion is at rest
+        moving_same = self._want_on and self._want_is_session
+        if self._want_on and not moving_same and abs(self._sv) <= _REST:
+            self._start_session()
+            moving_same = True
+        if self._limits_dirty and self._has_session:
+            self._refresh_limits()
 
-            # ── target velocity (joint space) ─────────────────────────────────
-            if i == self._jog_axis and self._jog_direction != 0:
-                if self._blocked_dir[i] == self._jog_direction:
-                    target_vel = 0.0  # blocked at limit — must press opposite to unblock
-                else:
-                    target_vel = self._jog_direction * self._max_vel_rad[i] * self._jog_speed_pct
+        # 2. the free length along the ray: the nearer of the soft limits and the self-collision limit
+        s_lim = self._s_soft
+        sc_final = True
+        if moving_same and self._sc_enabled:
+            if rti['sc_ray_session'][0] == self._session:
+                s_sc = rti['sc_ray_free'][0]
+                sc_final = rti['sc_ray_done'][0] >= 0.5
             else:
-                target_vel = 0.0
+                s_sc, sc_final = 0.0, False                  # the worker has not answered for this ray yet: wait
+            if s_sc < s_lim:
+                s_lim = s_sc
 
-            # ── lookahead deceleration ────────────────────────────────────────
-            # Everything is in joint space (rad, rad/s) — no dir confusion.
-            # stopping_dist is the kinematic distance to bring vel_i down to 0
-            # under the *active* ramp profile:
-            #   trapezoidal: d = ½·v²/a            (instant accel snap to −a)
-            #   s-curve:     d = ½·v²/a + v·a/(2j) (extra term for jerk ramp-in/out)
-            # Without the s-curve term the lookahead under-estimates by a·v/(2j),
-            # the joint overshoots the soft limit, and the hard clamp at the
-            # bottom of this loop fires — snapping accel_state to 0 and giving
-            # a noticeably abrupter stop than a normal jog-button release.
-            if abs(vel_i) > 0:
-                a = self._accel_rad[i]
-                trap_dist = 0.5 * abs(vel_i) * (abs(vel_i) / a)
-                if self._ramp_fn is _ramp_scurve and self._jerk_rad[i] > 0:
-                    stopping_dist = (trap_dist + 0.5 * abs(vel_i) * (a / self._jerk_rad[i])) \
-                                    * _LOOKAHEAD_SAFETY_FACTOR
-                else:
-                    stopping_dist = trap_dist * _LOOKAHEAD_SAFETY_FACTOR
+        # 3. Ruckig along the ray: to the limit with zero speed (jogging), or to rest (released / switching)
+        inp = self._rk_in
+        self._rk_x[0], self._rk_v[0], self._rk_a[0] = self._s, self._sv, self._sa
+        inp.current_position, inp.current_velocity, inp.current_acceleration = self._rk_x, self._rk_v, self._rk_a
+        if moving_same:
+            inp.control_interface = ControlInterface.Position
+            self._rk_tx[0] = s_lim
+            inp.target_position = self._rk_tx
+            self._rk_vmax[0] = max(self._v_ray * self._jog_speed_pct, 1e-9)
+        else:
+            inp.control_interface = ControlInterface.Velocity
+            self._rk_vmax[0] = max(self._v_ray, abs(self._sv), 1e-9)
+        inp.max_velocity, inp.max_acceleration, inp.max_jerk = self._rk_vmax, self._rk_amax, self._rk_jmax
+        if self._has_session:
+            res = self._rk.update(inp, self._rk_out)
+            if res == Result.Working or res == Result.Finished:
+                self._s = self._rk_out.new_position[0]
+                self._sv = self._rk_out.new_velocity[0]
+                self._sa = self._rk_out.new_acceleration[0]
+            else:                                            # cold: Ruckig refused — hold where the command is
+                self._sv = self._sa = 0.0
 
-                if vel_i > 0 and self._limit_pos is not None:
-                    if (self._limit_pos[i] - pos) <= stopping_dist:
-                        target_vel = 0.0
-                        if self._blocked_dir[i] == 0:
-                            log_activity(self._activity_logger, "RTI", "warning", "LIMIT_REACHED",
-                                         message=f"axis={i} direction=+1")
-                        self._blocked_dir[i] = 1
-                elif vel_i < 0 and self._limit_neg is not None:
-                    if (pos - self._limit_neg[i]) <= stopping_dist:
-                        target_vel = 0.0
-                        if self._blocked_dir[i] == 0:
-                            log_activity(self._activity_logger, "RTI", "warning", "LIMIT_REACHED",
-                                         message=f"axis={i} direction=-1")
-                        self._blocked_dir[i] = -1
+        # 4. the joint targets: on the ray
+        np.multiply(self._dir, self._s, out=self._tmp)
+        np.add(self._ref, self._tmp, out=self._target_pos_rad)
+        np.multiply(self._dir, self._sv, out=self._target_vel_rad)
+        np.multiply(self._dir, self._sa, out=self._accel_state)
 
-            # ── velocity ramp ─────────────────────────────────────────────────
-            self._target_vel_rad[i], self._accel_state[i] = self._ramp_fn(
-                vel_i, target_vel, self._accel_rad[i], self._jerk_rad[i], dt, self._accel_state[i]
-            )
-
-            # ── hard clamp (safety net) ───────────────────────────────────────
-            # Fires if lookahead undershot due to measurement noise or integrator drift.
-            if self._limit_neg is not None and pos <= self._limit_neg[i] and vel_i < 0:
-                self._target_vel_rad[i] = 0.0
-                self._accel_state[i]    = 0.0
-                if self._blocked_dir[i] == 0:
-                    log_activity(self._activity_logger, "RTI", "warning", "LIMIT_REACHED",
-                                 message=f"axis={i} direction=-1 hard_clamp")
-                self._blocked_dir[i]    = -1
-            if self._limit_pos is not None and pos >= self._limit_pos[i] and vel_i > 0:
-                self._target_vel_rad[i] = 0.0
-                self._accel_state[i]    = 0.0
-                if self._blocked_dir[i] == 0:
-                    log_activity(self._activity_logger, "RTI", "warning", "LIMIT_REACHED",
-                                 message=f"axis={i} direction=+1 hard_clamp")
-                self._blocked_dir[i]    = 1
-
-            # ── position integration ──────────────────────────────────────────
-            self._target_pos_rad[i] += self._target_vel_rad[i] * dt
+        # 5. arrived at a final limit while the jog is still held: the GUI indicator and one activity-log line
+        if (moving_same and sc_final and not self._limit_logged and abs(self._sv) <= _REST
+                and self._s >= s_lim - _ARRIVED):
+            self._limit_logged = True
+            soft = s_lim >= self._s_soft - _ARRIVED
+            if self._jog_axis >= 0:
+                k = 1 if self._jog_direction > 0 else 0
+                self._blocked_dir[self._jog_axis] = self._jog_direction
+                log_activity(self._activity_logger, "RTI", "warning", "LIMIT_REACHED" if soft else "SELF_COLLISION_BLOCK",
+                             message=self._limit_msg[self._jog_axis][k] if soft else self._sc_msg[self._jog_axis][k])
+            else:
+                for i in range(self.joint_num):
+                    if self._dir[i] != 0.0:
+                        self._blocked_dir[i] = 1 if self._dir[i] > 0 else -1
+                log_activity(self._activity_logger, "RTI", "warning", "LIMIT_REACHED" if soft else "SELF_COLLISION_BLOCK",
+                             message="vector jog")
 
         ctx.shared_data.joint['jog_blocked'][:self.joint_num] = self._blocked_dir
 
         # Gravity-comp feedforward only when enabled. Dispatch's _to_motor_space
         # converts Nm → mA in one in-place multiply.
-        grav_on = bool(ctx.shared_data.rti['gravity_comp_enabled'][0])
+        grav_on = bool(rti['gravity_comp_enabled'][0])
         trq = ctx.shared_data.joint['joint_gravity_torque'][:self.joint_num] if grav_on else None
 
-        # target == commanded in JOG (handler doesn't separate the two — the
-        # lookahead and hard clamp mutate _target_*_rad in place, so the buffers
-        # already reflect post-clamp values). Setting both explicitly per the
-        # "tight" definition in control_output_refactor_plan.md §7.5 — matches
-        # the meaning EXEC / RTI will use ("target = next waypoint after any
-        # planner-side intervention").
-        # acc_rad is the ramp's current acceleration (rad/s^2). It is TELEMETRY only — no CAN
-        # pack carries acceleration (data_pack_1/PD are Position/Speed/Current), so publishing
-        # it changes nothing the arm does. It exists so JOG populates the same channels EXEC
-        # already does instead of leaving joint_acceleration_commanded pinned at 0.
+        # target == commanded in JOG (the planned ray is already within every limit). acc_rad is the ray's current
+        # acceleration (rad/s^2) per joint — TELEMETRY only: no CAN pack carries acceleration (data_pack_1/PD are
+        # Position/Speed/Current), so publishing it changes nothing the arm does. EXEC fills the same channel.
         return TickResult(), ControlOutput(
             pos_rad=self._target_pos_rad,
             vel_rad=self._target_vel_rad,
@@ -378,7 +435,13 @@ class JogHandler:
         if self._jog_session_active:
             self._jog_session_active = False
             log_activity(self._activity_logger, "RTI", "info", "JOG_STOPPED", message="mode exit")
+        self._want_on = self._want_is_session = self._has_session = False
+        self._dir[:] = 0.0
+        self._ref[:] = self._target_pos_rad
+        self._s = self._sv = self._sa = 0.0
         self._target_vel_rad[:] = 0.0
         self._accel_state[:]    = 0.0
         self._blocked_dir[:] = 0
         ctx.shared_data.joint['jog_blocked'][:self.joint_num] = 0
+        if self._shared_data is not None:
+            self._shared_data.rti['jog_dir'][:self.joint_num] = 0.0

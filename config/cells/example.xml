@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ==========================================================================================
+     EXAMPLE CELL — a template. Every zone below is enabled="0", so selecting this cell checks
+     nothing until you edit it. Copy it to config/cells/<your_cell>.xml, set
+     <active_cell>your_cell</active_cell> in config/system.xml, and send reload_zones (or restart).
+     Full guide: docs/safety_zones.md.
+
+     Coordinates: the ROBOT BASE frame, METRES — the numbers robot.get_pose() reports. The easiest
+     way to measure a corner is to jog the TCP to it and read get_pose().
+
+     Attributes of every zone:
+       name      1-32 letters, digits, '_' or '-'; unique in the file
+       shape     box | prism | cylinder | sphere | plane
+       kind      allowed (the robot must stay INSIDE) | forbidden (the robot must stay OUTSIDE)  [required]
+       reaction  stop (default: latch an error, robot stops) | warn (report it, keep going)
+       checks    tool (default: the TCP point + the gripper's <tool_spheres>) | tcp (the TCP point only)
+       margin    extra clearance in metres for the PLANNER (default 0). The monitor trips at the
+                 zone's surface + <safety_monitor><zone_tolerance>, margin not counted.
+       enabled   1 (default) | 0
+     Every zone is its own rule: two allowed zones mean "inside both".
+     ========================================================================================== -->
+<cell>
+    <!-- The table the robot stands on: stay above z = 0 (the normal points to the allowed side). -->
+    <zone name="table" shape="plane" kind="allowed" margin="0.010" enabled="0">
+        <point>0 0 0</point>
+        <normal>0 0 1</normal>
+    </zone>
+
+    <!-- A fixture to keep out of: a box from its min corner to its max corner. -->
+    <zone name="fixture" shape="box" kind="forbidden" margin="0.010" enabled="0">
+        <min>0.20 -0.10 0.00</min>
+        <max>0.35  0.10 0.15</max>
+    </zone>
+
+    <!-- A round column: a cylinder from p1 to p2 (any direction). rounded="1" makes it a capsule. -->
+    <zone name="column" shape="cylinder" kind="forbidden" rounded="0" enabled="0">
+        <p1>-0.30 0.30 0.00</p1>
+        <p2>-0.30 0.30 0.60</p2>
+        <radius>0.05</radius>
+    </zone>
+
+    <!-- A lamp or a sensor head. -->
+    <zone name="lamp" shape="sphere" kind="forbidden" enabled="0">
+        <center>0.00 -0.40 0.50</center>
+        <radius>0.08</radius>
+    </zone>
+
+    <!-- The cell floor plan: a polygon (3-16 corners, in order around it) from z_min to z_max.
+         reaction="warn" here only to show the option. -->
+    <zone name="cell" shape="prism" kind="allowed" reaction="warn" enabled="0">
+        <vertex>-0.45 -0.45</vertex>
+        <vertex> 0.55 -0.45</vertex>
+        <vertex> 0.55  0.45</vertex>
+        <vertex>-0.45  0.45</vertex>
+        <z_min>-0.05</z_min>
+        <z_max>0.80</z_max>
+    </zone>
+</cell>

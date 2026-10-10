@@ -25,25 +25,28 @@ Description:
         )
         shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
 
-    Architecture — two separate safety layers
-    -----------------------------------------
-    Layer               Handles                                    Behaviour                          Recovery
-    ----------------    ---------------------------------------    --------------------------------   ----------------------------------
-    safety_checks.py    Joint limits, singularity, velocity,       Blocks/scales motion this tick,    Auto-resolves when you move away.
-                        collision detection.                        does NOT latch.
-    error_checks.py     Motor faults (watchdog, temperature,       Latches until user explicitly       Requires CAN clear command,
-                        encoder, ...), CAN lost, ESTOP.            clears via GUI or ZMQ.              settle period, then user action.
+    Architecture — where each safety concern lives (updated 2026-09-30)
+    ------------------------------------------------------------------
+    Prevention          Each motion source keeps the arm inside the soft limits: EXEC refuses the move
+                        (planner JOINT_LIMIT), JOG stops, RTI clamps/brakes. Per mode, never latches.
+    safety_monitor.py   Detection on the MEASURED state, every tick, every mode: OUT_OF_RANGE,
+                        BEYOND_ENDSTOP, HARD_LIMIT, JOINT_WALL, OVERSPEED, TRACKING, TCP_OVERSPEED, and the
+                        safety zones' ZONE_VIOLATION. Reports EVENTS that latch here like any hard error
+                        (monitor_errors=); warn-zones, soft limits and pushed-through freedrive walls are live
+                        warnings (monitor_warnings=).
+    error_checks.py     The one latch: motor faults (watchdog, temperature, encoder, ...), CAN lost,
+                        ESTOP, link/loop watchdogs, monitor events. Latches until the user clears;
+                        a hard error disables the robot and holds it (ACTIVE_ERROR).
 
-    Rule of thumb: if the robot motors are healthy and the condition goes away
-    by itself when you move — it belongs in safety_checks.py.  If the motor has
-    entered a fault state and needs a CAN clear command to recover — it belongs
-    here in error_checks.py.
+    (safety_checks.py's run_safety_checks() — once meant to be the detection layer — was never called
+    and was removed on 2026-09-30; see TODO/safety_stack_research.md.)
 """
 
 import logging
 import time
 
 from utility.state_machine import RobotMode, MAINTENANCE_MODES
+from utility.safety_monitor import BEYOND_ENDSTOP, MONITOR_KEYS
 from communication.can_message_handlers import write_motor_config_to_shared
 from utility.activity_log import get_rti_activity_logger, log_activity, RateLimiter
 
@@ -83,64 +86,25 @@ CLEAR_ERROR_SEND_REPEATS = 3    # how many times Send_Clear_Error() is sent per 
 # The band is one-sided by construction: RTI sleeps delta_t - exec (a relative sleep with
 # no catch-up), so the loop can overshoot its period but can never run FAST.
 LOOP_WARN_PERIOD_FACTOR  = 1.05   # p99 > +5% of nominal  -> warning (4.20 ms / 238 Hz on PAR6)
-LOOP_ERROR_PERIOD_FACTOR = 1.10   # p99 > +10% of nominal -> error   (4.40 ms / 227 Hz on PAR6)
+# The latching error is for a REAL loss of the real-time loop, not a slow burst (user decision 2026-10-01).
+# Measured that day: memory traffic on the other cores (an interpreter starting, the GUI, a planner) slows
+# RTI's Python up to ~3.5x for a few ticks — 5.5 ms worst — harmless to control, yet +10% for 1 s latched
+# LOOP_CRITICAL and disabled the robot on ~20 days since July. The warning above still shows those bursts.
+LOOP_ERROR_PERIOD_FACTOR = 1.50   # p99 > +50% of nominal -> error   (6.00 ms / 167 Hz on PAR6)
 LOOP_ERROR_SUSTAIN_S     = 1.0    # ...and held that long before the error latches
+LOOP_ERROR_TICK_FACTOR   = 3.0    # ...or ONE tick longer than 3 periods (12 ms on PAR6): a real stall
+                                  # (a velocity command keeps running through it). In-tick one-shot work
+                                  # measured <= 5.5 ms; reconnect reloads go one node per tick for this.
 
 # Keys (or key suffixes) that are warnings only — they do not set error_active.
-_WARNING_SUFFIXES = ("CAN_STALE", "HOMING_FAILED", "NOT_HOMED", "LOOP_DEGRADED")
+_WARNING_SUFFIXES = ("CAN_STALE", "HOMING_FAILED", "NOT_HOMED", "LOOP_DEGRADED", "ZONE_WARNING",
+                     "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING", "OVERSPEED_WARNING", "TRACKING_WARNING",
+                     "TCP_OVERSPEED_WARNING", "HOLD_OSCILLATION_WARNING", "SELF_COLLISION_WARNING", "SELF_COLLISION_STALE")
 
 
-# ---------------------------------------------------------------------------
-# Cause/fix descriptions for every possible error key, also the RTI-hardware
-# slice of the activity-log catalog (see utility/activity_log.py). The key is
-# what goes into the set; "cause" is what gets printed by check_errors()/
-# process_errors_tick(), "fix" is only surfaced in the activity log.
-# ---------------------------------------------------------------------------
-ERROR_DESCRIPTIONS = {
-    # E-stop
-    "ESTOP":                    {"cause": "E-STOP is active — robot is halted.", "fix": "release the E-STOP, then clear errors to resume."},
-    "SW_ESTOP":                 {"cause": "Software E-STOP is active — robot is halted.", "fix": "clear the software E-STOP, then clear errors to resume."},
-    "EXEC_LINK_LOST":           {"cause": "command_executor went silent during EXEC motion — the control link is lost.", "fix": "restart command_executor, then clear errors to resume."},
-    "RTI_LINK_LOST":            {"cause": "the external PC stopped sending setpoints while it held RTI control — the robot stopped itself.", "fix": "check the network and the controlling PC, then clear errors and re-claim control."},
-
-    # RT loop health (see LoopDegradationMonitor)
-    "LOOP_DEGRADED":            {"cause": "RT loop is running slower than its configured rate.", "fix": "check CPU load, thermal throttling, or a silent CAN node; clears itself once the loop recovers."},
-    "LOOP_CRITICAL":            {"cause": "RT loop has been critically slow for over a second — real-time guarantees are not being met.", "fix": "check CPU load/thermals and the timing stats in the GUI's RT Diagnostics tab, then clear errors to resume."},
-
-    # Per-joint motor errors  (formatted as "J{i}:KEY" at runtime)
-    "TEMPERATURE":              {"cause": "motor is overheating.", "fix": "let the motor cool down before re-enabling."},
-    "ENCODER":                  {"cause": "encoder error — position signal is lost or corrupted.", "fix": "check the encoder cable/connector on this joint."},
-    "VBUS":                     {"cause": "bus voltage error — supply voltage is out of range.", "fix": "check the power supply and bus wiring."},
-    "DRIVER":                   {"cause": "motor driver fault — internal hardware error.", "fix": "power-cycle the joint driver; replace if the fault recurs."},
-    "VELOCITY":                 {"cause": "velocity error — motor exceeded its velocity limit.", "fix": "check for an unexpected collision/obstruction, then re-enable."},
-    "CURRENT":                  {"cause": "current error — overcurrent detected.", "fix": "check for a mechanical jam on this joint before re-enabling."},
-    "ESTOP_MOTOR":              {"cause": "e-stop error reported by the motor driver.", "fix": "check the motor driver's own e-stop input wiring."},
-    "WATCHDOG":                 {"cause": "watchdog error — motor did not receive a command in time.", "fix": "check CAN wiring/power to the joint; re-enable once the fault clears."},
-
-    # Per-joint CAN communication errors
-    "CAN_LOST":                 {"cause": "CAN connection lost — no data received for too long.", "fix": "check CAN bus wiring/termination and joint power."},
-    "CAN_STALE":                {"cause": "CAN data is getting stale — motor may be slow to respond.", "fix": "check CAN bus load/wiring; usually resolves on its own."},
-
-    # Homing
-    "NOT_HOMED":                {"cause": "robot is not homed — home the robot before operating.", "fix": "run the home command."},
-    "HOMING_FAILED":            {"cause": "homing failed — could not find the endstop.", "fix": "check the endstop/limit switch wiring for this joint, then retry homing."},
-
-    # Gripper errors
-    "GRIPPER_DISCONNECTED":     {"cause": "gripper is not connected — no CAN reply from the gripper.", "fix": "check the gripper's CAN wiring/power."},
-    "GRIPPER_TIMEOUT":          {"cause": "gripper timeout error — gripper did not respond in time.", "fix": "check gripper CAN wiring/power."},
-    "GRIPPER_ESTOP":            {"cause": "gripper e-stop error — gripper received an e-stop signal.", "fix": "clear the gripper's e-stop condition."},
-    "GRIPPER_ERROR":            {"cause": "gripper reported a general fault.", "fix": "check logs/high_level.log for detail; power-cycle the gripper if it recurs."},
-
-    # Gripper motor-level errors (same faults as arm motors, reported by the gripper's motor driver)
-    "GRIPPER_MOTOR_TEMPERATURE": {"cause": "gripper motor is overheating.", "fix": "let the gripper motor cool down before re-enabling."},
-    "GRIPPER_MOTOR_ENCODER":     {"cause": "gripper motor encoder error — position signal is lost or corrupted.", "fix": "check the gripper's encoder cable/connector."},
-    "GRIPPER_MOTOR_VBUS":        {"cause": "gripper motor bus voltage error — supply voltage is out of range.", "fix": "check the power supply and bus wiring to the gripper."},
-    "GRIPPER_MOTOR_DRIVER":      {"cause": "gripper motor driver fault — internal hardware error.", "fix": "power-cycle the gripper driver; replace if the fault recurs."},
-    "GRIPPER_MOTOR_VELOCITY":    {"cause": "gripper motor velocity error — exceeded velocity limit.", "fix": "check for an obstruction in the gripper before re-enabling."},
-    "GRIPPER_MOTOR_CURRENT":     {"cause": "gripper motor current error — overcurrent detected.", "fix": "check for a mechanical jam in the gripper before re-enabling."},
-    "GRIPPER_MOTOR_ESTOP":       {"cause": "gripper motor e-stop error reported by the motor driver.", "fix": "check the gripper motor driver's own e-stop input wiring."},
-    "GRIPPER_MOTOR_WATCHDOG":    {"cause": "gripper motor watchdog error — motor did not receive a command in time.", "fix": "check CAN wiring/power to the gripper; re-enable once the fault clears."},
-}
+# The cause/fix catalog lives in utility/error_catalog.py (a leaf module, 2026-10-03); re-exported here so
+# `error_checks.ERROR_DESCRIPTIONS` keeps working.
+from utility.error_catalog import ERROR_DESCRIPTIONS
 
 
 def _cause_text(short_key: str, fallback: str) -> str:
@@ -175,8 +139,10 @@ _GRIPPER_MOTOR_ERROR_SHARED_KEYS = (
 
 
 def _joint_key(joint_index: int, short_key: str) -> str:
-    """Build a unique error key for a per-joint error, e.g. 'J2:TEMPERATURE'."""
-    return f"J{joint_index}:{short_key}"
+    """Build a unique error key for a per-joint error from its 0-based index, e.g. index 2 -> 'J3:TEMPERATURE'. The key
+    names the joint 1-based, J1..J6, like everything else the robot shows (2026-10-09, user: an error on J3 was reported
+    as J2 — the keys used to be 0-based)."""
+    return f"J{joint_index + 1}:{short_key}"
 
 
 def send_clear_errors(
@@ -187,9 +153,10 @@ def send_clear_errors(
     send_repeats: int = 1,
     Gripper_data=None,
     active_CAN_gripper: int = 0,
+    all_motors: bool = False,
 ):
     """
-    Send CAN clear-error commands to motors with active errors and zero
+    Send CAN clear-error commands to motors with active errors (every motor with `all_motors`) and zero
     stale deque data so the next update_motor_and_gripper_data tick reads 0
     instead of pre-clear poll values.
 
@@ -207,9 +174,12 @@ def send_clear_errors(
         send_repeats:       How many times to send Send_Clear_Error() per motor.
         Gripper_data:       Per-node deques of gripper CAN dicts (pass when gripper present).
         active_CAN_gripper: 1 if a CAN gripper is configured, 0 if not.
+        all_motors:         clear every joint motor, not only those showing an error — RTI's start (2026-10-05):
+                            the drivers carry the watchdog fault the LAST run's end left them, and before the loop
+                            has read any status, global_motor_error does not show it yet.
     """
     for i in range(joint_num):
-        if shared_data.motor['global_motor_error'][i] != 0:
+        if all_motors or shared_data.motor['global_motor_error'][i] != 0:
             for _ in range(send_repeats):
                 Motor[i].Send_Clear_Error()
         for entry in Motor_errors_data[i]:
@@ -312,7 +282,7 @@ class ExecLinkWatchdog:
 
 
 class LoopDegradationMonitor:
-    """Trips when the RT loop's p99 period stays above nominal for too long.
+    """Trips when the RT loop's p99 period stays above nominal for too long, or one tick stalls.
 
     Stateful — it counts how long p99 has been out of band, so it lives across RTI ticks
     (instantiate once, call update() each tick).
@@ -322,6 +292,9 @@ class LoopDegradationMonitor:
     window and never moves the 99th), while a genuine sustained degradation moves it within
     ~2 s. That is exactly the difference between "a log write took a while" and "this loop
     is not meeting its deadline any more".
+
+    A single tick longer than error_tick_factor x nominal is critical on its own: that is a stall, not a
+    slow burst (2026-10-01: bursts up to 5.5 ms are normal on the Pi 5 when other cores move memory).
 
     warmup_ticks gates it until the rolling window holds only post-boot samples. Without it
     the boot transients the stats are explicitly wiped for (RTI's tick 8 selfcheck, the
@@ -333,15 +306,18 @@ class LoopDegradationMonitor:
     def __init__(self, delta_t: float, warmup_ticks: int,
                  warn_factor: float = LOOP_WARN_PERIOD_FACTOR,
                  error_factor: float = LOOP_ERROR_PERIOD_FACTOR,
-                 sustain_s: float = LOOP_ERROR_SUSTAIN_S):
+                 sustain_s: float = LOOP_ERROR_SUSTAIN_S,
+                 error_tick_factor: float = LOOP_ERROR_TICK_FACTOR):
         self._warn_period   = delta_t * warn_factor
         self._error_period  = delta_t * error_factor
+        self._stall_period  = delta_t * error_tick_factor
         self._sustain_ticks = max(1, int(round(sustain_s / delta_t))) if delta_t > 0 else 1
         self._warmup_ticks  = warmup_ticks
         self._over_since    = None
 
-    def update(self, p99_period: float, tick: int) -> tuple:
-        """Returns (degraded, critical): the warning flag and the latching-error flag."""
+    def update(self, p99_period: float, tick: int, period: float = 0.0) -> tuple:
+        """Returns (degraded, critical): the warning flag and the latching-error flag. `period` is this
+        tick's own loop period (the single-tick stall check)."""
         if tick <= self._warmup_ticks:
             self._over_since = None
             return False, False
@@ -356,41 +332,44 @@ class LoopDegradationMonitor:
             self._over_since = None
             critical = False
 
-        return degraded, critical
+        return degraded, critical or period > self._stall_period
 
 
-def check_errors(
-    shared_data,
-    joint_num: int,
-    latched_errors: set,
-    estop_active: bool,
-    active_CAN_gripper: int = 0,
-    exec_link_lost: bool = False,
-    rti_link_lost: bool = False,
-    loop_degraded: bool = False,
-    loop_critical: bool = False,
-) -> tuple:
-    """
-    Inspect all error sources and update the latched error set.
+# ---------------------------------------------------------------------------
+# Per-tick error collection — one function per error family (split out of check_errors() on 2026-10-03,
+# Phase 5; the bodies are the former sections verbatim). Each adds its keys to `current_errors`.
+# ---------------------------------------------------------------------------
 
-    Logs exactly once when an error first appears. Errors stay latched until
-    clear_errors() is called — they do NOT auto-remove when the condition clears.
+# Motor driver error flags: (shared_data.motor field, error key). Module constants — check_errors() used to
+# rebuild them as lists on every tick (the hot-path allocation rule).
+_MOTOR_ERROR_FIELDS = (
+    ("motor_temperature_error", "TEMPERATURE"),
+    ("motor_encoder_error",     "ENCODER"),
+    ("motor_vbus_error",        "VBUS"),
+    ("motor_driver_error",      "DRIVER"),
+    ("motor_velocity_error",    "VELOCITY"),
+    ("motor_current_error",     "CURRENT"),
+    ("motor_estop_error",       "ESTOP_MOTOR"),
+    ("motor_watchdog_error",    "WATCHDOG"),
+)
 
-    Args:
-        shared_data:        The shared memory object (from data.shared_data).
-        joint_num:          Number of joints on the robot.
-        latched_errors:     The set returned by the previous call (pass set() on the first call).
-        estop_active:       Result of check_estop_active() — passed in so this module
-                            stays independent of the GPIO import.
-        active_CAN_gripper: 1 if a CAN gripper is configured, 0 if not.
+# Motor-level faults from the gripper's motor driver (same as arm motors): (shared_data.gripper field, error key).
+_GRIPPER_MOTOR_ERROR_FIELDS = (
+    ("gripper_motor_temp_error",     "GRIPPER_MOTOR_TEMPERATURE"),
+    ("gripper_motor_enc_error",      "GRIPPER_MOTOR_ENCODER"),
+    ("gripper_motor_vbus_error",     "GRIPPER_MOTOR_VBUS"),
+    ("gripper_motor_driver_error",   "GRIPPER_MOTOR_DRIVER"),
+    ("gripper_motor_velocity_error", "GRIPPER_MOTOR_VELOCITY"),
+    ("gripper_motor_current_error",  "GRIPPER_MOTOR_CURRENT"),
+    ("gripper_motor_estop_error",    "GRIPPER_MOTOR_ESTOP"),
+    ("gripper_motor_watchdog_error", "GRIPPER_MOTOR_WATCHDOG"),
+)
 
-    Returns:
-        (error_active: bool, latched_errors: set)
-        Pass latched_errors back on the next call.
-    """
 
-    current_errors = set()
-
+def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost,
+                           loop_degraded, loop_critical, monitor_errors, monitor_warnings):
+    """E-STOP, the EXEC / RTI link watchdogs, RT loop health and the safety monitor's events. The caller
+    pre-computes every flag; this only turns them into keys."""
     # ------------------------------------------------------------------
     # E-STOP
     # ------------------------------------------------------------------
@@ -431,21 +410,22 @@ def check_errors(
     if loop_critical:
         current_errors.add("LOOP_CRITICAL")
 
+    # Safety monitor trips (utility/safety_monitor.py). EVENTS, reported on the tick they fire and
+    # never again for the same excursion, so they reach the latch exactly once and stay there until
+    # clear_errors — hard errors like the E-STOP.
+    if monitor_errors:
+        current_errors.update(monitor_errors)
+    if monitor_warnings:
+        current_errors.update(monitor_warnings)
+
+
+def _collect_motor_errors(shared_data, joint_num, current_errors):
+    """Motor driver faults per joint, trusted only while the motor's LIVE aggregate fault bit is set."""
     # ------------------------------------------------------------------
     # Motor driver errors (per joint)
     # These come from the motor over CAN and are updated every ~20 ticks.
     # A motor in error enters idle mode and can no longer hold position.
     # ------------------------------------------------------------------
-    motor_error_fields = [
-        ("motor_temperature_error", "TEMPERATURE"),
-        ("motor_encoder_error",     "ENCODER"),
-        ("motor_vbus_error",        "VBUS"),
-        ("motor_driver_error",      "DRIVER"),
-        ("motor_velocity_error",    "VELOCITY"),
-        ("motor_current_error",     "CURRENT"),
-        ("motor_estop_error",       "ESTOP_MOTOR"),
-        ("motor_watchdog_error",    "WATCHDOG"),
-    ]
 
     for i in range(joint_num):
         # Trust the motor's LIVE aggregate fault bit over the slow per-type breakdown.
@@ -465,10 +445,13 @@ def check_errors(
         # suppress — unknown stays conservative.
         if shared_data.motor['global_motor_error'][i] == 0:
             continue
-        for field, short_key in motor_error_fields:
+        for field, short_key in _MOTOR_ERROR_FIELDS:
             if shared_data.motor[field][i]:
                 current_errors.add(_joint_key(i, short_key))
 
+
+def _collect_can_errors(shared_data, joint_num, current_errors):
+    """CAN connection health per joint: CAN_LOST (hard error), CAN_STALE (warning)."""
     # ------------------------------------------------------------------
     # CAN connection health (per joint)
     # ------------------------------------------------------------------
@@ -482,6 +465,9 @@ def check_errors(
         if shared_data.rti["old_data_warning"][i]:
             current_errors.add(_joint_key(i, "CAN_STALE"))
 
+
+def _collect_homing_errors(shared_data, joint_num, current_errors):
+    """NOT_HOMED (a general warning) and HOMING_FAILED per joint."""
     # ------------------------------------------------------------------
     # Homing state — general warning when robot is not homed
     # ------------------------------------------------------------------
@@ -496,51 +482,111 @@ def check_errors(
         if shared_data.rti["homing_status"][i] == 3:
             current_errors.add(_joint_key(i, "HOMING_FAILED"))
 
+
+def _collect_gripper_errors(shared_data, joint_num, current_errors, faults=True):
+    """Gripper node, gripper and gripper-motor faults. Only called when a CAN gripper is configured.
+    `faults` False: only the disconnection — the gripper's own fault bits are not read (RTI's start settle)."""
     # ------------------------------------------------------------------
     # Gripper errors (only checked when a CAN gripper is configured)
     # ------------------------------------------------------------------
+    # Disconnection: gripper node has been silent for ~50 ticks.
+    # Uses CAN_node_connection_error[joint_num] — same threshold as joint motors.
+    # This is much more robust than the per-tick received_ids check, which would
+    # falsely report a disconnect on every single missed tick.
+    if shared_data.rti["CAN_node_connection_error"][joint_num]:
+        current_errors.add("GRIPPER_DISCONNECTED")
+    if not faults:
+        return
+
+    # Fault bits reported by the gripper itself over CAN.
+    if shared_data.gripper["gripper_timeout_error"][0]:
+        current_errors.add("GRIPPER_TIMEOUT")
+    if shared_data.gripper["gripper_estop_error"][0]:
+        current_errors.add("GRIPPER_ESTOP")
+
+    # The gripper's live aggregate fault bit. Read from node_error_bits, NOT from
+    # shared_data.gripper['gripper_error']: that one is only refreshed by gripper-status
+    # replies, so in MOTOR mode (where the gripper is driven with Send_data_pack_1 and answers
+    # with DATA_PACK instead) it holds whatever firmware mode last saw — stale forever.
+    # node_error_bits comes off the CAN ID of every reply, so it is live in both modes.
+    _gripper_faulted = shared_data.rti["node_error_bits"][joint_num] != 0
+    if _gripper_faulted:
+        current_errors.add("GRIPPER_ERROR")
+
+    # Motor-level faults from the gripper's motor driver (same as arm motors).
+    # Same rule as the arm joints: these per-type flags are the SLOW round-robin breakdown, so
+    # only trust them while the gripper's live fault bit confirms a fault. Without this the
+    # gripper had the arm's "Clear Errors needs two presses" race — a stale pre-clear reading
+    # refilling its deque and surviving the latch wipe.
+    if _gripper_faulted:
+        for field, error_key in _GRIPPER_MOTOR_ERROR_FIELDS:
+            if shared_data.gripper[field][0]:
+                current_errors.add(error_key)
+
+
+def _log_new_error(key):
+    """Log an error the first time it appears — warnings at WARNING, everything else at ERROR."""
+    short_key = key.split(":", 1)[-1]          # strips the "J{i}:" prefix if present
+    description = _cause_text(short_key, key)
+    if key.startswith("J") and ":" in key:
+        joint_idx = key.split(":")[0][1:]      # e.g. "J3:TEMPERATURE" → "3" (the joint's 1-based number)
+        if short_key in ("CAN_STALE", "HOMING_FAILED", "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING",
+                         "OVERSPEED_WARNING", "TRACKING_WARNING", "HOLD_OSCILLATION_WARNING"):
+            logging.warning(f"[WARNING] Joint {joint_idx}: {description}")
+        else:
+            logging.error(f"[ERROR] Joint {joint_idx}: {description}")
+    elif short_key in ("NOT_HOMED", "ZONE_WARNING", "TCP_OVERSPEED_WARNING", "SELF_COLLISION_WARNING", "SELF_COLLISION_STALE"):
+        logging.warning(f"[WARNING] {description}")
+    else:
+        logging.error(f"[ERROR] {description}")
+
+
+def check_errors(
+    shared_data,
+    joint_num: int,
+    latched_errors: set,
+    estop_active: bool,
+    active_CAN_gripper: int = 0,
+    exec_link_lost: bool = False,
+    rti_link_lost: bool = False,
+    loop_degraded: bool = False,
+    loop_critical: bool = False,
+    monitor_errors=(),
+    monitor_warnings=(),
+    driver_faults: bool = True,
+) -> tuple:
+    """
+    Inspect all error sources and update the latched error set.
+
+    Logs exactly once when an error first appears. Errors stay latched until
+    clear_errors() is called — they do NOT auto-remove when the condition clears.
+
+    Args:
+        shared_data:        The shared memory object (from data.shared_data).
+        joint_num:          Number of joints on the robot.
+        latched_errors:     The set returned by the previous call (pass set() on the first call).
+        estop_active:       Result of check_estop_active() — passed in so this module
+                            stays independent of the GPIO import.
+        active_CAN_gripper: 1 if a CAN gripper is configured, 0 if not.
+        driver_faults:      False = the faults the motor drivers and the gripper REPORT are not read (connection
+                            losses, the E-stop, the monitor and every system error still are). RTI passes False
+                            for the settle after its start-up clear (2026-10-05): the drivers report the fault the
+                            last run's end left them until that clear lands — not a fault of this run.
+
+    Returns:
+        (error_active: bool, latched_errors: set)
+        Pass latched_errors back on the next call.
+    """
+
+    current_errors = set()
+    _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost,
+                           loop_degraded, loop_critical, monitor_errors, monitor_warnings)
+    if driver_faults:
+        _collect_motor_errors(shared_data, joint_num, current_errors)
+    _collect_can_errors(shared_data, joint_num, current_errors)
+    _collect_homing_errors(shared_data, joint_num, current_errors)
     if active_CAN_gripper:
-        # Disconnection: gripper node has been silent for ~50 ticks.
-        # Uses CAN_node_connection_error[joint_num] — same threshold as joint motors.
-        # This is much more robust than the per-tick received_ids check, which would
-        # falsely report a disconnect on every single missed tick.
-        if shared_data.rti["CAN_node_connection_error"][joint_num]:
-            current_errors.add("GRIPPER_DISCONNECTED")
-
-        # Fault bits reported by the gripper itself over CAN.
-        if shared_data.gripper["gripper_timeout_error"][0]:
-            current_errors.add("GRIPPER_TIMEOUT")
-        if shared_data.gripper["gripper_estop_error"][0]:
-            current_errors.add("GRIPPER_ESTOP")
-
-        # The gripper's live aggregate fault bit. Read from node_error_bits, NOT from
-        # shared_data.gripper['gripper_error']: that one is only refreshed by gripper-status
-        # replies, so in MOTOR mode (where the gripper is driven with Send_data_pack_1 and answers
-        # with DATA_PACK instead) it holds whatever firmware mode last saw — stale forever.
-        # node_error_bits comes off the CAN ID of every reply, so it is live in both modes.
-        _gripper_faulted = shared_data.rti["node_error_bits"][joint_num] != 0
-        if _gripper_faulted:
-            current_errors.add("GRIPPER_ERROR")
-
-        # Motor-level faults from the gripper's motor driver (same as arm motors).
-        gripper_motor_error_fields = [
-            ("gripper_motor_temp_error",     "GRIPPER_MOTOR_TEMPERATURE"),
-            ("gripper_motor_enc_error",      "GRIPPER_MOTOR_ENCODER"),
-            ("gripper_motor_vbus_error",     "GRIPPER_MOTOR_VBUS"),
-            ("gripper_motor_driver_error",   "GRIPPER_MOTOR_DRIVER"),
-            ("gripper_motor_velocity_error", "GRIPPER_MOTOR_VELOCITY"),
-            ("gripper_motor_current_error",  "GRIPPER_MOTOR_CURRENT"),
-            ("gripper_motor_estop_error",    "GRIPPER_MOTOR_ESTOP"),
-            ("gripper_motor_watchdog_error", "GRIPPER_MOTOR_WATCHDOG"),
-        ]
-        # Same rule as the arm joints: these per-type flags are the SLOW round-robin breakdown, so
-        # only trust them while the gripper's live fault bit confirms a fault. Without this the
-        # gripper had the arm's "Clear Errors needs two presses" race — a stale pre-clear reading
-        # refilling its deque and surviving the latch wipe.
-        if _gripper_faulted:
-            for field, error_key in gripper_motor_error_fields:
-                if shared_data.gripper[field][0]:
-                    current_errors.add(error_key)
+        _collect_gripper_errors(shared_data, joint_num, current_errors, driver_faults)
 
     # ------------------------------------------------------------------
     # Drop resolved WARNINGS from the latch (hard errors are handled below).
@@ -561,20 +607,8 @@ def check_errors(
     # self-remove when the underlying condition goes away.
     # ------------------------------------------------------------------
     newly_appeared = current_errors - latched_errors
-
     for key in newly_appeared:
-        short_key = key.split(":", 1)[-1]          # strips the "J{i}:" prefix if present
-        description = _cause_text(short_key, key)
-        if key.startswith("J") and ":" in key:
-            joint_idx = key.split(":")[0][1:]      # e.g. "J2:TEMPERATURE" → "2"
-            if short_key in ("CAN_STALE", "HOMING_FAILED"):
-                logging.warning(f"[WARNING] Joint {joint_idx}: {description}")
-            else:
-                logging.error(f"[ERROR] Joint {joint_idx}: {description}")
-        elif short_key in ("NOT_HOMED",):
-            logging.warning(f"[WARNING] {description}")
-        else:
-            logging.error(f"[ERROR] {description}")
+        _log_new_error(key)
         latched_errors.add(key)
 
     # ------------------------------------------------------------------
@@ -587,47 +621,15 @@ def check_errors(
     return error_active, latched_errors
 
 
-def process_errors_tick(
-    shared_data,
-    Motor,
-    Motor_errors_data,
-    joint_num: int,
-    clear_error_countdown: int,
-    latched_errors: set,
-    error_metadata: dict,
-    active_CAN_gripper: int,
-    current_mode,
-    homing_ctrl,
-    estop_active: bool,
-    Gripper_data=None,
-    exec_link_lost: bool = False,
-    rti_link_lost: bool = False,
-    loop_degraded: bool = False,
-    loop_critical: bool = False,
-) -> tuple:
-    """Run one tick of error processing in the RTI superloop.
+# ---------------------------------------------------------------------------
+# The per-tick error processing, one step per function (split out of process_errors_tick() on 2026-10-03,
+# Phase 5; bodies verbatim). process_errors_tick() below is the order they run in.
+# ---------------------------------------------------------------------------
 
-    Handles the clear-error signal, settle countdown, error detection,
-    homing invalidation, mode forcing, metadata bookkeeping, and
-    shared-memory publishing in one call.
-
-    Args:
-        shared_data:            Shared memory module.
-        Motor:                  List of SpectralCAN motor objects.
-        Motor_errors_data:      Per-motor deques of error-poll dicts.
-        joint_num:              Number of joints.
-        clear_error_countdown:  Current countdown value (ticks remaining).
-        latched_errors:         The current latched error set.
-        error_metadata:         Dict of error key → metadata (timestamp, tick, …).
-        active_CAN_gripper:     1 if a CAN gripper is configured, 0 if not.
-        current_mode:           Current RobotMode value.
-        homing_ctrl:            HomingController instance (needed to abort homing on error).
-        estop_active:           Result of check_estop_active() — pre-computed by caller.
-        Gripper_data:           Per-node deques of gripper CAN dicts.
-
-    Returns:
-        (clear_error_countdown, latched_errors, error_metadata, current_mode)
-    """
+def _handle_clear_signal(shared_data, Motor, Motor_errors_data, joint_num, clear_error_countdown,
+                         Gripper_data, active_CAN_gripper):
+    """The clear-error signal: send the CAN clear to the errored motors and start the settle countdown.
+    Returns the countdown (unchanged when there was no signal)."""
     # ── Clear-error signal: send CAN clear to errored motors, start settle countdown ──
     if shared_data.clear_error_signal.get() == "1":
         send_clear_errors(
@@ -640,24 +642,11 @@ def process_errors_tick(
             f"[ERRORS] CAN clear sent to errored motors. "
             f"Settling for {CLEAR_ERROR_SETTLE_TICKS} ticks before wiping latch."
         )
+    return clear_error_countdown
 
-    # ── Settle countdown: wipe latch only after N clean verification ticks ──
-    clear_error_countdown, latched_errors = tick_clear_countdown(
-        clear_error_countdown, latched_errors, shared_data, active_CAN_gripper,
-    )
 
-    # ── Detect errors ────────────────────────────────────────────────────────
-    error_active, latched_errors = check_errors(
-        shared_data, joint_num, latched_errors,
-        estop_active=estop_active,
-        active_CAN_gripper=active_CAN_gripper,
-        exec_link_lost=exec_link_lost,
-        rti_link_lost=rti_link_lost,
-        loop_degraded=loop_degraded,
-        loop_critical=loop_critical,
-    )
-    shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
-
+def _invalidate_homing_on_errors(shared_data, latched_errors):
+    """A lost node or a position past an endstop means the position reference is gone: NOT HOMED."""
     # ── CAN disconnect → invalidate homing ───────────────────────────────────
     disconnect_errors = {
         k for k in latched_errors
@@ -668,6 +657,18 @@ def process_errors_tick(
         shared_data.rti["homing_status"][:] = 0
         logging.error(f"[RTI] Connection lost ({disconnect_errors}) — homing invalidated.")
 
+    # ── Position past a physical endstop → the reference is wrong → invalidate homing ──
+    beyond = {k for k in latched_errors if k.endswith(":" + BEYOND_ENDSTOP)} if latched_errors else ()
+    if beyond and shared_data.homed_state.get() == "HOMED":
+        shared_data.homed_state.set("NOT HOMED")
+        shared_data.rti["homing_status"][:] = 0
+        logging.error(f"[RTI] Measured position past an endstop ({beyond}) — the position reference "
+                      f"cannot be trusted; homing invalidated.")
+
+
+def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, error_active):
+    """A hard error forces DISABLED and ACTIVE_ERROR (velocity-hold); errors cleared returns to IDLE.
+    Returns the (possibly changed) mode."""
     # ── Hard error → force DISABLED / ACTIVE_ERROR (velocity-hold) ─────────
     if error_active and current_mode != RobotMode.BOOTING:
         if shared_data.robot_state.get() != "DISABLED":
@@ -711,7 +712,12 @@ def process_errors_tick(
         current_mode = RobotMode.IDLE
         shared_data.robot_mode.set(current_mode)
         logging.info("[RTI] Errors cleared — returning to IDLE.")
+    return current_mode
 
+
+def _update_error_metadata(shared_data, latched_errors, error_metadata):
+    """Metadata (timestamp, tick, description, level) for newly latched keys — with an activity-log entry —
+    and removal for cleared ones. Returns True when anything changed."""
     # ── Update error metadata: add new, prune cleared ────────────────────────
     tick = int(shared_data.rti["loop_tick"][0])
     existing_error_keys = set(error_metadata)
@@ -733,21 +739,113 @@ def process_errors_tick(
             joint_msg = None
             if key.startswith("J") and ":" in key:
                 joint_msg = f"joint {key.split(':')[0][1:]}"
+            elif key.startswith("Z_") and ":" in key:
+                joint_msg = f"zone {key.split(':')[0][2:]}"
             log_activity(get_rti_activity_logger(), "RTI", level, short_key, message=joint_msg)
     for key in cleared_error_keys:
         del error_metadata[key]
+    return error_metadata_changed
 
+
+def _publish_error_list(shared_data, error_metadata):
+    """Write the rich error list to shared memory (sorted by timestamp), "NONE" when empty."""
     # ── Publish rich error list to shared memory (sorted by timestamp) ────────
     # SharedString.set_json() serializes and zero-fills the whole shared-memory
     # block, so only publish on edge changes instead of every RT tick.
-    if error_metadata_changed:
-        if error_metadata:
-            error_list = sorted(
-                [{"key": k, **v} for k, v in error_metadata.items()],
-                key=lambda e: e["timestamp"],
-            )
-            shared_data.error_state.set_json(error_list)
-        else:
-            shared_data.error_state.set_json("NONE")
+    if error_metadata:
+        error_list = sorted(
+            [{"key": k, **v} for k, v in error_metadata.items()],
+            key=lambda e: e["timestamp"],
+        )
+        shared_data.error_state.set_json(error_list)
+    else:
+        shared_data.error_state.set_json("NONE")
+
+
+def process_errors_tick(
+    shared_data,
+    Motor,
+    Motor_errors_data,
+    joint_num: int,
+    clear_error_countdown: int,
+    latched_errors: set,
+    error_metadata: dict,
+    active_CAN_gripper: int,
+    current_mode,
+    homing_ctrl,
+    estop_active: bool,
+    Gripper_data=None,
+    exec_link_lost: bool = False,
+    rti_link_lost: bool = False,
+    loop_degraded: bool = False,
+    loop_critical: bool = False,
+    monitor_errors=(),
+    monitor_warnings=(),
+    on_hard_error=None,
+    driver_faults: bool = True,
+) -> tuple:
+    """Run one tick of error processing in the RTI superloop.
+
+    Handles the clear-error signal, settle countdown, error detection,
+    homing invalidation, mode forcing, metadata bookkeeping, and
+    shared-memory publishing in one call.
+
+    Args:
+        shared_data:            Shared memory module.
+        Motor:                  List of SpectralCAN motor objects.
+        Motor_errors_data:      Per-motor deques of error-poll dicts.
+        joint_num:              Number of joints.
+        clear_error_countdown:  Current countdown value (ticks remaining).
+        latched_errors:         The current latched error set.
+        error_metadata:         Dict of error key → metadata (timestamp, tick, …).
+        active_CAN_gripper:     1 if a CAN gripper is configured, 0 if not.
+        current_mode:           Current RobotMode value.
+        homing_ctrl:            HomingController instance (needed to abort homing on error).
+        estop_active:           Result of check_estop_active() — pre-computed by caller.
+        Gripper_data:           Per-node deques of gripper CAN dicts.
+        on_hard_error:          Optional callable(new_hard_keys, tick), called on the ONE tick a hard error
+                                first latches (utility/incident_dump.py saves the last two seconds).
+        driver_faults:          False during the settle after RTI's start-up clear (check_errors).
+
+    Returns:
+        (clear_error_countdown, latched_errors, error_metadata, current_mode)
+    """
+    clear_error_countdown = _handle_clear_signal(shared_data, Motor, Motor_errors_data, joint_num,
+                                                 clear_error_countdown, Gripper_data, active_CAN_gripper)
+
+    # ── Settle countdown: wipe latch only after N clean verification ticks ──
+    clear_error_countdown, latched_errors = tick_clear_countdown(
+        clear_error_countdown, latched_errors, shared_data, active_CAN_gripper,
+    )
+
+    # ── Detect errors ────────────────────────────────────────────────────────
+    error_active, latched_errors = check_errors(
+        shared_data, joint_num, latched_errors,
+        estop_active=estop_active,
+        active_CAN_gripper=active_CAN_gripper,
+        exec_link_lost=exec_link_lost,
+        rti_link_lost=rti_link_lost,
+        loop_degraded=loop_degraded,
+        loop_critical=loop_critical,
+        monitor_errors=monitor_errors,
+        monitor_warnings=monitor_warnings,
+        driver_faults=driver_faults,
+    )
+    shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
+    # rti['safety_violation'] (the status event's "safety" field) finally means something: 1 while
+    # a safety-monitor error is latched.
+    monitor_latched = any(k.rsplit(":", 1)[-1] in MONITOR_KEYS for k in latched_errors) if latched_errors else False
+    shared_data.rti["safety_violation"][0] = 1.0 if monitor_latched else 0.0
+
+    _invalidate_homing_on_errors(shared_data, latched_errors)
+    current_mode = _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, error_active)
+    # A hard error latching THIS tick: the keys that are not in the metadata yet. Evaluated before the metadata
+    # update that would absorb them; cold — only a tick with a new key reaches the call.
+    if on_hard_error is not None:
+        _new_hard = [k for k in latched_errors if k not in error_metadata and not k.endswith(_WARNING_SUFFIXES)]
+        if _new_hard:
+            on_hard_error(_new_hard, int(shared_data.rti["loop_tick"][0]))
+    if _update_error_metadata(shared_data, latched_errors, error_metadata):
+        _publish_error_list(shared_data, error_metadata)
 
     return clear_error_countdown, latched_errors, error_metadata, current_mode

@@ -53,6 +53,9 @@ class TickContext:
     # invisible in every other metric: success rate still reads 100%, misses still read 0.
     rti_udp_count: int = 0
 
+    # Haptic zone walls (utility/haptic_walls.py) for IDLE gravity-comp freedrive. None = no walls.
+    haptic_walls: object = None
+
 
 @dataclass
 class TickResult:

@@ -16,7 +16,6 @@ import time
 settings = {
     "blink_time": 1.0,    # LED + PCB heartbeat period (s)
     "contrast": 255,      # OLED contrast 0-255
-    "simulate": True,     # inject random motor data so the GUI has live values
 }
 
 # OLED UI navigation state.

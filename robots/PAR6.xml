@@ -24,9 +24,9 @@
             <name>joint1</name>
             <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
             <kt>0.28</kt> <!-- Torque constant in Nm/A -->
-            <Ilim>1800</Ilim>  <!-- Current limit in mA -->
+            <Ilim>2400</Ilim>  <!-- 2026-10-09: was 1800 (user's new tune) --> <!-- Current limit in mA -->
             <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
-            <Velocity_limit>80000</Velocity_limit> <!-- (Motor) Velocity limit in ticks/s -->
+            <Velocity_limit>88000</Velocity_limit>  <!-- 2026-10-09: was 80000 (user's new tune) --> <!-- (Motor) Velocity limit in ticks/s -->
             <joint_velocity_limit>4.8</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
             <joint_acceleration_limit>32.0</joint_acceleration_limit> <!-- (Joint) Acceleration limit in rad/s^2. **LIBERAL TEST VALUE 2026-08-06 — was 9.6.** Raised from the velocity/0.5s convention to velocity/0.15s (~3.3x) to open up headroom for finding the real numbers; the physically correct value is (available torque / effective inertia), is pose-dependent, and is still NOT MEASURED. SHARED FIELD: command_executor.py (every EXEC move) and robotics/jog.py (every jog) read this too, so raising it made those ~3.3x punchier as well — it is not RTI-only. Revert with robots/PAR6.xml.conservative-backup. -->
             <joint_jerk_limit>16000.0</joint_jerk_limit> <!-- (Joint) Jerk limit in rad/s^3. **LIBERAL TEST VALUE 2026-08-06 — was 480.0.** Raised from 50x acceleration to 500x. READ THIS: jerk only binds while it is below acceleration_limit/dt, which is 8000.0 rad/s^3 here at 250 Hz — 16000.0 is ABOVE that, so THE JERK LIMIT NO LONGER BINDS AT ALL and acceleration can step to full scale in a single 4 ms tick. That is deliberate: jerk was the sole cause of the RTI tracking lag (0.5-3 deg on smooth streams). It also means jerk limiting is effectively OFF, so gearbox-friendly torque ramping is no longer enforced here. RTI-only field (nothing in EXEC or JOG reads it). Revert with robots/PAR6.xml.conservative-backup. -->
@@ -34,7 +34,7 @@
 
             <!-- ================= PER-MODE MOTION LIMITS =================
                  The <joint_*_limit> fields above are the HARDWARE CEILING: what the arm
-                 survives. Nothing may exceed them — config/xml_parser.py clamps every block
+                 survives. Nothing may exceed them — config/xml_parser/robot.py clamps every block
                  below to them on load and warns if one tries to go higher. A mode can only
                  ask for LESS than the hardware allows, never more.
 
@@ -72,21 +72,25 @@
                 <torque_rate>364.0</torque_rate>
             </rti_limits>
             <watchdog_rate>5000</watchdog_rate>  <!-- (Motor) Watchdog rate in ms -->
-            <KPP>5</KPP> <!-- Kp value for Positon loop of cascade PID controller -->
-            <KPV>0.015</KPV> <!-- Kp value for Velocity loop of cascade PID controller -->
-            <KIV>0.0015</KIV> <!-- Ki value for Velocity loop of cascade PID controller -->
-            <KIIQ>0.9</KIIQ> <!-- Ki value for Current loop of cascade PID controller -->
-            <KPIQ>7</KPIQ> <!-- Kp value for Current loop of cascade PID controller -->
+            <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0015, KIIQ 0.9, KPIQ 7 -->
+            <KPP>88</KPP> <!-- Kp value for Positon loop of cascade PID controller -->
+            <KPV>0.078</KPV> <!-- Kp value for Velocity loop of cascade PID controller -->
+            <KIV>0.00012</KIV> <!-- Ki value for Velocity loop of cascade PID controller -->
+            <KIIQ>0.1</KIIQ> <!-- Ki value for Current loop of cascade PID controller -->
+            <KPIQ>1.5</KPIQ> <!-- Kp value for Current loop of cascade PID controller -->
             <KP>0.12</KP> <!-- KP (Stiffness) value of joint space impedance PD controller -->
             <KD>0.002</KD> <!-- KD (Damping) value of joint space impedance PD controller -->
             <joint_limit_negative>-2.952</joint_limit_negative> <!-- True Joint limits in radians. At this positions robot hits its mechanical limits / endstops-->
             <joint_limit_positive>2.952</joint_limit_positive> <!-- True Joint limits in radians. At this positions robot hits its mechanical limits / endstops-->
             <software_joint_limit_negative>-2.8647335</software_joint_limit_negative> <!-- Soft Joint limits in radians. These limits are imoposed on software to never actually touch the mechanical limits-->
             <software_joint_limit_positive>2.8647335</software_joint_limit_positive> <!-- Soft Joint limits in radians. These limits are imoposed on software to never actually touch the mechanical limits-->
+            <tracking_limit_deg>5.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked. PROVISIONAL 5 deg (2026-10-01, the check runs warn-only): not measured yet — measure like J4-J6 (api_tests/46) and set ~2x the peak. -->
+            <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
             <encoder>14</encoder> <!-- Encoder resolution in bits.-->
             <sector_home_master_position>3969 </sector_home_master_position> <!-- Encoder ticks the robot is at bootup at MASTER POSITIONS-->
             <sector_home_offset>1.570796327 </sector_home_offset> <!-- Joint level position from master position to the one defined in kinematics chain-->
             <home_offset>2.96279 </home_offset> <!-- joint level position from endstop to the one defined in kinematic chain TODO add another direction also-->
+            <calibration_screw_rad>1.570796327</calibration_screw_rad>  <!-- 90 deg. The joint's calibration screw pins it here (user, 2026-10-09): homed and pinned, it should read this angle; api_tests/65_calibration_screws.py measures the difference. -->
             <home_offset_gripper_dependent>0</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
             <homing_speed>4500</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
@@ -96,19 +100,23 @@
             <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
             <homing_two_pass_max_diff>3500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
             <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
-            <homing_release_current_ma>0</homing_release_current_ma>   <!-- Current [mA] during release phase (0 = coast/relax gearbox) -->
-            <homing_release_duration_s>NaN</homing_release_duration_s>   <!-- NaN = skip release phase -->
+            <homing_release_current_ma>300</homing_release_current_ma>   <!-- 2026-10-09 (homing plan H2.3b): was 0 (coast). The coast release gave J1 only sd 0.034 -> 0.025 deg; J5, which pushes INTO its stop (+1500 mA), repeats within +-0.005 deg. +300 mA = a defined push into J1's stop (homing direction positive; its homing current is 700 mA) — the latch is taken at that force. To be measured on the arm. -->
+            <homing_release_duration_s>0.5</homing_release_duration_s>   <!-- 2026-10-09 (homing plan H2.3): was NaN (no release). J1 latched in the zero-speed hold after its stall and spread +-0.04 deg with the new PID tune (+-0.01 before); 0.5 s of coast (current 0 above) lets the gearbox unwind from the 700 mA push first. Coast, not a current away from the stop: J1 carries no gravity, so a pull would drift it off the stop. -->
             <homing_release_sample_pct>0.8</homing_release_sample_pct>   <!-- When to latch position: 0.0=start, 0.5=midpoint, 1.0=end of release -->
             <gear_ratio>6.4</gear_ratio> <!-- Gear ratio of the joint -->
             <gear_efficiency>0.98</gear_efficiency> <!-- Gear efficiency of the joint -->
             <dir>0</dir> <!-- is positive rotation of the joint matched to the one in kinematic definiton of the robot 0 yes 1 no -->
             <joint_type>revolute</joint_type> <!-- Type of the joint. Options: revolute, prismatic, continuous_revolute -->
+            <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured yet; api_tests/54, 2026-10-02). 0 = not measured: no friction compensation -->
+            <friction_sliding_nm>0.177</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest at any angle and speed tested (2026-10-02: 0.177-0.218 Nm at 82 / 112 / 142 deg, + 0.09-0.14 Nm.s/rad x speed; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
+            <gravity_error_nm>0.035</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this); J1 carries no gravity: this is direction asymmetry -->
+            <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
         </joint>
         <joint id="1">
             <name>joint2</name>
             <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
             <kt>0.31</kt>
-            <Ilim>2500</Ilim>  <!-- Current limit in mA -->
+            <Ilim>2800</Ilim>  <!-- 2026-10-09: was 2500 (user's new tune) --> <!-- Current limit in mA -->
             <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
             <Velocity_limit>80000</Velocity_limit>
             <joint_velocity_limit>1.5</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
@@ -130,21 +138,25 @@
                 <torque_rate>2005.0</torque_rate>
             </rti_limits>
             <watchdog_rate>5000</watchdog_rate>  <!-- (Motor) Velocity limit in ticks/s -->
-            <KPP>3</KPP>
-            <KPV>0.01</KPV> 
-            <KIV>0.001</KIV> 
-            <KIIQ>0.5</KIIQ> 
-            <KPIQ>2</KPIQ> 
+            <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 3, KPV 0.01, KIV 0.001, KIIQ 0.5, KPIQ 2 -->
+            <KPP>100</KPP>
+            <KPV>0.025</KPV>
+            <KIV>0.00044</KIV>
+            <KIIQ>0.12</KIIQ>
+            <KPIQ>1.45</KPIQ>
             <KP>0.12</KP> 
             <KD>0.002</KD> 
             <joint_limit_negative>-2.528</joint_limit_negative>
             <joint_limit_positive>-0.025</joint_limit_positive>
             <software_joint_limit_negative>-2.4407335</software_joint_limit_negative>
             <software_joint_limit_positive>-0.1122665</software_joint_limit_positive>
+            <tracking_limit_deg>5.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked. PROVISIONAL 5 deg (2026-10-01, the check runs warn-only): not measured yet — measure like J4-J6 (api_tests/46) and set ~2x the peak. -->
+            <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
             <encoder>14</encoder>
             <sector_home_master_position>5707 </sector_home_master_position>
             <sector_home_offset>-2.516096327 </sector_home_offset>
-            <home_offset>-2.5259796 </home_offset>  <!-- -2.5259796  -2.4359 -->
+            <home_offset>-2.499061 </home_offset>  <!-- 2026-10-09: was -2.5259796 — J2 read 1.54 deg LOW at its calibration screw on average over the three arms measured (grey -1.27, light_grey -0.88, black -2.47 deg; api_tests/65_calibration_screws.py, compare mode; temp_data/calibration). ONE generic value for every arm (user): each arm sits within ~0.9 deg of it; an arm can be calibrated on its own with the same tool. (older: -2.4359) -->
+            <calibration_screw_rad>-1.570796327</calibration_screw_rad>  <!-- -90 deg. -->
             <home_offset_gripper_dependent>0</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
             <homing_speed>6000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
             <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
@@ -161,13 +173,17 @@
             <gear_efficiency>0.90</gear_efficiency>
             <dir>0</dir>
             <joint_type>revolute</joint_type>
+            <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
+            <friction_sliding_nm>0</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest at any angle and speed tested (MEASURED 0.561 + 0.92 Nm.s/rad x speed at -112 deg, 2026-10-02 — but only where the model's gravity on J2 is 0.5 Nm of up to 7.4: its gravity error there (0.072) says nothing about loaded poses. Left at 0 = NOT compensated until 54 is run where J2 carries several Nm; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
+            <gravity_error_nm>0</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this); J2: 0.072 measured at 0.5 Nm of gravity only -->
+            <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
         <joint id="2">
             <name>joint3</name>
             <driver_type>stepfoc</driver_type> <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
             <kt>0.3</kt>
-            <Ilim>2500</Ilim>
+            <Ilim>2800</Ilim>  <!-- 2026-10-09: was 2500 (user's new tune) -->
             <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
             <Velocity_limit>80000</Velocity_limit>
             <joint_velocity_limit>1.7</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
@@ -189,21 +205,25 @@
                 <torque_rate>1483.0</torque_rate>
             </rti_limits>
             <watchdog_rate>5000</watchdog_rate>
-            <KPP>5</KPP>
-            <KPV>0.015</KPV>
-            <KIV>0.0015</KIV>
-            <KIIQ>0.9</KIIQ>
-            <KPIQ>7</KPIQ>
+            <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0015, KIIQ 0.9, KPIQ 7 -->
+            <KPP>113</KPP>
+            <KPV>0.025</KPV>
+            <KIV>0.00044</KIV>
+            <KIIQ>0.12</KIIQ>
+            <KPIQ>1.45</KPIQ>
             <KP>0.12</KP>
             <KD>0.002</KD>
             <joint_limit_negative>1.904</joint_limit_negative>
             <joint_limit_positive>6.65</joint_limit_positive>
             <software_joint_limit_negative>1.9912665</software_joint_limit_negative>
             <software_joint_limit_positive>6.5627335</software_joint_limit_positive>
+            <tracking_limit_deg>5.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked. PROVISIONAL 5 deg (2026-10-01, the check runs warn-only): not measured yet — measure like J4-J6 (api_tests/46) and set ~2x the peak. -->
+            <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. MEASURED on J3 (api_tests/59, 2026-10-06): buzzing ~230 mA, quiet <= 25 mA once settled. -->
             <encoder>14</encoder>
             <sector_home_master_position>2838 </sector_home_master_position>
             <sector_home_offset>1.913322625 </sector_home_offset>
-            <home_offset>1.90859 </home_offset>
+            <home_offset>1.857626 </home_offset>  <!-- 2026-10-09: was 1.90859 — J3 read 182.92 deg pinned at its mechanical 180 deg (the calibration screw), so -2.92 deg (-0.050964 rad); the self-collision contact probe (api_tests/63) had found it reading high too. Limits NOT shifted (user): the soft upper limit now sits ~2.9 deg closer to J3's physical upper end -->
+            <calibration_screw_rad>3.141592654</calibration_screw_rad>  <!-- 180 deg. -->
             <home_offset_gripper_dependent>0</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
             <homing_speed>6000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
@@ -220,6 +240,10 @@
             <gear_efficiency>0.95</gear_efficiency> 
             <dir>1</dir>
             <joint_type>revolute</joint_type>
+            <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
+            <friction_sliding_nm>0.369</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest at any angle and speed tested (2026-10-02: 0.37-0.47 Nm at 129 / 144 / 159 deg — LESS at 15 than at 5 deg/s; model gravity there 2.2-2.5 Nm of at most 2.7; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
+            <gravity_error_nm>0.124</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this) -->
+            <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
         <joint id="3">
@@ -248,21 +272,25 @@
                 <torque_rate>173.0</torque_rate>
             </rti_limits>
             <watchdog_rate>5000</watchdog_rate>
-            <KPP>5</KPP>
-            <KPV>0.015</KPV>
+            <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0005, KIIQ 1, KPIQ 7 -->
+            <KPP>94</KPP>
+            <KPV>0.04</KPV>
             <KIV>0.0005</KIV>
-            <KIIQ>1</KIIQ>
-            <KPIQ>7</KPIQ>
+            <KIIQ>0.1</KIIQ>
+            <KPIQ>1.2</KPIQ>
             <KP>0.12</KP>
             <KD>0.002</KD>
             <joint_limit_negative>-2.702</joint_limit_negative>
             <joint_limit_positive>2.642</joint_limit_positive>
             <software_joint_limit_negative>-2.6147335</software_joint_limit_negative>
             <software_joint_limit_positive>2.5547335</software_joint_limit_positive>
+            <tracking_limit_deg>3.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked (2x the 1.39 deg measured at 100% EXEC, api_tests/46 2026-09-30). Re-measure after changing speeds. -->
+            <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
             <encoder>14</encoder>
             <sector_home_master_position>6683 </sector_home_master_position>
             <sector_home_offset>0 </sector_home_offset>
             <home_offset>-2.717 </home_offset>   <!-- fallback value if no gripper XML override; normally overridden by active gripper -->
+            <calibration_screw_rad>0</calibration_screw_rad>  <!-- 0 deg. -->
             <home_offset_gripper_dependent>1</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
             <homing_speed>13500</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
@@ -279,6 +307,10 @@
             <gear_efficiency>0.98</gear_efficiency>
             <dir>1</dir>
             <joint_type>revolute</joint_type>
+            <friction_static_nm>0.13</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.26; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
+            <friction_sliding_nm>0.163</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest over the angles tested (2026-10-02: 0.163 / 0.225 / 0.201 Nm at 11 / -19 / 41 deg, + 0.02-0.13 Nm.s/rad x speed; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
+            <gravity_error_nm>0.031</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this) -->
+            <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
         <joint id="4">
@@ -307,21 +339,25 @@
                 <torque_rate>173.0</torque_rate>
             </rti_limits>
             <watchdog_rate>5000</watchdog_rate>
-            <KPP>5</KPP>
-            <KPV>0.015</KPV>
+            <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0005, KIIQ 1, KPIQ 7 -->
+            <KPP>94</KPP>
+            <KPV>0.04</KPV>
             <KIV>0.0005</KIV>
-            <KIIQ>1</KIIQ>
-            <KPIQ>7</KPIQ>
+            <KIIQ>0.1</KIIQ>
+            <KPIQ>1.2</KPIQ>
             <KP>0.12</KP>
             <KD>0.002</KD>
             <joint_limit_negative>-2.244</joint_limit_negative>
             <joint_limit_positive>2.262</joint_limit_positive>
             <software_joint_limit_negative>-1.73</software_joint_limit_negative>
             <software_joint_limit_positive>1.6</software_joint_limit_positive>
+            <tracking_limit_deg>2.5</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked (2x the 1.09 deg measured). Re-measure after changing speeds. -->
+            <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
             <encoder>14</encoder>
             <sector_home_master_position>15658 </sector_home_master_position>
             <sector_home_offset>0 </sector_home_offset>
             <home_offset>0 </home_offset>
+            <calibration_screw_rad>0</calibration_screw_rad>  <!-- 0 deg. -->
             <home_offset_gripper_dependent>1</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
             <homing_speed>13500</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
@@ -338,6 +374,10 @@
             <gear_efficiency>0.98</gear_efficiency>
             <dir>1</dir>
             <joint_type>revolute</joint_type>
+            <friction_static_nm>0.06</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.05-0.12; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
+            <friction_sliding_nm>0.080</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest over the angles tested (2026-10-02: 0.080 / 0.099 Nm at -62 / -33 deg, + 0.06-0.07 Nm.s/rad x speed; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
+            <gravity_error_nm>0.039</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this) -->
+            <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
         <joint id="5">
@@ -366,21 +406,31 @@
                 <torque_rate>198.0</torque_rate>
             </rti_limits>
             <watchdog_rate>5000</watchdog_rate>
-            <KPP>3</KPP>
-            <KPV>0.009</KPV> 
-            <KIV>0.0006</KIV> 
-            <KIIQ>0.5</KIIQ> 
-            <KPIQ>2</KPIQ> 
+            <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 3, KPV 0.009, KIV 0.0006, KIIQ 0.5, KPIQ 2 -->
+            <KPP>75</KPP>
+            <KPV>0.016</KPV>
+            <KIV>0.0003</KIV>
+            <KIIQ>0.3</KIIQ>
+            <KPIQ>2.2</KPIQ>
             <KP>0.012</KP> 
             <KD>0.002</KD> 
-            <joint_limit_negative>-6.2831</joint_limit_negative>
-            <joint_limit_positive>6.2831</joint_limit_positive>
+            <!-- J6 has NO mechanical endstop (it is homed on a Hall sensor), so its "hard" limit is not
+                 an endstop: it is the wind-up boundary the joint must never reach. It was +/-6.2831,
+                 which put the soft upper limit (7.14) OUTSIDE it. Now the soft range +/- 5 degrees, the
+                 same margin as every other joint (2026-09-30). The soft range itself is unchanged.
+                 NOTE: the J6 range is also tool-dependent - each gripper XML carries <qlim_deg> - and
+                 today only EXEC/IK read that; RTI and JOG use these values. See TODO/safety_stack_research.md. -->
+            <joint_limit_negative>-0.9372665</joint_limit_negative>
+            <joint_limit_positive>7.2272665</joint_limit_positive>
             <software_joint_limit_negative>-0.85</software_joint_limit_negative>
             <software_joint_limit_positive>7.14</software_joint_limit_positive>
+            <tracking_limit_deg>2.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked (2x the 0.87 deg measured). Re-measure after changing speeds. -->
+            <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
             <encoder>14</encoder>
             <sector_home_master_position>3956 </sector_home_master_position>
             <sector_home_offset>0 </sector_home_offset>
             <home_offset>1.86159 </home_offset>  <!-- -1.28 -->
+            <calibration_screw_rad>3.141592654</calibration_screw_rad>  <!-- 180 deg. -->
             <home_offset_gripper_dependent>0</home_offset_gripper_dependent>   <!-- 1 = use home_offset from the active gripper XML instead of this value -->
             <homing_speed>12000</homing_speed>   <!-- Motor velocity in ticks/s during homing -->
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
@@ -397,34 +447,56 @@
             <gear_efficiency>0.95</gear_efficiency>
             <dir>1</dir>
             <joint_type>revolute</joint_type>
+            <friction_static_nm>0.111</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.19; informational once friction_sliding_nm is set; 2026-10-02) -->
+            <friction_sliding_nm>0.070</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest over the angles tested (2026-10-02: 0.078 / 0.070 / 0.076 Nm at 146 / 116 / 176 deg, + 0.02-0.06 Nm.s/rad x speed; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
+            <gravity_error_nm>0.019</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this) -->
+            <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
     </joints>
 
     <safety>
-        <max_joint_velocity>8.0</max_joint_velocity>
-        <joint_velocity_sustain_ticks>80</joint_velocity_sustain_ticks>
-        <warn_motor_temperature>90</warn_motor_temperature>
-        <max_motor_temperature>100</max_motor_temperature>
-        <current_spike_factor>4.0</current_spike_factor>
-        <current_spike_lookback>30</current_spike_lookback>
-        <collision_torque_threshold>15.0</collision_torque_threshold>
-        <vibration_speed_variance_threshold>100000000</vibration_speed_variance_threshold>
-        <vibration_lookback>40</vibration_lookback>
-        <loop_overrun_limit>200</loop_overrun_limit>
-        <can_error_limit>5</can_error_limit>
-        <warning_speed_scale>0.9</warning_speed_scale>
-        <!-- Per-check enable flags: 1 = active, 0 = disabled -->
-        <check_joint_position>0</check_joint_position>
-        <check_joint_velocity>0</check_joint_velocity>
-        <check_motor_temperature>0</check_motor_temperature>
-        <check_current_spike>0</check_current_spike>
-        <check_torque_discontinuity>0</check_torque_discontinuity>
-        <check_vibration>0</check_vibration>
-        <check_loop_overrun>0</check_loop_overrun>
-        <check_can_health>0</check_can_health>
-        <check_estop>0</check_estop>
+        <!-- Robot-SPECIFIC safety numbers. The safety monitor's on/off switches and time windows are
+             <safety_monitor> in config/system.xml (robot-independent policy). The thresholds of the old
+             run_safety_checks() were removed with it on 2026-09-30 — that function was never called. -->
+        <!-- TCP translational speed limit in m/s, 0 = DISABLED. One number, two consumers:
+             the RTI handler's Cartesian velocity cap (prevention, live) and the safety monitor's
+             TCP_OVERSPEED check (detection; also off until <safety_monitor><tcp_speed>). Joint
+             velocity limits do NOT bound TCP speed near a singularity — that is the case
+             this exists for. Shipped 0 until a value is verified on hardware; 1.5 is a
+             reasonable first setting for this arm's reach. Runtime override:
+             rti_set_tcp_vel_limit over TCP. -->
+        <max_tcp_velocity>0</max_tcp_velocity>
+        <!-- SOFT_RTI only: the most a streaming PC may widen the command watchdog to, in SECONDS.
+             Hard RTI is fixed at 40 ms and can only be tightened; SOFT_RTI is position-only, so
+             a stale target converges and holds and a longer window is safe. 0.25 rides out
+             ~12 missed commands at 50 Hz. The declared rate always keeps its own 3 intervals
+             (5 Hz needs 0.6 s just to be healthy), so this limits EXTRA slack, not the contract.
+             Clamped to 0.04 .. 1.0. Runtime request: rti_set_command_timeout. -->
+        <max_soft_rti_timeout>0.25</max_soft_rti_timeout>
+        <!-- Safety monitor: how far past a SOFT limit the MEASURED position may go before OUT_OF_RANGE
+             trips. Smaller than the 5 deg soft-to-hard margin, so an excursion is caught well before
+             the endstop. -->
+        <joint_limit_tolerance_deg>2.0</joint_limit_tolerance_deg>
+        <!-- Safety monitor: how far past a HARD limit (an endstop) the MEASURED position may read before
+             BEYOND_ENDSTOP (homing invalidated). Generous on purpose: homing differs between robots and
+             an endstop hit hard reads a few degrees past it (J3 read 2.5 deg past after a hand pushed
+             through its wall, 2026-10-01). Only a reading no real arm reaches means the reference is wrong. -->
+        <endstop_tolerance_deg>10.0</endstop_tolerance_deg>
+        <!-- The heaviest part a program may declare with set_payload (kg) — robotclient / dashboard "Payload".
+             0.75 kg: the user's working limit for PAR6 (2026-10-04, "for now"); a claim above it is refused
+             (PAYLOAD_LIMIT). Missing in a robot XML -> 1.0. -->
+        <max_payload_kg>0.75</max_payload_kg>
     </safety>
 
+    <!-- Self-collision geometry (2026-10-06; refitted 2026-10-07 from Source Robotics' PAR6 description package 2.0 —
+         ~/Desktop/PAR6 Description): the arm's convex pieces, fitted from the CAD meshes by
+         tools/self_collision_capsules.py (export), in robots/PAR6_collision.json. Frames: 0 = base, 1-5 = the links
+         after joints 1-5 (shoulder, upper arm, forearm, wrist 1, wrist 2), 6 = the tool (its pieces come from the gripper XML). Pairs close BY DESIGN, measured over
+         20 000 random poses inside the soft limits (the tool's `map`): -->
+    <self_collision file="PAR6_collision.json">
+        <pair a="2" b="4" planner_mm="3" monitor_mm="1"/>   <!-- upper arm vs wrist 1: the folded elbow brings them within 15 mm in 23 % of poses; the CAD meshes never touch (9.4 mm at J3 375 deg); the pieces read 4.5 mm at their closest over 5000 poses and within ~1 mm of the meshes since the 2026-10-07 refit (was up to 24 mm: long CAD triangles, now split before grouping) -->
+        <pair a="0" b="2" planner_mm="8"/>                  <!-- base vs upper arm: 15 mm apart at home by construction -->
+    </self_collision>
 </robot>
 

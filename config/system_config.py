@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # System Configuration
 # ==========================================================================
 
-def setup_realtime_process(cpu_core=3, priority=99):
+def setup_realtime_process(cpu_core=3, priority=99, enforce=False):
     """
     Configure process for real-time operation.
 
@@ -52,6 +52,13 @@ def setup_realtime_process(cpu_core=3, priority=99):
         is visible even if this function runs before setup_logging() attaches
         a file handler — useful during process startup before the logger
         is fully wired.
+   
+        enforce (2026-10-03, as industrial real-time interfaces do): when the result is not EXACTLY
+        SCHED_FIFO at `priority` on `cpu_core`, raise RuntimeError instead of carrying on without
+        real-time guarantees. RTI passes <realtime_required> from config/system.xml (default 1).
+
+    Returns:
+        True when the full real-time setup applied, False when running degraded (enforce=False).
     """
     pid = os.getpid()
 
@@ -80,6 +87,13 @@ def setup_realtime_process(cpu_core=3, priority=99):
     else:
         logger.warning(f"[RT setup] DEGRADED — wanted SCHED_FIFO {priority} on core {cpu_core}, got {summary}")
         print(f"[RT setup] DEGRADED — wanted SCHED_FIFO {priority} on core {cpu_core}, got {summary}")
+        if enforce:
+            raise RuntimeError(
+                f"[RT setup] real-time scheduling is required and not available (got {summary}). Run under "
+                f"the service (root, PREEMPT_RT), or set <realtime_required>0</realtime_required> in "
+                f"config/system.xml to run without real-time guarantees.")
+        return False
+    return True
 
 
 def get_system_info():
@@ -280,41 +294,12 @@ def setup_numpy_printing():
     logger.info("NumPy print options configured")
 
 
-def initialize_system(cpu_core=3, rt_priority=99, verbose=True):
-    """
-    Complete system initialization for RTI.
-    
-    Args:
-        cpu_core (int): CPU core for affinity (default: 3)
-        rt_priority (int): Real-time priority (default: 99)
-        verbose (bool): Print system information (default: True)
-    """
-    if verbose:
-        print_system_info()
-    
-    setup_realtime_process(cpu_core, rt_priority)
-    setup_numpy_printing()
-    
-    if verbose:
-        logger.info("System initialization complete")
-
-
-# ==========================================================================
-# CAN Interface Management — canonical implementation in hardware/can_hardware.py
-# ==========================================================================
-from hardware.can_hardware import (
-    is_can_interface_up,
-    start_can_interface,
-    stop_can_interface,
-)
-
 
 # ==========================================================================
 # Logging Setup – use logger_setup.setup_logging() instead
 # ==========================================================================
 # Duplicate removed: this module no longer defines setup_logging().
 # Import from logger_setup:  from logger_setup import setup_logging
-
 
 
 if __name__ == "__main__":

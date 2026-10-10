@@ -4,12 +4,12 @@ Run: python3 tools/check_gc_pauses.py            (offline, does not touch RTI)
 
 RTI showed 211 overruns / 7.269 ms max exec over 73 min — 0.019% of ticks, p99 a healthy
 1.844 ms, i.e. rare outliers rather than systemic cost. The suspect is the generational
-collector: process_Joint_data does 32 numpy .copy() per tick (~8,000 allocations/sec at
+collector: process_joint_data does 32 numpy .copy() per tick (~8,000 allocations/sec at
 250 Hz) into a 500-deep deque of dicts, and RTI never calls gc.disable/freeze/set_threshold.
 CLAUDE.md's hot-path rule names this exact failure: "a GC pause doesn't respect SCHED_FIFO —
 it happens inside your own process".
 
-This drives the REAL process_Joint_data at the real rate and times every collection via
+This drives the REAL process_joint_data at the real rate and times every collection via
 gc.callbacks, so the pause distribution is measured rather than assumed.
 
 IMPORTANT — this is a LOWER BOUND. A gen2 pass walks every tracked object in the process, and
@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from utility.data_init import get_default_joint_data, process_Joint_data
+from utility.data_init import get_default_joint_data, process_joint_data
 
 JN = 6
 DT = 0.004
@@ -71,7 +71,7 @@ def main():
                   zj, zj, zj, zj, z6, z6, zj, zj, zj, zj, z6, z6,
                   1.0, 0.001, 0, zj)
 
-    print(f"driving the real process_Joint_data at {1/DT:.0f} Hz for {args.seconds:.0f}s "
+    print(f"driving the real process_joint_data at {1/DT:.0f} Hz for {args.seconds:.0f}s "
           f"({32} array copies/tick)...\n")
 
     ticks = 0
@@ -79,7 +79,7 @@ def main():
     t_end = time.time() + args.seconds
     while time.time() < t_end:
         t_tick = time.perf_counter()
-        process_Joint_data(Joint_data, *args_tuple)
+        process_joint_data(Joint_data, *args_tuple)
         el = (time.perf_counter() - t_tick) * 1e3
         if el > worst_tick_ms:
             worst_tick_ms = el

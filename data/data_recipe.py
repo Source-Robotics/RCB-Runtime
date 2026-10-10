@@ -40,7 +40,7 @@ Description:
         # resolved once per tick — zero-allocation hot path after caching
         recipe  = recipe_mgr.get(shared_data.active_recipe.get())
         payload = build_payload(recipe, Joint_data, Gripper_data, motor_buffers, joint_num)
-        broadcast_UDP_telemetry(telemetry_socket, payload)
+        broadcast_udp_telemetry(telemetry_socket, payload)
 
     The active recipe name is a SharedString so the GUI can switch it live
     without restarting RTI.  Call recipe_mgr.reload() after uploading a new file.
@@ -126,16 +126,32 @@ def load_recipe_from_file(xml_path: str | Path) -> Optional[DataRecipe]:
     except ET.ParseError as e:
         logger.error(f"[DataRecipe] XML parse error in '{xml_path}': {e}")
         return None
+    return _recipe_from_root(root, xml_path.name)
 
+
+def load_recipe_from_text(text: str, label: str) -> Optional[DataRecipe]:
+    """The same recipe from the file's TEXT (2026-10-04): command_executor reads data_recipe/*.xml and hands RTI
+    the texts with reload_recipes, so the RT process parses from memory and never opens a file in the tick.
+    `label` names the file in log lines."""
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        logger.error(f"[DataRecipe] XML parse error in '{label}': {e}")
+        return None
+    return _recipe_from_root(root, label)
+
+
+def _recipe_from_root(root: ET.Element, label: str) -> Optional[DataRecipe]:
+    """One parsed <recipe> root -> DataRecipe, or None (logged) when it is not a usable recipe."""
     if root.tag != "recipe":
         logger.error(
-            f"[DataRecipe] '{xml_path.name}': root element must be <recipe>, got <{root.tag}> — skipped."
+            f"[DataRecipe] '{label}': root element must be <recipe>, got <{root.tag}> — skipped."
         )
         return None
 
     name = root.get("name", "").strip()
     if not name:
-        logger.warning(f"[DataRecipe] '{xml_path.name}': <recipe> has no name attribute — skipped.")
+        logger.warning(f"[DataRecipe] '{label}': <recipe> has no name attribute — skipped.")
         return None
 
     fields: list = []
@@ -162,7 +178,7 @@ def load_recipe_from_file(xml_path: str | Path) -> Optional[DataRecipe]:
         logger.warning(f"[DataRecipe] Recipe '{name}' has no valid fields — skipped.")
         return None
 
-    logger.info(f"[DataRecipe] Loaded '{name}' ({len(fields)} fields) from '{xml_path.name}'.")
+    logger.info(f"[DataRecipe] Loaded '{name}' ({len(fields)} fields) from '{label}'.")
     return DataRecipe(name=name, fields=fields, precision_overrides=overrides)
 
 
@@ -237,7 +253,7 @@ class RecipeManager:
     def reload(self):
         """
         Re-scan the recipe directory and reload all *.xml files.
-        Safe to call at any time from any thread.
+        Safe to call at any time from any thread. (RTI no longer calls this in its loop — see reload_from_texts.)
         """
         loaded: dict = {}
         if not self.recipe_dir.is_dir():
@@ -247,7 +263,20 @@ class RecipeManager:
                 recipe = load_recipe_from_file(xml_file)
                 if recipe is not None:
                     loaded[recipe.name] = recipe
+        self._install(loaded)
 
+    def reload_from_texts(self, texts: dict) -> None:
+        """Reload from {file name: xml text} (2026-10-04): what command_executor's reload_recipes carries, so the
+        RT process never reads the directory itself. The same install rule as reload(): nothing usable -> the
+        recipes in force stay (the fallback only if there were none)."""
+        loaded: dict = {}
+        for label in sorted(texts):
+            recipe = load_recipe_from_text(str(texts[label]), str(label))
+            if recipe is not None:
+                loaded[recipe.name] = recipe
+        self._install(loaded)
+
+    def _install(self, loaded: dict) -> None:
         if loaded:
             self._recipes = loaded
             # Invalidate name cache

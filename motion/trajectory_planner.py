@@ -89,7 +89,7 @@ from motion.cartesian_paths import (
     cartesian_line, cartesian_arc_3point, cartesian_circle, cartesian_spline,
     pose_from_xyz_rpy, build_composite_cartesian_path, blend_zone_poses,
     DEFAULT_ARCLEN_SPACING_M as CART_ARCLEN_SPACING_M,
-    linear_segment_arclen, interp_pose, CartesianPath,
+    interp_pose, CartesianPath,
     ROTATION_RADIUS_M as CART_ROTATION_RADIUS_M,
 )
 from motion.ik_config import (
@@ -98,7 +98,7 @@ from motion.ik_config import (
 from motion.ik_path import SeededIKPathSolver
 from motion.joint_paths import (
     build_composite_joint_path, arclen_spacing_for,
-    blend_joint_zone, linear_joint_segment,
+    blend_joint_zone,
 )
 from motion.planner_pipeline import (
     PathBuilder, make_time_parameterizer, ExecBatchSampler, TimedJointPath, JointPath,
@@ -115,6 +115,7 @@ from robotics.robot_kinematics import (
 )
 from utility.kinematics_backend import set_kinematics_backend
 from utility.activity_log import get_exec_activity_logger, log_activity
+from utility.zones import ZONE_WARNING, first_path_violation, robot_spheres
 
 logger = logging.getLogger(__name__)
 _activity_logger = get_exec_activity_logger()
@@ -324,7 +325,7 @@ class TrajectoryPlanner(Thread):
                  read_current_joints, speed_scale=1.0, read_gripper_status=None,
                  read_gripper_position=None,
                  robot=None, read_exec_runway=None, offline_output=False,
-                 max_jerk=None):
+                 max_jerk=None, joint_limits=None, zones=(), tool_spheres=()):
         """
         Args:
             motion_queue:        queue.Queue of QueuedCommand records (legacy dicts
@@ -356,6 +357,10 @@ class TrajectoryPlanner(Thread):
             offline_output:      do not create output ZMQ sockets. Intended only for
                                  an offline planner subclass that overrides every send/
                                  checkpoint hook with an in-memory collector.
+            joint_limits:        (lo, hi) software joint limits in rad, from the robot XML.
+                                 Every planned trajectory is checked against them before it
+                                 is sent (JOINT_LIMIT). None falls back to the robot model's
+                                 qlim (itself read from the same XML); with neither, no check.
         """
         super().__init__(daemon=True, name="TrajectoryPlanner")
         self._queue = motion_queue
@@ -386,6 +391,29 @@ class TrajectoryPlanner(Thread):
                                        # blended corner; None = next move starts from
                                        # rest. See module docstring "Blending".
         self._running = True
+        # Software joint limits (rad). See _check_joint_limits().
+        self._joint_lo = self._joint_hi = None
+        if joint_limits is not None:
+            self._joint_lo = np.asarray(joint_limits[0], dtype=np.float64)[:joint_num].copy()
+            self._joint_hi = np.asarray(joint_limits[1], dtype=np.float64)[:joint_num].copy()
+        elif robot is not None:
+            qlim = np.asarray(getattr(robot, "qlim", []), dtype=np.float64)
+            if qlim.shape == (2, joint_num):
+                self._joint_lo, self._joint_hi = qlim[0].copy(), qlim[1].copy()
+        # Safety zones of the active cell (utility/zones.py). One tuple, swapped whole by set_zones(),
+        # so the planner thread never sees half of a reload. See _check_zones().
+        self._zone_setup = ((), robot_spheres(()))
+        self.set_zones(zones, tool_spheres)
+        # ABORT LATCH. Once a queued command fails, the rest of the program must not run —
+        # in async mode it is already queued behind the failure. Set by _latch_abort() (a
+        # planner-side failure) or interrupt() (the robot stopped mid-program); while set,
+        # every command that reaches the planner is answered ABORTED without being planned.
+        # Cleared only by clear_abort() — command_executor calls it on clear_errors.
+        self._abort = None
+        # Set when the arm may have moved by something other than EXEC (another mode, an
+        # error, a hand). The next plan then starts from the MEASURED position instead of
+        # the last planned endpoint. Consumed by _start_point().
+        self._resync = False
         self._pending_gripper = None  # (cid, deadline) — at most one in-flight target
         self._path_builder = PathBuilder(joint_num)
         self._time_parameterizer = make_time_parameterizer("trapezoid")
@@ -462,9 +490,39 @@ class TrajectoryPlanner(Thread):
         self._last_endpoint = None
         self._last_exit_speed = None
 
+    def abort_info(self):
+        """The failure that aborted the program ({cid, code, message}), or None."""
+        a = self._abort
+        return dict(a) if a is not None else None
+
+    def clear_abort(self):
+        """Accept motion again after an abort. command_executor calls this on clear_errors."""
+        if self._abort is not None:
+            logger.info(f"[Planner] abort cleared (was: {self._abort['code']})")
+        self._abort = None
+
+    def interrupt(self, code, message):
+        """The robot stopped mid-program — an error, E-stop or a mode change took it out of
+        EXEC while commands were still pending. RTI already discarded what it had, so there is
+        nothing to finish cleanly: latch the abort and drop everything queued, like flush().
+        Called from command_executor's thread; the caller fails the pending clients."""
+        if self._abort is None:
+            self._abort = {"cid": None, "code": code, "message": message}
+            logger.error(f"[Planner] motion ABORTED: {message}")
+        self.flush()
+        self._resync = True
+
+    def note_exec_exit(self):
+        """RTI left EXEC. Whatever moves the arm next (JOG, IDLE by hand, RTI, homing, an
+        error) is not EXEC, so the last planned endpoint can no longer be trusted as the start
+        of the next move: re-read the measured position next time. Without this the next EXEC
+        move planned from where the PREVIOUS program ended, not from where the arm was."""
+        self._resync = True
+
     def status_snapshot(self):
         """Snapshot for command_executor status events."""
         return {
+            "motion_aborted": self.abort_info(),
             "executing_seq": int(self._executing_seq),
             "completed_seq": int(self._completed_seq),
             "queue_depth": int(self._queue.qsize()),
@@ -516,6 +574,11 @@ class TrajectoryPlanner(Thread):
                     # so it costs no extra wakeup.
                     self._flush_blend_buffer()
                 self._poll_gripper_completions()
+                continue
+
+            if self._abort is not None:
+                # The program already failed — nothing behind the failure may run.
+                self._report_aborted(cmd)
                 continue
 
             if self._held is not None:
@@ -588,6 +651,11 @@ class TrajectoryPlanner(Thread):
         individual-fallback path when a zone-blend chain can't be flushed as
         one composite trajectory (wrong profile, IK/TOPPRA failure, etc.).
         """
+        if self._abort is not None:
+            # Reached through a chain's individual fallback after one of its own commands
+            # failed: the rest of the chain is behind the failure too.
+            self._report_aborted(cmd)
+            return
         try:
             self._mark_started(cmd)
             self._plan_and_send(cmd)
@@ -684,6 +752,10 @@ class TrajectoryPlanner(Thread):
         self._blend_buffer = []
         if not chain:
             return
+        if self._abort is not None:
+            for cmd in chain:
+                self._report_aborted(cmd)
+            return
 
         family = self._chain_family(chain[0])
 
@@ -706,6 +778,13 @@ class TrajectoryPlanner(Thread):
         plan_fn = self._plan_blended_chain if family == "joint" else self._plan_blended_cartesian_chain
         try:
             sample, timed_boundaries, waypoints, geometry, geom_boundaries = plan_fn(chain)
+            # A blended corner can bulge past a limit that no individual endpoint touches.
+            # Failing here falls back to planning each command alone, where the offending
+            # one is rejected by name.
+            self._check_joint_limits(sample.positions, sample.positions[0],
+                                     f"blended chain of {len(chain)}")
+            self._check_self_collision(sample.positions, f"blended chain of {len(chain)}")
+            self._check_zones(sample.positions, sample.positions[0], f"blended chain of {len(chain)}")
         except Exception as e:
             logger.warning(
                 f"[Planner] zone blend failed for a {len(chain)}-command chain: "
@@ -930,12 +1009,6 @@ class TrajectoryPlanner(Thread):
         ta = self._cumulative_arclength(timed_positions)
         idx = int(np.searchsorted(ga, ta[split], side="left"))
         return int(np.clip(idx, 0, geometry.shape[0] - 1))
-
-    @staticmethod
-    def _arc_from_end(positions):
-        return np.concatenate((
-            [0.0],
-            np.cumsum(np.linalg.norm(np.diff(positions[::-1], axis=0), axis=1))))[::-1]
 
     def _reused_prefix(self, geometry, geom_split, split_q, d_cut_joint, spacing):
         """The already-planned path from the split up to the new Bezier's entry, resampled
@@ -1532,6 +1605,16 @@ class TrajectoryPlanner(Thread):
                           f"rad/s, tol {self.SPLICE_SEAM_POS_TOL:.0e}/{vel_tol:.1e}) "
                           f"— refusing to inject a discontinuity")
 
+        if reject is None:
+            # A rejected splice just lets the in-flight move finish; the commands then run as a
+            # fresh chain, where the one that leaves the limits is refused by name.
+            try:
+                self._check_joint_limits(timed.positions, split_q, "splice continuation")
+                self._check_zones(timed.positions, split_q, "splice continuation")
+                self._check_self_collision(timed.positions, "splice continuation")
+            except PlannerError as e:
+                reject = e.message
+
         if reject is not None:
             logger.info(f"[Planner] splice REJECTED for {len(cmds)} command(s) "
                         f"[{cids}]: {reject} — the in-flight move will finish normally, "
@@ -1837,6 +1920,10 @@ class TrajectoryPlanner(Thread):
 
         try:
             sample, boundaries = self._plan_ruckig_corner_chain(chain)
+            self._check_joint_limits(sample.positions, sample.positions[0],
+                                     f"ruckig_corner chain of {len(chain)}")
+            self._check_self_collision(sample.positions, f"ruckig_corner chain of {len(chain)}")
+            self._check_zones(sample.positions, sample.positions[0], f"ruckig_corner chain of {len(chain)}")
         except Exception as e:
             logger.warning(
                 f"[Planner] ruckig corner blend failed for a {len(chain)}-command chain: "
@@ -2119,9 +2206,19 @@ class TrajectoryPlanner(Thread):
         return True
 
     def _start_point(self):
+        if self._resync:
+            # RTI left EXEC since the last move was planned (note_exec_exit / interrupt): the
+            # arm may have been jogged, streamed, pushed or homed. Start from where it IS.
+            self._resync = False
+            self._last_endpoint = None
+            self._last_exit_speed = None
         if self._last_endpoint is not None:
             return self._last_endpoint
-        return np.asarray(self._read_current_joints(), dtype=np.float64)[:self.joint_num]
+        # A SNAPSHOT. read_current_joints returns a live view of shared memory and np.asarray of a float64 view
+        # does not copy: `start` kept changing while the move was planned and checked, so a robot settling 0.4 mm
+        # between the two made the zone check see the move's first sample as "deeper than the start" and refuse
+        # the move back OUT of a zone (api_tests/53, 2026-10-02). The joint-limit recovery check had the same race.
+        return np.array(self._read_current_joints(), dtype=np.float64)[:self.joint_num]
 
     def _cmd_id(self, cmd):
         return cmd.id if isinstance(cmd, QueuedCommand) else cmd.get("id", "")
@@ -2300,6 +2397,11 @@ class TrajectoryPlanner(Thread):
                                                      max_jerk=self._max_jerk)
         path = self._path_builder.joint_line_from_degrees(start, args)
         target = path.target
+        # Before any planning, so the error names the target rather than a sample of a path.
+        self._check_joint_limits(target, start, f"move_joints id={cid} target")
+        self._check_zones(target, start, f"move_joints id={cid} target")
+        self._check_self_collision(np.vstack([np.asarray(start, dtype=np.float64)[None, :], np.asarray(target, dtype=np.float64)[None, :]]),
+                                   f"move_joints id={cid} target")
         speed_scale = self._speed_scale_for(options)
         blend_pct = self._blend_pct_for(options)
         dist = path.delta
@@ -3042,48 +3144,6 @@ class TrajectoryPlanner(Thread):
         return self._retime_cartesian_on_arclength(waypoints, options, profile, speed_scale,
                                                    cart_s=cart_s, cart_path=cart_path)
 
-    def _dead_old_cartesian_retimer(self, waypoints, options, speed_scale):
-        """UNUSED — kept only so the diff is legible. Delete on the next pass."""
-        vel_limit = np.maximum(self._max_vel * speed_scale, 1e-6)
-        dq = np.diff(waypoints, axis=0)
-        base_seg_dt = np.max(np.abs(dq) / vel_limit[None, :], axis=1)
-        base_seg_dt = np.maximum(base_seg_dt, 2.0 * self._dt)
-
-        stretch = 1.0
-        pos = vel = acc = None
-        ts = None
-        for _ in range(8):
-            times = np.concatenate(([0.0], np.cumsum(base_seg_dt * stretch)))
-            duration = float(times[-1])
-            n = max(2, int(round(duration / self._dt)) + 1)
-            ts = np.linspace(0.0, duration, n)
-            spline = CubicSpline(
-                times, waypoints, axis=0,
-                bc_type=((1, np.zeros(self.joint_num)), (1, np.zeros(self.joint_num))))
-            pos = np.asarray(spline(ts), dtype=np.float64)
-            vel = np.asarray(spline(ts, 1), dtype=np.float64)
-            acc = np.asarray(spline(ts, 2), dtype=np.float64)
-
-            vel_ratio = float(np.max(np.abs(vel) / (self._max_vel[None, :] + 1e-12)))
-            acc_ratio = float(np.max(np.abs(acc) / (self._max_accel[None, :] + 1e-12)))
-            ratio = max(vel_ratio, np.sqrt(acc_ratio))
-            if ratio <= 1.0:
-                break
-            stretch *= ratio * 1.10
-
-        if pos is None or vel is None or not np.all(np.isfinite(pos)) or not np.all(np.isfinite(vel)):
-            raise PlannerError("IK_PARTIAL_PATH", "retimed Cartesian trajectory is not finite")
-
-        self._assert_sampled_joint_limits(pos)
-        self._last_diagnostic.update({
-            "cartesian_speed_scale": float(speed_scale),
-            "trajectory_points": int(pos.shape[0]),
-            "trajectory_duration_s": float(ts[-1]) if ts is not None else 0.0,
-            "retime_stretch": float(stretch),
-            **self._utilization_metrics(vel, acc),
-        })
-        return self._sampler.sample(TimedJointPath(pos, vel, pos.shape[0]))
-
     def _plan_move_linear(self, ctype, start, args, cid, options):
         dry_run = bool(options.dry_run)
         result = self._solve_move_linear_path(ctype, start, args, cid, options, dry_run=dry_run)
@@ -3363,6 +3423,12 @@ class TrajectoryPlanner(Thread):
         else:
             raise ValueError(f"unknown motion command '{ctype}'")
 
+        # The last gate before RTI, for EVERY command type. move_joints was the one command
+        # that could drive a joint into its endstop: nothing checked it anywhere downstream
+        # (not ExecHandler, not dispatch, not the drive firmware).
+        self._check_joint_limits(sample.positions, start, f"{ctype} id={cid}")
+        self._check_zones(sample.positions, start, f"{ctype} id={cid}")
+        self._check_self_collision(sample.positions, f"{ctype} id={cid}")
         flags = BATCH_FLAG_BLEND_CONTINUES if v_corner > 1e-9 else 0
         sent = self._send_chunks(sample.positions, sample.velocities, cid, sample.torque_ff, flags=flags)
         if sent:
@@ -3594,9 +3660,184 @@ class TrajectoryPlanner(Thread):
             logger.error(f"[Planner] could not report gripper checkpoint for {cid}")
 
     def _report_error(self, cid, code, message):
+        # The abort's STATE CHANGES — the latch, and dropping everything queued behind the
+        # failure — happen BEFORE this error leaves. A client that sees the failure can react at
+        # once (a script catching MotionFailed, calling clear_errors and queueing its next
+        # program). If either were still pending then, it would land on the NEXT program: a late
+        # latch re-aborts it, a late drain swallows its first moves. Measured in the test, both.
+        # Only the ABORTED *reports* for the dropped commands go out after this error, so a
+        # client reads the cause first (on the arm they arrived cause-last, which reads backwards).
+        aborting = self._latch_abort(cid, code, message)
+        dropped = self._finish_abort(aborting) if aborting else ()
         try:
             self._status_sock.send_json(
                 {"checkpoint_id": cid or "", "status": "error",
                  "code": code, "message": message}, flags=zmq.NOBLOCK)
         except zmq.Again:
             logger.error(f"[Planner] could not report error for {cid} (status backpressure)")
+        for cmd in dropped:
+            self._report_aborted(cmd, aborting)
+
+    # Failures that do NOT abort the program. Gripper outcomes and the strict-completion settle
+    # timeout stay per-command for now (user decision 2026-09-30); ABORTED is the abort itself.
+    # SETTLE_TIMEOUT is reported by RTI, never by the planner — listed so the rule is in one place.
+    NON_ABORTING_CODES = frozenset({"ABORTED", "GRIPPER_TIMEOUT", "SUPERSEDED", "SETTLE_TIMEOUT"})
+
+    # Joint-limit comparison slack (rad): absorbs float noise, far below anything physical.
+    JOINT_LIMIT_TOL = 1e-6
+
+    def _command_failed(self, cid, code, message):
+        """For a subclass that reports failures its own way (the dry run): abort unless exempt."""
+        aborting = self._latch_abort(cid, code, message)
+        if aborting:
+            for cmd in self._finish_abort(aborting):
+                self._report_aborted(cmd, aborting)
+
+    def _latch_abort(self, cid, code, message):
+        """Set the abort latch for a failure that aborts. Returns the latch dict, or None when
+        the code is exempt or an abort is already latched (the FIRST failure is the cause)."""
+        if code in self.NON_ABORTING_CODES or self._abort is not None:
+            return None
+        self._abort = {"cid": cid, "code": code, "message": message}
+        return self._abort
+
+    def _finish_abort(self, abort):
+        """A queued command failed: the program stops here.
+
+        Everything ALREADY sent to RTI is before the failure and finishes normally — a held
+        braking tail is committed, not dropped, because RTI is mid-motion and without it would
+        run dry at speed. Everything queued BEHIND the failure is answered ABORTED unplanned,
+        and new commands are refused until clear_errors (clear_abort()). Industrial arms commonly
+        do the same: an error clears the motion queue and commands are ignored until a reset.
+        Returns the dropped commands; the CALLER reports them ABORTED, after the failure itself.
+        """
+        cid, code, message = abort["cid"], abort["code"], abort["message"]
+        logger.error(f"[Planner] motion ABORTED: command {cid} failed ({code}: {message}) — "
+                     f"the rest of the program is cancelled until clear_errors")
+        log_activity(_activity_logger, "EXEC", "error", "MOTION_ABORTED", id=cid,
+                     message=f"{code}: {message}")
+        self._last_exit_speed = None
+        if code == "SEND_TIMEOUT":
+            # RTI is not consuming: part of this move may have reached it, so where the arm
+            # stops is unknown, and sending it a held tail would only block again.
+            self._held = None
+            self._last_endpoint = None
+        elif self._held is not None:
+            self._commit_held_tail("aborting after a failed command")
+        dropped = self._blend_buffer
+        self._blend_buffer = []
+        try:
+            while True:
+                dropped.append(self._queue.get_nowait())
+        except Empty:
+            pass
+        return dropped
+
+    def _report_aborted(self, cmd, abort=None):
+        a = abort or self._abort or {}
+        if a.get("cid"):
+            why = f"not executed: command {a['cid']} failed earlier ({a.get('code')})"
+        else:
+            why = f"not executed: {a.get('message', 'motion was aborted')}"
+        self._report_error(self._cmd_id(cmd), "ABORTED", why + " — clear errors to run motion again")
+
+    def set_self_collision(self, model):
+        """Install the self-collision model (utility/self_collision.SelfCollisionModel) — or None for no check."""
+        self._self_collision = model
+
+    def _check_self_collision(self, positions, label):
+        """Raise PlannerError('SELF_COLLISION') if any sample of the path brings two links within the PLANNER margin
+        (TODO/self_collision_plan.md). Same gate as _check_joint_limits: the whole path, before anything moves.
+        A path that STARTS within the margin may move the parts apart, never closer (the escape rule, 2026-10-07)."""
+        model = getattr(self, "_self_collision", None)
+        if model is None:
+            return
+        hit = model.check_path(positions, "planner")
+        if hit is None:
+            return
+        k, a, b, gap, why = hit
+        n = int(np.atleast_2d(np.asarray(positions)).shape[0])
+        where = f"at sample {k + 1} of {n} ({100.0 * k / max(n - 1, 1):.0f} % of the way)"
+        if why == "within":
+            text = (f"the arm would run into itself — {model.describe(a, b)} would be {1e3 * gap:.1f} mm apart {where}; "
+                    f"the margin is {1e3 * float(model.margins['planner'].min()):.0f} mm")
+        elif why == "closer":
+            text = (f"the arm starts with {model.describe(a, b)} within the self-collision margin and this move brings "
+                    f"them CLOSER ({1e3 * gap:.1f} mm {where}) — from there only a move that takes them apart is allowed")
+        else:
+            text = (f"the arm starts within the self-collision margin and this move brings ANOTHER pair, "
+                    f"{model.describe(a, b)}, within it ({1e3 * gap:.1f} mm {where}) — from there only a move that "
+                    f"takes the parts apart is allowed")
+        raise PlannerError("SELF_COLLISION", f"{label}: {text}")
+
+    def _check_joint_limits(self, positions, start, label):
+        """Raise PlannerError('JOINT_LIMIT') if any sample leaves the software joint limits.
+
+        RECOVERY: a joint that STARTS outside its range (pushed there by hand, or a limit
+        tightened in the XML) may stay as far out as it already is, never farther — so a move
+        back into range is accepted and nothing can drive it further out. Same rule as RTI's
+        _brake_at_limits and JOG.
+        """
+        if self._joint_lo is None:
+            return
+        pos = np.atleast_2d(np.asarray(positions, dtype=np.float64))[:, :self.joint_num]
+        st = np.asarray(start, dtype=np.float64)[:self.joint_num]
+        lo = np.minimum(self._joint_lo, st) - self.JOINT_LIMIT_TOL
+        hi = np.maximum(self._joint_hi, st) + self.JOINT_LIMIT_TOL
+        over = pos > hi[None, :]
+        under = pos < lo[None, :]
+        bad = np.flatnonzero(np.any(over | under, axis=0))
+        if bad.size == 0:
+            return
+        j = int(bad[0])
+        worst = float(pos[:, j].max() if np.any(over[:, j]) else pos[:, j].min())
+        raise PlannerError(
+            "JOINT_LIMIT",
+            f"{label}: J{j + 1} would reach {np.degrees(worst):.2f} deg, outside its software "
+            f"limits [{np.degrees(self._joint_lo[j]):.2f}, {np.degrees(self._joint_hi[j]):.2f}] deg")
+
+    def set_zones(self, zones, tool_spheres):
+        """Install the active cell's zones (startup, and command_executor's reload_zones). Validates the
+        tool spheres; the zones arrive validated from config/xml_parser.parse_cell_zones()."""
+        active = tuple(z for z in zones if z["enabled"])
+        self._zone_setup = (active, robot_spheres(tool_spheres))
+
+    def _tcp_poses(self, positions):
+        """Flat row-major TCP poses for joint samples — from the planner's OWN model (pinocchio keeps
+        one scratch buffer per model; this thread is its only user)."""
+        robot = self._robot
+        fk = getattr(robot, "pinocchio_fkine", None)
+        if fk is not None:
+            return [fk(q).ravel().tolist() for q in positions]
+        return [np.asarray(robot.fkine(q).A, dtype=np.float64).ravel().tolist() for q in positions]
+
+    def _check_zones(self, positions, start, label):
+        """Raise PlannerError('ZONE_LIMIT') if any sample takes a robot sphere into a stop-zone of the
+        active cell (with the zone's margin). Same RECOVERY rule as the joint limits: a robot that
+        starts in violation may stay as deep as it is, never deeper. Warn-zones are logged, not refused."""
+        zones, spheres = self._zone_setup
+        if not zones:
+            return
+        if self._robot is None:
+            raise PlannerError("ZONE_CHECK_UNAVAILABLE",
+                               f"{label}: safety zones are active but there is no robot model to check them")
+        pos = np.atleast_2d(np.asarray(positions, dtype=np.float64))[:, :self.joint_num]
+        poses = self._tcp_poses(pos)
+        start_pose = self._tcp_poses(np.atleast_2d(np.asarray(start, dtype=np.float64))[:, :self.joint_num])[0]
+        hit = first_path_violation(zones, poses, spheres, start_pose, reaction="stop")
+        if hit is not None:
+            zone, i, pen, k = hit
+            what = "the TCP" if k == 0 else f"tool sphere {k}"
+            side = "leave allowed" if zone["kind"] == "allowed" else "enter forbidden"
+            where = f"{100.0 * i / max(len(poses) - 1, 1):.0f}% of the move" if len(poses) > 1 else "the target"
+            raise PlannerError(
+                "ZONE_LIMIT",
+                f"{label}: {what} would {side} zone '{zone['name']}' by {1000.0 * pen:.1f} mm "
+                f"(margin {1000.0 * zone['margin']:.0f} mm included) at {where}")
+        warn = first_path_violation(zones, poses, spheres, start_pose, reaction="warn")
+        if warn is not None:
+            zone = warn[0]
+            logger.warning(f"[Planner] {label}: passes through warn-zone '{zone['name']}' "
+                           f"({1000.0 * warn[2]:.1f} mm) — allowed, reaction=warn")
+            log_activity(_activity_logger, "EXEC", "warning", ZONE_WARNING,
+                         message=f"{label} passes through zone '{zone['name']}'")

@@ -207,13 +207,9 @@ def _apply_debounce(input_index, raw_value):
     return shared_data.gpio_states[input_index]
 
 
-def read_all_inputs():
-    """
-    Read all GPIO inputs with debouncing and update shared memory.
-
-    Returns:
-        dict: Dictionary containing all input states
-    """
+def read_inputs_into_shared():
+    """Read every input pin with debouncing into shared memory — the RT loop's per-tick call (2026-10-03).
+    read_all_inputs() below adds the dict the GUI and scripts want; the loop never used it."""
     # Read isolated inputs with debounce filter
     raw_input_1 = lgpio.gpio_read(_gpio_handle, ISOLATED_INPUT_1_PIN)
     shared_data.gpio_states[ISOLATED_INPUT_1] = _apply_debounce(ISOLATED_INPUT_1, raw_input_1)
@@ -244,6 +240,15 @@ def read_all_inputs():
     raw_gpio_4 = lgpio.gpio_read(_gpio_handle, GPIO_4_PIN)
     shared_data.gpio_states[GPIO_4] = _apply_debounce(GPIO_4, raw_gpio_4)
 
+
+def read_all_inputs():
+    """
+    Read all GPIO inputs with debouncing and update shared memory.
+
+    Returns:
+        dict: Dictionary containing all input states
+    """
+    read_inputs_into_shared()
     return {
         'isolated_input_1': shared_data.gpio_states[ISOLATED_INPUT_1],
         'isolated_input_2': shared_data.gpio_states[ISOLATED_INPUT_2],
@@ -257,6 +262,34 @@ def read_all_inputs():
     }
 
 
+# E-stop channel policy (2026-10-04, hardware/control_box.py): how many hardware channels the fitted PCB can be
+# trusted on. PCB v1: channel 2 (GPIO6) always reads pressed (layout fault) -> channel 1 only, as it has always
+# been. v2+: both channels, cross-checked — any channel pressed = pressed; the two disagreeing for longer than
+# _estop_disagree_limit ticks is a CHANNEL FAULT (a broken wire or contact on one channel): treated as pressed and
+# logged once per episode, so a single-channel failure can neither hide a press nor pass unnoticed.
+_estop_channels = 1
+_estop_disagree_limit = 50           # ticks (200 ms at 250 Hz): longer than contact bounce, shorter than a hand
+_estop_disagree_count = 0
+_estop_fault = False
+
+
+def configure_estop(channels, disagree_ticks=50):
+    """Called once at start-up with the PCB's capability (control_box.capabilities()['estop_channels'])."""
+    global _estop_channels, _estop_disagree_limit, _estop_disagree_count, _estop_fault
+    _estop_channels = 2 if int(channels) >= 2 else 1
+    _estop_disagree_limit = max(1, int(disagree_ticks))
+    _estop_disagree_count = 0
+    _estop_fault = False
+    logger.info(f"[E-stop] hardware channels in use: {_estop_channels}"
+                + (f" (cross-checked, fault after {_estop_disagree_limit} ticks of disagreement)" if _estop_channels == 2
+                   else " (channel 2 not trusted on this PCB)"))
+
+
+def estop_channel_fault():
+    """True while the two channels disagree past the limit (dual-channel PCBs only)."""
+    return _estop_fault
+
+
 def check_estop_active():
     """
     Check if any E-stop is active — hardware GPIO or software flag.
@@ -264,9 +297,24 @@ def check_estop_active():
     Returns:
         bool: True if any E-stop is active, False otherwise
     """
+    global _estop_disagree_count, _estop_fault
     # Hardware e-stop: active LOW (pressed = 0). Debounced values from shared_data.
-    # ESTOP_2 is excluded — hardware fault, always reads as triggered.
+    # Channel 2 only on a PCB that can be trusted on it (configure_estop).
     hw_estop = shared_data.gpio_states[ESTOP_1] == 0
+    if _estop_channels == 2:
+        ch2 = shared_data.gpio_states[ESTOP_2] == 0
+        if ch2 != hw_estop:
+            _estop_disagree_count += 1
+            if _estop_disagree_count > _estop_disagree_limit and not _estop_fault:
+                _estop_fault = True
+                logger.error(f"[E-stop] CHANNEL FAULT: channel {1 if hw_estop else 2} reads pressed, the other released, "
+                             f"for {_estop_disagree_count} ticks — a broken wire or contact; treated as PRESSED until both agree")
+            hw_estop = True
+        else:
+            if _estop_fault:
+                logger.warning("[E-stop] channel fault cleared — both channels agree again")
+            _estop_disagree_count = 0
+            _estop_fault = False
 
     # Software e-stop: GUI (or any client) sets shared_data.rti['software_estop'][0] = 1.
     sw_estop = bool(shared_data.rti["software_estop"][0])
@@ -278,13 +326,23 @@ def check_estop_active():
 # GPIO Output Control
 # ==========================================================================
 
+# The level last written to each output pin (None = not yet written). An output holds its level, so the
+# per-tick write only has to happen when shared memory asks for a DIFFERENT one (2026-10-03: three ioctls per
+# tick bought nothing). Every other writer of these pins keeps this in step.
+_OUTPUTS = ((ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_1_PIN), (ISOLATED_OUTPUT_2, ISOLATED_OUTPUT_2_PIN),
+            (ISOLATED_OUTPUT_3, ISOLATED_OUTPUT_3_PIN))
+_last_written = {ISOLATED_OUTPUT_1: None, ISOLATED_OUTPUT_2: None, ISOLATED_OUTPUT_3: None}
+
+
 def write_all_outputs():
     """
-    Write all GPIO outputs from shared memory to physical pins.
+    Write the GPIO outputs from shared memory to the physical pins — each one only when its level changed.
     """
-    lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_1_PIN, int(shared_data.gpio_states[ISOLATED_OUTPUT_1]))
-    lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_2_PIN, int(shared_data.gpio_states[ISOLATED_OUTPUT_2]))
-    lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_3_PIN, int(shared_data.gpio_states[ISOLATED_OUTPUT_3]))
+    for idx, pin in _OUTPUTS:
+        value = int(shared_data.gpio_states[idx])
+        if value != _last_written[idx]:
+            lgpio.gpio_write(_gpio_handle, pin, value)
+            _last_written[idx] = value
 
 
 def set_output(output_index, value):
@@ -306,6 +364,7 @@ def set_output(output_index, value):
 
     if output_index in pin_map:
         lgpio.gpio_write(_gpio_handle, pin_map[output_index], int(value))
+        _last_written[output_index] = int(value)
 
 
 def set_all_outputs_low():
@@ -467,6 +526,8 @@ def emergency_stop_all_outputs():
     lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_1_PIN, 0)
     lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_2_PIN, 0)
     lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_3_PIN, 0)
+    for idx in _last_written:
+        _last_written[idx] = 0
 
     shared_data.gpio_states[ISOLATED_OUTPUT_1] = 0
     shared_data.gpio_states[ISOLATED_OUTPUT_2] = 0

@@ -42,6 +42,26 @@ def ip():
     return _ip["v"]
 
 
+def force_confirm():
+    """(pending, who, seconds_left) for a forced control takeover awaiting a button press.
+
+    Returns (False, "", 0.0) when nothing is pending, when the fields do not exist yet
+    (an older RTI that has not been restarted since the field was added), or on any read
+    error — a prompt that cannot be read must not become a prompt that never clears.
+    """
+    try:
+        rti = shared_data.rti
+        if float(rti["force_confirm_pending"][0]) < 0.5:
+            return False, "", 0.0
+        # monotonic: must match the clock command_executor._await_physical_confirm writes.
+        left = float(rti["force_confirm_deadline"][0]) - time.monotonic()
+        if left <= 0:
+            return False, "", 0.0     # stale: the executor died mid-request
+        return True, shared_data.force_confirm_who.get() or "unknown", left
+    except Exception:
+        return False, "", 0.0
+
+
 def hostname(): return _safe(socket.gethostname)
 def mem_pct():  return _safe(lambda: f"{psutil.virtual_memory().percent:.0f}%")
 def load1():    return _safe(lambda: f"{os.getloadavg()[0]:.2f}")

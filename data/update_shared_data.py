@@ -18,7 +18,7 @@ data: one tick (4 ms on PAR6) of skew, with no exception and no log to point at 
 Nothing enforces this, so it is written down here instead. RTI.py's superloop is the
 only caller and has them in the right order (motor at ~1235, joint/TCP at ~1254).
 
-A third step closes the loop, and its position matters too: process_Joint_data() appends
+A third step closes the loop, and its position matters too: process_joint_data() appends
 this tick's joint values to Joint_data AFTER both functions run (RTI.py ~1276). That is
 what makes Joint_data[-1] the PREVIOUS tick inside update_joint_and_tcp_data(), which the
 acceleration/jerk finite differences depend on. Append earlier and both silently read 0.
@@ -27,7 +27,7 @@ acceleration/jerk finite differences depend on. Append earlier and both silently
 # robot/data_sync.py
 import numpy as np
 from robotics.dynamics import motor_current_to_joint_torque, torque_to_motor_current, estimate_external_force_tcp
-from robotics.dynamics import calculate_gravity_compensation
+from robotics.dynamics import gravity_torque_rt
 from robotics.robot_kinematics import calculate_all_kinematics
 from utility.kinematics_backend import write_quaternion_wxyz
 from utility.signal_filters import apply_filter_bank
@@ -59,9 +59,13 @@ def update_joint_and_tcp_data(
     motor_kt,
     motor_signs,
     robot,
+    jacobian_out=None,
 ):
     """
     Update joint-level and TCP-level shared memory.
+
+    jacobian_out: optional (6, joint_num) buffer that receives this tick's TCP Jacobian [J_v; J_w] at the
+    measured pose (the haptic walls need it; it is not in shared memory).
 
     Computes joint positions/speeds/accel/jerk/torque,
     runs FK, gravity compensation, and external force estimation,
@@ -108,21 +112,23 @@ def update_joint_and_tcp_data(
     # concerns. A signal needs as many poles as differentiations, so the accel bank is a
     # single stage (default 'none' — its filtered-speed input already carries one pole) and
     # the jerk bank must be 2-pole.
+    # Whole-array ufuncs with out= (2026-10-03): the same (a - b) / dt per element as the per-joint loops
+    # they replace — bit-identical — at ~1/4 of the cost (the loops were ~50 us of a 316 us function).
     prev = Joint_data[-1]
     ja = shared_data.joint['joint_acceleration']
-    for i in range(joint_num):
-        ja[i] = (js[i] - prev['j_s'][i]) / delta_t                      # RAW
+    np.subtract(js, prev['j_s'], out=ja)                                # RAW
+    np.divide(ja, delta_t, out=ja)
     scratch = _scratch(joint_num)
-    for i in range(joint_num):
-        scratch[i] = (jsf[i] - prev['j_s_f'][i]) / delta_t
+    np.subtract(jsf, prev['j_s_f'], out=scratch)
+    np.divide(scratch, delta_t, out=scratch)
     apply_filter_bank(filter_banks['accel'], scratch, shared_data.joint['joint_acceleration_filtered'])
     jaf = shared_data.joint['joint_acceleration_filtered']
 
     jj = shared_data.joint['joint_jerk']
-    for i in range(joint_num):
-        jj[i] = (ja[i] - prev['j_a'][i]) / delta_t                      # RAW
-    for i in range(joint_num):
-        scratch[i] = (jaf[i] - prev['j_a_f'][i]) / delta_t
+    np.subtract(ja, prev['j_a'], out=jj)                                # RAW
+    np.divide(jj, delta_t, out=jj)
+    np.subtract(jaf, prev['j_a_f'], out=scratch)
+    np.divide(scratch, delta_t, out=scratch)
     apply_filter_bank(filter_banks['jerk'], scratch, shared_data.joint['joint_jerk_filtered'])
 
     # --- Joint torque from motor current: RAW, then filtered ---
@@ -145,6 +151,8 @@ def update_joint_and_tcp_data(
         joint_acceleration=shared_data.joint['joint_acceleration_filtered'],
     )
     J = kin['J']
+    if jacobian_out is not None:
+        jacobian_out[:] = J
     shared_data.tcp['robot_pose'][:]        = kin['tcp_pose']
     shared_data.tcp['robot_pose_matrix'][:] = kin['tcp_pose_matrix']
 
@@ -178,7 +186,7 @@ def update_joint_and_tcp_data(
     shared_data.tcp['jacobian_manipulability'][0] = kin['manipulability']
 
     # --- Gravity/dynamics compensation ---
-    grav_torque = calculate_gravity_compensation(robot, shared_data.joint['joint_position'][:])
+    grav_torque = gravity_torque_rt(robot, shared_data.joint['joint_position'][:])
     shared_data.joint['joint_gravity_torque'][:] = grav_torque  # Nm — joint space, always updated
     if shared_data.rti['gravity_comp_enabled'][0]:
         shared_data.joint['compensation_torque'][:] = torque_to_motor_current(
@@ -236,18 +244,15 @@ def update_motor_and_gripper_data(
     tick = shared_data.rti["loop_tick"][0]
 
     # === Always update ===
-    shared_data.motor['motor_position'][:] = [
-        Motor_data[i][-1]["position"] for i in range(joint_num)
-    ]
-    shared_data.motor['motor_speed'][:] = [
-        Motor_data[i][-1]["speed"] for i in range(joint_num)
-    ]
-    shared_data.motor['motor_current'][:] = [
-        Motor_data[i][-1]["current"] for i in range(joint_num)
-    ]
-    shared_data.motor['global_motor_error'][:] = [
-        Motor_data[i][-1]["error"] for i in range(joint_num)
-    ]
+    # One pass over the joints writing in place (2026-10-03) — the four list comprehensions this replaces built
+    # four lists per tick; the values written are the same. (Written as explicit shared_data.motor[...] subscripts
+    # on purpose: test_motor_array_writers recognises the ONE legitimate writer of these arrays by that text.)
+    for i in range(joint_num):
+        latest = Motor_data[i][-1]
+        shared_data.motor['motor_position'][i] = latest["position"]
+        shared_data.motor['motor_speed'][i] = latest["speed"]
+        shared_data.motor['motor_current'][i] = latest["current"]
+        shared_data.motor['global_motor_error'][i] = latest["error"]
 
     # === 5-tick staggered updates ===
     if tick % 5 == 0:

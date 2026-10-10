@@ -24,15 +24,16 @@ import json
 import logging
 import os
 import time
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, RotatingFileHandler
 
 from project_paths import ACTIVITY_RTI_LOG, ACTIVITY_EXEC_LOG
+from utility.error_catalog import ERROR_DESCRIPTIONS
 
 
 # ---------------------------------------------------------------------------
 # Catalog — code -> {"cause": str|None, "fix": str|None}.
 #
-# RTI hardware-fault codes already live in error_checks.ERROR_DESCRIPTIONS
+# RTI hardware-fault codes already live in error_catalog.ERROR_DESCRIPTIONS
 # (that's the existing source of truth for those); this dict covers
 # everything else — EXEC's command lifecycle/rejection/planner codes and
 # RTI's routine (non-fault) events. get_catalog_entry() checks both.
@@ -90,14 +91,13 @@ CATALOG = {
 def get_catalog_entry(code: str) -> dict:
     """Look up {cause, fix} for a code.
 
-    RTI hardware-fault codes (short_keys from error_checks.ERROR_DESCRIPTIONS)
+    RTI hardware-fault codes (short_keys from error_catalog.ERROR_DESCRIPTIONS)
     take priority since that's their existing source of truth; falls back to
     this module's CATALOG, then to the generic not-yet-documented fallback.
 
-    Import is local (not module-level) — error_checks.py imports this module
-    for logging/emission, so a top-level import here would be circular.
+    (The catalog is a leaf module since 2026-10-03, so this import is at module level — the former
+    in-function import worked around the error_checks <-> activity_log cycle.)
     """
-    from utility.error_checks import ERROR_DESCRIPTIONS
     if code in ERROR_DESCRIPTIONS:
         return ERROR_DESCRIPTIONS[code]
     return CATALOG.get(code, _FALLBACK)
@@ -133,8 +133,49 @@ def format_entry(source, level, code, id=None, command=None, message=None, conte
 # Two dedicated loggers — one per file, one writer per file, no shared root.
 # propagate=False keeps entries out of RTI.log/high_level.log/console; a bare
 # formatter means the JSON line *is* the message, no added prefix.
+#
+# IN A REAL-TIME PROCESS the file is NOT written by the caller (2026-10-03). propagate=False put these
+# loggers outside the root logger's QueueHandler, so every activity entry — a mode change, a newly latched
+# error, a jog limit — was a synchronous file write (and at the rotation boundary a rename) inside the RT
+# tick: the same mechanism as the 18.4 ms LOOP_CRITICAL tick that queued RTI.log. route_through_queue()
+# (called by utility.logger_setup.setup_logging(queued=True)) moves each activity file handler onto the
+# process's one QueueListener thread and leaves the logger a QueueHandler on the same queue. The handlers
+# filter by logger NAME, so activity lines never reach RTI.log and RTI.log lines never reach the activity
+# file. Content and format are unchanged. Processes that set up logging without `queued` (the executor,
+# the supervisor) keep the direct file handler.
 # ---------------------------------------------------------------------------
 _LOGGERS = {}
+_QUEUE = None        # the RT process's log queue, once route_through_queue() has been called
+_LISTENER = None     # its QueueListener — file handlers of loggers created later are added to it
+
+
+def _only_logger(name: str):
+    """Handler filter: exactly this logger's records (the listener hands every record to every handler)."""
+    def accept(record):
+        return record.name == name
+    return accept
+
+
+def _queue_logger(name: str, logger: logging.Logger) -> None:
+    """Move the logger's file handler(s) to the listener; leave the logger a QueueHandler. Idempotent."""
+    for h in [h for h in logger.handlers if not isinstance(h, QueueHandler)]:
+        logger.removeHandler(h)
+        h.addFilter(_only_logger(name))
+        _LISTENER.handlers = (*_LISTENER.handlers, h)
+    if not any(isinstance(h, QueueHandler) for h in logger.handlers):
+        logger.addHandler(QueueHandler(_QUEUE))
+
+
+def route_through_queue(q, listener) -> None:
+    """Real-time processes only: activity loggers (existing and future) enqueue; `listener` writes their files.
+
+    Called once by setup_logging(queued=True) after the listener exists. Start the listener after the
+    real-time scheduling is set, stop it at exit — exactly as for RTI.log (utility/logger_setup.py).
+    """
+    global _QUEUE, _LISTENER
+    _QUEUE, _LISTENER = q, listener
+    for name, logger in _LOGGERS.items():
+        _queue_logger(name, logger)
 
 
 def _get_activity_logger(name: str, log_file: str, max_bytes: int, backup_count: int = 5) -> logging.Logger:
@@ -150,6 +191,8 @@ def _get_activity_logger(name: str, log_file: str, max_bytes: int, backup_count:
         handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count)
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
+    if _QUEUE is not None:
+        _queue_logger(name, logger)
 
     _LOGGERS[name] = logger
     return logger

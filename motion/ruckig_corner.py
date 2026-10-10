@@ -57,6 +57,11 @@ Planner-side code (command_executor process), NOT the RT hot path — normal
 allocation rules apply, same as trajectory_planner.py.
 """
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any
+
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -209,7 +214,7 @@ def _clamp_state(state, vmax, amax):
             np.clip(qdd, -amax * _LIMIT_EPS, amax * _LIMIT_EPS))
 
 
-def _leg_trajectory(start, end, vmax, amax, jmax):
+def _leg_trajectory(start: np.ndarray, end: np.ndarray, vmax: np.ndarray, amax: np.ndarray, jmax: np.ndarray) -> Any:
     """Rest-to-rest, phase-synchronized leg: a straight joint-space line.
 
     Rest-to-rest is NOT the waste it looks like: the leg is cut at the blend ball, so the
@@ -256,7 +261,8 @@ def _polyline_distance(points, waypoints):
     return float(best.max())
 
 
-def _transition(state_a, state_b, vmax, amax, jmax):
+def _transition(state_a: tuple[np.ndarray, np.ndarray, np.ndarray], state_b: tuple[np.ndarray, np.ndarray, np.ndarray],
+                vmax: np.ndarray, amax: np.ndarray, jmax: np.ndarray) -> Any | None:
     """Full-state corner transition; None if Ruckig rejects the boundary states."""
     _, InputParameter, _, _, _ = _require_ruckig()
     qa, qda, qdda = state_a
@@ -281,7 +287,7 @@ def _distance_to(traj, t, point):
     return float(np.linalg.norm(np.asarray(q) - point))
 
 
-def _entry_cut_time(leg, corner_q, radius, dt):
+def _entry_cut_time(leg: Any, corner_q: np.ndarray, radius: float, dt: float) -> float | None:
     """Last time the incoming leg is OUTSIDE the corner ball (then stays inside).
 
     Sample-scan from the end backwards to find the last sample outside the radius,
@@ -307,7 +313,7 @@ def _entry_cut_time(leg, corner_q, radius, dt):
     return lo
 
 
-def _exit_cut_time(leg, corner_q, radius, dt):
+def _exit_cut_time(leg: Any, corner_q: np.ndarray, radius: float, dt: float) -> float | None:
     """First time the outgoing leg is OUTSIDE the corner ball."""
     duration = float(leg.duration)
     n = max(2, int(np.ceil(duration / dt)) + 1)
@@ -329,16 +335,16 @@ def _exit_cut_time(leg, corner_q, radius, dt):
     return hi
 
 
-def _state_at(traj, t):
+def _state_at(traj: Any, t: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     q, qd, qdd = traj.at_time(float(t))
     return (np.asarray(q, dtype=np.float64),
             np.asarray(qd, dtype=np.float64),
             np.asarray(qdd, dtype=np.float64))
 
 
-def plan_ruckig_corner_chain(waypoints, max_vel, max_accel, dt, blend_dists,
-                             jerk_factor=RUCKIG_JERK_FACTOR, speed_scale=1.0,
-                             max_jerk=None):
+def plan_ruckig_corner_chain(waypoints: np.ndarray, max_vel: np.ndarray, max_accel: np.ndarray, dt: float,
+                             blend_dists: Sequence[float], jerk_factor: float = RUCKIG_JERK_FACTOR, speed_scale: float = 1.0,
+                             max_jerk: np.ndarray | None = None) -> RuckigCornerChain:
     """Plan a jerk-limited joint-space chain with Ruckig corner transitions.
 
     Args:

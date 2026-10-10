@@ -1,5 +1,9 @@
 """Initialise robot state data structures (deques, default dicts, process helpers)."""
 
+from __future__ import annotations
+
+from typing import Any
+
 import logging
 import numpy as np
 from collections import deque
@@ -13,7 +17,7 @@ MAX_DATA_POINTS = 500  # History of data points we receive from CAN bus
 # Default data factories
 # --------------------------------------------------------------------------- #
 
-def get_default_motor_data():
+def get_default_motor_data() -> dict:
     return {
         "position": -99999999,
         "speed": -99999999,
@@ -24,7 +28,7 @@ def get_default_motor_data():
         "error": -1,
     }
 
-def get_default_motor_temperature():
+def get_default_motor_temperature() -> dict:
     return {
         "temp": -99999999,
         "timestamp": -1,
@@ -33,7 +37,7 @@ def get_default_motor_temperature():
         "error": -1
     }
 
-def get_default_motor_voltage():
+def get_default_motor_voltage() -> dict:
     return {
         "volt": -99999999,
         "timestamp": -1,
@@ -42,7 +46,7 @@ def get_default_motor_voltage():
         "error": -1
     }
 
-def get_default_motor_errors():
+def get_default_motor_errors() -> dict:
     return {
         "global_error": 0,
         "temperature_error": 0,
@@ -61,7 +65,7 @@ def get_default_motor_errors():
         "error": -1
     }
 
-def get_default_motor_info():
+def get_default_motor_info() -> dict:
     return {
         "HARDWARE_VERSION": -1,
         "BATCH_DATE": -1,
@@ -73,7 +77,7 @@ def get_default_motor_info():
         "error": -1
     }
 
-def get_default_motor_kt():
+def get_default_motor_kt() -> dict:
     return {
         "Kt":        -1.0,
         "timestamp": -1,
@@ -82,7 +86,7 @@ def get_default_motor_kt():
         "error":     -1,
     }
 
-def get_default_gripper_data():
+def get_default_gripper_data() -> dict:
     return {
         "g_p": -99999999,
         "g_c": -99999999,
@@ -109,7 +113,7 @@ def get_default_gripper_data():
         "g_jfc": -99999999.0,   # joint force commanded (N)
     }
 
-def get_default_joint_data(num_joints):
+def get_default_joint_data(num_joints: int) -> dict:
     return {
         "j_p": np.full(num_joints, -99999999, dtype=float),
         "j_s": np.full(num_joints, -99999999, dtype=float),
@@ -164,21 +168,11 @@ def get_default_joint_data(num_joints):
         "period_ms": 0.0,
     }
 
-def get_default_system_data(num_joints):
-    return {
-        "i/o": np.full(8, -1, dtype=int),
-        "rob_v": -1,
-        "rob_c": -1,
-        "rob_mode": -1,
-        "pi_temp": -1,
-    }
-
-
 # --------------------------------------------------------------------------- #
 # Top-level initialiser
 # --------------------------------------------------------------------------- #
 
-def initialize_robot_data(joint_num):
+def initialize_robot_data(joint_num: int) -> dict:
     """
     Initialise all dictionary deques based on the actual joint number.
     Returns a dict containing all the state structures.
@@ -214,21 +208,23 @@ def initialize_robot_data(joint_num):
 # Data append helpers (process_* functions)
 # --------------------------------------------------------------------------- #
 
-def process_Joint_data(Joint_data, position, speed, torque, acceleration, jerk,
-                       speed_filtered, torque_filtered, acceleration_filtered, jerk_filtered,
-                       TCP_pose_vect, TCP_pose_SE3, TCP_pose_quaternion,
-                       TCP_speed, torque_external,
-                       TCP_force_external,
-                       TCP_speed_filtered, TCP_acceleration, TCP_acceleration_filtered,
-                       TCP_force_external_tool,
-                       position_commanded, speed_commanded,
-                       acceleration_commanded, torque_commanded,
-                       TCP_pose_commanded, TCP_speed_commanded,
-                       position_target, speed_target, acceleration_target,
-                       torque_target, TCP_pose_target, TCP_speed_target,
-                       timestamp, exec_time, tick, error,
-                       rti_seq=0, rti_ok=0.0, rti_miss=0,
-                       rti_state=0, mode="", period_ms=0.0):
+def process_joint_data(Joint_data: deque, position: np.ndarray, speed: np.ndarray, torque: np.ndarray,
+                       acceleration: np.ndarray, jerk: np.ndarray,
+                       speed_filtered: np.ndarray, torque_filtered: np.ndarray, acceleration_filtered: np.ndarray,
+                       jerk_filtered: np.ndarray,
+                       TCP_pose_vect: np.ndarray, TCP_pose_SE3: np.ndarray, TCP_pose_quaternion: np.ndarray,
+                       TCP_speed: np.ndarray, torque_external: np.ndarray,
+                       TCP_force_external: np.ndarray,
+                       TCP_speed_filtered: np.ndarray, TCP_acceleration: np.ndarray, TCP_acceleration_filtered: np.ndarray,
+                       TCP_force_external_tool: np.ndarray,
+                       position_commanded: np.ndarray, speed_commanded: np.ndarray,
+                       acceleration_commanded: np.ndarray, torque_commanded: np.ndarray,
+                       TCP_pose_commanded: np.ndarray, TCP_speed_commanded: np.ndarray,
+                       position_target: np.ndarray, speed_target: np.ndarray, acceleration_target: np.ndarray,
+                       torque_target: np.ndarray, TCP_pose_target: np.ndarray, TCP_speed_target: np.ndarray,
+                       timestamp: float, exec_time: float, tick: float, error: np.ndarray,
+                       rti_seq: float = 0, rti_ok: float = 0.0, rti_miss: float = 0,
+                       rti_state: float = 0, mode: str = "", period_ms: float = 0.0) -> None:
     Joint_data.append({
         "j_p":    position.copy(),
         "j_s":    speed.copy(),
@@ -280,10 +276,11 @@ def process_Joint_data(Joint_data, position, speed, torque, acceleration, jerk,
     })
 
 
-def process_Gripper_joint_data(Gripper_data, gripper_id,
-                               joint_position, joint_speed, joint_force,
-                               joint_position_target, joint_speed_target, joint_force_target,
-                               joint_position_commanded, joint_speed_commanded, joint_force_commanded):
+def process_gripper_joint_data(Gripper_data: dict[int, deque], gripper_id: int,
+                               joint_position: float, joint_speed: float, joint_force: float,
+                               joint_position_target: float, joint_speed_target: float, joint_force_target: float,
+                               joint_position_commanded: float, joint_speed_commanded: float,
+                               joint_force_commanded: float) -> None:
     """Update the latest Gripper_data queue entry with SI unit values."""
     if gripper_id not in Gripper_data or len(Gripper_data[gripper_id]) == 0:
         return
@@ -299,12 +296,8 @@ def process_Gripper_joint_data(Gripper_data, gripper_id,
     g["g_jfc"] = joint_force_commanded
 
 
-def process_System_data(System_data, test, gpio_states, scan_receive_ids):
-    System_data.append({"test": test})
-
-
-def process_Motor_data(Motor_data, joint_id, position, speed, current,
-                       timestamp, CAN_msg_ID, loop_tick, error):
+def process_motor_data(Motor_data: dict[int, deque], joint_id: int, position: float, speed: float, current: float,
+                       timestamp: float, CAN_msg_ID: Any, loop_tick: float, error: int) -> None:
     if joint_id not in Motor_data:
         logger.warning(f"Invalid joint ID: {joint_id}")
         return
@@ -319,13 +312,14 @@ def process_Motor_data(Motor_data, joint_id, position, speed, current,
     })
 
 
-def process_Gripper_data(Motor_data, Gripper_data, gripper_id, position, current,
-                         timestamp, activated, action_status, object_detection,
-                         temp_error, timeout_error, estop_error, calibrated,
-                         CAN_msg_ID, loop_tick, error,
-                         joint_position=0.0, joint_speed=0.0, joint_force=0.0,
-                         joint_position_target=0.0, joint_speed_target=0.0, joint_force_target=0.0,
-                         joint_position_commanded=0.0, joint_speed_commanded=0.0, joint_force_commanded=0.0):
+def process_gripper_data(Motor_data: dict[int, deque], Gripper_data: dict[int, deque], gripper_id: int, position: float,
+                         current: float, timestamp: float, activated: int, action_status: int, object_detection: int,
+                         temp_error: int, timeout_error: int, estop_error: int, calibrated: int,
+                         CAN_msg_ID: Any, loop_tick: float, error: int,
+                         joint_position: float = 0.0, joint_speed: float = 0.0, joint_force: float = 0.0,
+                         joint_position_target: float = 0.0, joint_speed_target: float = 0.0,
+                         joint_force_target: float = 0.0, joint_position_commanded: float = 0.0,
+                         joint_speed_commanded: float = 0.0, joint_force_commanded: float = 0.0) -> None:
     if gripper_id not in Gripper_data:
         logger.warning(f"Invalid joint ID: {gripper_id}")
         return
@@ -364,8 +358,8 @@ def process_Gripper_data(Motor_data, Gripper_data, gripper_id, position, current
     })
 
 
-def process_Motor_temperature(Motor_temperature, joint_id, temperature,
-                              timestamp, CAN_msg_ID, loop_tick, error):
+def process_motor_temperature(Motor_temperature: dict[int, deque], joint_id: int, temperature: float,
+                              timestamp: float, CAN_msg_ID: Any, loop_tick: float, error: int) -> None:
     if joint_id not in Motor_temperature:
         logger.warning(f"Invalid joint ID: {joint_id}")
         return
@@ -378,8 +372,8 @@ def process_Motor_temperature(Motor_temperature, joint_id, temperature,
     })
 
 
-def process_Motor_Voltage(Motor_voltage, joint_id, voltage,
-                          timestamp, CAN_msg_ID, loop_tick, error):
+def process_motor_voltage(Motor_voltage: dict[int, deque], joint_id: int, voltage: float,
+                          timestamp: float, CAN_msg_ID: Any, loop_tick: float, error: int) -> None:
     if joint_id not in Motor_voltage:
         logger.warning(f"Invalid joint ID: {joint_id}")
         return
@@ -392,8 +386,8 @@ def process_Motor_Voltage(Motor_voltage, joint_id, voltage,
     })
 
 
-def process_Motor_Kt(Motor_Kt, joint_id, Kt,
-                     timestamp, CAN_msg_ID, loop_tick, error):
+def process_motor_kt(Motor_Kt: dict[int, deque], joint_id: int, Kt: float,
+                     timestamp: float, CAN_msg_ID: Any, loop_tick: float, error: int) -> None:
     if joint_id not in Motor_Kt:
         logger.warning(f"Invalid joint ID: {joint_id}")
         return
@@ -406,10 +400,10 @@ def process_Motor_Kt(Motor_Kt, joint_id, Kt,
     })
 
 
-def process_Motor_errors(Motor_errors, joint_id, global_error, temperature_error,
-                         encoder_error, vbus_error, driver_error, velocity_error,
-                         current_error, estop_error, watchdog_error, calibrated,
-                         activated, timestamp, CAN_msg_ID, loop_tick, error):
+def process_motor_errors(Motor_errors: dict[int, deque], joint_id: int, global_error: int, temperature_error: int,
+                         encoder_error: int, vbus_error: int, driver_error: int, velocity_error: int,
+                         current_error: int, estop_error: int, watchdog_error: int, calibrated: int,
+                         activated: int, timestamp: float, CAN_msg_ID: Any, loop_tick: float, error: int) -> None:
     if joint_id not in Motor_errors:
         logger.warning(f"Invalid joint ID: {joint_id}")
         return
@@ -432,9 +426,9 @@ def process_Motor_errors(Motor_errors, joint_id, global_error, temperature_error
     })
 
 
-def process_Motor_info(Motor_info, joint_id, HARDWARE_VERSION, BATCH_DATE,
-                       SOFTWARE_VERSION, SERIAL_NUMBER, timestamp,
-                       CAN_msg_ID, loop_tick, error):
+def process_motor_info(Motor_info: dict[int, deque], joint_id: int, HARDWARE_VERSION: int, BATCH_DATE: int,
+                       SOFTWARE_VERSION: int, SERIAL_NUMBER: int, timestamp: float,
+                       CAN_msg_ID: Any, loop_tick: float, error: int) -> None:
     if joint_id not in Motor_info:
         logger.warning(f"Invalid joint ID: {joint_id}")
         return
@@ -448,3 +442,14 @@ def process_Motor_info(Motor_info, joint_id, HARDWARE_VERSION, BATCH_DATE,
         "tick":             loop_tick,
         "error":            error,
     })
+
+# PEP8 renames 2026-10-03: the old spellings stay importable for one release (external scripts).
+process_Joint_data = process_joint_data
+process_Gripper_joint_data = process_gripper_joint_data
+process_Motor_data = process_motor_data
+process_Gripper_data = process_gripper_data
+process_Motor_temperature = process_motor_temperature
+process_Motor_Voltage = process_motor_voltage
+process_Motor_Kt = process_motor_kt
+process_Motor_errors = process_motor_errors
+process_Motor_info = process_motor_info

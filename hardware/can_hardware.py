@@ -17,6 +17,7 @@ Contact: petar@source-robotics.com
 import logging
 import socket
 import Spectral_BLDC as Spectral
+import can
 import time
 import subprocess
 
@@ -140,6 +141,7 @@ def initialize_can_communication(bustype='socketcan', channel='can0', bitrate=10
         )
         logger.info(f"Communication initialized: {channel} @ {bitrate} bps")
         raise_can_tx_buffer(communication)
+        count_can_tx_drops(communication)
         return communication
 
     except Exception as e:
@@ -173,6 +175,46 @@ def raise_can_tx_buffer(communication, request_bytes=CAN_TX_SNDBUF_REQUEST_BYTES
         logger.warning(f"CAN TX buffer raise failed (keeping default): {e}")
 
 
+CAN_TX_DROP_LOG_WINDOW_S = 10.0      # at most one "frames dropped" line per this many seconds
+
+
+def count_can_tx_drops(communication, window_s=CAN_TX_DROP_LOG_WINDOW_S):
+    """Make the library's send layer COUNT what it swallows (2026-10-03).
+
+    Spectral_BLDC.CanCommunication.send_can_message catches python-can's CanOperationError and does nothing, so
+    a frame the socketcan TX queue refused is gone without a trace — CLAUDE.md §6 records how that cost the
+    gripper its watchdog for weeks. (python-can's socketcan send() with no timeout is a zero-timeout poll: it
+    raises "Transmit buffer full" at once and never blocks the RT loop — read in python-can 4.5.0.)
+
+    This replaces the INSTANCE's send with one that sends exactly the same frame and counts the refusals:
+    the first drop of a quiet period is logged at WARNING at once, then at most one line per `window_s` with
+    the count. Never raises into the caller (the library's contract). The counter stays on the object as
+    `communication.can_tx_drops` for diagnostics; returned too.
+    """
+    bus = communication.bus
+    counter = {"dropped": 0, "pending": 0, "last_log": float("-inf"), "last_error": ""}
+
+    def send_can_message(message_id, data=b"", remote_frame=False):
+        message = can.Message(arbitration_id=message_id, data=data, is_remote_frame=remote_frame,
+                              is_extended_id=False)
+        try:
+            bus.send(message)
+        except Exception as e:                       # CanOperationError ("Transmit buffer full"), or anything else
+            counter["dropped"] += 1
+            counter["pending"] += 1
+            counter["last_error"] = str(e)
+            now = time.monotonic()
+            if now - counter["last_log"] >= window_s:
+                logger.warning(f"[CAN] {counter['pending']} frame(s) dropped — the TX queue refused them ({e}); "
+                               f"{counter['dropped']} since start")
+                counter["pending"] = 0
+                counter["last_log"] = now
+
+    communication.send_can_message = send_can_message
+    communication.can_tx_drops = counter
+    return counter
+
+
 # ==========================================================================
 # CAN Bus Scanning
 # ==========================================================================
@@ -180,43 +222,50 @@ def raise_can_tx_buffer(communication, request_bytes=CAN_TX_SNDBUF_REQUEST_BYTES
 # Scan can bus for all available CAN devices! NOTE that no 2 devices can share
 # same CAN id!
 # ==========================================================================    
-def scan_can_bus(communication, max_id=16, timeout=0.0025, num_pings=2):
+def scan_can_bus(communication, max_id=16, timeout=0.0025, num_pings=2, window_s=0.02):
     """
     Scan CAN bus for all available devices.
-    
+
+    Pings every ID (num_pings sweeps), then reads every frame that arrives for `window_s` seconds and counts a node
+    only when the frame is ITS PING REPLY. 2026-10-09: the scan runs inside the live loop (RTI tick 8), where the
+    receive queue already holds the drivers' normal replies; it used to read ONE frame per ping and count the node if
+    that frame merely came from it — so it reported every node missing on 31 of 46 starts (while the same selfcheck
+    read their firmware versions), and could count a node from a frame that was not a ping reply.
+
     Args:
         communication: CAN communication object
         max_id (int): Maximum CAN ID to scan (default: 16)
-        timeout (float): Timeout for each ping response (default: 0.0025s)
+        timeout (float): Timeout of each receive poll (default: 0.0025s)
         num_pings (int): Number of ping attempts per device (default: 2)
-    
+        window_s (float): How long replies are collected after the pings (default: 0.02s)
+
     Returns:
         np.array: Array indicating which CAN IDs responded (1=present, 0=absent)
     """
     import numpy as np
-    
+
     scan_received_ids = np.zeros(16, dtype=int)
-    
+
     # Create test nodes for scanning
     CAN_test_node = [
         Spectral.SpectralCAN(node_id=i, communication=communication)
         for i in range(max_id)
     ]
-    
+
     logger.info(f"Scanning CAN bus (IDs 0-{max_id-1})...")
-    
+
     # Perform multiple ping sweeps
     for ping_round in range(num_pings):
         for i in range(max_id):
-            # Send ping
             CAN_test_node[i].Send_Respond_Ping()
-            
-            # Try to receive response
-            message, msg_ID = communication.receive_can_messages(timeout=timeout)
-            
-            # If we got a valid response from node i, mark it
-            if msg_ID is not None and msg_ID[0] == i:
-                scan_received_ids[i] = 1
+
+    # Collect the ping replies — every other frame (the loop's own replies) is skipped
+    ping_id = Spectral.SpectralCAN.SEND_RESPOND_PING_ID
+    deadline = time.monotonic() + window_s
+    while time.monotonic() < deadline:
+        message, msg_ID = communication.receive_can_messages(timeout=timeout)
+        if msg_ID is not None and msg_ID[1] == ping_id and 0 <= msg_ID[0] < max_id:
+            scan_received_ids[msg_ID[0]] = 1
     
     # Print results
     detected_ids = [i for i in range(max_id) if scan_received_ids[i] == 1]
@@ -230,132 +279,9 @@ def scan_can_bus(communication, max_id=16, timeout=0.0025, num_pings=2):
 # Motor Configuration Pre-loading
 # ==========================================================================
 
-def preload_motor_configs(Motor, joint_num, watchdog_rate=5000, 
-                         velocity_limit=800000, current_limit=2000, 
-                         num_repeats=2):
-    """
-    Pre-load motor driver configurations (watchdog, limits, gains).
-    This needs to be done after every fatal error or disconnect.
-    
-    Args:
-        Motor (list): List of motor objects
-        joint_num (int): Number of joints to configure
-        watchdog_rate (int): Watchdog timeout in ms (default: 5000)
-        velocity_limit (int): Velocity limit (default: 800000)
-        current_limit (int): Current limit in mA (default: 2000)
-        num_repeats (int): Number of times to send each config (default: 2)
-    """
-    logger.info("Pre-loading motor configurations...")
-    
-    for repeat in range(num_repeats):
-        logger.info(f"Configuration pass {repeat + 1}/{num_repeats}")
-        
-        # Send watchdog configuration
-        for i in range(joint_num):
-            Motor[i].Send_Watchdog(_rate=watchdog_rate, _action='Idle')
-        time.sleep(0.1)
-        
-        # Send limits
-        for i in range(joint_num):
-            Motor[i].Send_Limits(
-                Velocity_limit=velocity_limit,
-                Current_limit=current_limit
-            )
-        time.sleep(0.1)
-        
-        # TODO: Add PD, Current, Velocity, Position gains if needed
-        # for i in range(joint_num):
-        #     Motor[i].Send_PD_Gains(...)
-        #     Motor[i].Send_Current_Gains(...)
-        #     Motor[i].Send_Velocity_Gains(...)
-        #     Motor[i].Send_Position_Gains(...)
-    
-    time.sleep(0.5)
-    logger.info("Motor configuration complete")
-
-
-def send_idle_to_all_motors(Motor, joint_num):
-    """
-    Send idle command to all motors.
-    
-    Args:
-        Motor (list): List of motor objects
-        joint_num (int): Number of joints
-    """
-    for i in range(joint_num):
-        Motor[i].Send_Idle()
-    logger.info(f"Idle command sent to all {joint_num} motors")
-
-
-def send_estop_to_all_motors(Motor, joint_num):
-    """
-    Send emergency stop to all motors.
-    
-    Args:
-        Motor (list): List of motor objects
-        joint_num (int): Number of joints
-    """
-    for i in range(joint_num):
-        Motor[i].Send_ESTOP()
-    logger.info(f"E-STOP sent to all {joint_num} motors")
-
-
-def send_clear_error_to_all_motors(Motor, joint_num):
-    """
-    Send clear error command to all motors.
-    
-    Args:
-        Motor (list): List of motor objects
-        joint_num (int): Number of joints
-    """
-    for i in range(joint_num):
-        Motor[i].Send_Clear_Error()
-    logger.info(f"Clear error sent to all {joint_num} motors")
-
-
 # ==========================================================================
 # CAN Bus Diagnostics
 # ==========================================================================
-
-def check_can_bus_health(received_ids, expected_ids):
-    """
-    Check if all expected CAN devices are responding.
-    
-    Args:
-        received_ids (np.array): Array of received IDs in current cycle
-        expected_ids (list): List of expected CAN IDs
-    
-    Returns:
-        tuple: (all_ok (bool), missing_ids (list))
-    """
-    missing_ids = [id for id in expected_ids if received_ids[id] == 0]
-    all_ok = len(missing_ids) == 0
-    
-    if not all_ok:
-        logger.warning(f"Missing responses from IDs: {missing_ids}")
-    
-    return all_ok, missing_ids
-
-
-def get_can_statistics(housekeeping):
-    """
-    Get CAN communication statistics.
-    
-    Args:
-        housekeeping (dict): Housekeeping variables dictionary
-    
-    Returns:
-        dict: CAN statistics
-    """
-    stats = {
-        'received_ids': housekeeping['received_ids'].copy(),
-        'connection_errors': housekeeping['CAN_node_connection_error'].copy(),
-        'old_data_warnings': housekeeping['old_data_warning'].copy(),
-        'last_commands': housekeeping['latest_commands_id'].copy(),
-        'gripper_connected': housekeeping['CAN_gripper_connected']
-    }
-    return stats
-
 
 # ==========================================================================
 # Complete CAN System Initialization

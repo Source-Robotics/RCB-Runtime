@@ -1,4 +1,6 @@
 """Offline EXEC planner client for previewing programs without RTI, ZMQ, or CAN."""
+from __future__ import annotations
+from typing import Any, Callable, Sequence
 
 from dataclasses import dataclass, replace
 from queue import Empty, Queue
@@ -6,9 +8,12 @@ from queue import Empty, Queue
 import numpy as np
 
 import config.xml_parser as xml_parser
+from motion.cartesian_paths import pose_from_xyz_rpy
 from motion.exec_commands import MotionOptions, QueuedCommand
+from motion.reachability import find_reachable_clear, make_starts
+from utility.zones import reach_reply, zones_summary
 from motion.trajectory_planner import PlannerError, TrajectoryPlanner
-from project_paths import GRIPPERS_DIR, ROBOTS_DIR, SYSTEM_XML
+from project_paths import CELLS_DIR, GRIPPERS_DIR, ROBOTS_DIR, SYSTEM_XML
 from robotics.robot_kinematics import (
     calculate_forward_kinematics,
     calculate_jacobian,
@@ -44,6 +49,12 @@ class DryRunError:
     command: str
     code: str
     message: str
+
+    def failure(self):
+        """This error as a MotionFailed failure: the live client's {"id", "code", "message"} — MotionFailed formats
+        f["id"], so a bare __dict__ (command_id, no id) raised a KeyError instead of MotionFailed; found 2026-10-05 by
+        the block editor's Check — plus the preview's own fields."""
+        return {"id": self.command_id, **self.__dict__}
 
 
 @dataclass(frozen=True)
@@ -84,7 +95,7 @@ class DryRunPlan:
 
     def require_valid(self):
         if self.errors:
-            raise MotionFailed([error.__dict__ for error in self.errors])
+            raise MotionFailed([error.failure() for error in self.errors])
         return self
 
 
@@ -98,7 +109,8 @@ def _finite_difference(values, dt):
 class _OfflineTrajectoryPlanner(TrajectoryPlanner):
     """TrajectoryPlanner with its live output boundary replaced by memory."""
 
-    def __init__(self, initial_joints_rad, joint_num, max_vel, max_accel, dt, robot):
+    def __init__(self, initial_joints_rad, joint_num, max_vel, max_accel, dt, robot,
+                 max_jerk=None, joint_limits=None):
         self._initial_joints = np.asarray(initial_joints_rad, dtype=np.float64).copy()
         self._commands = {}
         self._segments = []
@@ -111,6 +123,8 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
             robot=robot,
             read_exec_runway=None,
             offline_output=True,
+            max_jerk=max_jerk,
+            joint_limits=joint_limits,
         )
 
     @property
@@ -146,6 +160,7 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
 
     def reset(self, joints_rad):
         self.flush()
+        self.clear_abort()
         self._initial_joints = np.asarray(joints_rad, dtype=np.float64).copy()
         self._segments.clear()
         self._events.clear()
@@ -166,6 +181,9 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
         )
 
     def _run_single(self, command):
+        if self._abort is not None:
+            self._report_aborted(command)
+            return
         try:
             self._mark_started(command)
             self._plan_and_send(command)
@@ -200,6 +218,8 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
             code=str(code),
             message=str(message),
         ))
+        # The preview must show what the robot will do: a failure aborts the rest.
+        self._command_failed(command_id, code, message)
 
     def _send_range(self, pos, vel, torque_ff, range_start, range_end, command_id,
                     flags=0, terminal=True):
@@ -287,8 +307,6 @@ class DryRunRobotClient(RobotClient):
     receive timestamped samples suitable for NiceGUI plots or path previews.
     """
 
-    ACCEL_TIME_S = 0.5
-
     def __init__(self, start_joints):
         initial_deg = np.asarray(start_joints, dtype=np.float64)
         if initial_deg.shape != (6,):
@@ -304,10 +322,28 @@ class DryRunRobotClient(RobotClient):
 
         robot = create_robot(system["active_robot"], config.get("gripper_name", ""))
         attach_pinocchio(robot)
-        max_vel = np.asarray(config["joint_velocity_limit"], dtype=np.float64)[:joint_num]
+        # The SAME limits command_executor plans with, from the same robot XML fields — a preview
+        # that plans with different numbers previews a different trajectory. This used to read the
+        # velocity CEILING and derive acceleration as max_vel / 0.5 s (a limit computed from another
+        # limit in consumer code, which CLAUDE.md forbids), and hard-coded a 4 ms tick.
         self._planner = _OfflineTrajectoryPlanner(
-            np.deg2rad(initial_deg), joint_num, max_vel,
-            max_vel / self.ACCEL_TIME_S, 0.004, robot)
+            np.deg2rad(initial_deg), joint_num,
+            np.asarray(config["exec_velocity_limit"], dtype=np.float64)[:joint_num],
+            np.asarray(config["exec_acceleration_limit"], dtype=np.float64)[:joint_num],
+            float(config.get("delta_t", 0.004)), robot,
+            max_jerk=np.asarray(config["exec_jerk_limit"], dtype=np.float64)[:joint_num],
+            joint_limits=(config["software_joint_limit_negative"],
+                          config["software_joint_limit_positive"]))
+        # The same safety zones command_executor checks, so a preview refuses what the robot would.
+        self._gripper_xml = GRIPPERS_DIR / f"{system['active_gripper']}.xml"
+        self._zone_setup = xml_parser.load_zone_setup(SYSTEM_XML, CELLS_DIR, self._gripper_xml)
+        self._planner.set_zones(self._zone_setup["zones"], self._zone_setup["tool_spheres"])
+        # ...and the same self-collision check (the pieces of the arm + the active gripper), when enabled
+        if system.get("self_collision", {}).get("enabled", 0):
+            from utility.self_collision import SelfCollisionModel, load_geometry
+            rg, tg = load_geometry(ROBOTS_DIR, GRIPPERS_DIR, config)
+            self._planner.set_self_collision(SelfCollisionModel(robot, rg, tg, system["self_collision"],
+                                                                 config["self_collision"]["pairs"] + config["gripper_collision"]["pairs"]))
         self._sync = False
         self._last_queued = None
         self._next_seq = 1
@@ -331,31 +367,31 @@ class DryRunRobotClient(RobotClient):
             completion_policy="settled",
         )
 
-    def connect(self, ip=None, port=None):
+    def connect(self, ip: str | None = None, port: int | None = None) -> DryRunRobotClient:
         return self
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         return None
 
     @property
-    def connected(self):
+    def connected(self) -> bool:
         return True
 
 
-    def on_error(self, fn):
+    def on_error(self, fn: Callable[[str], None]) -> None:
         self._on_error = fn
 
-    def on_status_change(self, fn):
+    def on_status_change(self, fn: Callable[[dict], None]) -> None:
         self._on_status_change = fn
 
-    def on_motion_complete(self, fn):
+    def on_motion_complete(self, fn: Callable[[str], None]) -> None:
         self._on_motion_complete = fn
 
-    def on_motion_error(self, fn):
+    def on_motion_error(self, fn: Callable[[dict], None]) -> None:
         self._on_motion_error = fn
 
 
-    def status(self):
+    def status(self) -> dict:
         return self.get_status()
     def _queued(self, command, args=None, timeout=DEFAULT_MOVE_TIMEOUT, options=None):
         del timeout
@@ -377,69 +413,69 @@ class DryRunRobotClient(RobotClient):
             details={'immediate': True, **details},
         ))
 
-    def enable(self, wait=None):
+    def enable(self, wait: bool | None = None) -> None:
         del wait
         self._state = "ENABLED"
 
-    def disable(self, wait=None):
+    def disable(self, wait: bool | None = None) -> None:
         del wait
         self._state = "DISABLED"
 
-    def clear_errors(self, wait=None):
+    def clear_errors(self, wait: bool | None = None) -> None:
         del wait
         return None
 
-    def home(self, wait=None):
+    def home(self, wait: bool | None = None) -> None:
         del wait
         self._homed = True
 
-    def enter_exec_mode(self, wait=None):
+    def enter_exec_mode(self, wait: bool | None = None) -> None:
         del wait
         self._mode = "EXEC"
 
-    def stop(self, wait=None):
+    def stop(self, wait: bool | None = None) -> None:
         del wait
         self._planner.flush()
         self._mode = "IDLE"
 
-    def pause(self, wait=None):
+    def pause(self, wait: bool | None = None) -> None:
         del wait
         return None
 
-    def resume(self, wait=None):
+    def resume(self, wait: bool | None = None) -> None:
         del wait
         return None
 
-    def set_joint_speed(self, percent):
+    def set_joint_speed(self, percent: float) -> Any:
         value = float(percent)
         self._defaults = MotionOptions.from_dict({"speed": value}, self._defaults)
         self._record_immediate_event("set_joint_speed", {"percent": value, "kind": "setup"})
 
-    def set_blending(self, percent):
+    def set_blending(self, percent: float) -> Any:
         value = float(percent)
         self._defaults = MotionOptions.from_dict({"blend": value}, self._defaults)
         self._record_immediate_event("set_blending", {"percent": value, "kind": "setup"})
 
-    def set_profile(self, profile):
+    def set_profile(self, profile: str) -> Any:
         value = str(profile).strip().lower()
         self._defaults = MotionOptions.from_dict({"profile": value}, self._defaults)
         self._record_immediate_event("set_profile", {"profile": value, "kind": "setup"})
 
     set_default_profile = set_profile
 
-    def set_default_ik_solver(self, solver):
+    def set_default_ik_solver(self, solver: str) -> Any:
         value = str(solver).strip().lower()
         self._defaults = MotionOptions.from_dict({"ik_solver": value}, self._defaults)
         self._record_immediate_event("set_ik_solver", {"solver": value, "kind": "setup"})
 
     set_ik_solver = set_default_ik_solver
 
-    def set_completion_policy(self, policy):
+    def set_completion_policy(self, policy: str) -> Any:
         value = str(policy).strip().lower()
         self._defaults = MotionOptions.from_dict({"completion_policy": value}, self._defaults)
         self._record_immediate_event("set_completion_policy", {"policy": value, "kind": "setup"})
 
-    def plan_summary(self):
+    def plan_summary(self) -> DryRunPlan:
         summary = self._planner.summary()
         if self._setup_events:
             events = (*self._setup_events, *summary.events)
@@ -465,30 +501,55 @@ class DryRunRobotClient(RobotClient):
         return summary
 
 
-    def wait_idle(self, timeout=None, raise_on_error=True):
+    def wait_idle(self, timeout: float | None = None, raise_on_error: bool = True) -> list[dict]:
         del timeout
         summary = self.plan_summary()
         if summary.errors and raise_on_error:
             summary.require_valid()
         return [error.__dict__ for error in summary.errors]
 
-    def wait_motion_complete(self, timeout=None):
+    def wait_motion_complete(self, timeout: float | None = None) -> None:
         del timeout
         summary = self.plan_summary()
         if self._last_queued is not None:
             for error in summary.errors:
                 if error.command_id == self._last_queued:
-                    raise MotionFailed([error.__dict__])
+                    raise MotionFailed([error.failure()])
 
-    def get_joints(self):
+    def get_joints(self) -> list[float]:
         self.plan_summary()
         return np.rad2deg(self._planner.current_joints_rad).tolist()
 
-    def get_pose(self):
+    def get_pose(self) -> list[float]:
         self.plan_summary()
         return get_tcp_pose_rpy(self._planner._robot, self._planner.current_joints_rad).tolist()
 
-    def get_status(self):
+    def is_reachable(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, near: Sequence[float] | None = None) -> dict:
+        """Same answer as RobotClient.is_reachable; `near` defaults to where the preview has got to."""
+        planner = self._planner
+        if near is None:
+            self.plan_summary()
+            near_rad = planner.current_joints_rad
+        else:
+            near_rad = np.deg2rad(np.asarray(near, dtype=np.float64))
+        if getattr(self, "_reach_starts", None) is None:
+            self._reach_starts = make_starts(planner._joint_lo, planner._joint_hi)
+        target = pose_from_xyz_rpy([x, y, z, rx, ry, rz]).A
+        sc = getattr(planner, "_self_collision", None)          # the planner's own: the preview is one thread
+        q, pair = find_reachable_clear(planner._robot, target, near_rad, planner._joint_lo, planner._joint_hi,
+                                       self._reach_starts, sc)
+        return reach_reply(None if q is None else np.rad2deg(q).tolist(), target.ravel().tolist(),
+                           self._zone_setup, None if pair is None else sc.describe(*pair))
+
+    def get_zones(self) -> dict:
+        return zones_summary(self._zone_setup)
+
+    def reload_zones(self) -> dict:
+        self._zone_setup = xml_parser.load_zone_setup(SYSTEM_XML, CELLS_DIR, self._gripper_xml)
+        self._planner.set_zones(self._zone_setup["zones"], self._zone_setup["tool_spheres"])
+        return zones_summary(self._zone_setup)
+
+    def get_status(self) -> dict:
         summary = self.plan_summary()
         return {
             "mode": self._mode,
@@ -503,26 +564,26 @@ class DryRunRobotClient(RobotClient):
 
     status = get_status
 
-    def set_digital_output(self, pin, value):
+    def set_digital_output(self, pin: int, value: bool | int) -> None:
         pin = int(pin)
         value = bool(value)
         self._digital_outputs[pin] = value
         self._record_immediate_event(
             "set_digital_output", {"pin": pin, "value": value, "kind": "io"})
 
-    def get_digital_input(self, pin):
+    def get_digital_input(self, pin: int) -> bool:
         return False
 
-    def wait(self, predicate, timeout=None, what="wait"):
+    def wait(self, predicate: Callable[[dict], bool], timeout: float | None = None, what: str = 'wait') -> None:
         del timeout
         if not predicate(self.get_status()):
             raise RobotTimeout(f"{what} cannot become true in dry-run mode")
 
-    def wait_enabled(self, timeout=None):
+    def wait_enabled(self, timeout: float | None = None) -> None:
         self.wait(lambda status: status["state"] == "ENABLED", timeout, "wait_enabled")
 
-    def wait_mode(self, mode, timeout=None):
+    def wait_mode(self, mode: str, timeout: float | None = None) -> None:
         self.wait(lambda status: status["mode"] == mode, timeout, f"wait_mode({mode})")
 
-    def wait_homed(self, timeout=None):
+    def wait_homed(self, timeout: float | None = None) -> None:
         self.wait(lambda status: status["homed"], timeout, "wait_homed")

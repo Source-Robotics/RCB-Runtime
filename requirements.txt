@@ -1,5 +1,6 @@
 # RCB Control Runtime Python dependencies
-# Created: 2026-06-29 UTC; last reviewed: 2026-08-08 UTC.
+# Created: 2026-06-29 UTC; last reviewed: 2026-10-06 UTC (pinokin 0.1.6 -> 0.1.8: adds CollisionChecker for the
+#   self-collision tools; nothing in the runtime imports pinokin any more — motion/cartesian_paths.py uses spatialmath).
 #
 # 2026-08-08 — audited every third-party import in the tree against this file. Added
 #   `pinokin` (see below): it was imported by motion/cartesian_paths.py and installed in
@@ -35,11 +36,11 @@ spatialmath-python==1.1.16
 pin==3.9.0                                       # Pinocchio — default FK/Jacobian backend
 cmeel-urdfdom==4.0.1                             # ABI match for pin==3.9.0 (liburdfdom_sensor.so.4.0)
 cmeel-tinyxml2==10.0.0                           # ABI match for pin==3.9.0 (libtinyxml2.so.10)
-pinokin==0.1.6                                   # SE(3) helpers on top of Pinocchio; imported
-                                                 # by motion/cartesian_paths.py. Added to this
-                                                 # file 2026-08-08 — it had been installed by
-                                                 # hand in .venv and never pinned, so a clean
-                                                 # install could not plan Cartesian motion.
+pinokin==0.1.8                                   # Pinocchio FK/IK + coal CollisionChecker (new in 0.1.8) — the
+                                                 # self-collision tools (tools/self_collision_capsules.py). Pinned
+                                                 # 2026-08-08 at 0.1.6 when motion/cartesian_paths.py imported it;
+                                                 # nothing in the runtime imports it since (spatialmath took over).
+                                                 # Wheels: github.com/Jepson2k/pinokin/releases (not on PyPI).
 
 # ── Numerics ─────────────────────────────────────────────────────────────────
 numpy==2.3.5

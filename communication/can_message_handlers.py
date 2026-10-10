@@ -17,14 +17,14 @@ import logging
 import time
 import numpy as np
 from config.xml_parser import clamp_voltage_limit
-from utility.RTI_utils import (
-    process_Motor_data,
-    process_Gripper_data,
-    process_Motor_Voltage,
-    process_Motor_errors,
-    process_Motor_temperature,
-    process_Motor_info,
-    process_Motor_Kt
+from utility.data_init import (
+    process_motor_data,
+    process_gripper_data,
+    process_motor_voltage,
+    process_motor_errors,
+    process_motor_temperature,
+    process_motor_info,
+    process_motor_kt
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,9 @@ def handle_motor_reconnect(
     active_CAN_gripper: int,
     startup_selfcheck: int,
     prev_old_data_warning,
+    reload_last_tick,
+    reload_pending,
+    cooldown_ticks,
     motor_watchdog_rate,
     motor_velocity_limit,
     motor_Ilim,
@@ -125,67 +128,100 @@ def handle_motor_reconnect(
     watchdog, limits, and gains to that node only (motor_index=i, num_repeats=2).
     prev_old_data_warning is a numpy array updated in-place each call.
     Gated behind startup_selfcheck to avoid a redundant reload at boot.
-    Runs on the RT tick, so num_repeats stays small: a reconnected node needs
-    14 frames, and even all 7 nodes recovering in the same tick (~98 frames)
-    cannot overflow the socketcan TX queue the way the old unpaced boot did.
+    Runs on the RT tick, so num_repeats stays small: a reconnected node needs 14 frames.
+
+    STORM GUARD (2026-10-01). A recovered node is marked pending; pending nodes are reloaded ONE PER TICK, each
+    at most once per cooldown_ticks. Measured: when the other cores saturate memory, the CAN path (RP1 SPI)
+    starves, every node flaps stale/fresh several times a second, and reloading all of them on every flap made
+    one tick take 2 s. A reload is DEFERRED, never dropped: a driver that really lost power (and its config)
+    still gets it, at most one cooldown late. reload_last_tick / reload_pending: per-node state (RTI owns it).
     """
     if startup_selfcheck != 1:
         return
 
-    for i in range(joint_num):
+    tick = int(shared_data.rti['loop_tick'][0])
+    nodes = joint_num + (1 if active_CAN_gripper else 0)
+    for i in range(nodes):
         _cur_warn = int(shared_data.rti['old_data_warning'][i])
-        if prev_old_data_warning[i] == 1 and _cur_warn == 0:
-            logger.info(f"[RTI] Motor J{i+1} reconnected — reloading config.")
-            load_motor_configs(Motor,
-                               joint_num=joint_num,
-                               watchdog_rate=motor_watchdog_rate,
-                               velocity_limit=motor_velocity_limit,
-                               current_limit=motor_Ilim,
-                               KP=motor_KP, KD=motor_KD,
-                               KPIQ=motor_KPIQ, KIIQ=motor_KIIQ,
-                               KPV=motor_KPV, KIV=motor_KIV,
-                               KPP=motor_KPP,
-                               watchdog_action="Idle",
-                               num_repeats=2,
-                               motor_index=i,
-                               voltage_limit=motor_voltage_limit)
-            write_motor_config_to_shared(
-                shared_data, joint_num,
-                KPP=motor_KPP, KPV=motor_KPV, KIV=motor_KIV,
-                KPIQ=motor_KPIQ, KIIQ=motor_KIIQ,
-                KP=motor_KP, KD=motor_KD,
-                Ilim=motor_Ilim, velocity_limit=motor_velocity_limit,
-                voltage_limit=motor_voltage_limit,
-            )
-            logger.info(f"[RTI] Motor J{i+1} config reload done.")
+        if prev_old_data_warning[i] == 1 and _cur_warn == 0 and not reload_pending[i]:
+            reload_pending[i] = True
+            if tick - reload_last_tick[i] < cooldown_ticks:
+                name = f"Motor J{i + 1}" if i < joint_num else "Gripper"
+                logger.warning(f"[RTI] {name} went stale and recovered again within "
+                               f"{cooldown_ticks} ticks of its last config reload — next reload deferred "
+                               f"(many nodes at once = a host-side CAN stall, e.g. memory starvation)")
         prev_old_data_warning[i] = _cur_warn
 
-    if active_CAN_gripper:
-        _cur_warn = int(shared_data.rti['old_data_warning'][joint_num])
-        if prev_old_data_warning[joint_num] == 1 and _cur_warn == 0:
-            logger.info("[RTI] Gripper reconnected — reloading config.")
-            load_gripper_configs(Motor,
-                                 joint_num=joint_num,
-                                 watchdog_rate=gripper_watchdog_rate,
-                                 velocity_limit=gripper_velocity_limit,
-                                 current_limit=gripper_Ilim,
-                                 KP=gripper_KP, KD=gripper_KD,
-                                 KPIQ=gripper_KPIQ, KIIQ=gripper_KIIQ,
-                                 KPV=gripper_KPV, KIV=gripper_KIV,
-                                 KPP=gripper_KPP,
-                                 watchdog_action="Idle",
-                                 num_repeats=2,
-                                 voltage_limit=gripper_voltage_limit)
-            write_gripper_config_to_shared(
-                shared_data,
-                KPP=gripper_KPP, KPV=gripper_KPV, KIV=gripper_KIV,
-                KPIQ=gripper_KPIQ, KIIQ=gripper_KIIQ,
-                KP=gripper_KP, KD=gripper_KD,
-                Ilim=gripper_Ilim, velocity_limit=gripper_velocity_limit,
-                voltage_limit=gripper_voltage_limit,
-            )
-            logger.info("[RTI] Gripper config reload done.")
-        prev_old_data_warning[joint_num] = _cur_warn
+    for i in range(nodes):                          # serve ONE pending node per tick
+        if (reload_pending[i] and int(shared_data.rti['old_data_warning'][i]) == 0
+                and tick - reload_last_tick[i] >= cooldown_ticks):
+            reload_pending[i] = False
+            reload_last_tick[i] = tick
+            if i < joint_num:
+                _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_velocity_limit,
+                              motor_Ilim, motor_KPP, motor_KP, motor_KD, motor_KPIQ, motor_KIIQ, motor_KPV,
+                              motor_KIV, motor_voltage_limit)
+            else:
+                _reload_gripper(shared_data, Motor, joint_num, gripper_watchdog_rate, gripper_velocity_limit,
+                                gripper_Ilim, gripper_voltage_limit, gripper_KP, gripper_KD, gripper_KPIQ,
+                                gripper_KIIQ, gripper_KPV, gripper_KIV, gripper_KPP)
+            return
+
+
+def _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_velocity_limit, motor_Ilim,
+                  motor_KPP, motor_KP, motor_KD, motor_KPIQ, motor_KIIQ, motor_KPV, motor_KIV, motor_voltage_limit):
+    """Re-send one joint's config after it recovered (handle_motor_reconnect's storm guard decides when)."""
+    logger.info(f"[RTI] Motor J{i+1} reconnected — reloading config.")
+    load_motor_configs(Motor,
+                       joint_num=joint_num,
+                       watchdog_rate=motor_watchdog_rate,
+                       velocity_limit=motor_velocity_limit,
+                       current_limit=motor_Ilim,
+                       KP=motor_KP, KD=motor_KD,
+                       KPIQ=motor_KPIQ, KIIQ=motor_KIIQ,
+                       KPV=motor_KPV, KIV=motor_KIV,
+                       KPP=motor_KPP,
+                       watchdog_action="Idle",
+                       num_repeats=2,
+                       motor_index=i,
+                       voltage_limit=motor_voltage_limit)
+    write_motor_config_to_shared(
+        shared_data, joint_num,
+        KPP=motor_KPP, KPV=motor_KPV, KIV=motor_KIV,
+        KPIQ=motor_KPIQ, KIIQ=motor_KIIQ,
+        KP=motor_KP, KD=motor_KD,
+        Ilim=motor_Ilim, velocity_limit=motor_velocity_limit,
+        voltage_limit=motor_voltage_limit,
+    )
+    logger.info(f"[RTI] Motor J{i+1} config reload done.")
+
+
+def _reload_gripper(shared_data, Motor, joint_num, gripper_watchdog_rate, gripper_velocity_limit, gripper_Ilim,
+                    gripper_voltage_limit, gripper_KP, gripper_KD, gripper_KPIQ, gripper_KIIQ, gripper_KPV,
+                    gripper_KIV, gripper_KPP):
+    """Re-send the gripper's config after it recovered (handle_motor_reconnect's storm guard decides when)."""
+    logger.info("[RTI] Gripper reconnected — reloading config.")
+    load_gripper_configs(Motor,
+                         joint_num=joint_num,
+                         watchdog_rate=gripper_watchdog_rate,
+                         velocity_limit=gripper_velocity_limit,
+                         current_limit=gripper_Ilim,
+                         KP=gripper_KP, KD=gripper_KD,
+                         KPIQ=gripper_KPIQ, KIIQ=gripper_KIIQ,
+                         KPV=gripper_KPV, KIV=gripper_KIV,
+                         KPP=gripper_KPP,
+                         watchdog_action="Idle",
+                         num_repeats=2,
+                         voltage_limit=gripper_voltage_limit)
+    write_gripper_config_to_shared(
+        shared_data,
+        KPP=gripper_KPP, KPV=gripper_KPV, KIV=gripper_KIV,
+        KPIQ=gripper_KPIQ, KIIQ=gripper_KIIQ,
+        KP=gripper_KP, KD=gripper_KD,
+        Ilim=gripper_Ilim, velocity_limit=gripper_velocity_limit,
+        voltage_limit=gripper_voltage_limit,
+    )
+    logger.info("[RTI] Gripper config reload done.")
 
 
 def send_motor_commands(motors, joint_num, positions=None, speeds=None, currents=None):
@@ -377,8 +413,6 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
         state["joint_index"] = 0
         if state["device_info_counter"] != 0:
             state["step"] = (state["step"] + 1) % 3
-
-
 
 
 def secondary_data_send():
@@ -764,7 +798,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
     
     # DATA_PACK messages (3, 5, 7)
     if command_id in [3, 5, 7]:
-        process_Motor_data(
+        process_motor_data(
             Motor_data, node_id,
             motor_obj.position,
             motor_obj.speed,
@@ -777,7 +811,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
     
     # RESPOND_DATA_HALL (32)
     elif command_id == 32:
-        process_Motor_data(
+        process_motor_data(
             Motor_data, node_id,
             motor_obj.position,
             0, 0,  # Speed and current not in hall message
@@ -793,7 +827,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
     
     # RESPOND_GRIPPER_DATA_PACK (60)
     elif command_id == 60:
-        process_Gripper_data(
+        process_gripper_data(
             Motor_data, Gripper_data, node_id,
             motor_obj.gripper_position,
             motor_obj.gripper_current,
@@ -812,7 +846,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
     
     # SEND_RESPOND_VOLTAGE (24)
     elif command_id == 24:
-        process_Motor_Voltage(
+        process_motor_voltage(
             Motor_voltage_data, node_id,
             motor_obj.voltage,
             motor_obj.timestamp,
@@ -823,7 +857,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
     
     # SEND_RESPOND_STATE_OF_ERRORS (26)
     elif command_id == 26:
-        process_Motor_errors(
+        process_motor_errors(
             Motor_errors_data, node_id,
             motor_obj.error,
             motor_obj.temperature_error,
@@ -844,7 +878,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
     
     # SEND_RESPOND_TEMPERATURE (23)
     elif command_id == 23:
-        process_Motor_temperature(
+        process_motor_temperature(
             Motor_temperature_data, node_id,
             motor_obj.temperature,
             motor_obj.timestamp,
@@ -855,7 +889,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
     
     # SEND_RESPOND_DEVICE_INFO (25)
     elif command_id == 25:
-        process_Motor_info(
+        process_motor_info(
             Motor_info_data, node_id,
             motor_obj.HARDWARE_VERSION,
             motor_obj.BATCH_DATE,
@@ -873,7 +907,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
 
     # SEND_RESPOND_KT (33)
     elif command_id == 33:
-        process_Motor_Kt(
+        process_motor_kt(
             Motor_Kt_data, node_id,
             motor_obj.Kt,
             motor_obj.timestamp,
@@ -884,7 +918,7 @@ def process_can_message(motor_obj, node_id, command_id, error_bit,
 
     # SEND_RESPOND_ENCODER_DATA_ID (28)
     elif command_id == 28:
-        process_Motor_data(
+        process_motor_data(
             Motor_data, node_id,
             motor_obj.position,
             motor_obj.speed,
@@ -1104,23 +1138,6 @@ def check_data_freshness(Motor_data, joint_num, active_CAN_gripper, loop_tick_cn
 # ==========================================================================
 # Gripper Connection Check
 # ==========================================================================
-
-def check_gripper_connection(active_CAN_gripper, received_ids, joint_num):
-    """
-    Check if CAN gripper is connected.
-    
-    Args:
-        active_CAN_gripper (int): 1 if gripper should be active
-        received_ids (np.array): Received ID flags
-        joint_num (int): Number of joints (gripper ID = joint_num)
-    
-    Returns:
-        int: 1 if gripper connected, 0 otherwise
-    """
-    if active_CAN_gripper == 1 and received_ids[joint_num] == 1:
-        return 1
-    return 0
-
 
 if __name__ == "__main__":
     """Test CAN message handlers"""

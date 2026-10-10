@@ -1,0 +1,11 @@
+Blockly 13.3.0 — Apache-2.0 (LICENSE in this folder). Vendored 2026-10-04 so the editor works with no internet.
+
+From:   https://registry.npmjs.org/blockly/-/blockly-13.3.0.tgz
+sha1:   18947fe0f4992bbf1ee5051e2d18dabee7ee9581   (matches the registry's dist.shasum)
+Taken:  blockly_compressed.js, blocks_compressed.js, msg/en.js, media/*, LICENSE — unmodified.
+Not taken: the code generators (Python is written on the Pi by blockly/codegen.py — TODO/blockly_plan.md D1),
+           source maps, other languages, the ESM/Node entry points.
+
+The page must pass `media:` pointing at media/ — Blockly's default is https://static.blockly.com/media/.
+To update: download the new tarball, check its sha1 against `https://registry.npmjs.org/blockly/<version>`, copy
+the same files into a new blockly-<version>/ folder, change the paths in blockly/web/*.html, delete this one.

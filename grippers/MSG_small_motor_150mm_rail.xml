@@ -7,11 +7,12 @@
     <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
     <Velocity_limit>80000</Velocity_limit> <!-- Motor velocity limit in ticks/s -->
     <watchdog_rate>5000</watchdog_rate>   <!-- Motor watchdog rate in ms -->
-    <KPP>5</KPP>
-    <KPV>0.015</KPV>
-    <KIV>0.0005</KIV>
-    <KIIQ>1</KIIQ>
-    <KPIQ>7</KPIQ>
+    <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0005, KIIQ 1, KPIQ 7 -->
+    <KPP>69</KPP>
+    <KPV>0.016</KPV>
+    <KIV>0.0003</KIV>
+    <KIIQ>0.3</KIIQ>
+    <KPIQ>2.2</KPIQ>
     <KP>0.12</KP>
     <KD>0.002</KD>
     <Gear_r>0.0083</Gear_r>
@@ -27,6 +28,11 @@
     <has_hall_sensor>0</has_hall_sensor>
     <home_offset>0.0</home_offset>
     <homing_timeout_s>8.0</homing_timeout_s>
+    <!-- 2026-10-09: how long homing waits after the firmware calibrate command before it accepts "calibrated". It must
+         cover a WHOLE calibration: the firmware keeps the old "calibrated" while it recalibrates, and the next homing
+         step abandons an unfinished one, whose timeout the firmware keeps counting (the 12th homing in a row failed).
+         Measured on this gripper: ~4.5 s from where homing leaves the jaws (position 252). Missing -> 2.0 s. -->
+    <homing_calibration_wait_s>5.5</homing_calibration_wait_s>
     <homing_two_pass>1</homing_two_pass>
     <homing_two_pass_max_diff>200</homing_two_pass_max_diff>
     <homing_backoff_s>0.8</homing_backoff_s>
@@ -46,4 +52,11 @@
         <Tc>0.02 -0.02</Tc>                                                               <!-- Coulomb friction [+, -] [N·m] -->
         <qlim_deg>-160 160</qlim_deg>                                                     <!-- joint limits [deg] -->
     </kinematics>
+    <!-- Self-collision (2026-10-06; refitted 2026-10-07 from Source Robotics' PAR6 description package 2.0, par6_msg.urdf):
+         the MSG gripper's convex pieces in grippers/MSG_collision.json, J6 joint frame, the jaws over their WHOLE stroke —
+         ONE geometry for every MSG rail length for now. The gripper comes within 2.1 mm of wrist 1 (frame 4) at its
+         closest, a function of J5/J6 alone, so it can never get closer inside the limits: that pair is not checked. -->
+    <collision file="MSG_collision.json">
+        <pair with="4" check="off"/>
+    </collision>
 </gripper>

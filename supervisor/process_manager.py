@@ -14,6 +14,9 @@ Description: Script lifecycle management for supervisor.
       PIPE and were never read, so crash tracebacks were silently swallowed
       (and a chatty child could deadlock when the 64 KB pipe buffer filled).
     - kill_stale() clears leftovers from a previous supervisor run on boot.
+    - <NAME>.out.log is rotated when its script is (re)started and the file is over
+      OUT_LOG_MAX_BYTES (never while a child holds it open). RTI.out.log had reached
+      240 MB in three months with no rotation at all (2026-10-01).
 """
 
 import os
@@ -28,13 +31,32 @@ logger = logging.getLogger(__name__)
 
 LOG_DIR = PROJECT_ROOT / "logs"
 _TERM_TIMEOUT = 5  # seconds to wait for graceful exit before SIGKILL
+OUT_LOG_MAX_BYTES = 20 * 1024 * 1024   # rotate <name>.out.log at (re)start when it is bigger than this
+OUT_LOG_KEEP = 3                        # ...keeping <name>.out.log.1 .. .3
 
 
 # ==========================================================================
 # Low-level process helpers
 # ==========================================================================
+def _rotate_out_log(path, max_bytes=OUT_LOG_MAX_BYTES, keep=OUT_LOG_KEEP):
+    """<name>.out.log -> .1 -> .2 ... (the oldest dropped) when it is over max_bytes. Called only before a
+    script starts, so no running child is writing to the file being renamed."""
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return
+        for i in range(keep - 1, 0, -1):
+            older = path.with_name(f"{path.name}.{i}")
+            if older.exists():
+                older.replace(path.with_name(f"{path.name}.{i + 1}"))
+        path.replace(path.with_name(f"{path.name}.1"))
+        logger.info(f"Rotated {path.name} (was over {max_bytes // (1024 * 1024)} MB)")
+    except OSError as e:
+        logger.warning(f"Could not rotate {path.name}: {e}")
+
+
 def _spawn(name, cmd):
-    """Launch one script in its own process group, output -> logs/<name>.out.log."""
+    """Launch one script in its own process group, output -> logs/<name>.out.log (rotated first if large)."""
+    _rotate_out_log(LOG_DIR / f"{name}.out.log")
     logf = open(LOG_DIR / f"{name}.out.log", "ab", buffering=0)
     proc = subprocess.Popen(
         cmd,
@@ -133,16 +155,6 @@ def stop_scripts(processes):
         _terminate(name, proc)
         del processes[name]
     logger.info("✅ All managed scripts stopped.")
-
-
-def stop_specific_script(name, processes):
-    """Stop a single running script safely."""
-    proc = processes.get(name)
-    if proc is None:
-        logger.info(f"❌ Script {name} not found.")
-        return
-    _terminate(name, proc)
-    del processes[name]
 
 
 def restart_script(name, processes, SCRIPTS):

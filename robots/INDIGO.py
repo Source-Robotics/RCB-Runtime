@@ -230,8 +230,6 @@ if __name__ == "__main__":
     print("flange")
     rne_test = par6.rne(q=par6.qs,qd=[0,0,0,0,0,0], qdd=[0,0,0,0,0,0])
     print(rne_test)
-    #robot_plot = par6.plot(par6.qs)
-    #time.sleep(4)
     """
 
     par6 = INDIGO(symbolic=False, gripper_name="SSG48")
@@ -241,8 +239,6 @@ if __name__ == "__main__":
     print("ssg48")
     rne_test = par6.rne(q=par6.qs,qd=[0,0,0,0,0,0,0], qdd=[0,0,0,0,0,0,0])
     print(rne_test)
-    #robotplot = par6.plot(par6.qrr)
-    #robotplot.hold()
 
     # T = I * Kt 
     # I = T / Kt 2.57 Nm /20 Nm/A = 0.1285 Nm/A 

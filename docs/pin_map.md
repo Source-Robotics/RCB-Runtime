@@ -57,6 +57,12 @@ inside `gpio_handler.py` uses `<NAME>_PIN`, so most code never touches it.
 | E-Stop 1 | E2, E4 | 29 | GPIO5 | in, pull-down | `ESTOP_1` | 7 |
 | E-Stop 2 | E1, E3 | 31 | GPIO6 | in, pull-down | `ESTOP_2` | 6 |
 
+Which channels the software trusts is decided by the fitted board — `<control_box><pcb_version>` in
+`config/system.xml`, table in `hardware/control_box.py` (2026-10-04). **PCB v1: E-Stop 2 (GPIO6) always reads
+pressed (a layout fault), so `check_estop_active()` reads E-Stop 1 only.** From v2 both channels are read and
+cross-checked: any channel pressed = pressed; the two disagreeing for more than 50 ticks (200 ms) is a channel
+fault — treated as pressed and logged once (`[E-stop] CHANNEL FAULT`) until both agree again.
+
 ## General GPIO
 
 | Signal | Connector pin | Pi header pin | BCM | Direction | Constant | Index |

@@ -35,6 +35,11 @@ Design notes (from mode_dispatch_plan_2.md and control_output_refactor_plan.md):
     inside step() or the dispatch helpers.
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
 import os
 import time
 
@@ -69,6 +74,7 @@ _tick_flashing       = TickResult(gripper_owned=True)
 _output_vel_zero     = None
 _output_torque_zero  = None
 _output_idle_gravity = ControlOutput()
+_idle_trq_buf = None       # gravity (+ walls) + friction compensation, preallocated in build
 
 _MODE_PROFILE_ENABLED = os.environ.get("RTI_MODE_PROFILE", "0") == "1"
 _MODE_PROFILE_INTERVAL = max(1, int(os.environ.get("RTI_MODE_PROFILE_INTERVAL", "500")))
@@ -313,14 +319,30 @@ def handle_booting(ctx):
     return _tick_ok, _output_vel_zero
 
 
-def handle_idle(ctx):
+def handle_idle(ctx: TickContext) -> tuple[TickResult, ControlOutput]:
     """IDLE: gravity-comp torque hold if homed/enabled/grav-on — velocity-hold otherwise."""
     robot_homed     = bool(np.all(ctx.shared_data.rti['homing_status'][:ctx.joint_num] == 2))
     robot_enabled   = ctx.shared_data.robot_state.get() == "ENABLED"
     gravity_comp_on = bool(ctx.shared_data.rti['gravity_comp_enabled'][0])
 
     if robot_homed and robot_enabled and gravity_comp_on:
-        _output_idle_gravity.trq_nm = ctx.shared_data.joint['joint_gravity_torque'][:ctx.joint_num]
+        gravity = ctx.shared_data.joint['joint_gravity_torque'][:ctx.joint_num]
+        # Freedrive: the safety zones push back as haptic walls (utility/haptic_walls.py). None = no wall
+        # touched this tick, so the arm is exactly as weightless as it always was.
+        walls = ctx.haptic_walls
+        trq = walls.step(ctx.current_tick, gravity) if walls is not None else None
+        base = gravity if trq is None else trq
+        # Friction compensation (utility/friction_comp.py): the operator switch, off at every start. Added into
+        # our own buffer — `gravity` is a view of shared memory and must never be written.
+        fc = getattr(ctx, "friction_comp", None)
+        if fc is not None and ctx.shared_data.rti['friction_comp_enabled'][0] > 0.5:
+            n = ctx.joint_num
+            comp = fc.step(ctx.shared_data.joint['joint_speed_filtered'])
+            np.add(base[:n], comp[:n], out=_idle_trq_buf[:n])
+            ctx.shared_data.joint['joint_friction_comp_torque'][:n] = comp[:n]
+            _output_idle_gravity.trq_nm = _idle_trq_buf
+        else:
+            _output_idle_gravity.trq_nm = base
         return _tick_ok, _output_idle_gravity
     return _tick_ok, _output_vel_zero
 
@@ -438,7 +460,7 @@ class _HomingDispatch:
 # Dispatch — single per-tick entry point.
 # ---------------------------------------------------------------------------
 
-def dispatch_step(handler, ctx):
+def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
     """Run one tick of the active mode handler.
 
     Pipeline:
@@ -451,6 +473,9 @@ def dispatch_step(handler, ctx):
     if handler is None:
         handler = handle_idle
     step_fn = handler.step if hasattr(handler, 'step') else handler
+    # The friction compensation applied this tick: 0 unless freedrive (handle_idle) sets it — every mode, so a
+    # value from the last freedrive tick never lingers.
+    ctx.shared_data.joint['joint_friction_comp_torque'].fill(0.0)
 
     if not _MODE_PROFILE_ENABLED:
         result, output = step_fn(ctx)
@@ -508,9 +533,9 @@ def dispatch_step(handler, ctx):
 # Factory — call once before the main loop.
 # ---------------------------------------------------------------------------
 
-def build_mode_dispatch(joint_num, homing_ctrl, load_motor_configs_fn,
-                        motor_config, jog_config, motor_dynamics,
-                        shared_data=None):
+def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn: Callable,
+                        motor_config: dict, jog_config: dict, motor_dynamics: Any,
+                        shared_data: Any = None) -> dict:
     """Initialise pre-allocated buffers and return the MODE_HANDLERS dict.
 
     Must be called before the RT loop starts.
@@ -540,9 +565,10 @@ def build_mode_dispatch(joint_num, homing_ctrl, load_motor_configs_fn,
         dict mapping RobotMode → handler (plain function or class instance).
     """
     global _zeros_rad, _motor_pos_buf, _motor_vel_buf, _motor_curr_buf, _torque_to_mA_factor
-    global _output_vel_zero, _output_torque_zero
+    global _output_vel_zero, _output_torque_zero, _idle_trq_buf
 
     _zeros_rad      = np.zeros(joint_num, dtype=np.float64)
+    _idle_trq_buf   = np.zeros(joint_num, dtype=np.float64)
     _motor_pos_buf  = np.zeros(joint_num, dtype=np.float64)
     _motor_vel_buf  = np.zeros(joint_num, dtype=np.float64)
     _motor_curr_buf = np.zeros(joint_num, dtype=np.float64)
@@ -575,6 +601,7 @@ def build_mode_dispatch(joint_num, homing_ctrl, load_motor_configs_fn,
         control_mode = jog_config.get('control_mode', 'pid'),
         speed_pct    = jog_config.get('speed_pct',    0.20),
         shared_data  = shared_data,
+        self_collision = bool(jog_config.get('self_collision', False)),
     )
     _exec_handler    = ExecHandler(joint_num, shared_data=shared_data)
 
@@ -586,6 +613,10 @@ def build_mode_dispatch(joint_num, homing_ctrl, load_motor_configs_fn,
         RobotMode.JOG:           _jog_handler,
         RobotMode.EXEC:          _exec_handler,      # Phase 3
         RobotMode.RTI:           handle_idle,        # Phase 4
+        # SOFT_RTI is replaced by the same RTIModeHandler instance as RTI in RTI.py, for
+        # the same reason RTI is: both contracts share one handler so no safety layer can
+        # be applied to one and forgotten in the other.
+        RobotMode.SOFT_RTI:      handle_idle,
         RobotMode.HAND_GUIDING:  handle_idle,        # Future
         RobotMode.IMPEDANCE:     handle_idle,        # Future
         RobotMode.SAFETY_STOP:   handle_safety_stop,

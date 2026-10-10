@@ -39,7 +39,7 @@ import zmq
 
 from utility.tick_types import TickResult, ControlOutput
 from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, unpack_batch
-from config.networking import ZMQ_EXEC_TRAJECTORY_SOCKET, ZMQ_EXEC_STATUS_SOCKET
+from config.networking import ZMQ_EXEC_TRAJECTORY_SOCKET, ZMQ_EXEC_STATUS_SOCKET, background_zmq_context
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,8 @@ class ExecHandler:
         # ZMQ sockets — bound/connected once for the process lifetime. enter()/exit()
         # only drain and reset local state; they do not open/close sockets (avoids
         # IPC rebind races on every mode transition).
-        ctx = zmq.Context.instance()
+        # Its I/O threads at normal priority off the RT core (config/networking.background_zmq_context).
+        ctx = background_zmq_context(zmq.Context.instance())
         self._traj_sock = ctx.socket(zmq.PULL)
         self._traj_sock.setsockopt(zmq.RCVHWM, self.RECV_HWM)
         self._traj_sock.bind(ZMQ_EXEC_TRAJECTORY_SOCKET)

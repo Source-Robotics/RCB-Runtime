@@ -18,13 +18,18 @@ Supported model type:
     separate conversion.
 """
 
+from __future__ import annotations
+
+from typing import Any
+
+import logging
 import math
 
 import numpy as np
 from roboticstoolbox import DHRobot
 
 
-def _Rz(theta):
+def _rot_z(theta):
     c, s = math.cos(theta), math.sin(theta)
     T = np.eye(4)
     T[0, 0] = c
@@ -34,7 +39,7 @@ def _Rz(theta):
     return T
 
 
-def _Rx(theta):
+def _rot_x(theta):
     c, s = math.cos(theta), math.sin(theta)
     T = np.eye(4)
     T[1, 1] = c
@@ -44,13 +49,13 @@ def _Rx(theta):
     return T
 
 
-def _Tz(d):
+def _trans_z(d):
     T = np.eye(4)
     T[2, 3] = d
     return T
 
 
-def _Tx(a):
+def _trans_x(a):
     T = np.eye(4)
     T[0, 3] = a
     return T
@@ -58,7 +63,7 @@ def _Tx(a):
 
 def _link_transform(d, a, alpha):
     """Classical DH static link transform: Tz(d) * Tx(a) * Rx(alpha)."""
-    return _Tz(d) @ _Tx(a) @ _Rx(alpha)
+    return _trans_z(d) @ _trans_x(a) @ _rot_x(alpha)
 
 
 def _build_pinocchio_model(rtb_robot):
@@ -88,7 +93,7 @@ def _build_pinocchio_model(rtb_robot):
     joint_ids = []
 
     for i, link in enumerate(rtb_robot.links):
-        placement = pin.SE3(prev_link_transform @ _Rz(link.offset))
+        placement = pin.SE3(prev_link_transform @ _rot_z(link.offset))
         joint_name = link.name or f"j{i + 1}"
         joint_id = model.addJoint(parent_joint_id, pin.JointModelRZ(), placement, joint_name)
 
@@ -170,7 +175,48 @@ def _make_pinocchio_fkine_jacob0_jdot(model, data, ee_frame_id):
     return pinocchio_fkine_jacob0_jdot
 
 
-def attach_pinocchio(rtb_robot):
+def build_pinocchio_dynamics(rtb_robot: Any) -> tuple[Any, Any]:
+    """A Pinocchio model of the DHRobot WITH its real dynamics, for the mass matrix: each link's mass, centre of
+    mass and inertia tensor (rtb gives them in link frame i, the frame AFTER the link's DH transform), plus the
+    motor rotor reflected to the joint as armature Jm*G^2 — exactly what rtb's inertia() includes. Matches
+    rtb's inertia() to ~1e-15 relative (dummy_test_scripts/test_haptic_walls.py). Returns (model, data); the
+    caller owns the Data: one per thread (one Pinocchio Data is not thread-safe).
+
+    (The FK model built by _build_pinocchio_model has RANDOM inertias on purpose — FK/Jacobians do not use
+    them — so it must never be used for dynamics.)"""
+    import pinocchio as pin
+
+    if not isinstance(rtb_robot, DHRobot):
+        raise TypeError(f"Expected DHRobot, got {type(rtb_robot).__name__}")
+    model = pin.Model()
+    model.name = f"{rtb_robot.name}_pinocchio_dynamics"
+    prev = np.asarray(rtb_robot.base.A, dtype=np.float64) if rtb_robot.base is not None else np.eye(4)
+    parent = 0
+    for i, link in enumerate(rtb_robot.links):
+        if not link.isrevolute:
+            raise NotImplementedError(f"Link {i} is non-revolute; only revolute DH chains are supported")
+        joint_id = model.addJoint(parent, pin.JointModelRZ(), pin.SE3(prev @ _rot_z(link.offset)), link.name or f"j{i + 1}")
+        link_T = _link_transform(link.d, link.a, link.alpha)
+        inertia = pin.Inertia(float(link.m), np.asarray(link.r, dtype=np.float64), np.asarray(link.I, dtype=np.float64))
+        model.appendBodyToJoint(joint_id, inertia.se3Action(pin.SE3(link_T)), pin.SE3.Identity())
+        model.armature[joint_id - 1] = float(link.Jm) * float(link.G) ** 2
+        parent, prev = joint_id, link_T
+    return model, model.createData()
+
+
+def _make_pinocchio_gravity(model, data):
+    """fn(q) -> the dynamics model's generalized gravity g(q) (Nm, joint space) in a buffer the closure owns —
+    use it within the tick, it is overwritten by the next call."""
+    import pinocchio as pin
+    out = np.zeros(model.nq, dtype=np.float64)
+
+    def gravity(q):
+        np.copyto(out, pin.computeGeneralizedGravity(model, data, np.asarray(q, dtype=np.float64)))
+        return out
+    return gravity
+
+
+def attach_pinocchio(rtb_robot: Any) -> Any:
     """Attach Pinocchio model/data and FK/Jacobian helpers to rtb_robot."""
     model, data, ee_frame_id = _build_pinocchio_model(rtb_robot)
 
@@ -185,5 +231,15 @@ def attach_pinocchio(rtb_robot):
     rtb_robot.pinocchio_fkine_jacob0_jdot = _make_pinocchio_fkine_jacob0_jdot(
         model, data, ee_frame_id
     )
+
+    # Gravity for the RT loop (2026-10-03): the DYNAMICS model's g(q) — equal to rtb's rne(q, 0, 0) to 1.8e-15 Nm
+    # over 300 poses, at 1.3 us instead of 24 (tools/bench_rti_tick.py). Its own Data, one per function, as the
+    # walls' inertia helpers have. Best effort: a model whose dynamics do not build keeps the rne path
+    # (robotics/dynamics.gravity_torque_rt).
+    try:
+        dyn_model, dyn_data = build_pinocchio_dynamics(rtb_robot)
+        rtb_robot.pinocchio_gravity = _make_pinocchio_gravity(dyn_model, dyn_data)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("[pinocchio] no dynamics model for gravity (%s) — rtb rne stays", exc)
 
     return rtb_robot

@@ -12,6 +12,8 @@ choice (SeededIKPathSolver's `solver` arg, from a command's ik_solver option):
 Some fields therefore apply to only one engine (slimit/ilimit -> rtb; dls_* -> both).
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -103,7 +105,7 @@ DEFAULT_IK_CONFIG = IKConfig()
 SINGULAR_CONDITION_REPORT_CAP = 1e12
 
 
-def json_safe_metric(value, is_condition=False):
+def json_safe_metric(value: float | None, is_condition: bool = False) -> float | None:
     """Make one singularity metric safe to put in the status JSON.
 
       NaN  (metric unavailable)   -> None

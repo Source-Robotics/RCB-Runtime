@@ -4,6 +4,13 @@ Reads Kt values from CAN bus (or falls back to XML config), then preloads
 Motor_Kt_data and shared memory so the GUI reflects resolved values immediately.
 """
 
+from __future__ import annotations
+
+from typing import Any
+from collections import deque
+
+import numpy as np
+
 import logging
 from communication.can_message_handlers import fetch_kt_from_can
 
@@ -14,16 +21,16 @@ _KT_FETCH_SETTLE_S = 0.2
 
 
 def resolve_and_preload_kt(
-    _sys,
-    Motor,
-    communication1,
-    joint_num,
-    motor_kt,
-    gripper_kt,
-    active_CAN_gripper,
-    Motor_Kt_data,
-    shared_data,
-):
+    _sys: dict,
+    Motor: list,
+    communication1: Any,
+    joint_num: int,
+    motor_kt: np.ndarray,
+    gripper_kt: float,
+    active_CAN_gripper: int,
+    Motor_Kt_data: dict[int, deque],
+    shared_data: Any,
+) -> tuple[np.ndarray, float]:
     """Resolve Kt values from CAN or XML, then preload data structures.
 
     Returns the (possibly updated) motor_kt list and gripper_kt float.

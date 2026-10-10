@@ -6,12 +6,14 @@ Description: Shared utility for reading Raspberry Pi CPU temperature.
     Centralizes temperature reading to avoid duplication across modules.
 """
 
+from __future__ import annotations
+
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-def get_raspberry_pi_temperature():
+def get_raspberry_pi_temperature() -> float | None:
     """
     Retrieve the current temperature of the Raspberry Pi.
 

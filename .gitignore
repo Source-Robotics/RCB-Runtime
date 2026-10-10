@@ -58,3 +58,14 @@ Thumbs.db
 
 # Local working artifacts: pre-change copies of robot configs kept for quick revert
 *.conservative-backup
+
+# Temporary cell written (and deleted) by api_tests/50_safety_zones.py; ignored in case it is killed hard
+config/cells/api_test_50.xml
+config/cells/api_test_51.xml
+
+# Block programs saved on the robot (blockly/programs.py) — user data, local only (TODO/blockly_plan.md D8)
+/programs/
+
+# Motor-driver firmware (2026-10-06, user): it lives NEXT to the repo on the robot, outside git's reach; this
+# line keeps it out if it is ever moved inside.
+motor_driver_stuff/

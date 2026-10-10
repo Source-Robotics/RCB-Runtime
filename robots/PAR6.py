@@ -1,8 +1,24 @@
 """DH model definition for the PAR6 6-axis robot arm (Source Robotics)."""
 
+import os
+
 import numpy as np
 from roboticstoolbox import DHRobot, RevoluteDH
 import time
+
+
+def _software_joint_limits():
+    """[[lo, hi], ...] per joint, from this robot's XML (the one source of joint limits)."""
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:            # `python3 robots/PAR6.py` run directly
+        sys.path.insert(0, root)
+    from config.xml_parser import load_software_joint_limits
+    lo, hi = load_software_joint_limits(os.path.join(os.path.dirname(__file__), "PAR6.xml"))
+    if np.any(np.isnan(lo)) or np.any(np.isnan(hi)):
+        raise ValueError("robots/PAR6.xml must declare software_joint_limit_negative/positive "
+                         "for every joint")
+    return [[float(a), float(b)] for a, b in zip(lo, hi)]
 
 
 class PAR6(DHRobot):
@@ -83,18 +99,14 @@ class PAR6(DHRobot):
         # Gear ratios
         # In this case gear ratio is negative which means that motor controllers sense
         # of positive rotation is the oposite to the kinematic convention for the robot.
-        GearRatio = [6.4, 20, -20*(38/42), -4, -4, -10]
+        # J2 was 20 here while robots/PAR6.xml says 25 (found 2026-10-01; only the rotor term Jm*G^2 of the
+        # inertia uses it — gravity does not). test_joint_limit_config.py now checks |G| against the XML.
+        GearRatio = [6.4, 25, -20*(38/42), -4, -4, -10]
         
-        # Software joint limits from robots/PAR6.xml. These are the normal
-        # planning envelope; hard limits are reserved for physical endstops.
-        qlim = [
-            [-2.8647335, 2.8647335],
-            [-2.4407335, -0.1122665],
-            [1.9912665, 6.5627335],
-            [-2.6147335, 2.5547335],
-            [-1.73, 1.6],
-            [-0.85, 7.14],
-        ]
+        # Joint limits = the SOFTWARE limits in robots/PAR6.xml, read from the file rather than
+        # copied here, so the planner and IK can never disagree with RTI and JOG. They used to be
+        # a hand-typed copy of those values (2026-09-30).
+        qlim = _software_joint_limits()
 
         # inertia tensor of link with respect to
         # center of mass I = [L_xx, L_yy, L_zz, L_xy, L_yz, L_xz]
@@ -137,10 +149,16 @@ class PAR6(DHRobot):
         # Initialize grippers
         self._grippers = self._define_grippers(symbolic=symbolic)
 
-        # Add initial gripper / flange. Gripper XML supplies the tool-link
-        # geometry and the wrist rotation limit because J6 range is tool-dependent.
+        # Add initial gripper / flange. Gripper XML supplies the tool-link geometry.
         initial_gripper = self._grippers.get(gripper_name, self._grippers["Flange"])
         L.extend(initial_gripper)
+        # J6's limit is tool-dependent in principle (a gripper cable limits wrist rotation), and
+        # every gripper XML carries a <qlim_deg>. But those values are unverified — +/-160 deg in
+        # every tool file, centred on 0 while the arm's own J6 range is centred near 180 — and only
+        # the planner/IK ever read them, while RTI and JOG used the robot XML. Until real per-tool
+        # values exist, J6 uses the robot XML range for every tool, the same as RTI and JOG
+        # (2026-09-30; TODO/safety_stack_research.md).
+        L[5].qlim = qlim[5]
 
         # Initialize the robot
         super().__init__(
@@ -220,8 +238,6 @@ if __name__ == "__main__":
     print("flange")
     rne_test = par6.rne(q=par6.qs,qd=[0,0,0,0,0,0], qdd=[0,0,0,0,0,0])
     print(rne_test)
-    #robot_plot = par6.plot(par6.qs)
-    #time.sleep(4)
 
     par6 = PAR6(symbolic=False, gripper_name="SSG48")
     print("\nAfter switching to SSG48:")

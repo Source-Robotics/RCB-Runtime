@@ -1,5 +1,6 @@
 """Seeded IK-chain solving and diagnostics for Cartesian EXEC planning."""
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,6 +15,8 @@ from robotics.robot_kinematics import (
     calculate_jacobian,
 )
 from utility.kinematics_backend import set_kinematics_backend
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -240,7 +243,9 @@ class SeededIKPathSolver:
                             and rotation_error <= self.pose_rotation_tolerance):
                         return q
                 except Exception:
-                    pass
+                    # A broken candidate (a NaN pose, a shape error) must not abort the path — the seeded DLS
+                    # below is the fallback either way — but it is no longer silent (Phase 5, 2026-10-03).
+                    logger.debug("ik_LM candidate rejected by the pose check; DLS fallback", exc_info=True)
         return self._solve_dls_sample(target_pose, q_seed, low, high)
 
     def solve_pose(self, target_pose, seed):

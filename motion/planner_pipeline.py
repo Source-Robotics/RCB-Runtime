@@ -9,6 +9,10 @@ The first implementation is intentionally thin.  It wraps the existing
 byte-for-byte compatible while future Cartesian/IK/profile work has stable seams.
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -217,7 +221,8 @@ def geometric_gridpoints(waypoints, min_points=100):
     return grid
 
 
-def blend_distance_for_tolerance(p_prev, p, p_next, tol, continuity="c1"):
+def blend_distance_for_tolerance(p_prev: np.ndarray, p: np.ndarray, p_next: np.ndarray, tol: float,
+                                 continuity: str = "c1") -> float:
     """`G64 P<tol>` — the blend distance that keeps a corner within `tol` of the vertex.
 
     The G-code knob. A slicer emits no blend information at all: G-code is a bare list of
@@ -264,7 +269,7 @@ def blend_distance_for_tolerance(p_prev, p, p_next, tol, continuity="c1"):
     return float(tol) / (coeff * sin_half_phi)
 
 
-def build_geometric_path(waypoints):
+def build_geometric_path(waypoints: np.ndarray) -> Any:
     """The TOPPRA geometric path for a joint waypoint array (s in [0, 1]).
 
     Shared so the timing solve and the sd (path-velocity) conversion below always
@@ -315,7 +320,7 @@ def build_geometric_path(waypoints):
 # a uniform arc-length spacing. Never reintroduce polyline resampling here.
 
 
-def path_velocity_from_joint_velocity(waypoints, joint_velocity, s=0.0):
+def path_velocity_from_joint_velocity(waypoints: np.ndarray, joint_velocity: np.ndarray, s: float = 0.0) -> float:
     """Convert a JOINT velocity into TOPPRA's PATH velocity sd (ds/dt) at path
     coordinate `s` — the mapping the rolling buffer needs to splice a continuation
     onto an already-moving body (TODO/blending_design.md §6).
@@ -629,8 +634,8 @@ class TOPPRATimeParameterizer(TimeParameterizer):
         return TimedJointPath(positions=pos, velocities=vel, num_points=n)
 
 
-def make_time_parameterizer(profile_name, ramp_fraction=None, jerk_scale=None,
-                            max_jerk=None):
+def make_time_parameterizer(profile_name: str, ramp_fraction: float | None = None, jerk_scale: float | None = None,
+                            max_jerk: np.ndarray | None = None) -> TimeParameterizer:
     profile = normalize_profile_name(profile_name or "trapezoid")
     if jerk_scale is not None and profile != "ruckig":
         # Ruckig is the ONLY profile that can honour a jerk limit. trapezoid and toppra STEP

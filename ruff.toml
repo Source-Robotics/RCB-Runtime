@@ -1,0 +1,21 @@
+# ruff — lint baseline for RCB-Runtime (2026-10-02, TODO/refactor_plan.md Phase 0.5).
+# Deliberately NARROW: only what a typo or a dropped import produces. The runner (tools/run_nets.py) compares
+# findings with temp_data/ruff_baseline.txt — the rule is "no NEW findings", the existing ones are worked off by
+# the refactor phases. Widen `select` only together with a re-baselined run.
+line-length = 120
+target-version = "py311"
+exclude = [".venv", "temp_data", "legacy", "blockly/web", "scripts", "__pycache__", "api_tests/external"]
+
+[lint]
+select = [
+    "F",      # pyflakes: undefined names, unused imports/variables, star-import usage, duplicate args
+    "E9",     # syntax errors / io errors
+    "E711", "E712", "E714",   # == None / == True / not ... is
+    "B006", "B008",           # mutable / call defaults
+    "PLE",    # pylint errors (not conventions)
+]
+ignore = []
+
+[lint.per-file-ignores]
+"dummy_test_scripts/*" = ["F401", "F841"]   # nets import for side effects and keep locals for readability
+"tools/*" = ["F401"]

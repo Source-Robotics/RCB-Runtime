@@ -30,6 +30,10 @@ NOT SUPPORTED, on purpose:
 Anything else raises. Silently skipping an unrecognised word in a toolpath is how you get a
 crash or a ruined part; this project's rule is to degrade LOUDLY.
 """
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 import logging
 import re
 from dataclasses import dataclass, field
@@ -96,7 +100,7 @@ class GcodeError(ValueError):
     """A line we will not guess at. Carries the line number and the offending text."""
 
 
-def parse(text, start_xyz=(0.0, 0.0, 0.0), default_blend_mm=0.05):
+def parse(text: str, start_xyz: Sequence[float] = (0.0, 0.0, 0.0), default_blend_mm: float = 0.05) -> GcodeProgram:
     """Parse G-code into a GcodeProgram.
 
     `start_xyz` is where the tool already is, in mm — needed because G-code moves are

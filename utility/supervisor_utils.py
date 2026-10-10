@@ -5,6 +5,8 @@ Filename: supervisor_utils.py
 Description: Utility functions for supervisor, including PCB UART communication.
 """
 
+from __future__ import annotations
+
 import serial
 import numpy as np
 import logging
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ==========================================================================
 # Reads data from the PCB serial connection in a non-blocking manner.
 # ==========================================================================
-def read_pcb_data(ser, expected_length=4):
+def read_pcb_data(ser: serial.Serial, expected_length: int = 4) -> np.ndarray | None:
     """
     Reads data from the PCB serial connection in a non-blocking manner.
     
@@ -49,7 +51,7 @@ def read_pcb_data(ser, expected_length=4):
 # ==========================================================================
 # Sends data to the PCB control board via serial connection in a non-blocking manner.
 # ==========================================================================
-def send_data(ser,data):
+def send_data(ser: serial.Serial, data: str) -> None:
     """
     Sends data to the PCB control board via serial connection in a non-blocking manner.
     
@@ -62,5 +64,6 @@ def send_data(ser,data):
     """
     data_2_send = data.encode('utf-8')
     ser.write(data_2_send)
-    logger.info(f"Send data to PCB: {data_2_send}")
+    # The heartbeat goes out every blink period (~0.3 s): DEBUG, or it floods the log (2026-10-01).
+    (logger.debug if data == "heartbeat\n\r" else logger.info)(f"Send data to PCB: {data_2_send}")
 

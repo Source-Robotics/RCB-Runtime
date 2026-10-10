@@ -6,6 +6,8 @@ PathBuilder / TimeParameterizer / IK plumbing one stable internal shape while ke
 legacy dict commands working in tests during the transition.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
@@ -97,7 +99,7 @@ SUPPORTED_SINGULARITY_STRATEGIES = tuple(dict.fromkeys(_SINGULARITY_STRATEGY_ALI
 IMPLEMENTED_SINGULARITY_STRATEGIES = ("stop",)
 
 
-def normalize_profile_name(profile):
+def normalize_profile_name(profile: object) -> str:
     key = str(profile).strip().lower()
     try:
         return _PROFILE_ALIASES[key]
@@ -107,7 +109,7 @@ def normalize_profile_name(profile):
             f"(expected one of {', '.join(SUPPORTED_PROFILES)})")
 
 
-def normalize_singularity_strategy(strategy):
+def normalize_singularity_strategy(strategy: object) -> str:
     key = str(strategy).strip().lower()
     try:
         canonical = _SINGULARITY_STRATEGY_ALIASES[key]
@@ -122,7 +124,7 @@ def normalize_singularity_strategy(strategy):
     return canonical
 
 
-def normalize_ik_solver_name(solver):
+def normalize_ik_solver_name(solver: object) -> str:
     key = str(solver).strip().lower()
     try:
         return _IK_SOLVER_ALIASES[key]
@@ -132,7 +134,7 @@ def normalize_ik_solver_name(solver):
             f"(expected one of {', '.join(SUPPORTED_IK_SOLVERS)})")
 
 
-def normalize_blend_mode_name(mode):
+def normalize_blend_mode_name(mode: object) -> str:
     key = str(mode).strip().lower()
     try:
         return _BLEND_MODE_ALIASES[key]

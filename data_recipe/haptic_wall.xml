@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: haptic_wall
+    What api_tests/51_haptic_wall.py records with record/tune on, one packet per RTI tick: the TCP pose (depth
+    into the wall), the RAW TCP and joint speeds the wall damps with, and the joint torque commanded (gravity +
+    wall) vs measured (from current — it carries any stepper torque ripple). Enough to tell a wall limit cycle
+    (roughly fixed frequency) from motor torque ripple (frequency rises with speed).
+-->
+<recipe name="haptic_wall">
+    <field tag="TCP_p"  precision="5"/>
+    <field tag="TCP_s"  precision="4"/>
+    <field tag="j_p"    precision="5"/>
+    <field tag="j_s"    precision="4"/>
+    <field tag="j_t"    precision="4"/>
+    <field tag="j_tc"   precision="4"/>
+    <field tag="tick"/>
+    <field tag="mode"/>
+</recipe>

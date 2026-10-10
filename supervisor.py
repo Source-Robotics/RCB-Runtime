@@ -44,7 +44,6 @@ import threading
 import subprocess
 
 import serial
-import numpy as np
 from gpiozero import LED as GpioLED
 
 from data import shared_data
@@ -72,15 +71,16 @@ from utility.process_utils import setup_process
 
 setup_process(core=0, rt=False)   # supervisor: own core (0), normal scheduling
 
-# Restore user settings (contrast/blink/simulate) saved from the OLED menu.
+# Restore user settings (contrast/blink) saved from the OLED menu.
 settings_store.load()
 
 # ==========================================================================
 # Logging
 # ==========================================================================
 # DEBUG=True  -> also echo this file's logs to the terminal
-# DEBUG=False -> log to file only
-DEBUG = True
+# DEBUG=False -> log to file only. Under systemd the terminal IS the journal, which rsyslog copies into
+#                /var/log/syslog: with True every line was written three times (2026-10-01: ~150 MB/day).
+DEBUG = False
 setup_logging(str(SUPERVISOR_LOG), log_to_console=DEBUG, critical_log_file=str(CRITICAL_LOG))
 
 
@@ -111,6 +111,9 @@ SCRIPTS = {
     "RTI":        f"python3 {_ROOT}/RTI.py",
     "GUI":        f"python3 {_ROOT}/nicegui_test.py",
     "HIGH_LEVEL": f"python3 {_ROOT}/command_executor.py",
+    # the self-collision worker (utility/self_collision.py): the measured pose against the convex pieces on another
+    # core, ~100 Hz, into shared memory for RTI's monitor and jog (TODO/self_collision_plan.md, 2026-10-06)
+    "SELF_COLLISION": f"python3 {_ROOT}/self_collision_worker.py",
 } if RUN_ALL_SCRIPTS else {}
 
 # ==========================================================================
@@ -238,7 +241,9 @@ def update_script_supervisor():
             state.global_monitor_data = monitor_scripts(
                 emergency_stop=False, processes=state.processes, SCRIPTS=SCRIPTS
             )
-            logging.info(state.global_monitor_data)
+            # Every SCRIPT_MONITOR_TIME: DEBUG only. Crashes and restarts are logged by the process
+            # manager when they happen (2026-10-01: this line + the blink-tick lines were ~100 MB/day).
+            logging.debug(state.global_monitor_data)
         except Exception:
             logging.exception("Script supervisor pass failed")
         time.sleep(SCRIPT_MONITOR_TIME)
@@ -256,20 +261,12 @@ def read_uart():
         shared_data.control_board_data[:] = pcb_data
 
 
-def simulate_motor_data():
-    """Fill the motor arrays with random values so the GUI has live-looking data."""
-    n = shared_data.joint_num
-    shared_data.motor['motor_position'][:] = np.random.randint(-10000, 10000, size=n)
-    shared_data.motor['motor_speed'][:] = np.random.randint(-1000, 1000, size=n)
-    shared_data.motor['motor_current'][:] = np.random.randint(-200, 200, size=n)
+_last_gpio_logged = None      # GPIO state last written to the log, LEDs excluded (on_blink_tick)
 
 
 def on_blink_tick():
     """Once per blink period: toggle LEDs, send PCB heartbeat, publish GPIO state."""
     global led_state
-
-    if state.settings["simulate"]:
-        simulate_motor_data()
 
     led_state = not led_state
 
@@ -278,13 +275,17 @@ def on_blink_tick():
 
     shared_data.gpio_states[LED1] = led_state
     shared_data.gpio_states[LED2] = not led_state
-    shared_data.gpio_states[BUTTON1] = 0 if button1.gz_button.is_pressed else 1
-    shared_data.gpio_states[BUTTON2] = 0 if button2.gz_button.is_pressed else 1
+    # Buttons are published from the 50 Hz main loop now, not here — see the comment there.
 
     led1.value = int(shared_data.gpio_states[LED1])
     led2.value = int(shared_data.gpio_states[LED2])
 
-    logging.info(f"GPIO state: {list(shared_data.gpio_states)}")
+    # Only when something other than the two blinking LEDs changed (inputs, E-stop, buttons, outputs).
+    global _last_gpio_logged
+    now = tuple(v for i, v in enumerate(shared_data.gpio_states) if i not in (LED1, LED2))
+    if now != _last_gpio_logged:
+        _last_gpio_logged = now
+        logging.info(f"GPIO state: {list(shared_data.gpio_states)}")
 
 
 def shutdown():
@@ -324,8 +325,23 @@ def main():
         while True:
             start_time = time.perf_counter()
 
+            # Takeover-prompt latch brackets the button checks — arm BEFORE (so a press
+            # that starts during the prompt is caught from its first edge), release AFTER
+            # (so a short press, which fires on release INSIDE check_button, still sees it
+            # set). See app._modal_latch for why checking "is the prompt up" is not enough.
+            app.modal_latch_arm()
             button1.check_button()
             button2.check_button()
+            app.modal_latch_release(button1._stable, button2._stable)
+
+            # Publish the buttons EVERY loop (50 Hz), not in the blink tick. They used to
+            # be written only in on_blink_tick(), i.e. once per `blink_time` — 1.0 s by
+            # default and settable up to 5 s — so the executor, which reads them from shared
+            # memory to confirm or refuse a forced control takeover, could miss a quick DENY
+            # tap entirely and needed an ALLOW hold of up to two blink periods to see it at
+            # all. Active-low on purpose (0 = pressed); every reader already assumes that.
+            shared_data.gpio_states[BUTTON1] = 0 if button1.gz_button.is_pressed else 1
+            shared_data.gpio_states[BUTTON2] = 0 if button2.gz_button.is_pressed else 1
             read_uart()
 
             if time.perf_counter() - last_led_toggle >= state.settings["blink_time"]:

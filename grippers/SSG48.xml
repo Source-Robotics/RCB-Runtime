@@ -50,4 +50,10 @@
         <Tc>0.02 -0.02</Tc>                                                               <!-- Coulomb friction [+, -] [N·m] -->
         <qlim_deg>-160 160</qlim_deg>                                                     <!-- joint limits [deg] -->
     </kinematics>
+    <!-- Self-collision (2026-10-07, Source Robotics' PAR6 description package 2.0, par6_ssg48.urdf): the SSG48 gripper's
+         convex pieces in grippers/SSG48_collision.json, J6 joint frame, the jaws over their whole 23.5 mm stroke. The
+         gripper comes within 12.8 mm (2026-10-07 refit) of wrist 1 (frame 4) at its closest, by construction: its own, smaller margins. -->
+    <collision file="SSG48_collision.json">
+        <pair with="4" planner_mm="6" monitor_mm="2"/>
+    </collision>
 </gripper>

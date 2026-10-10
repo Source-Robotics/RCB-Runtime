@@ -12,6 +12,7 @@ A queued motion command receives TWO replies: ``{"status":"queued"}`` (ack) then
 import json
 import socket
 import threading
+import time
 
 from .constants import CONNECT_TIMEOUT
 from .exceptions import RobotConnectionError, RobotTimeout, CommandRejected
@@ -41,6 +42,7 @@ class Connection:
         self._outstanding = set()              # queued motion ids not yet complete
         self._idle_cv = threading.Condition()  # notified when _outstanding shrinks
 
+        self._rejected = False                 # executor refused us on the access list
         self._status = {}                      # latest {"type":"status",...} from the robot
         self._status_cv = threading.Condition()  # notified on every status event
 
@@ -82,6 +84,23 @@ class Connection:
             return None
         return self._sock.getsockname()[0]
 
+    def local_label(self):
+        """Our address exactly as the executor labels this connection ("ip:port"), or None.
+
+        The executor identifies a client by its TCP connection and publishes the holder as
+        that connection's peer address, so "is control mine?" is a string comparison against
+        this. Taken from the live socket, not a hostname lookup, for the same reason as
+        local_ip(). (Direct connections only: behind a NAT the server sees the translated
+        address and this will not match — the answer is then "not mine", the safe side.)
+        """
+        if self._sock is None:
+            return None
+        try:
+            ip, port = self._sock.getsockname()[:2]
+        except OSError:
+            return None
+        return f"{ip}:{port}"
+
     def connect(self, ip, port, timeout=CONNECT_TIMEOUT):
         try:
             self._sock = socket.create_connection((ip, port), timeout=timeout)
@@ -92,6 +111,22 @@ class Connection:
         self._recv_thread = threading.Thread(target=self._receive_loop, daemon=True,
                                               name="RobotClientReceiver")
         self._recv_thread.start()
+        # The TCP handshake succeeding does NOT mean we are allowed in: the executor accepts
+        # the socket, checks the source IP, then sends FORBIDDEN and closes. Give that one
+        # line time to arrive so the failure is reported HERE, at its cause, rather than as
+        # a puzzling silence several calls later.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if self._rejected:
+                self.disconnect()
+                raise RobotConnectionError(
+                    f"{ip} refused this machine: not in the executor's access list. "
+                    f"Restart command_executor.py on the robot with "
+                    f"RCB_ALLOWED_IPS=<this-pc-ip> (comma-separated for several). Do NOT "
+                    f"edit ALLOWED_IPS in the source -- it is tracked in a public repo.")
+            if self._status:
+                break
+            time.sleep(0.02)
 
     def disconnect(self):
         self._connected = False
@@ -163,6 +198,13 @@ class Connection:
 
         cid = msg.get("id")
         if cid is None:
+            # The executor's access-list refusal: it sends this ONE line and closes. It
+            # carries no id, so before 2026-09-29 it fell through _fire_event and was
+            # discarded -- connect() appeared to succeed, then nothing worked and the caller
+            # saw "no status event arrived" from a perfectly healthy robot. A refusal that
+            # the robot states plainly must not be silently dropped by the client.
+            if msg.get("code") == "FORBIDDEN":
+                self._rejected = True
             self._fire_event(msg)
             return
 
