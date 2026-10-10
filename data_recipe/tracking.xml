@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: tracking
+    How well each joint follows its commanded motion, one packet per RTI tick (api_tests/66_tracking.py, 2026-10-10):
+    measured vs commanded position (the tracking error), measured vs commanded speed, the commanded acceleration (to
+    split a move into accelerating / cruising / decelerating), and measured vs commanded torque (the commanded torque
+    is our feedforward — gravity today — so measured minus commanded is what the drive's own loops had to add).
+    j_p / j_pc at 5 decimals (1e-5 rad = 0.0006 deg): errors of a few hundredths of a degree must survive rounding.
+-->
+<recipe name="tracking">
+    <field tag="j_p"   precision="5"/>
+    <field tag="j_pc"  precision="5"/>
+    <field tag="j_s"   precision="4"/>
+    <field tag="j_sc"  precision="4"/>
+    <field tag="j_ac"  precision="3"/>
+    <field tag="j_t"   precision="3"/>
+    <field tag="j_tc"  precision="3"/>
+    <field tag="tick"/>
+    <field tag="mode"/>
+</recipe>
