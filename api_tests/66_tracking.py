@@ -2,10 +2,14 @@
 """66: how well each joint TRACKS its commanded motion — and how two control setups compare (2026-10-10).
 
 TODO/dynamics_feedforward_plan.md. The same EXEC moves are run with each SET in turn, recorded tick by tick, and compared
-per joint and speed. Two kinds of set:
+per joint and speed. Three kinds of set:
   gains          "new" (the XML values) / "old" (the tune before 2026-10-09, read from the "Was: KPP ..." comments in
                  robots/PAR6.xml) — inertia / Coriolis feedforward OFF                                  (step T2)
   feedforward    "off" / "inertia" / "coriolis" / "inertia+coriolis" — the XML gains, the two switches as named (F1)
+  profile        "trapezoid" (what every EXEC move uses unless told otherwise) / "ruckig" (jerk-limited, the full
+                 <exec_limits><jerk> budget) / "s_curve" / "quintic" / "toppra" — the shipped setup (XML gains,
+                 inertia + Coriolis feedforward ON), each move planned with that profile (F4, 2026-10-10: J1 rings
+                 at ~6 Hz after the trapezoid's abrupt end of braking; a jerk-limited profile should not pluck it)
 `--compare` puts two saved runs side by side.
 
 WHAT IS MEASURED, per move and joint (error = commanded - measured position, positive = the joint lags behind):
@@ -14,6 +18,9 @@ WHAT IS MEASURED, per move and joint (error = commanded - measured position, pos
   lag               mean error while cruising, signed along the motion (the steady lag)
   overshoot         how far the joint goes PAST the target after the command stops
   settle            ms after the command stops until |error| stays under 0.05 deg
+  post              RMS error in the 0.3 s after the command stops: the size of the ringing
+  dur               how long the command moved (ms): the cost of a gentler profile — a jerk-limited move at the same
+                    speed % takes longer and may not reach the same peak speed (compare 'vpeak')
   pid               RMS of measured torque - commanded torque while moving: the torque the drive's own loops had to add
                     beyond our feedforward (gravity today) — what a dynamics feedforward would take over
   others            the largest error on the joints that were NOT commanded to move (coupling)
@@ -44,6 +51,7 @@ the XML's), and the XML gains are ALWAYS put back at the end, whatever happens. 
     python3 api_tests/66_tracking.py --go                       # new, old, new (the 2nd new = repeatability)
     python3 api_tests/66_tracking.py --go --sets new --joints 4,5,6 --speeds 30,60
     python3 api_tests/66_tracking.py --go --sets off,inertia,inertia+coriolis,off      # the feedforward A/B
+    python3 api_tests/66_tracking.py --go --sets trapezoid,ruckig,trapezoid           # the profile A/B
     python3 api_tests/66_tracking.py --compare temp_data/tracking/A.json temp_data/tracking/B.json
     python3 api_tests/66_tracking.py --reanalyse temp_data/tracking/A.json   # recompute a saved run (no robot)
 
@@ -84,10 +92,12 @@ FINAL_S = 0.1
 NEED = ("j_p", "j_pc", "j_s", "j_sc", "j_ac", "j_t", "j_tc", "tick")
 OPTIONAL = ("j_t_inertia", "j_t_coriolis")      # 2026-10-10; zeros in runs recorded before them
 COMP_SETS = {"off": (False, False), "inertia": (True, False), "coriolis": (False, True), "inertia+coriolis": (True, True)}
+PROFILE_SETS = ("trapezoid", "ruckig", "s_curve", "quintic", "toppra")     # motion/exec_commands.SUPPORTED_PROFILES
+POST_S = 0.3                                    # the window after the stop that 'post' measures (J1 rings ~0.3 s)
 START_S = 0.04                                  # "from rest": the first 40 ms of a move
 DELAY_MAX_S, DELAY_STEP_S, DELAY_COARSE_S = 0.020, 0.00025, 0.001   # the time shift searched for each move
 METRICS = ("rms", "peak", "acc", "cru", "dec", "lag", "overshoot", "settle_ms", "final", "pid", "others", "vpeak",
-           "delay_ms", "rms_d", "peak_d", "d_acc", "d_dec", "d_start", "ff")
+           "delay_ms", "rms_d", "peak_d", "d_acc", "d_dec", "d_start", "ff", "post", "dur_ms")
 
 
 # ----------------------------------------------------------------------------- gains
@@ -118,15 +128,22 @@ def set_comp(robot, inertia, coriolis):
 
 
 def apply_set(robot, name, gain_sets):
-    """A gain set (feedforward OFF) or a feedforward set (the XML gains). Returns True when the gains differ from the
-    XML's (they must be put back)."""
+    """A gain set (feedforward OFF), a feedforward set (the XML gains) or a profile set (the XML gains, both
+    feedforward switches ON — the shipped setup). Returns True when the gains differ from the XML's (they must be
+    put back)."""
     if name in gain_sets:
         apply_gains(robot, gain_sets[name])
         set_comp(robot, False, False)
         return name != "new"
     apply_gains(robot, gain_sets["new"])
-    set_comp(robot, *COMP_SETS[name])
+    set_comp(robot, *(COMP_SETS[name] if name in COMP_SETS else (True, True)))
     return False
+
+
+def move_options(set_name, speed):
+    """move_joints options for one move of a set: a profile set plans with its profile; the other sets name none
+    (the planner's default, trapezoid), as every run before 2026-10-10 did."""
+    return {"speed": speed, **({"profile": set_name} if set_name in PROFILE_SETS else {})}
 
 
 # ----------------------------------------------------------------------------- telemetry capture
@@ -206,9 +223,10 @@ def move_metrics(s, j, direction, dt):
     dec = moving & (signed_acc < -ACC_FRACTION * a_ref)
     cru = moving & ~acc & ~dec
     rms = lambda m: float(np.sqrt(np.mean(err[m] ** 2))) if m.any() else None
-    end = int(np.flatnonzero(moving)[-1])
+    first, end = int(np.flatnonzero(moving)[0]), int(np.flatnonzero(moving)[-1])
     post = slice(end + 1, None)
     over = float(max(0.0, (-along[post]).max())) if end + 1 < err.size else 0.0
+    ring = err[end + 1:end + 1 + max(1, int(round(POST_S / dt)))]
     settle = None
     if end + 1 < err.size:
         inside = np.abs(err[post]) < SETTLE_DEG
@@ -229,6 +247,8 @@ def move_metrics(s, j, direction, dt):
     return {"delay_ms": 1000.0 * delay, "rms_d": float(np.sqrt(np.mean(res ** 2))), "peak_d": float(np.abs(res).max()),
             "d_acc": rms_r(acc[moving]), "d_dec": rms_r(dec[moving]), "d_start": rms_r(start),
             "ff": float(np.abs(ti[moving] + tco[moving]).max()),
+            "post": float(np.sqrt(np.mean(ring ** 2))) if ring.size else None,
+            "dur_ms": 1000.0 * (end - first + 1) * dt,
             "rms": rms(moving), "peak": float(np.abs(err[moving]).max()), "acc": rms(acc), "cru": rms(cru),
             "dec": rms(dec), "lag": float(along[cru].mean()) if cru.any() else None, "overshoot": over,
             "settle_ms": settle, "final": float(err[-nfin:].mean()), "pid": float(np.sqrt(np.mean(pid[moving] ** 2))),
@@ -300,7 +320,7 @@ def print_report(summ, set_names, title=""):
     if title:
         print(title)
     cols = [("rms", 3), ("delay_ms", 1), ("rms_d", 3), ("d_acc", 3), ("d_dec", 3), ("d_start", 3), ("overshoot", 3),
-            ("settle_ms", 0), ("pid", 3), ("ff", 3), ("others", 3)]
+            ("settle_ms", 0), ("post", 3), ("dur_ms", 0), ("pid", 3), ("ff", 3), ("others", 3)]
     head = "  ".join(f"{c[0][:7]:>7s}" for c in cols)
     print("  (degrees, ms, Nm; median of the moves at that speed; error = commanded - measured;"
           " rms_d / peak_d = after the best time shift 'delay')")
@@ -317,17 +337,20 @@ def print_report(summ, set_names, title=""):
                     v = summ.get(s, {}).get(jn, {}).get(grp, {}).get(sp)
                     if v is None:
                         continue
-                    print(f"    {sp + '%':>6s} {s:>8s} {_fmt(v['vpeak'], 1)}  " + "  ".join(_fmt(v[c], nd) for c, nd in cols))
+                    print(f"    {sp + '%':>6s} {s:>8s} {_fmt(v['vpeak'], 1)}  " + "  ".join(_fmt(v.get(c), nd) for c, nd in cols))
     # one line per joint and metric: the mean over speeds, each set relative to the first
     if len(set_names) > 1:
         for key, what in (("rms", "RMS tracking error"), ("rms_d", "RMS path error after the time shift"),
-                          ("pid", "torque the drive's own loops added beyond our feedforward (Nm)")):
+                          ("pid", "torque the drive's own loops added beyond our feedforward (Nm)"),
+                          ("overshoot", "overshoot past the target (deg)"), ("settle_ms", "settling time (ms)"),
+                          ("post", "RMS error in the 0.3 s after the stop: the ringing (deg)"),
+                          ("dur_ms", "move duration (ms)")):
             print(f"\n  Mean {what} over all speeds (joint moving alone), relative to the first set:")
             for jn in joints:
                 vals = []
                 for s in set_names:
                     g = summ.get(s, {}).get(jn, {}).get("alone", {})
-                    xs = [g[sp][key] for sp in g if g[sp].get(key) is not None]
+                    xs = [g[sp][key] for sp in g if g[sp].get(key) is not None]     # .get: runs saved before a metric
                     vals.append(float(np.mean(xs)) if xs else None)
                 if vals[0]:
                     print(f"    {jn}: " + "   ".join(f"{s} {v:.3f}" + ("" if i == 0 or v is None else f" ({v / vals[0]:.2f}x)")
@@ -429,6 +452,16 @@ def selftest():
     chk("drive torque beyond the feedforward = 0.3 Nm", abs(x["pid"] - 0.3) < 1e-3, x["pid"])
     chk("coupling: J4 sat 0.02 deg off", abs(x["others"] - 0.02) < 1e-4, x["others"])
     chk("commanded peak speed 40 deg/s", abs(x["vpeak"] - 40.0) < 0.01, x["vpeak"])
+    chk("move duration 896 ms: the 224 samples the command moves (t = 4 .. 896 ms of the 0.9 s trapezoid), both moves",
+        abs(x["dur_ms"] - 896.0) < 1e-6 and abs(y["dur_ms"] - 896.0) < 1e-6, (x["dur_ms"], y["dur_ms"]))
+    late = analyse(d, [{**rec[1], "t0": 5000 + n1 - 100}], dt)       # the segment starts 0.4 s into the last hold
+    chk("...counted from the first MOVING sample: a segment that starts 0.4 s early still gives 896 ms",
+        len(late) == 1 and abs(late[0]["dur_ms"] - 896.0) < 1e-6, late and late[0]["dur_ms"])
+    n_post = int(round(POST_S / dt))
+    want1 = 0.08 * np.sqrt(np.mean(np.exp(-2 * np.arange(n_post) * dt / 0.05)))
+    want2 = np.sqrt((2 * 0.08 ** 2 + 5 * 0.03 ** 2 + 5 * 0.07 ** 2) / n_post)
+    chk(f"post = RMS of the error over the {POST_S:g} s after the stop: decay {want1:.4f}, ringing {want2:.4f} deg",
+        abs(x["post"] - want1) < 0.001 and abs(y["post"] - want2) < 0.001, (x["post"], y["post"]))
     # a pure 6 ms delay plus an error proportional to the ACCELERATION (what inertia does): the shift finds 6 ms, the
     # residual is exactly the acceleration part, the plain error is much larger (the delay x the speed)
     ta_ = np.arange(0, 1.2, dt)
@@ -451,6 +484,37 @@ def selftest():
     chk("room check: J2 2 deg above a -140 limit is refused, J1 in the middle is not",
         len(pr) == 1 and pr[0].startswith("J2"), pr)
     chk("set labels: new, old, new2", label_sets(["new", "old", "new"]) == ["new", "old", "new2"])
+    # profile sets (2026-10-10): the planner's own profile names, the move options, and the setup each set applies
+    from motion.exec_commands import SUPPORTED_PROFILES
+    chk("profile sets = the planner's SUPPORTED_PROFILES", sorted(PROFILE_SETS) == sorted(SUPPORTED_PROFILES),
+        (PROFILE_SETS, SUPPORTED_PROFILES))
+    chk("a profile set plans with its profile; gain / feedforward sets name none (the default, as before)",
+        move_options("ruckig", 60.0) == {"speed": 60.0, "profile": "ruckig"}
+        and move_options("inertia", 60.0) == {"speed": 60.0} and move_options("old", 60.0) == {"speed": 60.0},
+        (move_options("ruckig", 60.0), move_options("inertia", 60.0)))
+
+    class FakeRobot:
+        def __init__(self):
+            self.gains, self.comp = {}, [None, None]
+
+        def set_pid_gains(self, j, **g):
+            self.gains[j] = g
+
+        def set_inertia_comp(self, on):
+            self.comp[0] = on
+
+        def set_coriolis_comp(self, on):
+            self.comp[1] = on
+    fake_sets = {"new": [{"KPP": 1.0 + j} for j in range(6)], "old": [{"KPP": 9.0} for _ in range(6)]}
+    seen = {}
+    for nm in ("ruckig", "trapezoid", "off", "old"):
+        fr = FakeRobot()
+        back = apply_set(fr, nm, fake_sets)
+        seen[nm] = (back, [fr.gains[j] for j in range(6)] == fake_sets["new"], tuple(fr.comp))
+    chk("profile sets: the XML gains, both feedforward switches ON, nothing to put back",
+        seen["ruckig"] == (False, True, (True, True)) and seen["trapezoid"] == (False, True, (True, True)), seen)
+    chk("...the other sets unchanged: 'off' = XML gains + both off; 'old' = other gains (to put back) + both off",
+        seen["off"] == (False, True, (False, False)) and seen["old"] == (True, False, (False, False)), seen)
     # the gain tables come out of the real robot XML
     try:
         g = read_gain_sets(os.path.join(_ROOT, "robots", "PAR6.xml"))
@@ -539,7 +603,8 @@ def run_session(args, cfg, gain_sets, set_order):
     robot = RobotClient(sync=False)
     robot.connect(args.host, args.port)
     capture, prev_recipe, claimed, gains_changed = None, None, False, False
-    comp_used, comp0, applied = any(n in COMP_SETS for n in set_order), (False, False), False
+    comp_used = any(n in COMP_SETS or n in PROFILE_SETS for n in set_order)
+    comp0, applied = (False, False), False
     records, ok = [], True
     names = label_sets(set_order)
     try:
@@ -556,7 +621,9 @@ def run_session(args, cfg, gain_sets, set_order):
               f"sets in order: {names}.")
         print("Sets (the current and velocity LIMITS stay the XML's):")
         for nm in dict.fromkeys(set_order):
-            if nm in COMP_SETS:
+            if nm in PROFILE_SETS:
+                print(f"  {nm:16s} XML gains, inertia + Coriolis feedforward ON, every move planned with profile='{nm}'")
+            elif nm in COMP_SETS:
                 i_on, c_on = COMP_SETS[nm]
                 print(f"  {nm:16s} XML gains, inertia feedforward {'ON' if i_on else 'off'}, Coriolis {'ON' if c_on else 'off'}")
             else:
@@ -603,7 +670,7 @@ def run_session(args, cfg, gain_sets, set_order):
             time.sleep(1.0)                               # let the hold settle on the new setup
             for i, mv in enumerate(moves, 1):
                 t0 = capture.last_tick()
-                robot.move_joints(*[float(x) for x in mv["target"]], speed=mv["speed"])
+                robot.move_joints(*[float(x) for x in mv["target"]], **move_options(set_name, mv["speed"]))
                 fails = robot.wait_idle(timeout=60.0, raise_on_error=False)
                 time.sleep(HOLD_S)
                 t1 = capture.last_tick()
@@ -637,7 +704,7 @@ def run_session(args, cfg, gain_sets, set_order):
                       f"{'ON' if comp0[1] else 'off'}.")
             except Exception as exc:
                 print(f"!!! COULD NOT RESTORE THE FEEDFORWARD SWITCHES ({exc}) — check the dashboard's Inertia / Coriolis "
-                      f"buttons (or restart the service: both start OFF).")
+                      f"buttons (or restart the service: both start as system.xml <dynamics_feedforward> says, ON as shipped).")
         if capture is not None:
             capture.stop()
         try:
@@ -663,7 +730,8 @@ def main():
     ap.add_argument("--go", action="store_true", help="actually move the arm")
     ap.add_argument("--selftest", action="store_true", help="check the analysis on synthetic data and exit")
     ap.add_argument("--sets", default="new,old,new",
-                    help="sets in order: gains new / old, or feedforward off / inertia / coriolis / inertia+coriolis")
+                    help="sets in order: gains new / old, feedforward off / inertia / coriolis / inertia+coriolis, "
+                         "or profile trapezoid / ruckig / s_curve / quintic / toppra")
     ap.add_argument("--joints", default="1,2,3,4,5,6", help="1-based joints to move")
     ap.add_argument("--speeds", default=",".join(f"{s:g}" for s in DEFAULT_SPEEDS), help="percent of the EXEC limits")
     ap.add_argument("--amp-scale", type=float, default=1.0, help="scale the default amplitudes (<= 1 to be gentler)")
@@ -696,8 +764,8 @@ def main():
     cfg = xp.load_full_robot_config(str(sysc["robot_xml_path"]), grippers_dir=GRIPPERS_DIR,
                                     active_gripper=sysc["active_gripper"])
     gain_sets = read_gain_sets(str(sysc["robot_xml_path"]))
-    if any(s not in gain_sets and s not in COMP_SETS for s in set_order):
-        print(f"Unknown set in {set_order}; known: {list(gain_sets) + list(COMP_SETS)}.")
+    if any(s not in gain_sets and s not in COMP_SETS and s not in PROFILE_SETS for s in set_order):
+        print(f"Unknown set in {set_order}; known: {list(gain_sets) + list(COMP_SETS) + list(PROFILE_SETS)}.")
         return 2
     rc, got = run_session(args, cfg, gain_sets, set_order)
     if got is None:
