@@ -158,6 +158,7 @@ cfg = read_XML2.load_full_robot_config(
     str(_sys['robot_xml_path']), grippers_dir=GRIPPERS_DIR,
     active_gripper=_sys['active_gripper'])
 JOINT_NUM = int(cfg['joint_num'])
+TICK_S = float(cfg['delta_t'])        # RTI's tick (s), published in the status (tick_s)
 # Safety zones of the active cell (config/cells/<active_cell>.xml; utility/zones.py). A bad cell file
 # RAISES here: running without the zones the operator configured would be silently disarming them.
 _GRIPPER_XML = GRIPPERS_DIR / f"{_sys['active_gripper']}.xml"
@@ -1539,6 +1540,9 @@ def current_status():
         "inertia_comp": bool(shared_data.rti["inertia_comp_enabled"][0] > 0.5),
         "coriolis_comp": bool(shared_data.rti["coriolis_comp_enabled"][0] > 0.5),
         # The declared payload RTI's gravity model carries (set_payload; 0 after every RTI start).
+        # RTI's tick length (s): an RTI client computes the robot's time from the state packets' `tick` with it
+        # (RTIClient.control, 2026-10-11) — the robot's clock, not the PC's, as industrial streaming interfaces do.
+        "tick_s": TICK_S,
         "payload": {"mass": float(shared_data.rti["payload_mass"][0]),
                     "com": [float(shared_data.rti["payload_com_x"][0]), float(shared_data.rti["payload_com_y"][0]),
                             float(shared_data.rti["payload_com_z"][0])]},

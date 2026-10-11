@@ -583,8 +583,16 @@ class RobotClient:
     def rti_set_servo_generator(self, name: str, gain: float | None = None, lookahead: float | None = None, self_lookahead: float | None = None) -> None:
         """Choose how the robot fills in the ticks between your position commands.
 
-        **"ruckig"** (the default) plans a jerk-limited move to each target and *arrives* on
-        it. Exact, no overshoot — right for point-to-point. On a sparse stream it sprints to
+        **"passthrough"** (hard RTI's default since 2026-10-11, hard RTI only) replays your
+        targets exactly, one tick behind, using each packet's send time (RTIClient sends it
+        by default; `control()` uses the robot's own time): no planning lag. Each joint
+        still stays within its velocity / acceleration / jerk limits — a jump is caught up
+        on, never overshot — and never passes a soft limit. A stream without send times
+        gets "ruckig" below, exactly as before.
+
+        **"ruckig"** plans a jerk-limited move to each target and *arrives* on it, stopped.
+        Exact, no overshoot — right for point-to-point. On a stream it trails by about its
+        stopping distance (15-20 ms on J1 at speed), and on a sparse stream it sprints to
         each target and idles until the next, which is what makes low-rate streaming pulse
         unless you cap the speed with `rti_set_vel_scale`.
 

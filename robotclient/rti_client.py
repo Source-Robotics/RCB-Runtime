@@ -108,10 +108,17 @@ class RobotState(dict):
     """Parsed state packet. Dict of recipe tag → scalar or list.
 
     `elapsed` is seconds since control started, filled in by RTIClient.control() so
-    callbacks can time themselves without closing over a start timestamp.
+    callbacks can time themselves without closing over a start timestamp. It is the
+    ROBOT's time (the packet's `tick` x the robot's tick length, 2026-10-11) when both are
+    known: a target computed from it lands on the robot's tick grid exactly, however late
+    the PC's callback runs — the PC's own clock put each target up to ±0.4 ms off that grid
+    (measured), which a pass-through plays back as speed noise. `robot_time` says which
+    (False: the PC's clock — a recipe without `tick`, or an executor too old to publish
+    its tick length).
     """
 
     elapsed = 0.0
+    robot_time = False
 
 
 class _Command:
@@ -208,6 +215,7 @@ class RTIClient:
         self.timestamps = bool(timestamps)
         self.seq = 0
         self.robot_ip = None
+        self.tick_s = None            # the robot's tick length (s), from its status at connect()
 
         # Optional full capture. read_state() deliberately drains to NEWEST and discards the
         # rest, which is right for a controller and wrong for a measurement: off-robot there
@@ -284,6 +292,12 @@ class RTIClient:
                 raise ValueError("transport must be 'udp' or 'tcp'")
             self.transport = transport
         self.robot.rti_connect(pc_ip, rate_hz=rate_hz, transport=self.transport)
+        # The robot's tick length, for control()'s robot time (None: an executor that does not publish it).
+        try:
+            ts_ = float(self.robot.status().get("tick_s") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            ts_ = 0.0
+        self.tick_s = ts_ if 0.0 < ts_ < 1.0 else None
         # Dial AFTER the robot has been told to expect us: it only accepts a stream
         # connection from the paired IP, and it only starts listening for one once
         # rti_connect has named that IP.
@@ -334,6 +348,7 @@ class RTIClient:
         self._running = True
         _to = [first_packet_timeout]
         started = time.monotonic()
+        tick0 = None
         try:
             while self._running:
                 try:
@@ -356,7 +371,14 @@ class RTIClient:
                                        "(never started streaming — is it paired?)")
 
                 state = self._decode(data)
-                state.elapsed = time.monotonic() - started
+                tick = state.get("tick")
+                if self.tick_s is not None and isinstance(tick, (int, float)):
+                    if tick0 is None:
+                        tick0 = tick
+                    state.elapsed = (tick - tick0) * self.tick_s
+                    state.robot_time = True
+                else:
+                    state.elapsed = time.monotonic() - started
 
                 # Did the robot revoke control? Needs `rti_state` in the active recipe;
                 # absent, this is a no-op and the old blind behaviour applies.
@@ -365,10 +387,13 @@ class RTIClient:
                 result = callback(state)
 
                 if isinstance(result, MotionFinished):
-                    self._send(CMD_STOP, [0.0] * 6, [0.0] * 6)
+                    self._send(CMD_STOP, [0.0] * 6, [0.0] * 6, state.elapsed if state.robot_time else None)
                     break
                 if result is not None:
-                    self._send(result.cmd_type, result.payload, result.feedforward)
+                    # Stamped with the time the target was computed FOR (robot time when known): the
+                    # robot then re-times it exactly, whenever it arrives.
+                    self._send(result.cmd_type, result.payload, result.feedforward,
+                               state.elapsed if state.robot_time else None)
 
                 _to[0] = timeout        # first packet may be slow; the rest must not be
         finally:
