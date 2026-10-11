@@ -10,7 +10,11 @@ This test measures it. Every SENDER runs every SET in turn:
 
   senders  hard250 (hard RTI, a command every tick) / soft50 (SOFT_RTI 50 Hz) / wander (SOFT_RTI, 50-60 Hz wandering,
            like a VR device) / soft10 (SOFT_RTI 10 Hz)
-  sets     off / stream (default order off,stream,off — the second off checks the measurement repeats)
+  sets     old / off / stream (default order old,off,stream,off — the second off checks the measurement repeats)
+           old     SOFT_RTI as it was until 2026-10-11: duration pacing 0 (the jerky kicks); feedforward off
+           off     the shipped setup: SOFT_RTI's duration pacing default (1.5 intervals), feedforward off
+           stream  the same + rti_set_dynamics_ff("stream")
+           (hard RTI never paces: there 'old' = 'off', a repeat)
            The robot-wide inertia and Coriolis switches are ON for every set (put back as they were at the end).
 
 Each block: a session (connect — the robot must really be in the sender's contract, RTI or SOFT_RTI, or the block is
@@ -31,9 +35,11 @@ generator's, which is what the arm is asked to follow):
   ff / ff_hf      RMS of the feedforward torque we added (inertia + Coriolis, Nm), and its part above ~10 Hz
   pid             RMS of measured - commanded torque while moving: what the drive's own loops had to add
   acc_hf          the published acceleration's part above ~10 Hz (rad/s^2): the generator's (off) or the stream's
-  cmd_vhf /       the COMMANDED / MEASURED speed's part above ~10 Hz during steady motion (deg/s): jerkiness — the
-  meas_vhf        generator's chatter in what the drive is told, and what the arm really did (speed, not position:
-                  the slow sine leaks ~0.09 deg through the filter, its speed only ~0.5 deg/s — the floor here)
+  cmd_jerk /      the COMMANDED / MEASURED speed's deviation from its smooth path at 1.5-10 Hz (deg/s RMS, the steady
+  arm_jerk        middle of the block): the jerkiness you SEE — the generator's kicks in what the drive is told, and
+                  what the arm really did
+  cmd_vhf /       the same above 10 Hz (deg/s): the fast part
+  arm_vhf
 One line per sender and set; then each joint's mean over the senders, relative to `off`.
 
 The robot must be ENABLED and homed; the arm moves J1 only by default (`--joints 1,4,5,6` allowed — J2 / J3 are not,
@@ -70,14 +76,18 @@ SENDERS = {                       # name: (lo Hz, hi Hz, soft)
     "wander": (50.0, 60.0, True),
     "soft10": (10.0, 10.0, True),
 }
-SETS = ("off", "stream")
+SETS = ("old", "off", "stream")
+SOFT_MIN_DURATION = 1.5           # motion/rti_handler.SOFT_MIN_DURATION_DEFAULT (what SOFT_RTI's contract sets)
 SAFE_JOINTS1 = (1, 4, 5, 6)       # 1-based; the servo tests' rule (api_tests/_servo_common.SAFE_JOINTS)
 CLEARANCE_DEG = 10.0
 STILL_S = 1.0
 FADE_S = 1.0
-MOVING = 1e-3                     # rad/s commanded: "moving"
+MOVING = 0.01                     # rad/s commanded (from j_pc): "moving" (0.57 deg/s, above j_pc's 1e-5 rad rounding)
 HF_W = 13                         # moving-mean half width (ticks): 27 ticks = 108 ms -> above ~10 Hz
-METRICS = ("rms_d", "peak_d", "delay_ms", "buzz", "ff", "ff_hf", "pid", "acc_hf", "cmd_vhf", "meas_vhf", "vpeak")
+METRICS = ("rms_d", "peak_d", "delay_ms", "buzz", "ff", "ff_hf", "pid", "acc_hf", "cmd_jerk", "arm_jerk", "cmd_vhf",
+           "arm_vhf", "vpeak")
+JERK_BAND_HZ = (1.5, 10.0)        # the smooth sine (0.67 Hz) below, the visible kicks inside, the fast part above
+FADE_MARGIN_S = 1.2               # the band metrics skip the fades (1 s each) + a margin
 
 
 # ----------------------------------------------------------------------------- the motion (pure)
@@ -118,9 +128,23 @@ def steady_mask(speed, frac=0.3, w=HF_W):
     return ~near[w:-w]
 
 
+def bands(v, dt, a, b):
+    """RMS of v's 1.5-10 Hz and > 10 Hz parts over [a, b) (zero-phase 4th-order Butterworth, applied over the whole
+    block so the edges do not matter). 4th order, not 2nd: the 0.67 Hz sine sits close to 1.5 Hz, and a 2nd-order split
+    let 4 % of its 63 deg/s into the band (1.7 deg/s RMS — most of hard RTI's '2.1' in the first look, 2026-10-11)."""
+    from scipy.signal import butter, filtfilt
+    lo = filtfilt(*butter(4, JERK_BAND_HZ[0] / (0.5 / dt)), v)
+    mid = filtfilt(*butter(4, JERK_BAND_HZ[1] / (0.5 / dt)), v)
+    return rms((mid - lo)[a:b]), rms((v - mid)[a:b])
+
+
 def block_metrics(s, j, dt):
-    """Metrics of joint j (0-based) in one block's segment (arrays from to_arrays)."""
-    moving = np.abs(s["j_sc"][:, j]) > MOVING
+    """Metrics of joint j (0-based) in one block's segment (arrays from to_arrays). The commanded SPEED is taken from
+    the commanded position (what the drive is told): in RTI the published j_sc is not the generator's — hard RTI
+    publishes the PC's speed feedforward (0 here), SOFT_RTI the target-velocity estimate (found on the first analysis,
+    2026-10-11: every hard-RTI block read as never moving)."""
+    vc = np.gradient(s["j_pc"][:, j], dt)
+    moving = np.abs(vc) > MOVING
     if moving.sum() < 50:
         return None
     first, last = int(np.flatnonzero(moving)[0]), int(np.flatnonzero(moving)[-1])
@@ -128,12 +152,20 @@ def block_metrics(s, j, dt):
     delay, res = best_delay(s["tick"] * dt, s["j_pc"][:, j], s["j_p"][:, j], moving)
     ff = (s["j_t_inertia"][:, j] + s["j_t_coriolis"][:, j])[win]
     return {"rms_d": float(np.sqrt(np.mean(res ** 2))), "peak_d": float(np.abs(res).max()),
-            "delay_ms": 1000.0 * delay, "buzz": rms(hf(s["j_t"][win, j])[steady_mask(s["j_sc"][win, j])]),
+            "delay_ms": 1000.0 * delay, "buzz": rms(hf(s["j_t"][win, j])[steady_mask(vc[win])]),
             "ff": rms(ff), "ff_hf": rms(hf(ff)),
             "pid": rms((s["j_t"][:, j] - s["j_tc"][:, j])[moving]), "acc_hf": rms(hf(s["j_ac"][win, j])),
-            "cmd_vhf": rms(hf(np.degrees(s["j_sc"][win, j]))[steady_mask(s["j_sc"][win, j])]),
-            "meas_vhf": rms(hf(np.degrees(s["j_s"][win, j]))[steady_mask(s["j_sc"][win, j])]),
-            "vpeak": float(np.degrees(np.abs(s["j_sc"][:, j]).max()))}
+            **_jerk_metrics(vc, s["j_s"][:, j], first, last, dt),
+            "vpeak": float(np.degrees(np.abs(vc).max()))}
+
+
+def _jerk_metrics(vc, vm, first, last, dt):
+    a, b = first + int(FADE_MARGIN_S / dt), last - int(FADE_MARGIN_S / dt)
+    if b - a < int(1.0 / dt) or vc.size < 50:
+        return {"cmd_jerk": None, "arm_jerk": None, "cmd_vhf": None, "arm_vhf": None}
+    cj, cv = bands(np.degrees(vc), dt, a, b)
+    aj, av = bands(np.degrees(vm), dt, a, b)
+    return {"cmd_jerk": cj, "arm_jerk": aj, "cmd_vhf": cv, "arm_vhf": av}
 
 
 def analyse(d, records, dt):
@@ -167,7 +199,7 @@ def print_report(moves, senders, set_labels, title=""):
     if title:
         print(title)
     cols = [("vpeak", 1), ("rms_d", 4), ("peak_d", 3), ("delay_ms", 1), ("buzz", 4), ("ff", 3), ("ff_hf", 4),
-            ("pid", 3), ("acc_hf", 2), ("cmd_vhf", 2), ("meas_vhf", 2)]
+            ("pid", 3), ("acc_hf", 2), ("cmd_jerk", 2), ("arm_jerk", 2), ("cmd_vhf", 2), ("arm_vhf", 2)]
     print("  (J = joint; deg, ms, Nm, rad/s^2; rms_d / peak_d = tracking error after the best time shift 'delay';"
           " buzz = torque above ~10 Hz)")
     joints = sorted({m["joint"] for m in moves})
@@ -180,11 +212,12 @@ def print_report(moves, senders, set_labels, title=""):
                 if v is not None:
                     print(f"    {snd:>8s} {lab:>8s}  " + "  ".join(_fmt(v.get(c), nd) for c, nd in cols))
     base = [lab for lab in set_labels if lab.startswith("off")]
-    others = [lab for lab in set_labels if not lab.startswith("off")]
+    others = [lab for lab in set_labels if not lab.startswith("off")]          # old, stream
     if base and others:
         for key, what in (("rms_d", "tracking error after the time shift"), ("buzz", "buzz (torque above ~10 Hz)"),
                           ("pid", "torque the drive's own loops added"),
-                          ("meas_vhf", "jerkiness (measured speed above ~10 Hz)")):
+                          ("arm_jerk", "JERKINESS: the arm's speed off its smooth path at 1.5-10 Hz (deg/s)"),
+                          ("arm_vhf", "the arm's speed above 10 Hz (deg/s)")):
             print(f"\n  {what}, per sender, relative to 'off' (mean of the off sets):")
             for j in joints:
                 for snd in senders:
@@ -200,7 +233,7 @@ def print_report(moves, senders, set_labels, title=""):
                         if v is not None and b > 0:
                             cells.append(f"{lab} {v / b:.2f}x")
                     print(f"    J{j} {snd:>8s}: off {b:.4f}   " + "   ".join(cells))
-        if not any(m["ff"] for m in moves if m["set"] in others and m.get("ff") is not None):
+        if not any(m["ff"] for m in moves if m["set"].startswith("stream") and m.get("ff") is not None):
             print("\n  !!! The 'stream' sets added NO feedforward — the running RTI does not know rti_set_dynamics_ff "
                   "(restart the service), or the inertia switch was off.")
 
@@ -232,7 +265,7 @@ def selftest():
     jp = np.zeros((n, 6)); jpc = np.zeros((n, 6)); jsc = np.zeros((n, 6)); jac = np.zeros((n, 6))
     jt = np.zeros((n, 6)); jtc = np.zeros((n, 6)); jti = np.zeros((n, 6)); jtco = np.zeros((n, 6)); js = np.zeros((n, 6))
     jp[:, 0], jpc[:, 0], jsc[:, 0], jac[:, 0] = meas, cmd, vel, acc
-    js[:, 0] = vel + 0.1 * np.sin(2 * np.pi * 10 * tt)                # the arm's speed wobbles 0.1 rad/s at 10 Hz
+    js[:, 0] = vel + 0.05 * np.sin(2 * np.pi * 4 * tt) + 0.1 * np.sin(2 * np.pi * 25 * tt)   # 4 Hz (visible) + 25 Hz wobble
     ripple = 0.01 * np.sin(2 * np.pi * 40 * tt)
     jti[:, 0] = 0.1 * acc + ripple
     jtc[:, 0] = 1.0 + jti[:, 0]
@@ -262,11 +295,16 @@ def selftest():
         abs(m["ff_hf"] - want_hf) < 0.1 * want_hf and abs(other_hf - want_hf) > 0.3 * want_hf, (m["ff_hf"], want_hf))
     chk("pid = the drive's extra 0.05 Nm (+ the buzz)", abs(m["pid"] - math.sqrt(0.05 ** 2 + 0.02 ** 2 / 2)) < 0.004,
         m["pid"])
-    k10 = math.degrees(0.1) / math.sqrt(2) * (1 + abs(math.sin(math.pi * 10 * (2 * HF_W + 1) * dt))
-                                                / (math.pi * 10 * (2 * HF_W + 1) * dt))
-    chk(f"meas_vhf = the measured speed's 10 Hz wobble (~{k10:.2f} deg/s); cmd_vhf of the smooth command = only the "
-        f"filter's leak of the 63 deg/s sine (< 0.7 deg/s — the floor of this measure)",
-        abs(m["meas_vhf"] - k10) < 0.15 * k10 and m["cmd_vhf"] < 0.7, (m["meas_vhf"], m["cmd_vhf"], k10))
+    j4, v25 = math.degrees(0.05) / math.sqrt(2), math.degrees(0.1) / math.sqrt(2)
+    chk(f"arm_jerk = the arm's 4 Hz wobble ({j4:.2f} deg/s, within 8 %); arm_vhf = its 25 Hz one ({v25:.2f})",
+        abs(m["arm_jerk"] - j4) < 0.08 * j4 and abs(m["arm_vhf"] - v25) < 0.08 * v25, (m["arm_jerk"], m["arm_vhf"]))
+    chk("the smooth command reads ~0 in both bands (< 0.3 deg/s: the 0.67 Hz sine stays below 1.5 Hz)",
+        m["cmd_jerk"] < 0.3 and m["cmd_vhf"] < 0.3, (m["cmd_jerk"], m["cmd_vhf"]))
+    d0 = dict(d)
+    d0["j_sc"] = np.zeros_like(d["j_sc"])                                 # hard RTI: the published j_sc is 0
+    m0 = analyse(d0, [{"sender": "hard250", "set": "off", "joints": [1], "t0": 1000, "t1": 1000 + n - 1}], dt)
+    chk("a block whose published commanded speed is 0 (hard RTI) is still analysed, the same",
+        len(m0) == 1 and abs(m0[0]["rms_d"] - m["rms_d"]) < 1e-9 and abs(m0[0]["buzz"] - m["buzz"]) < 1e-9, m0)
     chk("set labels: off, stream, off2", label_sets(["off", "stream", "off"]) == ["off", "stream", "off2"])
     sp = np.abs(np.sin(np.linspace(0, 4 * np.pi, 1000)))
     mk = steady_mask(sp)
@@ -376,8 +414,10 @@ def run_session(args, cfg, senders, set_order):
                         raise RuntimeError(f"the robot is in {robot.status().get('mode')}, not {want} — refusing to "
                                            f"run this block under the wrong contract") from None
                     time.sleep(0.4)
-                    sc.apply_config(robot, {"gen": "ruckig_advancing" if soft else "ruckig"})
-                    robot.rti_set_dynamics_ff(set_name)          # after the connect: every RTI entry starts 'off'
+                    # apply_config writes every knob (sticky ones too): the contract's own values, except 'old'
+                    md = (0.0 if set_name == "old" else SOFT_MIN_DURATION) if soft else 0.0
+                    sc.apply_config(robot, {"gen": "ruckig_advancing" if soft else "ruckig", "min_duration": md})
+                    robot.rti_set_dynamics_ff("stream" if set_name == "stream" else "off")   # every RTI entry: 'off'
                     rti.read_once(timeout=2.0)
                     rti.claim()
                     q0 = list(rti.read_once(timeout=1.0)["j_p"])
@@ -471,7 +511,7 @@ def main():
     ap.add_argument("--go", action="store_true", help="actually move the arm")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--senders", default=",".join(SENDERS), help=f"in order, of {list(SENDERS)}")
-    ap.add_argument("--sets", default="off,stream,off", help=f"in order, of {list(SETS)}")
+    ap.add_argument("--sets", default="old,off,stream,off", help=f"in order, of {list(SETS)}")
     ap.add_argument("--joints", default="1", help=f"1-based, of {SAFE_JOINTS1}")
     ap.add_argument("--amp", type=float, default=15.0, help="deg, around where the arm is (at most 20)")
     ap.add_argument("--period", type=float, default=1.5, help="s (at least 1.0)")
