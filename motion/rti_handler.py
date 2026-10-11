@@ -214,8 +214,13 @@ SPAN_MARGIN = 1.75
 # target-velocity estimate between arriving packets, over their interval, smoothed by a critically damped 2nd-order
 # low-pass. Simulated against the torque the commanded motion needs (1.0 = no better than no feedforward): hard RTI
 # 250 Hz 0.12, SOFT_RTI 50 Hz 0.27, wandering 50-60 Hz 0.33, 25 Hz 0.38, 10 Hz 0.69, 5 Hz ~1 (too late to help),
-# ripple <= 0.03 Nm. Opt-in per session (rti_set_dynamics_ff), "off" at every RTI / SOFT_RTI entry.
+# ripple <= 0.03 Nm. Set at every RTI / SOFT_RTI entry to DYNAMICS_FF_DEFAULT; a PC may choose with rti_set_dynamics_ff.
 DYNAMICS_FF_SOURCES = ("off", "stream")
+# "stream" since 2026-10-11 (user: "small gains and no harm - why not on by default"): on the arm (api_tests/68, J1,
+# hard RTI 250 Hz + SOFT_RTI 50 / wandering / 10 Hz) it never raised the buzz or the jerkiness, and cut the tracking
+# error 2-10 % and the drive's own extra torque 4-9 %. Like gravity compensation: on by default, "off" for a PC that
+# computes its own dynamics.
+DYNAMICS_FF_DEFAULT = "stream"
 
 # SOFT_RTI's duration pacing, set at EVERY SOFT_RTI entry (2026-10-11, user; TODO/dynamics_feedforward_plan.md F3). Without
 # it the advancing generator re-plans to each extrapolated target as fast as the RTI limits allow (J1: 32 rad/s^2,
@@ -566,7 +571,7 @@ class RTIModeHandler:
         self._trk_nvcap = np.zeros(joint_num, dtype=np.float64)
         # Stream-acceleration feedforward (see DYNAMICS_FF_SOURCES). All preallocated: _stream_acceleration runs every
         # tick of a position stream.
-        self.dynamics_ff_source = "off"
+        self.dynamics_ff_source = DYNAMICS_FF_DEFAULT
         self._sacc = np.zeros(joint_num, dtype=np.float64)         # the smoothed estimate — what is fed forward
         self._sacc_lp1 = np.zeros(joint_num, dtype=np.float64)     # first low-pass stage
         self._sacc_hold = np.zeros(joint_num, dtype=np.float64)    # the newest packet's raw estimate, held
@@ -1815,8 +1820,8 @@ class RTIModeHandler:
         logger.warning("[RTI] Gravity compensation %s", "ENABLED" if enabled else "DISABLED")
 
     def set_dynamics_ff_source(self, name):
-        """Inertia / Coriolis feedforward source for RTI / SOFT_RTI position streams: "off" (the default at every
-        RTI / SOFT_RTI entry) or "stream" (the stream's own acceleration — see DYNAMICS_FF_SOURCES). The robot-wide
+        """Inertia / Coriolis feedforward source for RTI / SOFT_RTI position streams: "stream" (the stream's own
+        acceleration; DYNAMICS_FF_DEFAULT, set at every RTI / SOFT_RTI entry) or "off". The robot-wide
         inertia / Coriolis switches still apply on top. An unknown name is refused and leaves the source unchanged."""
         key = str(name).strip().lower()
         if key not in DYNAMICS_FF_SOURCES:
@@ -1890,7 +1895,7 @@ class RTIModeHandler:
             self.soft_mode = False
             self._soft_rate_hz = None
             self._soft_refused = 0
-            self.dynamics_ff_source = "off"       # opt-in per session (rti_set_dynamics_ff)
+            self.dynamics_ff_source = DYNAMICS_FF_DEFAULT   # every entry (a PC may choose: rti_set_dynamics_ff)
             self.set_command_timeout(COMMAND_TIMEOUT_S)
             self.set_servo_generator(SERVO_RUCKIG)
             self.set_pace(0.0)
@@ -1920,7 +1925,7 @@ class RTIModeHandler:
         self.soft_mode = True
         self._soft_rate_hz = hz
         self._soft_refused = 0
-        self.dynamics_ff_source = "off"           # opt-in per session (rti_set_dynamics_ff)
+        self.dynamics_ff_source = DYNAMICS_FF_DEFAULT       # every entry (a PC may choose: rti_set_dynamics_ff)
         self.set_min_duration(SOFT_MIN_DURATION_DEFAULT)   # the glide, not the kicks (see the constant)
         if hz is not None:
             self.set_command_timeout(3.0 / hz)

@@ -367,7 +367,8 @@ class RobotClient:
     def rti_set_dynamics_ff(self, source: str) -> None:
         """Inertia / Coriolis feedforward source for RTI / SOFT_RTI POSITION streams: "off" or "stream".
 
-        **"off" at every RTI / SOFT_RTI entry** — set it after `rti_connect`, before claiming. "stream" feeds forward
+        **"stream" at every RTI / SOFT_RTI entry** (since 2026-10-11) — set "off" after `rti_connect`, before claiming,
+        if your PC computes its own dynamics (as with `rti_set_gravity_comp`). "stream" feeds forward
         M(q)·q̈ (+ C(q, q̇)·q̇) from the stream's OWN acceleration: the change of the target velocity between your
         packets over their interval, smoothed (~8 Hz). It helps from ~25 Hz up and is too late to help below ~10 Hz.
         The robot's generator acceleration is never fed forward (it switches between its limits as it chases each

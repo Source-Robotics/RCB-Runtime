@@ -1690,7 +1690,7 @@ def main():
 
     def _handle_rti_set_dynamics_ff(cmd_msg, cmd_dict):
         """rti_set_dynamics_ff:<off|stream> — inertia / Coriolis feedforward source for RTI / SOFT_RTI position
-        streams (default off at every RTI entry; motion/rti_handler.DYNAMICS_FF_SOURCES, 2026-10-11)."""
+        streams (every RTI entry starts with motion/rti_handler.DYNAMICS_FF_DEFAULT, "stream", 2026-10-11)."""
         parts = cmd_msg.split(":", 1)
         if len(parts) == 2:
             rti_handler.set_dynamics_ff_source(parts[1].strip())
