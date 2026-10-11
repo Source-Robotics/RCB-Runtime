@@ -11,6 +11,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from robotclient import RobotClient, CommandRejected, RobotTimeout, RobotError
+from motion.exec_commands import DEFAULT_PROFILE, SUPPORTED_PROFILES
+
+# set_profile() changes the EXECUTOR's default for every client until it restarts (block programs, the dashboard). These
+# tests used to call it with "trapezoid" every run, which quietly undid the ruckig default (2026-10-11). Now the default
+# is the executor's own, set_profile() is called only for an explicit other --profile, and finish() puts it back.
+_profile_changed = False
 
 
 # Canonical start pose for every movement test. Confirmed safe in the workspace
@@ -37,7 +43,9 @@ def parser(description):
     p.add_argument("--sync", action="store_true", help="use RobotClient(sync=True)")
     p.add_argument("--go", action="store_true", help="allow hardware-affecting actions")
     p.add_argument("--speed", type=float, default=10.0, help="joint speed percent")
-    p.add_argument("--profile", default="trapezoid", choices=["trapezoid", "quintic", "s_curve", "toppra"])
+    p.add_argument("--profile", default=DEFAULT_PROFILE, choices=list(SUPPORTED_PROFILES),
+                   help=f"motion profile (default: the EXEC default, {DEFAULT_PROFILE}); another one is set for this "
+                        f"test only")
     p.add_argument("--ik", default="pinocchio", choices=["pinocchio", "rtb"])
     p.add_argument("--timeout", type=float, default=20.0)
     p.add_argument("--assume-ready", action="store_true",
@@ -117,11 +125,18 @@ def _assert_ready(robot):
     return status
 
 
+def _set_profile_for_test(robot, args):
+    global _profile_changed
+    if args.profile != DEFAULT_PROFILE:
+        robot.set_profile(args.profile)
+        _profile_changed = True
+
+
 def prepare_exec(robot, args):
     if getattr(args, "assume_ready", False):
         status = _assert_ready(robot)
         robot.set_joint_speed(args.speed)
-        robot.set_profile(args.profile)
+        _set_profile_for_test(robot, args)
         robot.set_ik_solver(args.ik)
         show("ready", status)
         return
@@ -131,12 +146,21 @@ def prepare_exec(robot, args):
     robot.home(wait=True)
     robot.enter_exec_mode(wait=True)
     robot.set_joint_speed(args.speed)
-    robot.set_profile(args.profile)
+    _set_profile_for_test(robot, args)
     robot.set_ik_solver(args.ik)
     show("prepared", robot.get_status())
 
 
 def finish(robot):
+    global _profile_changed
+    if _profile_changed:
+        try:
+            robot.set_profile(DEFAULT_PROFILE)
+            print(f"EXEC default profile put back to {DEFAULT_PROFILE!r}.")
+            _profile_changed = False
+        except Exception as exc:
+            print(f"!!! could not put the EXEC default profile back to {DEFAULT_PROFILE!r} ({exc}) — restart the "
+                  f"executor (tools/restart_gui_and_executor.sh) before running programs.")
     try:
         show("final status", robot.get_status())
     finally:
