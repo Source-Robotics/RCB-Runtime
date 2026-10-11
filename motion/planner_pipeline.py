@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from motion.exec_commands import normalize_profile_name
+from motion.exec_commands import DEFAULT_PROFILE, normalize_profile_name
 from motion.joint_paths import CORNER_DEVIATION_COEFF
 from motion.trajectory_profiles import (
     plan_joint_move, TrapezoidalProfile, QuinticProfile, SCurveProfile,
@@ -368,7 +368,7 @@ RUCKIG_JERK_FACTOR = 3.0
 class RuckigTimeParameterizer(TimeParameterizer):
     """Ruckig — jerk-limited (3rd-order) point-to-point timing.
 
-    OPT-IN (`profile="ruckig"`); trapezoid remains the default. Genuinely better than
+    The DEFAULT profile since 2026-10-11 (exec_commands.DEFAULT_PROFILE). Genuinely better than
     trapezoid/quintic/s_curve for a plain move: those bound velocity and acceleration but
     let jerk be unbounded (trapezoid steps acceleration instantaneously), while Ruckig
     bounds all three and still lands the endpoint exactly. Measured on the Pi: 0.023 ms to
@@ -647,7 +647,7 @@ class TOPPRATimeParameterizer(TimeParameterizer):
 
 def make_time_parameterizer(profile_name: str, ramp_fraction: float | None = None, jerk_scale: float | None = None,
                             max_jerk: np.ndarray | None = None) -> TimeParameterizer:
-    profile = normalize_profile_name(profile_name or "trapezoid")
+    profile = normalize_profile_name(profile_name or DEFAULT_PROFILE)
     if jerk_scale is not None and profile != "ruckig":
         # Ruckig is the ONLY profile that can honour a jerk limit. trapezoid and toppra STEP
         # acceleration (jerk bounded only by the tick); quintic and s_curve are fixed

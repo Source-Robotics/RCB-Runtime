@@ -23,12 +23,20 @@ _PROFILE_ALIASES = {
     "scurve": "s_curve",
     "smoothstep7": "s_curve",
     "toppra": "toppra",
-    # Ruckig — jerk-limited (3rd-order) POINT-TO-POINT timing. Opt-in; trapezoid stays the
-    # default. Cannot zone-blend (target-following, not path-following) — that is TOPPRA's
+    # Ruckig — jerk-limited (3rd-order) POINT-TO-POINT timing, the DEFAULT since 2026-10-11.
+    # Cannot zone-blend (target-following, not path-following) — that is TOPPRA's
     # lane and always will be. See blending_design.md 10.
     "ruckig": "ruckig",
 }
 SUPPORTED_PROFILES = tuple(dict.fromkeys(_PROFILE_ALIASES.values()))
+
+# The profile of every EXEC move that names none — ONE value, read by command_executor's defaults, the dry run
+# (Plan Preview, the Blocks tab's Check), MotionOptions and the planner's fallbacks, so a preview always plans what the
+# robot runs. "ruckig" since 2026-10-11 (user): on the arm (api_tests/66, J1 at 100 %) the trapezoid's abrupt end of
+# braking left J1 ringing ~0.2 s (overshoot 0.076 deg); ruckig settled at once (0.014 deg) for ~1.6x the move time.
+# `robot.set_profile("trapezoid")` (until the executor restarts) or a per-move profile="trapezoid" brings the old
+# behaviour back. TODO/dynamics_feedforward_plan.md F4.
+DEFAULT_PROFILE = "ruckig"
 
 # The IK "solver" selects the IK ENGINE (and, with it, the FK/Jacobian backend the
 # solve runs on):
@@ -242,7 +250,7 @@ class MotionOptions:
       dry_run: validate/diagnose a queued motion without sending hardware trajectory
     """
 
-    profile: str = "trapezoid"
+    profile: str = DEFAULT_PROFILE
     speed: Optional[float] = None
     accel: Optional[float] = None
     duration: Optional[float] = None

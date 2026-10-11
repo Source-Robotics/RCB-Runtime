@@ -9,7 +9,7 @@ import numpy as np
 
 import config.xml_parser as xml_parser
 from motion.cartesian_paths import pose_from_xyz_rpy
-from motion.exec_commands import MotionOptions, QueuedCommand
+from motion.exec_commands import DEFAULT_PROFILE, MotionOptions, QueuedCommand
 from motion.reachability import find_reachable_clear, make_starts
 from utility.zones import reach_reply, zones_summary
 from motion.trajectory_planner import PlannerError, TrajectoryPlanner
@@ -359,7 +359,7 @@ class DryRunRobotClient(RobotClient):
         self._reported_completion_ids = set()
         self._reported_error_ids = set()
         self._defaults = MotionOptions(
-            profile="trapezoid",
+            profile=DEFAULT_PROFILE,
             speed=100.0,
             blend=0.0,
             blend_mode="exact_velocity",

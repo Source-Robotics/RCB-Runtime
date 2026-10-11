@@ -6,10 +6,12 @@ per joint and speed. Three kinds of set:
   gains          "new" (the XML values) / "old" (the tune before 2026-10-09, read from the "Was: KPP ..." comments in
                  robots/PAR6.xml) — inertia / Coriolis feedforward OFF                                  (step T2)
   feedforward    "off" / "inertia" / "coriolis" / "inertia+coriolis" — the XML gains, the two switches as named (F1)
-  profile        "trapezoid" (what every EXEC move uses unless told otherwise) / "ruckig" (jerk-limited, the full
+  profile        "trapezoid" (the EXEC default until 2026-10-11) / "ruckig" (jerk-limited, the full
                  <exec_limits><jerk> budget) / "s_curve" / "quintic" / "toppra" — the shipped setup (XML gains,
                  inertia + Coriolis feedforward ON), each move planned with that profile (F4, 2026-10-10: J1 rings
                  at ~6 Hz after the trapezoid's abrupt end of braking; a jerk-limited profile should not pluck it)
+The gain and feedforward sets plan every move with profile="trapezoid" — named, not the default: the EXEC default
+became ruckig on 2026-10-11, and their runs before it (all trapezoid) stay comparable with --compare.
 `--compare` puts two saved runs side by side.
 
 WHAT IS MEASURED, per move and joint (error = commanded - measured position, positive = the joint lags behind):
@@ -141,9 +143,9 @@ def apply_set(robot, name, gain_sets):
 
 
 def move_options(set_name, speed):
-    """move_joints options for one move of a set: a profile set plans with its profile; the other sets name none
-    (the planner's default, trapezoid), as every run before 2026-10-10 did."""
-    return {"speed": speed, **({"profile": set_name} if set_name in PROFILE_SETS else {})}
+    """move_joints options for one move of a set: a profile set plans with its profile; the gain / feedforward sets
+    with the trapezoid, NAMED — the default they ran on until it became ruckig (2026-10-11), so their runs compare."""
+    return {"speed": speed, "profile": set_name if set_name in PROFILE_SETS else "trapezoid"}
 
 
 # ----------------------------------------------------------------------------- telemetry capture
@@ -488,9 +490,10 @@ def selftest():
     from motion.exec_commands import SUPPORTED_PROFILES
     chk("profile sets = the planner's SUPPORTED_PROFILES", sorted(PROFILE_SETS) == sorted(SUPPORTED_PROFILES),
         (PROFILE_SETS, SUPPORTED_PROFILES))
-    chk("a profile set plans with its profile; gain / feedforward sets name none (the default, as before)",
+    chk("a profile set plans with its profile; gain / feedforward sets with the trapezoid, named (their old runs)",
         move_options("ruckig", 60.0) == {"speed": 60.0, "profile": "ruckig"}
-        and move_options("inertia", 60.0) == {"speed": 60.0} and move_options("old", 60.0) == {"speed": 60.0},
+        and move_options("inertia", 60.0) == {"speed": 60.0, "profile": "trapezoid"}
+        and move_options("old", 60.0) == {"speed": 60.0, "profile": "trapezoid"},
         (move_options("ruckig", 60.0), move_options("inertia", 60.0)))
 
     class FakeRobot:
@@ -625,10 +628,11 @@ def run_session(args, cfg, gain_sets, set_order):
                 print(f"  {nm:16s} XML gains, inertia + Coriolis feedforward ON, every move planned with profile='{nm}'")
             elif nm in COMP_SETS:
                 i_on, c_on = COMP_SETS[nm]
-                print(f"  {nm:16s} XML gains, inertia feedforward {'ON' if i_on else 'off'}, Coriolis {'ON' if c_on else 'off'}")
+                print(f"  {nm:16s} XML gains, inertia feedforward {'ON' if i_on else 'off'}, Coriolis {'ON' if c_on else 'off'}, "
+                      f"profile='trapezoid'")
             else:
                 print(f"  {nm:16s} " + "  ".join(f"J{j + 1} " + "/".join(f"{gain_sets[nm][j][k]:g}" for k in GAIN_KEYS)
-                                                for j in range(6)) + f"   ({'/'.join(GAIN_KEYS)}), feedforward off")
+                                                for j in range(6)) + f"   ({'/'.join(GAIN_KEYS)}), feedforward off, profile='trapezoid'")
         problems = room_problems(q0, joints1, lo, hi, amps)
         if problems:
             print("\nNOT ENOUGH ROOM from this pose:")

@@ -60,7 +60,7 @@ from utility.payload import check_payload
 from utility.haptic_walls import (damping_ratio_window, effective_inertia_range, joint_drive_torque,
                                   make_effective_inertia, resolve_joint_walls, wall_dynamics_limits, walls_public)
 from motion.exec_commands import (
-    MotionOptions, QueuedCommand, normalize_profile_name, normalize_ik_solver_name,
+    DEFAULT_PROFILE, MotionOptions, QueuedCommand, normalize_profile_name, normalize_ik_solver_name,
 )
 from motion.ik_config import DEFAULT_FK_JACOBIAN_BACKEND
 from utility.activity_log import get_exec_activity_logger, log_activity
@@ -138,7 +138,7 @@ _COMPLETION_POLICY_NAMES = ("commanded", "settled", "strict")
 _COMPLETION_POLICY_SET = set(_COMPLETION_POLICY_NAMES)
 
 _motion_defaults = MotionOptions(
-    profile="trapezoid",
+    profile=DEFAULT_PROFILE,
     speed=100.0,
     blend=0.0,
     blend_mode="exact_velocity",

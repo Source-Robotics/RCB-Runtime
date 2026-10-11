@@ -82,7 +82,7 @@ from spatialmath import SE3
 from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, pack_batch
 from config.networking import ZMQ_EXEC_TRAJECTORY_SOCKET, ZMQ_EXEC_STATUS_SOCKET, ZMQ_CMD_SOCKET
 from motion.exec_commands import (
-    MotionOptions, QueuedCommand, normalize_profile_name, normalize_ik_solver_name,
+    DEFAULT_PROFILE, MotionOptions, QueuedCommand, normalize_profile_name, normalize_ik_solver_name,
     normalize_blend_mode_name,
 )
 from motion.cartesian_paths import (
@@ -416,7 +416,7 @@ class TrajectoryPlanner(Thread):
         self._resync = False
         self._pending_gripper = None  # (cid, deadline) — at most one in-flight target
         self._path_builder = PathBuilder(joint_num)
-        self._time_parameterizer = make_time_parameterizer("trapezoid")
+        self._time_parameterizer = make_time_parameterizer(DEFAULT_PROFILE)
         self._sampler = ExecBatchSampler(joint_num)
         self._blend_buffer = []      # buffered move_joints commands awaiting a
                                       # zone-blend flush — TODO/blending_design.md §5.1
@@ -432,7 +432,7 @@ class TrajectoryPlanner(Thread):
         self._executing_seq = 0
         self._completed_seq = 0
         self._active_command = None
-        self._current_profile = "trapezoid"
+        self._current_profile = DEFAULT_PROFILE
         self._last_error = None
         self._last_diagnostic = None
 
@@ -2248,7 +2248,7 @@ class TrajectoryPlanner(Thread):
         self._executing_seq = seq
         self._active_command = self._cmd_name(cmd)
         options = self._cmd_options(cmd)
-        self._current_profile = normalize_profile_name(options.profile or "trapezoid")
+        self._current_profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
         self._last_diagnostic = None
         log_activity(_activity_logger, "EXEC", "info", "CMD_STARTED",
                      id=self._cmd_id(cmd), command=self._fmt_command(cmd),
@@ -2363,7 +2363,7 @@ class TrajectoryPlanner(Thread):
             return None
 
     def _sample_joint_path(self, path, cid, options, start_vel=None, end_vel=None):
-        profile = normalize_profile_name(options.profile or "trapezoid")
+        profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
         time_parameterizer = make_time_parameterizer(profile, options.ramp_fraction, options.jerk,
                                                      max_jerk=self._max_jerk)
         max_accel = self._max_accel * self._accel_scale_for(options)
@@ -2392,7 +2392,7 @@ class TrajectoryPlanner(Thread):
         is the exit speed this move ends at (0.0 if not blending into a next move);
         the caller applies it to self._last_exit_speed only after confirming the
         batch actually sent, same as self._last_endpoint."""
-        profile = normalize_profile_name(options.profile or "trapezoid")
+        profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
         time_parameterizer = make_time_parameterizer(profile, options.ramp_fraction, options.jerk,
                                                      max_jerk=self._max_jerk)
         path = self._path_builder.joint_line_from_degrees(start, args)
@@ -2418,7 +2418,7 @@ class TrajectoryPlanner(Thread):
             nxt = self._peek_next_command()
             if nxt is not None and self._cmd_name(nxt) == "move_joints":
                 nxt_args = self._cmd_args(nxt)
-                nxt_profile = normalize_profile_name(self._cmd_options(nxt).profile or "trapezoid")
+                nxt_profile = normalize_profile_name(self._cmd_options(nxt).profile or DEFAULT_PROFILE)
                 if nxt_profile == profile and len(nxt_args) >= self.joint_num:
                     nxt_target = np.deg2rad(np.asarray(nxt_args[:self.joint_num], dtype=np.float64))
                     dist_b = nxt_target - target
@@ -3084,7 +3084,7 @@ class TrajectoryPlanner(Thread):
             pos = np.repeat(waypoints[:1], 2, axis=0)
             return self._sampler.sample(TimedJointPath(pos, np.zeros_like(pos), 2))
 
-        profile = normalize_profile_name(options.profile or "trapezoid")
+        profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
         speed_scale = self._cartesian_speed_scale_for(options)
 
         if profile == "toppra":
