@@ -158,7 +158,35 @@ DEFAULT_SOFT_TIMEOUT_CEILING_S = 0.25
 SERVO_RUCKIG = "ruckig"       # point-to-point planner, default, hardware-verified
 SERVO_TRACKER = "tracker"     # servo-style tracking law (the common streaming-servo command), for low-rate streams
 SERVO_ADVANCING = "ruckig_advancing"   # same planner, aimed at where the target IS
-SERVO_GENERATORS = (SERVO_RUCKIG, SERVO_TRACKER, SERVO_ADVANCING)
+SERVO_PASSTHROUGH = "passthrough"      # hard RTI: the PC's stamped samples replayed exactly (2026-10-11)
+SERVO_GENERATORS = (SERVO_RUCKIG, SERVO_TRACKER, SERVO_ADVANCING, SERVO_PASSTHROUGH)
+
+# PASS-THROUGH (hard RTI's generator since 2026-10-11; TODO/servo_mode_options.md §17.21). Hard RTI trailed the PC's
+# targets by 26-41 ms on the arm: plain ruckig plans to STOP at every target (~19 ms on J1) and the drive got no speed
+# (~11 ms) — where a hard real-time interface should add a tick. Industrial 1 kHz interfaces pass the PC's position
+# straight through and derive its speed from the stream. Two findings shaped how we do it (simulated with this handler,
+# PAR6 limits, J1 sine 63 deg/s): (1) a PC that times its targets with its own clock samples them up to ±0.4 ms off the
+# robot's tick grid (measured on the arm: step sizes ±10 %); played as if evenly spaced that is 8-11 deg/s of speed
+# noise — so the samples are REPLAYED by their send times (communication/rti_protocol, 109-byte packets), a small,
+# slowly adapting delay behind the slowest recent delivery; (2) position, speed and acceleration must come from ONE
+# curve (a quadratic through the last three samples) — a straight-line position with a separately estimated speed
+# disagreed by about what a one-tick jerk-limited landing can absorb, and every disagreement cascaded. Per tick Ruckig
+# (time-synchronised, a minimum duration of exactly one tick) lands each joint on its aim when that joint's own fastest
+# landing fits in the tick — the pass-through — and otherwise catches up within the limits (a step, a jump, a dead
+# stop): no joint is slowed by another, nothing coasts past. Simulated: planner lag 18.8 -> 4.0 ms, path error
+# 0.13 -> 0.000 deg (robot-clocked), 4.3-5.8 ms / <= 0.004 deg with ±0.4-2 ms PC jitter, 6 ms / 0.008 deg for an
+# uneven 200-250 Hz sender, drops / late / mixed packets clean, steps never overshoot, soft limits within a / j. The
+# costs: a PC that stops dead at speed overshoots by the braking distance (J1 at 60 deg/s ~1 deg; the old planner
+# trailed by that much all the time), and target noise passes through more (3.5 vs 2.9 deg/s above 10 Hz).
+# A 101-byte packet carries no time: such a stream keeps the old planner exactly (simulated pass-through on arrival
+# ticks with a jittery PC: 13 / 39 deg/s of wobble, 2 deg peaks).
+PT_RING = 8                       # samples kept
+PT_DELAY_DECAY_TICKS = 0.002      # per packet: the slowest recent delivery is forgotten slowly
+PT_DELAY_RATE_TICKS = 0.002       # per tick: the replay delay drifts at most this much (a 0.2 % time warp, in the speed)
+PT_COAST_TICKS = 3.0              # past the newest sample (a dropped / late packet) at most this far, then stop there
+PT_GATE = 1.5                     # a curvature above 1.5x the acceleration limit is a jump: plan to stop on the aim
+PT_MAX_GAP_TICKS = 25.0           # samples further apart (100 ms) or out of order: a new start
+PT_UNSTAMPED_EXIT = 3             # this many packets in a row without a send time: back to the planner
 
 # Streaming contracts (rti_set_profile). Some industrial controllers split these into two interfaces (a hard
 # real-time one and a soft one); we keep one code path and name the contract, because the difference genuinely
@@ -457,6 +485,29 @@ class RTIModeHandler:
         self._rl_tmp_j = np.zeros(joint_num, dtype=np.float64)
         self._rl_out = np.zeros(joint_num, dtype=np.float64)
         self._rl_tgt = np.zeros(joint_num, dtype=np.float64)   # limit-clamped target
+        # Pass-through (SERVO_PASSTHROUGH): the ring of samples (send time in ticks, the PC's position) and scratch.
+        self._pt_s = np.zeros(PT_RING, dtype=np.float64)
+        self._pt_q = np.zeros((PT_RING, joint_num), dtype=np.float64)
+        self._pt_k = 0                    # samples taken since the last start (ring index = k % PT_RING)
+        self._pt_last_tick = -1           # the packet the ring last saw
+        self._pt_nost = 0                 # packets in a row without a send time
+        self._pt_shift = 0.0              # ticks taken off the send times after a jump of the PC's clock
+        self._pt_arrival = 0              # the arrival tick of the newest sample
+        self._pt_L = 0.0                  # replay delay: robot tick - send time (ticks), slewed
+        self._pt_Lt = 0.0                 # ... its target: the slowest recent delivery
+        self._pt_rk_cfg = False           # Ruckig's input set up for the pass-through (sync / duration / target acc)
+        self._pt_fbc = np.zeros(joint_num, dtype=np.float64)
+        self._pt_fab = np.zeros(joint_num, dtype=np.float64)
+        self._pt_fabc = np.zeros(joint_num, dtype=np.float64)
+        self._pt_aim_raw = np.zeros(joint_num, dtype=np.float64)
+        self._pt_aim = np.zeros(joint_num, dtype=np.float64)
+        self._pt_v = np.zeros(joint_num, dtype=np.float64)
+        self._pt_a = np.zeros(joint_num, dtype=np.float64)
+        self._pt_vb = np.zeros(joint_num, dtype=np.float64)
+        self._pt_gate = np.zeros(joint_num, dtype=bool)
+        self._pt_mask = np.zeros(joint_num, dtype=bool)
+        self._pt_ok = np.zeros(joint_num, dtype=bool)
+        self._pt_imd = np.zeros(joint_num, dtype=np.float64)
         # This tick's position bounds: the soft limits widened to wherever the limiter IS, per
         # joint. See _effective_limits().
         self._lim_lo_eff = np.zeros(joint_num, dtype=np.float64)
@@ -843,6 +894,7 @@ class RTIModeHandler:
         self._trk_interval_s = self.delta_t
         self._cmd_ts = self._ts_prev = self._ts_off = _NAN
         self._ts_prev_seq = 0
+        self._pt_reset(current_tick)
         self._reset_stream_acceleration(current_tick)
 
         # Rebuild the low-pass so it seeds from THIS session's first command. The engine
@@ -1039,7 +1091,12 @@ class RTIModeHandler:
         # is what makes the compensation visible in telemetry rather than hidden inside it.
         if ct == CMD_JOINT_POSITION:
             out.pos_rad = self._limit_position(payload, ctx)
-            out.vel_rad = self._feedforward
+            # The drive's speed feedforward. Hard RTI: the GENERATOR's own velocity — what the commanded positions
+            # really move at (2026-10-11). It was the PC's feedforward, which most PCs send as zeros: the drive then
+            # made all the motion from position error alone and trailed its command by 17.5 ms on the arm, against
+            # 6-7 ms in EXEC / SOFT_RTI, which hand it their trajectory's speed. SOFT_RTI keeps the PC's / the
+            # advancing estimate (verified on the arm; ruckig_advancing writes its estimate into _feedforward).
+            out.vel_rad = self._rl_v if (not self.soft_mode and self.rate_limit_enabled) else self._feedforward
             out.trq_nm = self._add_gravity(ctx, None)
             # Source "stream" (opt-in): the STREAM's acceleration is published AND fed forward. Otherwise the
             # generator's (ruckig / ruckig_advancing / tracker) commanded acceleration is PUBLISHED only
@@ -1158,6 +1215,8 @@ class RTIModeHandler:
         # check — hold the last limited position rather than emit an unlimited setpoint.
         if self._rk is None:
             return self._rl_q
+        if self.servo_generator == SERVO_PASSTHROUGH:
+            return self._limit_position_passthrough(q_des, tgt, ctx)
         return self._limit_position_ruckig(tgt, ctx)
 
     def _effective_limits(self):
@@ -1617,6 +1676,224 @@ class RTIModeHandler:
         self._rl_q[:] = out
         return out
 
+    def _pt_reset(self, current_tick):
+        """Empty the pass-through ring (a claim, a generator switch): the next three stamped packets start it again."""
+        self._pt_k = 0
+        self._pt_nost = 0
+        self._pt_shift = 0.0
+        self._pt_last_tick = current_tick
+        self._pt_restore_rk()
+
+    def _pt_restore_rk(self):
+        """Give Ruckig's input back to the planner path (its own synchronisation / duration logic, no target
+        acceleration) — once, when the pass-through hands over."""
+        if not self._pt_rk_cfg or self._rk is None:
+            return
+        inp = self._rk_in
+        inp.synchronization = Synchronization.Time if self.min_duration_mult > 0.0 else Synchronization.No
+        inp.minimum_duration = 0.0
+        self._min_dur_applied = False          # the planner re-applies its pacing itself, when there is one
+        inp.target_acceleration = self._zeros
+        self._pt_rk_cfg = False
+
+    def _pt_brake(self):
+        """The PC went silent past the coasting: every joint brakes straight to rest, time-optimally within its
+        limits. Not back to where the coasting ended — the joint has already passed it, and aiming there made it
+        brake, turn and come back (simulated: then cut short by the link-loss hold). The speed never exceeded what
+        each joint can stop from before its soft limit (the braking curve in the pass-through), so this stop is clear
+        of the limits; the clamp below is the backstop."""
+        inp = self._rk_in
+        inp.control_interface = ControlInterface.Velocity
+        inp.synchronization = Synchronization.No       # each joint's own shortest stop, none stretched by another
+        inp.minimum_duration = 0.0
+        inp.current_position = self._rl_q
+        inp.current_velocity = self._rl_v
+        inp.current_acceleration = self._rl_a
+        inp.target_velocity = self._zeros
+        inp.target_acceleration = self._zeros
+        try:
+            self._rk.update(inp, self._rk_out)
+            failed = False
+        except Exception:
+            failed = True
+        inp.control_interface = ControlInterface.Position
+        self._pt_rk_cfg = False                        # the next pass-through tick sets its own settings again
+        if failed:
+            self._rk_errors += 1
+            return self._rl_q
+        out = self._rl_out
+        out[:] = self._rk_out.new_position
+        self._rl_v[:] = self._rk_out.new_velocity
+        self._rl_a[:] = self._rk_out.new_acceleration
+        np.clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
+        self._rl_q[:] = out
+        return out
+
+    def _limit_position_passthrough(self, q_des, tgt, ctx):
+        """Hard RTI's generator (see SERVO_PASSTHROUGH / PT_*): the PC's stamped samples replayed a small adaptive
+        delay behind their send times, on a quadratic through the last three, each joint landing exactly on it when
+        its own one-tick landing is within the limits, else catching up. `q_des` the PC's target (unclamped: the
+        curve is the PC's), `tgt` the same clamped. Until three stamped samples are in — and for a stream without
+        send times — the plain ruckig tick, exactly as before."""
+        self._update_target_velocity(tgt)                  # the stream's velocity / interval: the stream feedforward
+        dt = self.delta_t
+        if self.last_cmd_tick != self._pt_last_tick:       # a new packet
+            self._pt_last_tick = self.last_cmd_tick
+            if self._cmd_ts == self._cmd_ts:
+                self._pt_nost = 0
+                s = self._cmd_ts / dt - self._pt_shift
+                k = self._pt_k
+                if k > 0:
+                    s_prev = self._pt_s[(k - 1) % PT_RING]
+                    ds = s - s_prev
+                    if not (0.0 < ds <= PT_MAX_GAP_TICKS):
+                        arr_gap = self.last_cmd_tick - self._pt_arrival
+                        if 0 < arr_gap <= PT_MAX_GAP_TICKS:
+                            # The PC's CLOCK jumped (the packets kept coming): carry its timeline on at the arrival
+                            # spacing. A restart would hand two ticks to the planner, which brakes — ~1 deg lost at
+                            # 60 deg/s (simulated).
+                            self._pt_shift += ds - arr_gap
+                            s = s_prev + arr_gap
+                        else:
+                            k = 0                          # a silence: start again from this sample
+                self._pt_arrival = self.last_cmd_tick
+                i = k % PT_RING
+                self._pt_s[i] = s
+                self._pt_q[i] = q_des
+                self._pt_k = k + 1
+                delay = self.last_cmd_tick - s
+                if k == 0:
+                    self._pt_L = self._pt_Lt = delay
+                elif delay > self._pt_Lt - PT_DELAY_DECAY_TICKS:
+                    self._pt_Lt = delay
+                else:
+                    self._pt_Lt -= PT_DELAY_DECAY_TICKS
+            else:
+                # A position without a time: skipped (the replay coasts over it like a dropped packet); a stream
+                # that stops sending times goes back to the planner.
+                self._pt_nost += 1
+                if self._pt_nost >= PT_UNSTAMPED_EXIT:
+                    self._pt_k = 0
+        k = self._pt_k
+        if k < 3:
+            self._pt_restore_rk()
+            return self._limit_position_ruckig(tgt, ctx)
+
+        # The replay clock: L moves toward the slowest recent delivery at most PT_DELAY_RATE_TICKS per tick; the
+        # time warp it makes is in the target speed (warp) so position and speed stay one curve.
+        dl = self._pt_Lt - self._pt_L
+        if dl > PT_DELAY_RATE_TICKS:
+            dl = PT_DELAY_RATE_TICKS
+        elif dl < -PT_DELAY_RATE_TICKS:
+            dl = -PT_DELAY_RATE_TICKS
+        self._pt_L += dl
+        warp = 1.0 - dl
+        r = ctx.current_tick - self._pt_L
+
+        # The segment [B, C] holding r (newest first; past the newest -> the newest segment), A the sample before B.
+        n = k if k < PT_RING else PT_RING
+        seg = n - 2
+        for j in range(n - 1):
+            if self._pt_s[(k - 2 - j) % PT_RING] <= r:
+                seg = j
+                break
+        i_c = (k - 1 - seg) % PT_RING
+        i_b = (k - 2 - seg) % PT_RING
+        t_b = self._pt_s[i_b]
+        t_c = self._pt_s[i_c]
+        coast = PT_COAST_TICKS
+        if r > t_c + coast:
+            return self._pt_brake()
+        rr = t_b if r < t_b else r
+        fbc, fab, fabc = self._pt_fbc, self._pt_fab, self._pt_fabc
+        np.subtract(self._pt_q[i_c], self._pt_q[i_b], out=fbc)
+        fbc *= 1.0 / (t_c - t_b)                            # rad per tick
+        gate = self._pt_gate
+        if seg + 2 < n:
+            i_a = (k - 3 - seg) % PT_RING
+            t_a = self._pt_s[i_a]
+            np.subtract(self._pt_q[i_b], self._pt_q[i_a], out=fab)
+            fab *= 1.0 / (t_b - t_a)
+            np.subtract(fbc, fab, out=fabc)
+            fabc *= 1.0 / (t_c - t_a)                       # half the curvature, rad per tick^2
+            np.abs(fabc, out=self._pt_vb)
+            self._pt_vb *= 2.0 / (dt * dt)
+            np.less_equal(self._pt_vb, PT_GATE * self.accel_limit, out=gate)
+        else:
+            gate[:] = False
+        np.multiply(fabc, gate, out=fabc)                  # a jump: the straight segment, stop on it
+
+        aim_raw, aim, v, a = self._pt_aim_raw, self._pt_aim, self._pt_v, self._pt_a
+        # p(rr) = q_B + f_BC (rr - t_B) + f_ABC (rr - t_B)(rr - t_C);  p' and p'' with the warp
+        np.multiply(fabc, (rr - t_b) * (rr - t_c), out=aim_raw)
+        np.multiply(fbc, rr - t_b, out=v)                  # v as scratch
+        aim_raw += v
+        aim_raw += self._pt_q[i_b]
+        np.multiply(fabc, 2.0 * rr - t_b - t_c, out=v)
+        v += fbc
+        v *= warp / dt
+        np.multiply(fabc, 2.0 * warp * warp / (dt * dt), out=a)
+        np.multiply(v, gate, out=v)
+        # Never past a soft limit: the aim clamped (and its speed 0 there), and the speed never more than the joint
+        # can still stop from before its limit.
+        np.clip(aim_raw, self._lim_lo_eff, self._lim_hi_eff, out=aim)
+        np.not_equal(aim, aim_raw, out=self._pt_mask)
+        np.copyto(v, 0.0, where=self._pt_mask)
+        np.copyto(a, 0.0, where=self._pt_mask)
+        self._pt_vb[:] = v
+        self._brake_at_limits(self._pt_vb, aim)
+        np.not_equal(self._pt_vb, v, out=self._pt_mask)
+        np.copyto(a, 0.0, where=self._pt_mask)
+        v[:] = self._pt_vb
+        np.clip(a, -self.accel_limit, self.accel_limit, out=a)
+
+        inp = self._rk_in
+        vcap = self._tcp_velocity_budget(aim, ctx)
+        vcap = self._auto_pace_budget(vcap)
+        if vcap is not self.vel_limit:
+            inp.max_velocity = vcap
+            self._tcp_cap_applied = True
+        elif self._tcp_cap_applied:
+            inp.max_velocity = self.vel_limit
+            self._tcp_cap_applied = False
+        np.clip(v, -vcap, vcap, out=v)
+        # Every tick, not once: a setter (rti_set_min_duration, sent by every servo test's config) may have changed
+        # them since — and under Synchronization.No the one-tick minimum duration does not hold (each joint would land
+        # early and coast past its aim).
+        inp.synchronization = Synchronization.Time
+        inp.minimum_duration = dt
+        self._pt_rk_cfg = True
+        inp.current_position = self._rl_q
+        inp.current_velocity = self._rl_v
+        inp.current_acceleration = self._rl_a
+        inp.target_position = aim
+        inp.target_velocity = v
+        inp.target_acceleration = a
+        try:
+            self._rk.update(inp, self._rk_out)
+        except Exception:
+            self._rk_errors += 1
+            if self._rk_errors == 1:
+                logger.error("[RTI] Ruckig rejected a setpoint (non-finite command?) — "
+                             "holding position. Further occurrences are counted, not logged.")
+            return self._rl_q
+        out = self._rl_out
+        out[:] = self._rk_out.new_position
+        self._rl_v[:] = self._rk_out.new_velocity
+        self._rl_a[:] = self._rk_out.new_acceleration
+        if self._rk_out.trajectory.duration > dt * (1.0 + 1e-9):
+            # Some joint cannot land in one tick (a jump, a dead stop, a speed cap): the shared plan is that joint's
+            # catch-up — every joint whose OWN landing fits still lands exactly on its aim (no joint slows another).
+            self._pt_imd[:] = self._rk_out.trajectory.independent_min_durations
+            np.less_equal(self._pt_imd, dt * (1.0 + 1e-9), out=self._pt_ok)
+            ok = self._pt_ok
+            np.copyto(out, aim, where=ok)
+            np.copyto(self._rl_v, v, where=ok)
+            np.copyto(self._rl_a, a, where=ok)
+        np.clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
+        self._rl_q[:] = out
+        return out
+
     def _vstop_into(self, d, out):
         """out[:] = fastest speed from which each joint can still stop within distance d.
 
@@ -1931,8 +2208,9 @@ class RTIModeHandler:
         compensation and start-pose validation are the same code in both. What differs is
         only the streaming contract, and it is all set here:
 
-            RTI       the PC closes the loop, one setpoint per tick. 40 ms watchdog,
-                      point-to-point Ruckig, no pacing. Hardware-verified.
+            RTI       the PC closes the loop, one setpoint per tick. 40 ms watchdog, the
+                      pass-through (stamped targets replayed one tick behind; a stream without
+                      send times gets the point-to-point Ruckig planner, as before 2026-10-11).
             SOFT_RTI  the PC sends targets at its own rate and the robot fills in between
                       them. Timeout sized from the rate, ruckig_advancing (best measured
                       accuracy, §13.6), pacing left to the operator.
@@ -1951,7 +2229,7 @@ class RTIModeHandler:
             self._soft_refused = 0
             self.dynamics_ff_source = DYNAMICS_FF_DEFAULT   # every entry (a PC may choose: rti_set_dynamics_ff)
             self.set_command_timeout(COMMAND_TIMEOUT_S)
-            self.set_servo_generator(SERVO_RUCKIG)
+            self.set_servo_generator(SERVO_PASSTHROUGH)     # the old planner for 101-byte streams (2026-10-11)
             self.set_pace(0.0)
             self.set_min_duration(0.0)
             self._state_every = 1     # hard RTI closes the loop per tick; it needs every one
@@ -2200,6 +2478,10 @@ class RTIModeHandler:
             logger.warning("[RTI] Servo generator refused: %r is not one of %s",
                            name, ", ".join(SERVO_GENERATORS))
             return
+        if key == SERVO_PASSTHROUGH and self.soft_mode:
+            logger.warning("[RTI] Servo generator 'passthrough' refused in SOFT_RTI: it replays a target EVERY tick "
+                           "(hard RTI); sparse targets need a generator that fills in between them.")
+            return
         if key == SERVO_TRACKER and self.rate_limit_enabled is False:
             logger.warning("[RTI] Servo generator 'tracker' selected while the rate limiter "
                            "is OFF — the limiter-off path streams commands through "
@@ -2257,6 +2539,7 @@ class RTIModeHandler:
 
         self._refresh_tracker_constants()
         self.servo_generator = key
+        self._pt_reset(self.last_cmd_tick)
         if key == SERVO_TRACKER:
             logger.warning("[RTI] Servo generator -> TRACKER (gain %.2f rad/s, lookahead "
                            "%.4f s). A servo law, not a planner: prefer 'ruckig' for "
@@ -2265,8 +2548,11 @@ class RTIModeHandler:
         elif key == SERVO_ADVANCING:
             logger.warning("[RTI] Servo generator -> RUCKIG_ADVANCING (planner aimed at the "
                            "moving target; exact arrival kept, ripple removed)")
+        elif key == SERVO_PASSTHROUGH:
+            logger.warning("[RTI] Servo generator -> PASSTHROUGH (hard RTI's default: stamped targets replayed "
+                           "exactly, ~1 tick; a stream without send times keeps the planner)")
         else:
-            logger.warning("[RTI] Servo generator -> RUCKIG (the default)")
+            logger.warning("[RTI] Servo generator -> RUCKIG (plans to stop at every target)")
 
     def timeout_ceiling(self):
         """The most the watchdog may be set to RIGHT NOW, in seconds.
