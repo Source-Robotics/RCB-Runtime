@@ -346,7 +346,8 @@ MIN_VEL_SCALE = 0.01
 # and 6.4 ms of added lag is a real cost to hand it by
 # default. So: opt-in, with the two features that actually prevent damage (rate limiter,
 # start-pose check) left ON. Revisit if a real command stream turns out to need it.
-DEFAULT_LOWPASS_CUTOFF_HZ = 25.0
+DEFAULT_LOWPASS_CUTOFF_HZ = 25.0   # (informational; the filter is a 2nd-order Butterworth since 2026-10-11 —
+                                  #  for hard RTI's strict checks 60 Hz (+3 ms) is the better start, §17.22)
 
 # Bandwidth is accumulated per tick and converted to a rate once per window. One second
 # matches the GUI's refresh, so the displayed number is a real second of traffic rather
@@ -3041,13 +3042,13 @@ class RTIModeHandler:
             self._lp_cutoff_hz = 0.0
             return
 
-        # First-order IIR == the engine's "ema", parameterised by time constant.
-        # The cutoff form, gain = dt/(dt + 1/(2*pi*fc)), is the same filter written as a
-        # per-tick alpha; tau = 1/(2*pi*fc) is that same pole as a time constant, which is
-        # what this codebase's filter config uses so a cutoff means the same thing at any
-        # loop rate.
+        # A 2nd-order Butterworth (the engine's "butter2"; tau = 1/(2*pi*fc), what this codebase's filter config
+        # uses so a cutoff means the same thing at any loop rate). Was the first-order "ema" until 2026-10-11: with the
+        # strict checks (target noise reads as acceleration) the Butterworth buys the most noise tolerance per ms of
+        # lag — J1, simulated: 60 Hz +3.0 ms -> 3x the tolerated noise (0.010 deg), 40 Hz +5.25 ms -> ~6x; the
+        # first-order 25 Hz cost +4.5 ms for 3x (TODO/servo_mode_options.md §17.22, user). Default stays OFF.
         tau = 1.0 / (2.0 * np.pi * cutoff)
-        self._lp_bank = create_filter_bank({"kind": "ema", "tau": tau}, self.joint_num,
+        self._lp_bank = create_filter_bank({"kind": "butter2", "tau": tau}, self.joint_num,
                                            self.delta_t)
         self._lp_cutoff_hz = cutoff
         logger.warning("[RTI] Command low-pass ENABLED at %.1f Hz (tau %.4f s)", cutoff, tau)

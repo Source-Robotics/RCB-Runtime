@@ -284,12 +284,13 @@ class RobotClient:
         genuine noise in your own command stream. For a sparse stream use
         `rti_set_min_duration` instead -- it was the entire Pareto frontier in that test.
 
-        A one-pole low-pass, defaulted OFF. Scaling the usual "cutoff at 10% of the
-        control rate" convention to our loop puts it at 25 Hz, whose time constant
-        (6.4 ms) is ~4x the absolute phase lag it would cost on a 1 kHz controller
-        (1.6 ms) purely because our loop runs at 250 Hz — a real cost to hand an
-        external control loop without being asked. Enable it if your command stream is
-        noisy; 25 Hz is the rate-matched starting point.
+        A 2nd-order Butterworth (since 2026-10-11; a one-pole filter before), defaulted
+        OFF: a computed trajectory has no noise and pays nothing. In hard RTI your stream
+        is checked for impossible motion, and noise reads as acceleration — about 0.003 deg
+        of white noise per sample already risks RTI_ACCELERATION_LIMIT on J1. What a
+        cutoff costs and buys there (simulated, J1): 100 Hz +1.0 ms, tolerates 0.005 deg;
+        60 Hz +3.0 ms, 0.010 deg; 40 Hz +5.3 ms, ~0.017 deg; 25 Hz +8.8 ms, 0.030 deg. Enable it if your command stream is
+        noisy; 60 Hz is a good start.
         """
         self._immediate("rti_set_lowpass", [float(cutoff_hz)])
 
