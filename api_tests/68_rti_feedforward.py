@@ -410,12 +410,15 @@ def stream_block_rc(rti, q0, joints0, amp, period, seconds):
 
 
 def stream_block(rti, q0, joints0, amp, period, lo, hi, seconds, rng):
-    """Still, the faded sine, still — sent at lo..hi Hz (each interval drawn from [1/hi, 1/lo])."""
+    """Still, the faded sine, still — sent at lo..hi Hz (each interval drawn from [1/hi, 1/lo]). Each target is stamped
+    with the very clock reading it was computed from (perf_counter): a stamp taken later, at the send, is off by any
+    hiccup in between (a garbage-collection pause), which a hard-RTI stream's strict checks read as an acceleration
+    jump (~137 rad/s^2 for 1 ms at 63 deg/s). With timestamps off the client ignores it."""
     total = STILL_S + seconds + STILL_S
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
     nxt = t0
     while True:
-        now = time.monotonic()
+        now = time.perf_counter()
         t = now - t0
         if t >= total:
             break
@@ -423,9 +426,9 @@ def stream_block(rti, q0, joints0, amp, period, lo, hi, seconds, rng):
         off = offset(t - STILL_S, seconds, amp, period)
         for j in joints0:
             q[j] = q0[j] + off
-        rti.send_joint_position(q)
+        rti.send_joint_position(q, timestamp=now)
         nxt += 1.0 / rng.uniform(lo, hi)
-        slp = nxt - time.monotonic()
+        slp = nxt - time.perf_counter()
         if slp > 0:
             time.sleep(slp)
 

@@ -470,8 +470,11 @@ class RTIClient:
 
     def send_joint_position(self, positions: Sequence[float], feedforward_speed: Sequence[float] | None = None,
                             timestamp: float | None = None) -> None:
-        """`timestamp`: when this target was taken, in seconds of a monotonic clock (default: now) — UDP with
-        `timestamps` on only."""
+        """`timestamp`: the time this target is FOR, in seconds of a monotonic clock — UDP with `timestamps` on
+        only. Default: now, at the send. Better: read the clock once, compute the target from that reading and pass the
+        same reading (`t = time.perf_counter(); send_joint_position(f(t), timestamp=t)`): a hiccup between computing
+        and sending (a garbage-collection pause) otherwise looks like a jump, and in hard RTI the robot refuses a
+        stream whose speed / acceleration jump beyond the joint limits (RTI_ACCELERATION_LIMIT)."""
         self._send(CMD_JOINT_POSITION, positions, feedforward_speed or [0.0] * 6, timestamp)
 
     def send_joint_velocity(self, velocities: Sequence[float], feedforward_torque: Sequence[float] | None = None) -> None:
