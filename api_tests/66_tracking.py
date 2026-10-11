@@ -68,19 +68,17 @@ import argparse
 import json
 import os
 import re
-import socket
 import sys
-import threading
 import time
 
 import numpy as np
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
-from robotclient.rti_client import parse_state_packet                 # noqa: E402
+from _tracking_common import (Capture, to_arrays, best_delay, robot_enabled, TELEMETRY_PORT,  # noqa: E402,F401
+                              NEED, OPTIONAL, DELAY_MAX_S, DELAY_STEP_S, DELAY_COARSE_S)
 
 RECIPE = "tracking"
-TELEMETRY_PORT = 30003            # config/networking.py TELEMETRY_PORT (the import would pull in zmq setup)
 GAIN_KEYS = ("KPP", "KPV", "KIV", "KIIQ", "KPIQ")
 DEFAULT_AMP = {1: 20.0, 2: 10.0, 3: 15.0, 4: 30.0, 5: 30.0, 6: 45.0}
 DEFAULT_SPEEDS = (10.0, 30.0, 60.0, 100.0)
@@ -91,13 +89,10 @@ MOVING = 1e-3                     # rad/s — a commanded speed above this is "m
 ACC_FRACTION = 0.1                # |commanded accel| above this x the move's peak counts as accelerating / decelerating
 SETTLE_DEG = 0.05
 FINAL_S = 0.1
-NEED = ("j_p", "j_pc", "j_s", "j_sc", "j_ac", "j_t", "j_tc", "tick")
-OPTIONAL = ("j_t_inertia", "j_t_coriolis")      # 2026-10-10; zeros in runs recorded before them
 COMP_SETS = {"off": (False, False), "inertia": (True, False), "coriolis": (False, True), "inertia+coriolis": (True, True)}
 PROFILE_SETS = ("trapezoid", "ruckig", "s_curve", "quintic", "toppra")     # motion/exec_commands.SUPPORTED_PROFILES
 POST_S = 0.3                                    # the window after the stop that 'post' measures (J1 rings ~0.3 s)
 START_S = 0.04                                  # "from rest": the first 40 ms of a move
-DELAY_MAX_S, DELAY_STEP_S, DELAY_COARSE_S = 0.020, 0.00025, 0.001   # the time shift searched for each move
 METRICS = ("rms", "peak", "acc", "cru", "dec", "lag", "overshoot", "settle_ms", "final", "pid", "others", "vpeak",
            "delay_ms", "rms_d", "peak_d", "d_acc", "d_dec", "d_start", "ff", "post", "dur_ms")
 
@@ -149,62 +144,6 @@ def move_options(set_name, speed):
 
 
 # ----------------------------------------------------------------------------- telemetry capture
-class Capture:
-    """Receives the robot's per-tick telemetry broadcast on this machine."""
-    def __init__(self, port=TELEMETRY_PORT):
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(("0.0.0.0", port))
-        self._sock.settimeout(0.2)
-        self.packets = []
-        self._run = True
-        self._t = threading.Thread(target=self._loop, daemon=True)
-        self._t.start()
-
-    def _loop(self):
-        while self._run:
-            try:
-                data, _ = self._sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-            self.packets.append(data)
-
-    def last_tick(self):
-        """The newest tick received (scans back past packets of another recipe)."""
-        for raw in reversed(self.packets[-50:]):
-            try:
-                r = parse_state_packet(raw.decode())
-            except Exception:
-                continue
-            if "tick" in r and "j_ac" in r:
-                return int(r["tick"])
-        return None
-
-    def stop(self):
-        self._run = False
-        self._t.join(timeout=1.0)
-        self._sock.close()
-
-
-def to_arrays(packets, joint_num=6):
-    """Raw packets -> arrays ordered by tick, duplicates and packets of another recipe dropped."""
-    rows = {}
-    for raw in packets:
-        try:
-            r = parse_state_packet(raw.decode() if isinstance(raw, bytes) else raw)
-        except Exception:
-            continue
-        if all(k in r for k in NEED):
-            rows[int(r["tick"])] = r
-    ticks = sorted(rows)
-    out = {"tick": np.array(ticks, dtype=np.int64),
-           "mode": np.array([str(rows[t].get("mode", "")) for t in ticks])}
-    for k in NEED[:-1] + OPTIONAL:
-        out[k] = np.array([np.resize(np.asarray(rows[t].get(k, 0.0), float), joint_num) for t in ticks]) if ticks \
-            else np.zeros((0, joint_num))
-    return out
-
-
 # ----------------------------------------------------------------------------- analysis (pure)
 def segment(d, t0, t1):
     m = (d["tick"] >= t0) & (d["tick"] <= t1)
@@ -255,26 +194,6 @@ def move_metrics(s, j, direction, dt):
             "dec": rms(dec), "lag": float(along[cru].mean()) if cru.any() else None, "overshoot": over,
             "settle_ms": settle, "final": float(err[-nfin:].mean()), "pid": float(np.sqrt(np.mean(pid[moving] ** 2))),
             "others": oth, "vpeak": float(np.degrees(np.abs(sc).max()))}
-
-
-def best_delay(t, cmd, meas, mask):
-    """The shift D (0..DELAY_MAX_S) minimising the RMS of cmd(t - D) - meas(t) over `mask`, and that residual (deg).
-    Coarse 1 ms grid, then the 0.25 ms grid within +/-0.75 ms of the coarse best: 28 evaluations instead of 81 (the
-    full grid made the analysis heavy enough to slow RTI's loop, 2026-10-10)."""
-    tm, mm = t[mask], meas[mask]
-    best = [np.inf, 0.0, None]
-
-    def try_at(D):
-        r = np.degrees(np.interp(tm - D, t, cmd) - mm)
-        e = float(np.mean(r ** 2))
-        if e < best[0]:
-            best[:] = [e, float(D), r]
-    for D in np.arange(0.0, DELAY_MAX_S + 1e-12, DELAY_COARSE_S):
-        try_at(D)
-    c = best[1]
-    for D in np.arange(max(0.0, c - 0.00075), min(DELAY_MAX_S, c + 0.00075) + 1e-12, DELAY_STEP_S):
-        try_at(D)
-    return best[1], best[2]
 
 
 def analyse(d, records, dt):
@@ -791,20 +710,6 @@ def main():
               f"  cd ~/Desktop/RCB-Runtime && .venv/bin/python api_tests/66_tracking.py --reanalyse {rel}.json")
         return rc
     return analyse_saved(base + ".json") or rc
-
-
-def robot_enabled(host, port):
-    """True / False from the executor's status(); None when it cannot be reached (an analysis on another machine)."""
-    try:
-        from robotclient import RobotClient
-        r = RobotClient(sync=False)
-        r.connect(host, port)
-        try:
-            return r.status().get("state") == "ENABLED"
-        finally:
-            r.disconnect()
-    except Exception:
-        return None
 
 
 def analyse_saved(json_path):
