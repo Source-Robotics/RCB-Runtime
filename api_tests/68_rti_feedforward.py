@@ -8,12 +8,14 @@ between packets over their interval, smoothed at 8 Hz. Simulated against the tor
 (1.0 = no better than none): hard RTI 250 Hz 0.12, SOFT_RTI 50 Hz 0.27, wandering 50-60 Hz 0.33, 10 Hz 0.69.
 This test measures it. Every SENDER runs every SET in turn:
 
-  senders  hard250 (hard RTI, a command every tick) / hard250v (the same + the PC's own velocity as feedforward: the
-           generator need not plan to stop at each target — the 26-41 ms lag explained 2026-10-11, simulated 0 ms) /
-           soft50 (SOFT_RTI 50 Hz) / wander (SOFT_RTI, 50-60 Hz wandering, like a VR device) / wander_ts (the same
-           with each packet's SEND TIME — simulated 15x less fast chatter, TODO/servo_mode_options.md §17.20) /
-           soft10 (SOFT_RTI 10 Hz). Only wander_ts sends send times (the client's default since 2026-10-11): the
-           others stay comparable with the runs before it.
+  senders  hard250 (hard RTI, a command every tick, 101-byte packets: the planner that stops at every target — the
+           26-41 ms lag of the earlier runs; the drive now gets the generator's speed) / hard250_ts (the same PC loop
+           with SEND TIMES: hard RTI's pass-through, TODO/servo_mode_options.md §17.21 — simulated 4-6 ms) /
+           hard250_rc (ROBOT-clocked: RTIClient.control() answers every state packet with a target computed from the
+           robot's time — the pass-through on the tick grid, simulated exactly one tick) / soft50 (SOFT_RTI 50 Hz) /
+           wander (SOFT_RTI, 50-60 Hz wandering, like a VR device) / wander_ts (the same with send times — simulated
+           15x less fast chatter, §17.20) / soft10 (SOFT_RTI 10 Hz). Only the _ts / _rc senders send times (the
+           client's default since 2026-10-11): the others stay comparable with the runs before it.
   sets     old / off / stream (default order old,off,stream,off — the second off checks the measurement repeats)
            old     SOFT_RTI as it was until 2026-10-11: duration pacing 0 (the jerky kicks); feedforward off
            off     the shipped setup: SOFT_RTI's duration pacing default (1.5 intervals), feedforward off
@@ -58,7 +60,7 @@ so put the arm where J1 has room (the start pose of the other tests: J1 90 deg).
     python3 api_tests/68_rti_feedforward.py                      # dry run: the plan
     python3 api_tests/68_rti_feedforward.py --go                 # ~4 min, J1
     python3 api_tests/68_rti_feedforward.py --go --senders soft50,wander --sets off,stream
-    python3 api_tests/68_rti_feedforward.py --go --senders wander,wander_ts,hard250,hard250v --sets off,stream,off
+    python3 api_tests/68_rti_feedforward.py --go --senders hard250,hard250_ts,hard250_rc,wander,wander_ts --sets off,stream,off
     python3 api_tests/68_rti_feedforward.py --reanalyse temp_data/rti_ff/<time>.json   # with the arm DISABLED
 
 As api_tests/66: the RAW packets are saved the moment the run ends; with the arm still ENABLED the analysis waits
@@ -79,9 +81,10 @@ sys.path.insert(0, _ROOT)
 from _tracking_common import Capture, to_arrays, best_delay, robot_enabled  # noqa: E402
 
 RECIPE = "tracking"
-SENDERS = {                       # name: (lo Hz, hi Hz, soft, send times, the PC's velocity)
+SENDERS = {                       # name: (lo Hz, hi Hz, soft, send times, robot-clocked)
     "hard250": (250.0, 250.0, False, False, False),
-    "hard250v": (250.0, 250.0, False, False, True),
+    "hard250_ts": (250.0, 250.0, False, True, False),
+    "hard250_rc": (250.0, 250.0, False, True, True),
     "soft50": (50.0, 50.0, True, False, False),
     "wander": (50.0, 60.0, True, False, False),
     "wander_ts": (50.0, 60.0, True, True, False),
@@ -383,9 +386,31 @@ def selftest():
 
 
 # ----------------------------------------------------------------------------- robot session
-def stream_block(rti, q0, joints0, amp, period, lo, hi, seconds, rng, pc_velocity=False):
-    """Still, the faded sine, still — sent at lo..hi Hz (each interval drawn from [1/hi, 1/lo]); with `pc_velocity`
-    the sine's own velocity goes along as the feedforward (central difference over 0.1 ms)."""
+def stream_block_rc(rti, q0, joints0, amp, period, seconds):
+    """The same motion ROBOT-clocked: RTIClient.control() answers every state packet with the target at the robot's
+    time (state.elapsed = tick x tick_s), stamped with it — on the robot's tick grid exactly. Falls back to the PC's
+    clock (said once) when the robot publishes no tick length."""
+    from robotclient.rti_client import JointPositionCommand
+    total = STILL_S + seconds + STILL_S
+    told = []
+
+    def cb(state):
+        if not state.robot_time and not told:
+            told.append(1)
+            print("(no robot time: PC clock) ", end="", flush=True)
+        t = state.elapsed
+        q = list(q0)
+        off = offset(t - STILL_S, seconds, amp, period)
+        for j in joints0:
+            q[j] = q0[j] + off
+        if t >= total:
+            rti._running = False                          # this reply is the last: control() returns after sending it
+        return JointPositionCommand(q)
+    rti.control(cb)
+
+
+def stream_block(rti, q0, joints0, amp, period, lo, hi, seconds, rng):
+    """Still, the faded sine, still — sent at lo..hi Hz (each interval drawn from [1/hi, 1/lo])."""
     total = STILL_S + seconds + STILL_S
     t0 = time.monotonic()
     nxt = t0
@@ -398,11 +423,7 @@ def stream_block(rti, q0, joints0, amp, period, lo, hi, seconds, rng, pc_velocit
         off = offset(t - STILL_S, seconds, amp, period)
         for j in joints0:
             q[j] = q0[j] + off
-        vel = None
-        if pc_velocity:
-            v = (offset(t - STILL_S + 1e-4, seconds, amp, period) - offset(t - STILL_S - 1e-4, seconds, amp, period)) / 2e-4
-            vel = [v if j in joints0 else 0.0 for j in range(len(q))]
-        rti.send_joint_position(q, vel)
+        rti.send_joint_position(q)
         nxt += 1.0 / rng.uniform(lo, hi)
         slp = nxt - time.monotonic()
         if slp > 0:
@@ -473,11 +494,11 @@ def run_session(args, cfg, senders, set_order):
         robot.set_inertia_comp(True)
         robot.set_coriolis_comp(True)
         for snd in senders:
-            lo, hi, soft, stamps, pc_vel = SENDERS[snd]
+            lo, hi, soft, stamps, rclock = SENDERS[snd]
             for set_name, label in zip(set_order, labels):
                 print(f"  {snd:>8s} {label:>7s} ... ", end="", flush=True)
                 rng = random.Random(args.seed)
-                rti = RTIClient(robot, clock="pc", timestamps=stamps)
+                rti = RTIClient(robot, clock="robot" if rclock else "pc", timestamps=stamps)
                 want = "SOFT_RTI" if soft else "RTI"
                 try:
                     rti.connect(rate_hz=lo if soft else None)
@@ -489,13 +510,17 @@ def run_session(args, cfg, senders, set_order):
                     time.sleep(0.4)
                     # apply_config writes every knob (sticky ones too): the contract's own values, except 'old'
                     md = (0.0 if set_name == "old" else SOFT_MIN_DURATION) if soft else 0.0
-                    sc.apply_config(robot, {"gen": "ruckig_advancing" if soft else "ruckig", "min_duration": md})
+                    # hard RTI: its contract's generator (the pass-through; a 101-byte stream gets the planner in it)
+                    sc.apply_config(robot, {"gen": "ruckig_advancing" if soft else "passthrough", "min_duration": md})
                     robot.rti_set_dynamics_ff("stream" if set_name == "stream" else "off")   # every RTI entry: 'off'
                     rti.read_once(timeout=2.0)
                     rti.claim()
                     q0 = list(rti.read_once(timeout=1.0)["j_p"])
                     t0 = capture.last_tick()
-                    stream_block(rti, q0, joints0, amp, args.period, lo, hi, args.seconds, rng, pc_vel)
+                    if rclock:
+                        stream_block_rc(rti, q0, joints0, amp, args.period, args.seconds)
+                    else:
+                        stream_block(rti, q0, joints0, amp, args.period, lo, hi, args.seconds, rng)
                     t1 = capture.last_tick()
                     sc.keep_alive(rti, q0, lo, 0.3)
                     rti.release()
