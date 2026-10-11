@@ -20,9 +20,10 @@ Sub-states (handler-local, not in the global state machine — see plan §3):
     connected       paired; state streams to the PC; NO timing rules, so an idle PC
                     is not an error. Holds position.
     control_active  PC claimed control; timeout + success-rate tracking enforced.
-    stopping_clean  PC ended motion (UDP CMD_STOP or TCP release). Holds 0.5 s, then
-                    → connected. No error latched.
-    stopping_error  timeout / packet loss. Holds 0.5 s, then → connected, error latched.
+    stopping_clean  PC ended motion (UDP CMD_STOP or TCP release). Brakes to rest within the
+                    limits (2026-10-11), holds 0.5 s, then → connected. No error latched.
+    stopping_error  timeout / packet loss / a refused command (the strict checks). Brakes to rest
+                    within the limits, THEN the error is latched (→ ACTIVE_ERROR).
 
 Hot-path discipline (CLAUDE.md): step() allocates nothing. Every buffer is
 preallocated in __init__ and written with `dest[:] = src`; one ControlOutput
@@ -183,10 +184,29 @@ SERVO_GENERATORS = (SERVO_RUCKIG, SERVO_TRACKER, SERVO_ADVANCING, SERVO_PASSTHRO
 PT_RING = 8                       # samples kept
 PT_DELAY_DECAY_TICKS = 0.002      # per packet: the slowest recent delivery is forgotten slowly
 PT_DELAY_RATE_TICKS = 0.002       # per tick: the replay delay drifts at most this much (a 0.2 % time warp, in the speed)
-PT_COAST_TICKS = 3.0              # past the newest sample (a dropped / late packet) at most this far, then stop there
+# Past the newest sample (dropped / late packets) the replay continues on the same curve — constant acceleration, as
+# industrial 1 kHz interfaces extrapolate a lost motion packet — until the 40 ms watchdog, whose stop is a controlled
+# one (_begin_stop). Until 2026-10-11 it coasted 3 ticks and braked: the stop that followed froze the command, and
+# braking first kept that freeze gentle (user: as industrial 1 kHz interfaces do, keeping our 40 ms, with the
+# controlled stop).
 PT_GATE = 1.5                     # a curvature above 1.5x the acceleration limit is a jump: plan to stop on the aim
 PT_MAX_GAP_TICKS = 25.0           # samples further apart (100 ms) or out of order: a new start
 PT_UNSTAMPED_EXIT = 3             # this many packets in a row without a send time: back to the planner
+
+# STRICT COMMAND CHECKS (2026-10-11, user: as industrial 1 kHz interfaces do). A hard-RTI stream with send times must be motion the arm
+# can do: a sample that moves a joint past its soft limit (or faster than it can still stop before it), faster than its
+# velocity limit, with an acceleration or a jerk above its limit (what 1 kHz interfaces call a velocity / acceleration
+# DISCONTINUITY) is an ERROR — a controlled stop, then J{i}:RTI_POSITION_LIMIT / RTI_VELOCITY_LIMIT /
+# RTI_ACCELERATION_LIMIT / RTI_JERK_LIMIT latched — instead of being absorbed (a step, a dead stop, a wild packet:
+# the pass-through caught up within the limits and carried on). Checked on the PC's samples over their TRUE intervals
+# (send times), so a stream without them (101 bytes: the robot cannot tell jitter from motion) keeps the forgiving
+# planner. SOFT_RTI: only the position check (the robot fills in between sparse targets, so the stream's speed is not
+# the arm's). Noise in the targets reads as acceleration (0.02 deg per sample ~ 44 rad/s^2): filter on the PC or
+# rti_set_lowpass. The limits are the RTI ceilings (<rti_limits>), not a vel_scale preference (that only limits).
+CMD_CHECK_TOL = 0.10              # 10 % over a limit before a sample is refused (a jerk-limited plan at the limit passes)
+CMD_CHECK_POS_EPS = 1e-9          # rad: a target ON the limit is fine
+CMD_CHECK_BRAKE_TOL = 0.02        # rad/s over the braking curve toward a limit: refused (absolute — a % of the speed limit
+                                  # was 0.48 rad/s on J1: refused 0.4 deg from the limit, too late to brake within it)
 
 # Streaming contracts (rti_set_profile). Some industrial controllers split these into two interfaces (a hard
 # real-time one and a soft one); we keep one code path and name the contract, because the difference genuinely
@@ -386,6 +406,7 @@ class RTIModeHandler:
         # --- command state ---
         self.last_cmd_tick = 0
         self.last_cmd_type = None
+        self._last_motion_type = None
         self.seq_rx_last = 0
         self.seq_rx_gaps = 0           # count of non-consecutive sequence numbers
 
@@ -508,6 +529,25 @@ class RTIModeHandler:
         self._pt_mask = np.zeros(joint_num, dtype=bool)
         self._pt_ok = np.zeros(joint_num, dtype=bool)
         self._pt_imd = np.zeros(joint_num, dtype=np.float64)
+        self._pt_skip_checks = 0          # samples whose spacing was guessed (a clock jump): not checked
+        self._chk_v = np.zeros(joint_num, dtype=np.float64)       # strict checks' scratch
+        self._chk_a = np.zeros(joint_num, dtype=np.float64)
+        self._chk_j = np.zeros(joint_num, dtype=np.float64)
+        self._chk_b = np.zeros(joint_num, dtype=np.float64)
+        self._chk_m = np.zeros(joint_num, dtype=bool)
+        self._chk_tick = -1               # the packet the SOFT_RTI position check last saw
+        self._chk_q_prev = np.zeros(joint_num, dtype=np.float64)   # its previous target (raw) and when it was valid
+        self._chk_t_prev = _NAN
+        self._chk_ts_prev = _NAN
+        self._chk_vlim = self._vel_limit_base * (1.0 + CMD_CHECK_TOL)
+        self._chk_alim = self.accel_limit * (1.0 + CMD_CHECK_TOL)
+        self._chk_jlim = self.jerk_limit * (1.0 + CMD_CHECK_TOL)
+        # Controlled stop (_begin_stop): brake within the limits, THEN hold — and only then raise the error.
+        self._ramp_on = False
+        self._ramp_seed_pending = False
+        self._ramp_errors = ()            # error keys raised once the arm is at rest
+        self._ramp_link_lost = False
+        self._cmd_errors = ()             # handed to the error pass once (take_command_errors)
         # This tick's position bounds: the soft limits widened to wherever the limiter IS, per
         # joint. See _effective_limits().
         self._lim_lo_eff = np.zeros(joint_num, dtype=np.float64)
@@ -858,6 +898,7 @@ class RTIModeHandler:
         self.sub_state = 'control_active'
         self.last_cmd_tick = current_tick
         self.last_cmd_type = None
+        self._last_motion_type = None
         self._payload[:] = 0.0
         self._feedforward[:] = 0.0
         self.control_ticks = 0
@@ -895,6 +936,12 @@ class RTIModeHandler:
         self._cmd_ts = self._ts_prev = self._ts_off = _NAN
         self._ts_prev_seq = 0
         self._pt_reset(current_tick)
+        self._pt_skip_checks = 0
+        self._chk_tick = current_tick                   # the strict checks start fresh with this session
+        self._chk_t_prev = self._chk_ts_prev = _NAN
+        self._ramp_on = False
+        self._ramp_errors = ()
+        self._ramp_link_lost = False
         self._reset_stream_acceleration(current_tick)
 
         # Rebuild the low-pass so it seeds from THIS session's first command. The engine
@@ -976,15 +1023,14 @@ class RTIModeHandler:
             if self.last_cmd_type == CMD_STOP:
                 self._begin_stop('stopping_clean')
                 logger.info("[RTI] Motion finished by PC")
-                return self._hold(ctx)
+                return self._step_stopping(ctx)
 
             # Validate the FIRST command of this claim before it can reach a motor.
             if not self._start_pose_checked:
                 self._start_pose_checked = True
                 if self.start_pose_check_enabled and not self._start_pose_ok(ctx):
-                    self._begin_stop('stopping_error')
-                    self.link_lost_event = True
-                    return self._hold(ctx)
+                    self._begin_stop('stopping_error', link_lost=True)
+                    return self._step_stopping(ctx)
 
         # Only score ticks from the first accepted command onward. Counting the
         # gap between claim_control() and the PC's first packet would report 0%
@@ -996,12 +1042,11 @@ class RTIModeHandler:
             self._update_success_rate(got)
 
         if not got and (ctx.current_tick - self.last_cmd_tick) > self.timeout_ticks:
-            self._begin_stop('stopping_error')
+            self._begin_stop('stopping_error', link_lost=True)
             logger.warning(
-                "[RTI] No command for %d ticks (limit %d) — stopping, latching RTI_LINK_LOST",
+                "[RTI] No command for %d ticks (limit %d) — braking to rest, then latching RTI_LINK_LOST",
                 ctx.current_tick - self.last_cmd_tick, self.timeout_ticks)
-            self.link_lost_event = True
-            return self._hold(ctx)
+            return self._step_stopping(ctx)
 
         if self.last_cmd_type is None:
             # Claimed but the first packet has not arrived yet — hold, don't time out
@@ -1009,9 +1054,14 @@ class RTIModeHandler:
             return self._hold(ctx)
 
         self._hold_frozen = False          # streaming again: the next hold starts from where the stream ends
-        return self._command_output(ctx)
+        out = self._command_output(ctx)
+        if self.sub_state != 'control_active':      # a strict command check refused this packet: a controlled stop
+            return self._step_stopping(ctx)
+        return out
 
     def _step_stopping(self, ctx):
+        if self._ramp_on:
+            return self._ramp_output(ctx)        # braking; the 0.5 s hold below counts from the rest
         self.stopping_counter -= 1
         if self.stopping_counter <= 0:
             was = self.sub_state
@@ -1026,10 +1076,75 @@ class RTIModeHandler:
     # Internals
     # ------------------------------------------------------------------ #
 
-    def _begin_stop(self, which):
+    def _begin_stop(self, which, errors=(), link_lost=False):
+        """A CONTROLLED stop (2026-10-11, review §7.1 for RTI; user: RTI's stops brake, safety trips stay instant):
+        every joint brakes to rest within its acceleration / jerk limits from where it is commanded to be, then
+        holds there; the error (`link_lost` -> RTI_LINK_LOST, `errors` -> those keys) is raised only once the arm is at
+        rest — raising it at once switched the mode to ACTIVE_ERROR, whose zero-velocity hold stopped the arm as hard
+        as the drives could. Without Ruckig: the old instant hold, the error at once."""
         self.sub_state = which
         self.stopping_counter = self.stopping_ticks
         self._hold_frozen = False          # the hold that follows captures where the arm is NOW, once
+        self._ramp_errors = errors
+        self._ramp_link_lost = link_lost
+        self._ramp_on = self._rk is not None
+        self._ramp_seed_pending = True
+        if not self._ramp_on:
+            self._raise_stop_errors()
+
+    def _raise_stop_errors(self):
+        if self._ramp_link_lost:
+            self.link_lost_event = True
+            self._ramp_link_lost = False
+        if self._ramp_errors:
+            self._cmd_errors = self._ramp_errors
+            self._ramp_errors = ()
+
+    def take_command_errors(self):
+        """One-shot read of the strict command checks' error keys (a tuple, () when none), for RTI.py to feed
+        process_errors_tick(rti_errors=)."""
+        ev = self._cmd_errors
+        if ev:
+            self._cmd_errors = ()
+        return ev
+
+    def _ramp_output(self, ctx):
+        """One tick of the controlled stop: Ruckig's velocity interface to rest, each joint on its own (none slowed by
+        another), within the RTI acceleration / jerk limits. Starts from the commanded state where there is one (a
+        position stream: the generator's; a velocity stream: its speed from the measured position), else from the
+        measured position and filtered speed (torque, or the rate limiter off)."""
+        if self._ramp_seed_pending:
+            self._ramp_seed_pending = False
+            ct = self._last_motion_type
+            if ct == CMD_JOINT_POSITION and self.rate_limit_enabled:
+                pass                                      # (_rl_q, _rl_v, _rl_a): what the drives were commanded
+            elif ct == CMD_JOINT_VELOCITY and self.rate_limit_enabled:
+                self._rl_q[:] = ctx.shared_data.joint['joint_position'][:self.joint_num]
+            else:
+                self._rl_q[:] = ctx.shared_data.joint['joint_position'][:self.joint_num]
+                self._rl_v[:] = ctx.shared_data.joint['joint_speed_filtered'][:self.joint_num]
+                self._rl_a[:] = 0.0
+        q = self._brake_tick()
+        np.abs(self._rl_v, out=self._chk_b)
+        moving = self._chk_b.max() > 1e-9
+        np.abs(self._rl_a, out=self._chk_b)
+        if not moving and self._chk_b.max() <= 1e-9:
+            self._ramp_on = False                         # at rest: hold HERE, then the error
+            self._hold_pos[:] = q
+            self._hold_frozen = True
+            self._raise_stop_errors()
+        out = self._out
+        out.mode = "pid"
+        out.pos_rad = q
+        out.vel_rad = self._rl_v
+        out.acc_rad = self._rl_a                          # published, not fed forward
+        out.acc_feedforward = False
+        out.trq_nm = self._add_gravity(ctx, None)
+        out.target_pos_rad = None
+        out.target_vel_rad = None
+        out.target_acc_rad = None
+        out.target_trq_nm = None
+        return out
 
     def _hold(self, ctx):
         """Hold the current measured position with zero velocity.
@@ -1193,6 +1308,18 @@ class RTIModeHandler:
         self._effective_limits()
         tgt = self._rl_tgt
         np.clip(q_des, self._lim_lo_eff, self._lim_hi_eff, out=tgt)
+
+        # SOFT_RTI's strict check (2026-10-11, user): a target past a soft limit — or heading for it faster than the
+        # joint could still stop before it (the braking curve, on the targets' own speed) — is an ERROR: a controlled
+        # stop, then J{i}:RTI_POSITION_LIMIT; not a silent clamp. Checking only "past" was too late: the generator
+        # was at the limit at speed by then, and the clamp stopped it at 171 rad/s^2 on J1 (simulated; the same
+        # before the check existed). The arm runs about one interval behind the targets, so refused at the curve it
+        # still has the room to brake. (Hard RTI with send times: _pt_check_sample.)
+        if self.soft_mode and self.last_cmd_tick != self._chk_tick:
+            refused = self._soft_check_position(q_des, tgt)
+            self._chk_tick = self.last_cmd_tick
+            if refused:
+                return self._rl_q
 
         if not self.rate_limit_enabled:
             # Still honour the joint limits — see the docstring. Keep the limiter state in
@@ -1606,6 +1733,7 @@ class RTIModeHandler:
             np.add(adv, tgt, out=adv)
             np.clip(adv, self._lim_lo_eff, self._lim_hi_eff, out=adv)
             inp.target_position = adv
+            aim = adv
             # Feedforward: the PC's own velocity WINS when it sent one. An earlier version
             # overwrote it unconditionally, reasoning that a measured estimate beats "what
             # the PC claims" — backwards. A VR headset or haptic controller MEASURES hand
@@ -1616,6 +1744,7 @@ class RTIModeHandler:
                 self._feedforward[:] = self._trk_vtgt
         else:
             inp.target_position = tgt
+            aim = tgt
 
         # Duration pacing (a minimum trajectory execution time). Force the
         # planned move to last at least `min_duration_mult` command intervals.
@@ -1651,6 +1780,11 @@ class RTIModeHandler:
         # Clamped against the ACTIVE budget: when the TCP cap has shrunk max_velocity, a
         # feedforward clipped only to the base limits would still be rejected.
         np.clip(self._feedforward, -vcap, vcap, out=self._rk_tv)
+        # Never ask to ARRIVE at a soft limit at speed (2026-10-11): the target speed toward a limit at most what the
+        # joint can still stop from at the target (the braking curve: 0 on the limit). Without it a stream into a
+        # limit made the planner reach the clamped target at speed and the clamp stopped it — SOFT_RTI, J1 at 60 deg/s,
+        # 50 Hz, pacing off: 167 rad/s^2 (simulated; the same before the strict checks). Far from a limit: unchanged.
+        self._brake_at_limits(self._rk_tv, aim)
         inp.target_velocity = self._rk_tv
 
         try:
@@ -1696,15 +1830,15 @@ class RTIModeHandler:
         inp.target_acceleration = self._zeros
         self._pt_rk_cfg = False
 
-    def _pt_brake(self):
-        """The PC went silent past the coasting: every joint brakes straight to rest, time-optimally within its
-        limits. Not back to where the coasting ended — the joint has already passed it, and aiming there made it
-        brake, turn and come back (simulated: then cut short by the link-loss hold). The speed never exceeded what
-        each joint can stop from before its soft limit (the braking curve in the pass-through), so this stop is clear
-        of the limits; the clamp below is the backstop."""
+    def _brake_tick(self):
+        """One tick of braking straight to rest from (_rl_q, _rl_v, _rl_a), time-optimally within each joint's limits
+        (Ruckig's velocity interface, joints independent). The controlled stop's step. The speed never exceeded what
+        each joint can stop from before its soft limit (the braking curve, in every position path), so this stop is
+        clear of the limits; the clamp is the backstop."""
+        self._effective_limits()
         inp = self._rk_in
         inp.control_interface = ControlInterface.Velocity
-        inp.synchronization = Synchronization.No       # each joint's own shortest stop, none stretched by another
+        inp.synchronization = Synchronization.No
         inp.minimum_duration = 0.0
         inp.current_position = self._rl_q
         inp.current_velocity = self._rl_v
@@ -1717,9 +1851,12 @@ class RTIModeHandler:
         except Exception:
             failed = True
         inp.control_interface = ControlInterface.Position
-        self._pt_rk_cfg = False                        # the next pass-through tick sets its own settings again
+        self._pt_rk_cfg = True                         # the next planner / pass-through tick resets its own settings
+        self._pt_restore_rk()
         if failed:
             self._rk_errors += 1
+            self._rl_v[:] = 0.0
+            self._rl_a[:] = 0.0
             return self._rl_q
         out = self._rl_out
         out[:] = self._rk_out.new_position
@@ -1728,6 +1865,141 @@ class RTIModeHandler:
         np.clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
         self._rl_q[:] = out
         return out
+
+    def _pt_check_sample(self, k):
+        """The strict checks on the newest stamped sample (k samples in the ring). True: refused — a controlled stop
+        has begun with the joints' error keys. Divided differences over the TRUE send-time intervals: speed (2
+        samples), acceleration (3), jerk (4). Hot path when clean: preallocated arrays only."""
+        dt = self.delta_t
+        i3 = (k - 1) % PT_RING
+        q3, s3 = self._pt_q[i3], self._pt_s[i3]
+        m = self._chk_m
+        # position: outside the (recovery-widened) soft limits
+        v, a, jj, b = self._chk_v, self._chk_a, self._chk_j, self._chk_b
+        np.subtract(self._lim_lo_eff, CMD_CHECK_POS_EPS, out=b)
+        np.less(q3, b, out=m)
+        bad_pos = bool(m.any())
+        if not bad_pos:
+            np.add(self._lim_hi_eff, CMD_CHECK_POS_EPS, out=b)
+            np.greater(q3, b, out=m)
+            bad_pos = bool(m.any())
+        bad_v = bad_a = bad_j = False
+        if k >= 2:
+            i2 = (k - 2) % PT_RING
+            s2 = self._pt_s[i2]
+            np.subtract(q3, self._pt_q[i2], out=v)
+            v *= 1.0 / ((s3 - s2) * dt)
+            np.abs(v, out=b)
+            np.greater(b, self._chk_vlim, out=m)
+            bad_v = bool(m.any())
+            # ... and toward a limit no faster than the joint can still stop before it (the braking curve)
+            b[:] = v
+            self._brake_at_limits(b, q3)
+            np.subtract(v, b, out=b)
+            np.abs(b, out=b)
+            np.greater(b, CMD_CHECK_BRAKE_TOL, out=m)
+            if m.any():
+                bad_pos = True
+            if k >= 3:
+                i1 = (k - 3) % PT_RING
+                s1 = self._pt_s[i1]
+                np.subtract(self._pt_q[i2], self._pt_q[i1], out=jj)
+                jj *= 1.0 / ((s2 - s1) * dt)                     # the previous segment's speed
+                np.subtract(v, jj, out=a)
+                a *= 2.0 / ((s3 - s1) * dt)                      # acceleration (the second divided difference x 2)
+                np.abs(a, out=b)
+                np.greater(b, self._chk_alim, out=m)
+                bad_a = bool(m.any())
+                if k >= 4 and not bad_a:
+                    i0 = (k - 4) % PT_RING
+                    s0 = self._pt_s[i0]
+                    np.subtract(self._pt_q[i1], self._pt_q[i0], out=b)
+                    b *= 1.0 / ((s1 - s0) * dt)                  # the speed before that
+                    np.subtract(jj, b, out=b)
+                    b *= 2.0 / ((s2 - s0) * dt)                  # the previous acceleration
+                    np.subtract(a, b, out=jj)
+                    jj *= 3.0 / ((s3 - s0) * dt)                 # jerk (the third divided difference x 6)
+                    np.abs(jj, out=b)
+                    np.greater(b, self._chk_jlim, out=m)
+                    bad_j = bool(m.any())
+        if not (bad_pos or bad_v or bad_a or bad_j):
+            return False
+        return self._refuse_command(q3, v, a, jj, bad_pos, bad_v, bad_a, bad_j)
+
+    def _refuse_command(self, q, v, a, jerk, bad_pos, bad_v, bad_a, bad_j):
+        """Cold path: name each offending joint, log it, begin the controlled stop with the error keys."""
+        keys, why = [], []
+        lim = (self._vel_limit_base * (1.0 + CMD_CHECK_TOL), self.accel_limit * (1.0 + CMD_CHECK_TOL),
+               self.jerk_limit * (1.0 + CMD_CHECK_TOL))
+        for j in range(self.joint_num):
+            if bad_pos and (q[j] < self._lim_lo_eff[j] - CMD_CHECK_POS_EPS or q[j] > self._lim_hi_eff[j]
+                            + CMD_CHECK_POS_EPS or self._too_fast_for_limit(j, q[j], v[j])):
+                keys.append(f"J{j + 1}:RTI_POSITION_LIMIT")
+                why.append(f"J{j + 1} target {np.degrees(q[j]):.2f} deg at {np.degrees(v[j]):.1f} deg/s: past "
+                           f"[{np.degrees(self.limit_neg[j]):.1f}, {np.degrees(self.limit_pos[j]):.1f}] deg or "
+                           f"unable to stop before it")
+            if bad_v and abs(v[j]) > lim[0][j]:
+                keys.append(f"J{j + 1}:RTI_VELOCITY_LIMIT")
+                why.append(f"J{j + 1} speed {v[j]:.2f} rad/s > {self._vel_limit_base[j]:.2f}")
+            if bad_a and abs(a[j]) > lim[1][j]:
+                keys.append(f"J{j + 1}:RTI_ACCELERATION_LIMIT")
+                why.append(f"J{j + 1} acceleration {a[j]:.1f} rad/s^2 > {self.accel_limit[j]:.1f}")
+            if bad_j and abs(jerk[j]) > lim[2][j]:
+                keys.append(f"J{j + 1}:RTI_JERK_LIMIT")
+                why.append(f"J{j + 1} jerk {jerk[j]:.0f} rad/s^3 > {self.jerk_limit[j]:.0f}")
+        if not keys:                                       # the masks said so; name the first joint generically
+            keys.append("J1:RTI_POSITION_LIMIT" if bad_pos else "J1:RTI_VELOCITY_LIMIT")
+        logger.error("[RTI] Command refused (%s) — braking to rest: %s", ", ".join(keys), "; ".join(why))
+        self._begin_stop('stopping_error', errors=tuple(keys))
+        return True
+
+    def _soft_check_position(self, q_des, tgt):
+        """SOFT_RTI: the new target past a soft limit, or its speed (from the previous target, over the send-time
+        interval when both carry one, else the arrival interval) above the braking curve at it. True: refused."""
+        m, v, b = self._chk_m, self._chk_v, self._chk_b
+        np.subtract(q_des, tgt, out=b)
+        np.abs(b, out=b)
+        np.greater(b, CMD_CHECK_POS_EPS, out=m)
+        bad_pos = bool(m.any())
+        dts = self._cmd_ts - self._chk_ts_prev
+        if 0.0 < dts <= TS_MAX_INTERVAL_S:
+            interval = dts
+        else:
+            interval = (self.last_cmd_tick - self._chk_tick) * self.delta_t if self._chk_t_prev == self._chk_t_prev \
+                else 0.0
+        v[:] = 0.0
+        if not bad_pos and interval > 0.0:
+            np.subtract(q_des, self._chk_q_prev, out=v)
+            v *= 1.0 / interval
+            b[:] = v
+            self._brake_at_limits(b, q_des)
+            np.subtract(v, b, out=b)
+            np.abs(b, out=b)
+            np.greater(b, CMD_CHECK_BRAKE_TOL, out=m)
+            bad_pos = bool(m.any())
+        if not bad_pos:
+            # ... and the generator itself (ruckig_advancing aims AHEAD of the newest target by up to an interval)
+            b[:] = self._rl_v
+            self._brake_at_limits(b, self._rl_q)
+            np.subtract(self._rl_v, b, out=b)
+            np.abs(b, out=b)
+            np.greater(b, CMD_CHECK_BRAKE_TOL, out=m)
+            bad_pos = bool(m.any())
+        self._chk_q_prev[:] = q_des
+        self._chk_t_prev = 0.0
+        self._chk_ts_prev = self._cmd_ts
+        if not bad_pos:
+            return False
+        self._chk_a[:] = 0.0
+        return self._refuse_command(q_des, v, self._chk_a, self._chk_a, True, False, False, False)
+
+    def _too_fast_for_limit(self, j, q, v):
+        """Cold path: is joint j's speed v at q faster (with the tolerance) than it can still stop from before its
+        soft limit? (the braking curve, one joint)"""
+        self._chk_b[:] = 0.0
+        self._chk_b[j] = v
+        self._brake_at_limits(self._chk_b, np.full(self.joint_num, q))
+        return abs(v - self._chk_b[j]) > CMD_CHECK_BRAKE_TOL
 
     def _limit_position_passthrough(self, q_des, tgt, ctx):
         """Hard RTI's generator (see SERVO_PASSTHROUGH / PT_*): the PC's stamped samples replayed a small adaptive
@@ -1751,9 +2023,10 @@ class RTIModeHandler:
                         if 0 < arr_gap <= PT_MAX_GAP_TICKS:
                             # The PC's CLOCK jumped (the packets kept coming): carry its timeline on at the arrival
                             # spacing. A restart would hand two ticks to the planner, which brakes — ~1 deg lost at
-                            # 60 deg/s (simulated).
+                            # 60 deg/s (simulated). That spacing is a guess: the strict checks skip it.
                             self._pt_shift += ds - arr_gap
                             s = s_prev + arr_gap
+                            self._pt_skip_checks = 4
                         else:
                             k = 0                          # a silence: start again from this sample
                 self._pt_arrival = self.last_cmd_tick
@@ -1768,6 +2041,10 @@ class RTIModeHandler:
                     self._pt_Lt = delay
                 else:
                     self._pt_Lt -= PT_DELAY_DECAY_TICKS
+                if self._pt_skip_checks > 0:
+                    self._pt_skip_checks -= 1
+                elif self._pt_check_sample(k + 1):
+                    return self._rl_q                      # refused: a controlled stop has begun (see _step_active)
             else:
                 # A position without a time: skipped (the replay coasts over it like a dropped packet); a stream
                 # that stops sending times goes back to the planner.
@@ -1801,10 +2078,7 @@ class RTIModeHandler:
         i_b = (k - 2 - seg) % PT_RING
         t_b = self._pt_s[i_b]
         t_c = self._pt_s[i_c]
-        coast = PT_COAST_TICKS
-        if r > t_c + coast:
-            return self._pt_brake()
-        rr = t_b if r < t_b else r
+        rr = t_b if r < t_b else r                         # past the newest: the same curve, until the watchdog
         fbc, fab, fabc = self._pt_fbc, self._pt_fab, self._pt_fabc
         np.subtract(self._pt_q[i_c], self._pt_q[i_b], out=fbc)
         fbc *= 1.0 / (t_c - t_b)                            # rad per tick
@@ -2837,6 +3111,8 @@ class RTIModeHandler:
         _ts = unpack_command_timestamp(data)
         self._cmd_ts = _NAN if _ts is None else _ts
         self.last_cmd_type = cmd_type
+        if cmd_type != CMD_STOP:
+            self._last_motion_type = cmd_type      # what the arm was DOING when a stop arrives (the stop ramp's seed)
         self._payload[:] = payload[:self.joint_num]
         self._feedforward[:] = feedforward[:self.joint_num]
         return True

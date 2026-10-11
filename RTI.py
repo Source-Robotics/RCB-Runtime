@@ -2537,6 +2537,8 @@ def main():
             # RTI command watchdog. A KEY, not a direct error_active write — this
             # function owns that flag and recomputes it every tick.
             rti_link_lost=rti_handler.take_link_lost(),
+            # The strict command checks' keys (J{i}:RTI_*_LIMIT), raised once the controlled stop is at rest.
+            rti_errors=rti_handler.take_command_errors(),
             loop_degraded=_loop_degraded,
             loop_critical=_loop_critical,
             monitor_errors=_monitor_errors,

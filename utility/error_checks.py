@@ -366,7 +366,7 @@ _GRIPPER_MOTOR_ERROR_FIELDS = (
 )
 
 
-def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost,
+def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
                            loop_degraded, loop_critical, monitor_errors, monitor_warnings):
     """E-STOP, the EXEC / RTI link watchdogs, RT loop health and the safety monitor's events. The caller
     pre-computes every flag; this only turns them into keys."""
@@ -397,6 +397,10 @@ def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_
     # ever latched. Caught on hardware 2026-08-02 by 25_rti_comm.py --test-timeout.
     if rti_link_lost:
         current_errors.add("RTI_LINK_LOST")
+    # The RTI handler's strict command checks (J{i}:RTI_POSITION_LIMIT / _VELOCITY_ / _ACCELERATION_ / _JERK_LIMIT,
+    # 2026-10-11): raised once the controlled stop has brought the arm to rest; latched like RTI_LINK_LOST.
+    if rti_errors:
+        current_errors.update(rti_errors)
 
     # ------------------------------------------------------------------
     # RT loop health (caller pre-computes both from LoopDegradationMonitor).
@@ -554,6 +558,7 @@ def check_errors(
     monitor_errors=(),
     monitor_warnings=(),
     driver_faults: bool = True,
+    rti_errors=(),
 ) -> tuple:
     """
     Inspect all error sources and update the latched error set.
@@ -579,7 +584,7 @@ def check_errors(
     """
 
     current_errors = set()
-    _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost,
+    _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
                            loop_degraded, loop_critical, monitor_errors, monitor_warnings)
     if driver_faults:
         _collect_motor_errors(shared_data, joint_num, current_errors)
@@ -783,6 +788,7 @@ def process_errors_tick(
     monitor_warnings=(),
     on_hard_error=None,
     driver_faults: bool = True,
+    rti_errors=(),
 ) -> tuple:
     """Run one tick of error processing in the RTI superloop.
 
@@ -830,6 +836,7 @@ def process_errors_tick(
         monitor_errors=monitor_errors,
         monitor_warnings=monitor_warnings,
         driver_faults=driver_faults,
+        rti_errors=rti_errors,
     )
     shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
     # rti['safety_violation'] (the status event's "safety" field) finally means something: 1 while
