@@ -383,6 +383,10 @@ class RuckigTimeParameterizer(TimeParameterizer):
     """
 
     supports_boundary_velocity = True
+    # No fixed normalized shape: an exact_velocity blend corner (`blend` > 0) is sized by
+    # compute_corner_speed with its default, the trapezoid's estimate. Without the attribute
+    # every profile="ruckig" move with blend > 0 failed PLAN_FAIL (found 2026-10-11).
+    profile = None
 
     def __init__(self, jerk_factor=RUCKIG_JERK_FACTOR, max_jerk=None):
         """max_jerk: per-joint rad/s^3 from <exec_limits><jerk>, ALREADY scaled by the
@@ -395,7 +399,7 @@ class RuckigTimeParameterizer(TimeParameterizer):
     def parameterize(self, path, max_vel, max_accel, dt, speed_scale=1.0,
                      start_vel=None, end_vel=None):
         try:
-            from ruckig import Ruckig, InputParameter, Trajectory, Result
+            from ruckig import Ruckig, InputParameter, Trajectory, Result, Synchronization
         except Exception as exc:
             raise RuckigUnavailable(
                 "profile='ruckig' requested but the ruckig package is not importable") from exc
@@ -427,6 +431,13 @@ class RuckigTimeParameterizer(TimeParameterizer):
         inp.max_velocity = vmax.tolist()
         inp.max_acceleration = amax.tolist()
         inp.max_jerk = jmax.tolist()
+        # PHASE synchronization: every joint follows a scaled copy of one profile, so the move stays on the straight
+        # start -> target line in joint space, as the trapezoid's does. Ruckig's default (time synchronization) only
+        # makes the joints FINISH together: measured 2026-10-11, a 6-joint move bent up to 2.3 deg off that line
+        # (2-joint moves 0.5-0.7) for the SAME duration, and the joints not setting the pace moved more abruptly (J1's
+        # 6 Hz excitation in J1+J6: 0.15 -> 0.01 deg). Exact-velocity blend corners keep it too: their boundary
+        # velocities lie along the line. Where phase sync is impossible Ruckig falls back to time sync itself.
+        inp.synchronization = Synchronization.Phase
 
         traj = Trajectory(dof)
         result = Ruckig(dof).calculate(inp, traj)
