@@ -125,7 +125,7 @@ class JogHandler:
         # Pre-allocated buffers — never reallocated inside step()
         self._target_pos_rad  = np.zeros(joint_num, dtype=np.float64)  # rad
         self._target_vel_rad  = np.zeros(joint_num, dtype=np.float64)  # rad/s
-        self._accel_state     = np.zeros(joint_num, dtype=np.float64)  # rad/s² (telemetry: the ray's acceleration per joint)
+        self._accel_state     = np.zeros(joint_num, dtype=np.float64)  # rad/s²: the ray's acceleration per joint (telemetry + the inertia feedforward)
         self._tmp             = np.zeros(joint_num, dtype=np.float64)
 
         # Per-joint direction block indicator for the GUI: 0 = free, +1 / -1 = that direction is at a limit.
@@ -418,8 +418,10 @@ class JogHandler:
         trq = ctx.shared_data.joint['joint_gravity_torque'][:self.joint_num] if grav_on else None
 
         # target == commanded in JOG (the planned ray is already within every limit). acc_rad is the ray's current
-        # acceleration (rad/s^2) per joint — TELEMETRY only: no CAN pack carries acceleration (data_pack_1/PD are
-        # Position/Speed/Current), so publishing it changes nothing the arm does. EXEC fills the same channel.
+        # acceleration (rad/s^2) per joint (direction x the 1-DOF profile's acceleration). No CAN pack carries an
+        # acceleration, but since 2026-10-10 dispatch feeds it forward as inertia / Coriolis torque
+        # (utility/mode_dispatch._add_dynamics_ff, behind the robot-wide switches) — it DOES change what the arm gets.
+        # EXEC fills the same channel.
         return TickResult(), ControlOutput(
             pos_rad=self._target_pos_rad,
             vel_rad=self._target_vel_rad,

@@ -568,6 +568,7 @@ class RTIModeHandler:
         self._trk_ideal_seeded = False
         self._trk_vtgt_from_pc = False
         self._trk_seeded = False
+        self._trk_spans = 1               # command intervals the last gap spanned (>1 = dropped packets); _stream_acceleration
         self._trk_nvcap = np.zeros(joint_num, dtype=np.float64)
         # Stream-acceleration feedforward (see DYNAMICS_FF_SOURCES). All preallocated: _stream_acceleration runs every
         # tick of a position stream.
@@ -1275,6 +1276,7 @@ class RTIModeHandler:
             self._trk_seeded = True
         self._trk_prev_tgt[:] = tgt
         self._trk_cmd_tick = self.last_cmd_tick
+        self._trk_spans = spans
 
         # The IDEAL fractional tick this command was meant for, which is NOT the tick it
         # arrived on. A 60 Hz command is due every 4.1667 ticks but can only ARRIVE on a
@@ -1851,7 +1853,9 @@ class RTIModeHandler:
             v = self._feedforward if self._trk_vtgt_from_pc else self._trk_vtgt
             self._sacc_n += 1
             if self._sacc_n >= 3:
-                span = max(1.0, round((self._trk_cmd_tick - self._sacc_cmd_tick) / self._trk_gap)) * self._trk_gap
+                # the SAME interval the velocity estimate was taken over (its own drop rule, SPAN_MARGIN) — a rule of
+                # its own here disagreed for gaps of 1.5-1.75 intervals and halved that packet's estimate (2026-10-11)
+                span = self._trk_spans * self._trk_gap
                 np.subtract(v, self._sacc_vprev, out=self._sacc_hold)
                 self._sacc_hold *= 1.0 / (span * self.delta_t)
             else:
