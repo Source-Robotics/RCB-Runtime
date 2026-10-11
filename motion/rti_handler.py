@@ -36,7 +36,7 @@ import numpy as np
 from communication.rti_protocol import (
     CMD_JOINT_POSITION, CMD_JOINT_VELOCITY, CMD_JOINT_TORQUE,
     CMD_CARTESIAN_POSE, CMD_CARTESIAN_VELOCITY, CMD_STOP,
-    CLOCK_ROBOT, CLOCK_PC, unpack_command_packet,
+    CLOCK_ROBOT, CLOCK_PC, unpack_command_packet, unpack_command_timestamp,
 )
 from data.data_recipe import build_payload
 from utility.kinematics_backend import should_use_pinocchio
@@ -232,6 +232,17 @@ DYNAMICS_FF_DEFAULT = "stream"
 # (<= 10 Hz), for more lag (+20 ms at 50 Hz, +50 at 25 Hz, +120 at 10 Hz). A PC may still set its own
 # (rti_set_min_duration; 0 = the old behaviour) after rti_connect. Hard RTI keeps 0 (one setpoint per tick).
 SOFT_MIN_DURATION_DEFAULT = 1.5
+
+# Packet SEND TIMES (2026-10-11, communication/rti_protocol.py; TODO/servo_mode_options.md §17.20). A sender whose rate
+# wanders (VR, Wi-Fi) made every target look early or late against the arrival ticks — the remaining fast chatter after
+# the duration pacing (on the arm, J1's generator acceleration above ~10 Hz 0.6 -> 20.6 rad/s^2 from a steady to a
+# wandering 50-60 Hz sender). With the PC's own send times the velocity is taken over the TRUE interval and the
+# "when was this target valid" clock follows the PC: simulated 3x less chatter, a 3x more faithful path, less lag.
+TS_MAX_INTERVAL_S = 1.0           # a longer gap between two timestamped packets: today's estimate for that one
+TS_MAX_SPANS = 50                 # sequence numbers further apart than this are not "dropped packets" but a new stream
+TS_OFFSET_LEAK_TICKS = 0.002      # per packet: the fastest delivery is forgotten slowly (clock drift, a slower route)
+TS_RESYNC_TICKS = 25.0            # a delivery 100 ms slower than the fastest: the PC's clock jumped -> re-anchor
+_NAN = float("nan")
 STREAM_ACC_LP_HZ = 8.0            # the low-pass: unsmoothed, a wandering sender's estimate was worse than none (1.5)
 STREAM_ACC_HOLD_INTERVALS = 2.0   # no packet for this many intervals: the held estimate drops to 0 (then decays)
 
@@ -568,7 +579,11 @@ class RTIModeHandler:
         self._trk_ideal_seeded = False
         self._trk_vtgt_from_pc = False
         self._trk_seeded = False
-        self._trk_spans = 1               # command intervals the last gap spanned (>1 = dropped packets); _stream_acceleration
+        self._trk_interval_s = delta_t   # the time the last velocity estimate was taken over (s): _stream_acceleration
+        self._cmd_ts = _NAN               # this packet's send time (s, the PC's clock); nan without one
+        self._ts_prev = _NAN              # the previous packet's
+        self._ts_prev_seq = 0
+        self._ts_off = _NAN               # arrival tick minus send time (ticks): the fastest delivery, forgotten slowly
         self._trk_nvcap = np.zeros(joint_num, dtype=np.float64)
         # Stream-acceleration feedforward (see DYNAMICS_FF_SOURCES). All preallocated: _stream_acceleration runs every
         # tick of a position stream.
@@ -825,6 +840,9 @@ class RTIModeHandler:
         self._trk_ideal_seeded = False
         self._trk_vtgt_from_pc = False
         self._trk_seeded = False
+        self._trk_interval_s = self.delta_t
+        self._cmd_ts = self._ts_prev = self._ts_off = _NAN
+        self._ts_prev_seq = 0
         self._reset_stream_acceleration(current_tick)
 
         # Rebuild the low-pass so it seeds from THIS session's first command. The engine
@@ -1223,7 +1241,23 @@ class RTIModeHandler:
         if self.last_cmd_tick == self._trk_cmd_tick:
             return
         gap = self.last_cmd_tick - self._trk_cmd_tick
-        if self._trk_seeded and gap > 0:
+        dts = self._cmd_ts - self._ts_prev        # nan unless this AND the previous packet carried a send time
+        if self._trk_seeded and gap > 0 and 0.0 < dts <= TS_MAX_INTERVAL_S:
+            # TIMESTAMPED: the PC said when each target was taken, so the velocity is taken over the TRUE interval
+            # and the interval estimate (duration pacing, the aim point's cap) is the PC's real rate — not the
+            # arrival ticks an uneven sender scatters. Dropped packets are counted from the sequence numbers.
+            spans = (self.seq_rx_last - self._ts_prev_seq) & 0xFFFFFFFF
+            if spans < 1 or spans > TS_MAX_SPANS:
+                spans = 1
+            self._trk_gaps.append(dts / (spans * self.delta_t))
+            if len(self._trk_gaps) > GAP_WINDOW:
+                del self._trk_gaps[0]
+            self._trk_gap = sum(self._trk_gaps) / len(self._trk_gaps)
+            np.subtract(tgt, self._trk_prev_tgt, out=self._trk_vtgt)
+            self._trk_vtgt *= 1.0 / dts
+            np.clip(self._trk_vtgt, -self.vel_limit, self.vel_limit, out=self._trk_vtgt)
+            self._trk_interval_s = dts
+        elif self._trk_seeded and gap > 0:
             # MEDIAN of recent gaps, not this one. The instantaneous gap is an integer
             # number of ticks, so a PC rate that is not an exact divisor of the loop rate
             # cannot be represented by it: 20 Hz is due every 12.5 ticks, so arrivals
@@ -1270,30 +1304,47 @@ class RTIModeHandler:
             # A stale target the PC never updated must not become a velocity estimate that
             # keeps extrapolating forever.
             np.clip(self._trk_vtgt, -self.vel_limit, self.vel_limit, out=self._trk_vtgt)
+            self._trk_interval_s = spans * self._trk_gap * self.delta_t
         else:
             spans = 1
             self._trk_vtgt[:] = 0.0
             self._trk_seeded = True
         self._trk_prev_tgt[:] = tgt
         self._trk_cmd_tick = self.last_cmd_tick
-        self._trk_spans = spans
-
-        # The IDEAL fractional tick this command was meant for, which is NOT the tick it
-        # arrived on. A 60 Hz command is due every 4.1667 ticks but can only ARRIVE on a
-        # whole tick, so it is already 0-1 ticks stale by an amount that cycles. Ageing the
-        # aim point from the arrival tick throws that away and re-quantises the extrapolation
-        # every command -- the residual roughness that survived fixing the velocity estimate.
-        # Advancing a fractional clock instead keeps the aim point continuous.
-        if self._trk_ideal_seeded:
-            self._trk_ideal += spans * self._trk_gap
-            # Re-sync if the PC's true rate differs from our estimate, or its clock drifts:
-            # never let the ideal time wander more than one interval from reality.
-            drift = self.last_cmd_tick - self._trk_ideal
-            if drift > self._trk_gap or drift < -self._trk_gap:
-                self._trk_ideal = float(self.last_cmd_tick)
-        else:
-            self._trk_ideal = float(self.last_cmd_tick)
+        if self._cmd_ts == self._cmd_ts:
+            # A send time: the target was valid at the PC's send time plus the FASTEST delivery seen (the offset
+            # between the two clocks; later packets were merely delayed, and the aim point then extrapolates over
+            # the delay). No clock synchronisation: only this offset is estimated, forgotten slowly for drift, and
+            # re-anchored when the PC's clock jumps.
+            sample = self.last_cmd_tick - self._cmd_ts / self.delta_t
+            if not (self._ts_off == self._ts_off) or sample > self._ts_off + TS_RESYNC_TICKS:
+                self._ts_off = sample
+            else:
+                self._ts_off += TS_OFFSET_LEAK_TICKS     # forget first, so a delivery as fast as ever re-anchors
+                if sample < self._ts_off:                # exactly on itself (a steady sender: the arrival tick)
+                    self._ts_off = sample
+            self._trk_ideal = self._cmd_ts / self.delta_t + self._ts_off
             self._trk_ideal_seeded = True
+        else:
+
+            # The IDEAL fractional tick this command was meant for, which is NOT the tick it
+            # arrived on. A 60 Hz command is due every 4.1667 ticks but can only ARRIVE on a
+            # whole tick, so it is already 0-1 ticks stale by an amount that cycles. Ageing the
+            # aim point from the arrival tick throws that away and re-quantises the extrapolation
+            # every command -- the residual roughness that survived fixing the velocity estimate.
+            # Advancing a fractional clock instead keeps the aim point continuous.
+            if self._trk_ideal_seeded:
+                self._trk_ideal += spans * self._trk_gap
+                # Re-sync if the PC's true rate differs from our estimate, or its clock drifts:
+                # never let the ideal time wander more than one interval from reality.
+                drift = self.last_cmd_tick - self._trk_ideal
+                if drift > self._trk_gap or drift < -self._trk_gap:
+                    self._trk_ideal = float(self.last_cmd_tick)
+            else:
+                self._trk_ideal = float(self.last_cmd_tick)
+                self._trk_ideal_seeded = True
+        self._ts_prev = self._cmd_ts
+        self._ts_prev_seq = self.seq_rx_last
 
         # The PC's OWN velocity, when it sent one, beats anything derived here. A VR headset
         # or haptic controller measures hand velocity directly; our estimate is a two-point
@@ -1853,11 +1904,10 @@ class RTIModeHandler:
             v = self._feedforward if self._trk_vtgt_from_pc else self._trk_vtgt
             self._sacc_n += 1
             if self._sacc_n >= 3:
-                # the SAME interval the velocity estimate was taken over (its own drop rule, SPAN_MARGIN) — a rule of
-                # its own here disagreed for gaps of 1.5-1.75 intervals and halved that packet's estimate (2026-10-11)
-                span = self._trk_spans * self._trk_gap
+                # the SAME interval the velocity estimate was taken over (its drop rule, or the send times) — a rule
+                # of its own here disagreed for gaps of 1.5-1.75 intervals and halved that packet's estimate
                 np.subtract(v, self._sacc_vprev, out=self._sacc_hold)
-                self._sacc_hold *= 1.0 / (span * self.delta_t)
+                self._sacc_hold *= 1.0 / self._trk_interval_s
             else:
                 self._sacc_hold[:] = 0.0
             self._sacc_vprev[:] = v
@@ -2498,6 +2548,8 @@ class RTIModeHandler:
         self._rx_applied += 1
         self.seq_rx_last = seq
         self.last_cmd_tick = ctx.current_tick
+        _ts = unpack_command_timestamp(data)
+        self._cmd_ts = _NAN if _ts is None else _ts
         self.last_cmd_type = cmd_type
         self._payload[:] = payload[:self.joint_num]
         self._feedforward[:] = feedforward[:self.joint_num]

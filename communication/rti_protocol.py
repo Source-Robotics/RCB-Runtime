@@ -9,10 +9,19 @@ Binary command packet format (101 bytes):
   53      float64     feedforward        6       48
   ─────────────────────────────────────────────────────
   Total: 101 bytes
+  101     float64     send_time          1       8      OPTIONAL (2026-10-11): 109 bytes in all
+
+The optional SEND TIME is the PC's own monotonic clock in seconds, when it took (or sent) the target. UDP only — the
+datagram's length tells whether it is there; a 101-byte packet is exactly what it always was, and a robot built before
+it reads the first 101 bytes and ignores the rest, so it is compatible both ways. The robot needs only the DIFFERENCES
+between send times (no clock synchronisation): with them its target-velocity estimate and its "when was this target
+valid" clock follow the PC's real timing instead of the arrival ticks — an uneven sender (VR, Wi-Fi) left 3x more
+chatter without it (simulated, TODO/servo_mode_options.md §17.20). TCP keeps fixed 101-byte frames.
 
 State packets use the recipe-driven format (see data/data_recipe.py build_payload).
 """
 
+import math
 import struct
 import numpy as np
 
@@ -31,6 +40,17 @@ CLOCK_PC = 1     # PC-clocked: PC sends when it wants, robot uses latest
 # Binary packet format string: uint32 + uint8 + 12*float64
 CMD_FMT = '<I B 12d'
 CMD_SIZE = struct.calcsize(CMD_FMT)  # 101 bytes
+CMD_TS_FMT = '<I B 12d d'
+CMD_TS_SIZE = struct.calcsize(CMD_TS_FMT)  # 109 bytes: + the optional send time
+
+
+def unpack_command_timestamp(data):
+    """The packet's send time (s, the PC's clock) when it carries one — exactly CMD_TS_SIZE bytes and finite — else
+    None. Separate from unpack_command_packet, whose 4-tuple every caller relies on."""
+    if data is None or len(data) != CMD_TS_SIZE:
+        return None
+    ts = struct.unpack_from('<d', data, CMD_SIZE)[0]
+    return ts if math.isfinite(ts) else None
 
 
 def unpack_command_packet(data):
@@ -55,7 +75,7 @@ def unpack_command_packet(data):
         return None
 
 
-def pack_command_packet(seq, cmd_type, payload, feedforward):
+def pack_command_packet(seq, cmd_type, payload, feedforward, timestamp=None):
     """Pack command packet for sending to robot.
 
     Args:
@@ -63,9 +83,10 @@ def pack_command_packet(seq, cmd_type, payload, feedforward):
         cmd_type: command type code (uint8)
         payload: 6-element array (float64)
         feedforward: 6-element array (float64)
+        timestamp: optional send time (s, the sender's monotonic clock) -> a 109-byte packet
 
     Returns:
-        bytes: 101-byte binary packet
+        bytes: 101-byte binary packet (109 with a timestamp)
     """
     payload = np.asarray(payload, dtype=np.float64)
     feedforward = np.asarray(feedforward, dtype=np.float64)
@@ -78,4 +99,6 @@ def pack_command_packet(seq, cmd_type, payload, feedforward):
         seq, cmd_type,
         *payload, *feedforward
     )
+    if timestamp is not None:
+        data += struct.pack('<d', float(timestamp))
     return data

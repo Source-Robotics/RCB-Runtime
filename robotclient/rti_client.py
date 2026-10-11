@@ -45,6 +45,7 @@ CMD_STOP = 0xFF
 
 CMD_FMT = '<I B 12d'
 CMD_SIZE = struct.calcsize(CMD_FMT)   # 101 bytes
+CMD_TS_SIZE = CMD_SIZE + 8            # + the optional send time (communication/rti_protocol.py)
 
 # Defaults from config/networking.py. Robot listens for commands on RTI_PORT_RECEIVE;
 # the PC listens for state on RTI_PORT_SENDER.
@@ -56,11 +57,16 @@ RTI_PORT_STREAM_TCP = 30003
 # enumerated here — the parser infers arity from how many values follow a tag.
 
 
-def pack_command_packet(seq: int, cmd_type: int, payload: Sequence[float], feedforward: Sequence[float]) -> bytes:
-    """Serialise a command. payload/feedforward are 6 floats each (zero-padded)."""
+def pack_command_packet(seq: int, cmd_type: int, payload: Sequence[float], feedforward: Sequence[float],
+                        timestamp: float | None = None) -> bytes:
+    """Serialise a command. payload/feedforward are 6 floats each (zero-padded). With `timestamp` (the send time in
+    seconds of a monotonic clock) the packet is 109 bytes — see communication/rti_protocol.py."""
     p = list(payload) + [0.0] * (6 - len(payload))
     f = list(feedforward) + [0.0] * (6 - len(feedforward))
-    return struct.pack(CMD_FMT, seq & 0xFFFFFFFF, cmd_type, *p[:6], *f[:6])
+    data = struct.pack(CMD_FMT, seq & 0xFFFFFFFF, cmd_type, *p[:6], *f[:6])
+    if timestamp is not None:
+        data += struct.pack('<d', float(timestamp))
+    return data
 
 
 def parse_state_packet(text: str) -> dict:
@@ -184,9 +190,14 @@ class RTIClient:
 
                      With 'tcp' ONE connection carries both directions and `listen_port` is
                      not used: the robot listens on RTI_PORT_STREAM_TCP and we dial in.
+        timestamps:  True (default): every UDP command carries its send time (time.perf_counter(), or the
+                     `timestamp` you pass to send_joint_position — e.g. when your device sampled the
+                     target), so the robot follows your real timing instead of the arrival times. An
+                     uneven sender (VR, Wi-Fi) left ~3x more chatter without it (simulated, 2026-10-11).
+                     No clock synchronisation is needed; only differences are used. TCP never sends it.
     """
 
-    def __init__(self, robot, clock='robot', listen_port=RTI_PORT_SENDER, transport='udp'):
+    def __init__(self, robot, clock='robot', listen_port=RTI_PORT_SENDER, transport='udp', timestamps=True):
         if clock not in ('robot', 'pc'):
             raise ValueError("clock must be 'robot' or 'pc'")
         if transport not in ('udp', 'tcp'):
@@ -194,6 +205,7 @@ class RTIClient:
         self.robot = robot
         self.clock = clock
         self.transport = transport
+        self.timestamps = bool(timestamps)
         self.seq = 0
         self.robot_ip = None
 
@@ -431,8 +443,11 @@ class RTIClient:
             bits.append(f"{int(self._last_miss)} consecutive misses")
         return ("  [" + ", ".join(bits) + "]") if bits else ""
 
-    def send_joint_position(self, positions: Sequence[float], feedforward_speed: Sequence[float] | None = None) -> None:
-        self._send(CMD_JOINT_POSITION, positions, feedforward_speed or [0.0] * 6)
+    def send_joint_position(self, positions: Sequence[float], feedforward_speed: Sequence[float] | None = None,
+                            timestamp: float | None = None) -> None:
+        """`timestamp`: when this target was taken, in seconds of a monotonic clock (default: now) — UDP with
+        `timestamps` on only."""
+        self._send(CMD_JOINT_POSITION, positions, feedforward_speed or [0.0] * 6, timestamp)
 
     def send_joint_velocity(self, velocities: Sequence[float], feedforward_torque: Sequence[float] | None = None) -> None:
         self._send(CMD_JOINT_VELOCITY, velocities, feedforward_torque or [0.0] * 6)
@@ -667,11 +682,14 @@ class RTIClient:
         data, _ = self._recv_sock.recvfrom(4096)
         return data
 
-    def _send(self, cmd_type, payload, feedforward):
+    def _send(self, cmd_type, payload, feedforward, timestamp=None):
         if self.robot_ip is None:
             raise RuntimeError("not connected — call connect() first")
         self.seq += 1
-        pkt = pack_command_packet(self.seq, cmd_type, payload, feedforward)
+        ts = None
+        if self.timestamps and self.transport == 'udp':
+            ts = time.perf_counter() if timestamp is None else float(timestamp)
+        pkt = pack_command_packet(self.seq, cmd_type, payload, feedforward, ts)
         self._raw_send(pkt)
         self.bytes_tx += len(pkt)
         self._t_send[self.seq] = time.perf_counter()
