@@ -124,6 +124,12 @@ class ControlOutput:
     target_TCP_speed:       Optional[np.ndarray] = None   # 6-vec twist [v, ω]
     target_TCP_pose_matrix: Optional[np.ndarray] = None   # 16-vec flattened 4x4 SE(3)
 
+    # Whether acc_rad may become inertia / Coriolis FEEDFORWARD torque (utility/mode_dispatch._add_dynamics_ff).
+    # False: acc_rad is still published (joint_acceleration_commanded, telemetry j_ac) but nothing is fed forward.
+    # The RTI handler sets it False (2026-10-11): its generator's acceleration is the planner's own state, switching
+    # between its limits as it chases each new target — fed forward it was up to ±1.8 Nm of 7-100 Hz torque on J1.
+    acc_feedforward: bool = True
+
 
 # Sentinel returned by handlers that own their own multi-phase CAN sends
 # (HOMING). Dispatch sees `output is SELF_MANAGED` and skips the commit /

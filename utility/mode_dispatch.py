@@ -481,13 +481,15 @@ def _add_dynamics_ff(ctx, output):
     joint_coriolis_torque (Nm; dispatch_step clears them every tick).
 
     From the COMMANDED motion only (user decision 2026-10-10): the handler's acc_rad declares that it has one —
-    EXEC (the planned velocity's change per tick), JOG (its profile), RTI / SOFT_RTI position and velocity commands
-    (the generator / limiter state, with the rate limiter on). Without a commanded acceleration (freedrive, holds of
-    RTI, error / stop outputs, RTI torque commands) nothing is added. q = the commanded position, or the measured one
-    where the mode commands none (velocity commands: M and C only need the configuration); qd = the commanded
-    velocity (no Coriolis without one). Gravity stays the handlers' own, at the measured pose. A non-finite result
-    adds nothing."""
-    if output.acc_rad is None:
+    EXEC (the planned velocity's change per tick), JOG (its profile). Without a commanded acceleration (freedrive,
+    holds, error / stop outputs) nothing is added. NOT in RTI / SOFT_RTI (user decision 2026-10-11): their output
+    carries the generator's acceleration with acc_feedforward=False — the planner's own state, switching between its
+    limits as it chases each new target (simulated on PAR6: ±1.8 Nm on J1 at 7-100 Hz in SOFT_RTI, 0.9 Nm RMS in hard
+    RTI, where the motion's own inertia torque was 0.06 Nm); a PC that wants dynamics sends torque. q = the commanded
+    position, or the measured one where the mode commands none (velocity commands: M and C only need the
+    configuration); qd = the commanded velocity (no Coriolis without one). Gravity stays the handlers' own, at the
+    measured pose. A non-finite result adds nothing."""
+    if output.acc_rad is None or not output.acc_feedforward:
         return
     rti = ctx.shared_data.rti
     use_i = rti['inertia_comp_enabled'][0] > 0.5

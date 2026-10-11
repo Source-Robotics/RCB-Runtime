@@ -351,7 +351,8 @@ class RTIModeHandler:
         # PC-side client expects after rti_release — "it stays where I left it"). Until then _hold re-sampled
         # the pose every tick: a damped float that a hand could push and that drifted under gravity.
         self._hold_frozen = False
-        self._out = ControlOutput()
+        # acc_feedforward=False: the acceleration below is published, never fed forward (see ControlOutput).
+        self._out = ControlOutput(acc_feedforward=False)
 
         # Scratch for the 6-wide wire packet before it is narrowed to joint_num.
         self._rx_payload = np.zeros(6, dtype=np.float64)
@@ -981,8 +982,10 @@ class RTIModeHandler:
             out.pos_rad = self._limit_position(payload, ctx)
             out.vel_rad = self._feedforward
             out.trq_nm = self._add_gravity(ctx, None)
-            # The generator's (ruckig / ruckig_advancing / tracker) commanded acceleration: what dispatch's inertia
-            # feedforward uses (2026-10-10). With the rate limiter OFF there is no bounded acceleration — none.
+            # The generator's (ruckig / ruckig_advancing / tracker) commanded acceleration — PUBLISHED only
+            # (joint_acceleration_commanded, telemetry j_ac); no inertia / Coriolis feedforward from it in RTI /
+            # SOFT_RTI (self._out.acc_feedforward is False, 2026-10-11): it switches between its limits as the
+            # planner chases each new target. With the rate limiter OFF there is no bounded acceleration — none.
             out.acc_rad = self._rl_a if self.rate_limit_enabled else None
         elif ct == CMD_JOINT_VELOCITY:
             out.pos_rad = None
