@@ -13,8 +13,12 @@ This test measures it. Every SENDER runs every SET in turn:
   sets     off / stream (default order off,stream,off — the second off checks the measurement repeats)
            The robot-wide inertia and Coriolis switches are ON for every set (put back as they were at the end).
 
-Each block: a session (connect, configure, claim), 1 s still, then a J1 sine around where the arm is (default ±15 deg,
-1.5 s period, faded in and out over 1 s so it starts and ends at rest), 1 s still, release. Recorded tick by tick from
+Each block: a session (connect — the robot must really be in the sender's contract, RTI or SOFT_RTI, or the block is
+refused —, configure, claim), 1 s still, then a J1 sine around where the arm is (default ±15 deg,
+1.5 s period, faded in and out over 1 s so it starts and ends at rest), 1 s still, release, DISCONNECT (back to IDLE:
+RTI <-> SOFT_RTI only change through IDLE — the first run, 2026-10-11, stayed in RTI after the hard blocks, so every
+'soft' block ran hard RTI fed at 50 Hz, and the 10 Hz one tripped the 40 ms watchdog). Any failure ends the run, and
+what was recorded is still saved. Recorded tick by tick from
 the robot's own UDP telemetry (recipe `tracking`, as api_tests/66).
 
 WHAT IS MEASURED, per block and moving joint (error = commanded - measured position; the commanded motion is the
@@ -27,6 +31,9 @@ generator's, which is what the arm is asked to follow):
   ff / ff_hf      RMS of the feedforward torque we added (inertia + Coriolis, Nm), and its part above ~10 Hz
   pid             RMS of measured - commanded torque while moving: what the drive's own loops had to add
   acc_hf          the published acceleration's part above ~10 Hz (rad/s^2): the generator's (off) or the stream's
+  cmd_vhf /       the COMMANDED / MEASURED speed's part above ~10 Hz during steady motion (deg/s): jerkiness — the
+  meas_vhf        generator's chatter in what the drive is told, and what the arm really did (speed, not position:
+                  the slow sine leaks ~0.09 deg through the filter, its speed only ~0.5 deg/s — the floor here)
 One line per sender and set; then each joint's mean over the senders, relative to `off`.
 
 The robot must be ENABLED and homed; the arm moves J1 only by default (`--joints 1,4,5,6` allowed — J2 / J3 are not,
@@ -70,7 +77,7 @@ STILL_S = 1.0
 FADE_S = 1.0
 MOVING = 1e-3                     # rad/s commanded: "moving"
 HF_W = 13                         # moving-mean half width (ticks): 27 ticks = 108 ms -> above ~10 Hz
-METRICS = ("rms_d", "peak_d", "delay_ms", "buzz", "ff", "ff_hf", "pid", "acc_hf", "vpeak")
+METRICS = ("rms_d", "peak_d", "delay_ms", "buzz", "ff", "ff_hf", "pid", "acc_hf", "cmd_vhf", "meas_vhf", "vpeak")
 
 
 # ----------------------------------------------------------------------------- the motion (pure)
@@ -124,6 +131,8 @@ def block_metrics(s, j, dt):
             "delay_ms": 1000.0 * delay, "buzz": rms(hf(s["j_t"][win, j])[steady_mask(s["j_sc"][win, j])]),
             "ff": rms(ff), "ff_hf": rms(hf(ff)),
             "pid": rms((s["j_t"][:, j] - s["j_tc"][:, j])[moving]), "acc_hf": rms(hf(s["j_ac"][win, j])),
+            "cmd_vhf": rms(hf(np.degrees(s["j_sc"][win, j]))[steady_mask(s["j_sc"][win, j])]),
+            "meas_vhf": rms(hf(np.degrees(s["j_s"][win, j]))[steady_mask(s["j_sc"][win, j])]),
             "vpeak": float(np.degrees(np.abs(s["j_sc"][:, j]).max()))}
 
 
@@ -158,7 +167,7 @@ def print_report(moves, senders, set_labels, title=""):
     if title:
         print(title)
     cols = [("vpeak", 1), ("rms_d", 4), ("peak_d", 3), ("delay_ms", 1), ("buzz", 4), ("ff", 3), ("ff_hf", 4),
-            ("pid", 3), ("acc_hf", 2)]
+            ("pid", 3), ("acc_hf", 2), ("cmd_vhf", 2), ("meas_vhf", 2)]
     print("  (J = joint; deg, ms, Nm, rad/s^2; rms_d / peak_d = tracking error after the best time shift 'delay';"
           " buzz = torque above ~10 Hz)")
     joints = sorted({m["joint"] for m in moves})
@@ -174,7 +183,8 @@ def print_report(moves, senders, set_labels, title=""):
     others = [lab for lab in set_labels if not lab.startswith("off")]
     if base and others:
         for key, what in (("rms_d", "tracking error after the time shift"), ("buzz", "buzz (torque above ~10 Hz)"),
-                          ("pid", "torque the drive's own loops added")):
+                          ("pid", "torque the drive's own loops added"),
+                          ("meas_vhf", "jerkiness (measured speed above ~10 Hz)")):
             print(f"\n  {what}, per sender, relative to 'off' (mean of the off sets):")
             for j in joints:
                 for snd in senders:
@@ -222,6 +232,7 @@ def selftest():
     jp = np.zeros((n, 6)); jpc = np.zeros((n, 6)); jsc = np.zeros((n, 6)); jac = np.zeros((n, 6))
     jt = np.zeros((n, 6)); jtc = np.zeros((n, 6)); jti = np.zeros((n, 6)); jtco = np.zeros((n, 6)); js = np.zeros((n, 6))
     jp[:, 0], jpc[:, 0], jsc[:, 0], jac[:, 0] = meas, cmd, vel, acc
+    js[:, 0] = vel + 0.1 * np.sin(2 * np.pi * 10 * tt)                # the arm's speed wobbles 0.1 rad/s at 10 Hz
     ripple = 0.01 * np.sin(2 * np.pi * 40 * tt)
     jti[:, 0] = 0.1 * acc + ripple
     jtc[:, 0] = 1.0 + jti[:, 0]
@@ -251,6 +262,11 @@ def selftest():
         abs(m["ff_hf"] - want_hf) < 0.1 * want_hf and abs(other_hf - want_hf) > 0.3 * want_hf, (m["ff_hf"], want_hf))
     chk("pid = the drive's extra 0.05 Nm (+ the buzz)", abs(m["pid"] - math.sqrt(0.05 ** 2 + 0.02 ** 2 / 2)) < 0.004,
         m["pid"])
+    k10 = math.degrees(0.1) / math.sqrt(2) * (1 + abs(math.sin(math.pi * 10 * (2 * HF_W + 1) * dt))
+                                                / (math.pi * 10 * (2 * HF_W + 1) * dt))
+    chk(f"meas_vhf = the measured speed's 10 Hz wobble (~{k10:.2f} deg/s); cmd_vhf of the smooth command = only the "
+        f"filter's leak of the 63 deg/s sine (< 0.7 deg/s — the floor of this measure)",
+        abs(m["meas_vhf"] - k10) < 0.15 * k10 and m["cmd_vhf"] < 0.7, (m["meas_vhf"], m["cmd_vhf"], k10))
     chk("set labels: off, stream, off2", label_sets(["off", "stream", "off"]) == ["off", "stream", "off2"])
     sp = np.abs(np.sin(np.linspace(0, 4 * np.pi, 1000)))
     mk = steady_mask(sp)
@@ -351,8 +367,14 @@ def run_session(args, cfg, senders, set_order):
                 print(f"  {snd:>8s} {label:>7s} ... ", end="", flush=True)
                 rng = random.Random(args.seed)
                 rti = RTIClient(robot, clock="pc")
+                want = "SOFT_RTI" if soft else "RTI"
                 try:
                     rti.connect(rate_hz=lo if soft else None)
+                    try:
+                        robot.wait(lambda st_: st_.get("mode") == want, 3.0, f"mode {want}")
+                    except Exception:
+                        raise RuntimeError(f"the robot is in {robot.status().get('mode')}, not {want} — refusing to "
+                                           f"run this block under the wrong contract") from None
                     time.sleep(0.4)
                     sc.apply_config(robot, {"gen": "ruckig_advancing" if soft else "ruckig"})
                     robot.rti_set_dynamics_ff(set_name)          # after the connect: every RTI entry starts 'off'
@@ -364,10 +386,21 @@ def run_session(args, cfg, senders, set_order):
                     t1 = capture.last_tick()
                     sc.keep_alive(rti, q0, lo, 0.3)
                     rti.release()
-                except ControlLost as exc:
-                    print(f"CONTROL LOST: {exc}")
+                    time.sleep(0.6)                           # the robot holds 0.5 s after a release
+                    robot.rti_disconnect(wait=True)           # back to IDLE: the next block may be the other contract
+                except (ControlLost, Exception) as exc:      # any failure ends the run; what was recorded is saved
+                    print(f"FAILED: {type(exc).__name__}: {exc}")
                     ok = False
+                    try:
+                        robot.rti_disconnect()
+                    except Exception:
+                        pass
                     break
+                finally:
+                    try:
+                        rti.close()
+                    except Exception:
+                        pass
                 records.append({"sender": snd, "set": label, "joints": joints1, "t0": t0, "t1": t1})
                 print("done")
                 time.sleep(0.3)
