@@ -9,7 +9,8 @@ from robotclient.rti_client import parse_state_packet
 
 TELEMETRY_PORT = 30003            # config/networking.py TELEMETRY_PORT (the import would pull in zmq setup)
 NEED = ("j_p", "j_pc", "j_s", "j_sc", "j_ac", "j_t", "j_tc", "tick")
-OPTIONAL = ("j_t_inertia", "j_t_coriolis")      # 2026-10-10; zeros in runs recorded before them
+OPTIONAL = ("j_t_inertia", "j_t_coriolis",      # 2026-10-10; zeros in runs recorded before them
+            "j_pt")                             # the target (RTI: the PC's raw request), 2026-10-11; zeros before
 DELAY_MAX_S, DELAY_STEP_S, DELAY_COARSE_S = 0.020, 0.00025, 0.001   # the time shift searched for each move
 
 

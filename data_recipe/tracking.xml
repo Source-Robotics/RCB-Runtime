@@ -18,6 +18,7 @@
     <field tag="j_tc"  precision="3"/>
     <field tag="j_t_inertia"  precision="3"/>
     <field tag="j_t_coriolis" precision="3"/>
+    <field tag="j_pt"  precision="5"/>  <!-- the TARGET: in RTI / SOFT_RTI the PC's raw request (api_tests/68: the lag behind it) -->
     <field tag="tick"/>
     <field tag="mode"/>
 </recipe>

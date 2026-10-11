@@ -40,6 +40,10 @@ generator's, which is what the arm is asked to follow):
                   what the arm really did
   cmd_vhf /       the same above 10 Hz (deg/s): the fast part
   arm_vhf
+  gen_lag /       how far the robot's COMMANDED path / the ARM trails the PC's intent (ms) — the PC's targets (recorded
+  arm_lag         as j_pt, joined point to point) against j_pc / j_p at the best time shift; the price of SOFT_RTI's
+                  smoothing (simulated: +20 ms at 50 Hz, +120 ms at 10 Hz for the duration pacing)
+  err_i           the arm's error against the intent after that shift (deg): how faithfully the PC's path is drawn
 One line per sender and set; then each joint's mean over the senders, relative to `off`.
 
 The robot must be ENABLED and homed; the arm moves J1 only by default (`--joints 1,4,5,6` allowed — J2 / J3 are not,
@@ -85,7 +89,8 @@ FADE_S = 1.0
 MOVING = 0.01                     # rad/s commanded (from j_pc): "moving" (0.57 deg/s, above j_pc's 1e-5 rad rounding)
 HF_W = 13                         # moving-mean half width (ticks): 27 ticks = 108 ms -> above ~10 Hz
 METRICS = ("rms_d", "peak_d", "delay_ms", "buzz", "ff", "ff_hf", "pid", "acc_hf", "cmd_jerk", "arm_jerk", "cmd_vhf",
-           "arm_vhf", "vpeak")
+           "arm_vhf", "gen_lag", "arm_lag", "err_i", "vpeak")
+INTENT_MAX_S = 0.4                # the lag searched behind the PC's intent
 JERK_BAND_HZ = (1.5, 10.0)        # the smooth sine (0.67 Hz) below, the visible kicks inside, the fast part above
 FADE_MARGIN_S = 1.2               # the band metrics skip the fades (1 s each) + a margin
 
@@ -155,8 +160,50 @@ def block_metrics(s, j, dt):
             "delay_ms": 1000.0 * delay, "buzz": rms(hf(s["j_t"][win, j])[steady_mask(vc[win])]),
             "ff": rms(ff), "ff_hf": rms(hf(ff)),
             "pid": rms((s["j_t"][:, j] - s["j_tc"][:, j])[moving]), "acc_hf": rms(hf(s["j_ac"][win, j])),
-            **_jerk_metrics(vc, s["j_s"][:, j], first, last, dt),
+            **_jerk_metrics(vc, s["j_s"][:, j], first, last, dt), **_intent_metrics(s, j, moving, dt),
             "vpeak": float(np.degrees(np.abs(vc).max()))}
+
+
+def intent_path(tick, target):
+    """The PC's intent as a continuous path: its targets (j_pt, a staircase at the PC's rate — each new value arrives
+    in the tick it was sent) joined point to point at the ticks they arrived. None when the run has no targets."""
+    if not np.any(target):
+        return None
+    new = np.flatnonzero(np.r_[True, np.diff(target) != 0])
+    if new.size < 4:
+        return None
+    return np.interp(tick, tick[new], target[new])
+
+
+def shift_fit(t, ref, sig, mask, max_s=INTENT_MAX_S):
+    """(the shift s in 0..max_s minimising RMS(ref(t - s) - sig(t)) over mask, that RMS in deg). 2 ms grid, then
+    0.25 ms around the best."""
+    tm, sm = t[mask], sig[mask]
+    best = [np.inf, 0.0]
+
+    def at(s):
+        e = float(np.sqrt(np.mean((np.interp(tm - s, t, ref) - sm) ** 2)))
+        if e < best[0]:
+            best[:] = [e, float(s)]
+    for s in np.arange(0.0, max_s + 1e-12, 0.002):
+        at(s)
+    c = best[1]
+    for s in np.arange(max(0.0, c - 0.002), min(max_s, c + 0.002) + 1e-12, 0.00025):
+        at(s)
+    return best[1], float(np.degrees(best[0]))
+
+
+def _intent_metrics(s, j, moving, dt):
+    none = {"gen_lag": None, "arm_lag": None, "err_i": None}
+    if "j_pt" not in s:
+        return none
+    t = s["tick"] * dt
+    ip = intent_path(s["tick"], s["j_pt"][:, j])
+    if ip is None:
+        return none
+    gl, _ = shift_fit(t, ip, s["j_pc"][:, j], moving)
+    al, ae = shift_fit(t, ip, s["j_p"][:, j], moving)
+    return {"gen_lag": 1000.0 * gl, "arm_lag": 1000.0 * al, "err_i": ae}
 
 
 def _jerk_metrics(vc, vm, first, last, dt):
@@ -199,7 +246,8 @@ def print_report(moves, senders, set_labels, title=""):
     if title:
         print(title)
     cols = [("vpeak", 1), ("rms_d", 4), ("peak_d", 3), ("delay_ms", 1), ("buzz", 4), ("ff", 3), ("ff_hf", 4),
-            ("pid", 3), ("acc_hf", 2), ("cmd_jerk", 2), ("arm_jerk", 2), ("cmd_vhf", 2), ("arm_vhf", 2)]
+            ("pid", 3), ("acc_hf", 2), ("cmd_jerk", 2), ("arm_jerk", 2), ("cmd_vhf", 2), ("arm_vhf", 2),
+            ("gen_lag", 1), ("arm_lag", 1), ("err_i", 3)]
     print("  (J = joint; deg, ms, Nm, rad/s^2; rms_d / peak_d = tracking error after the best time shift 'delay';"
           " buzz = torque above ~10 Hz)")
     joints = sorted({m["joint"] for m in moves})
@@ -264,6 +312,10 @@ def selftest():
     n = tt.size
     jp = np.zeros((n, 6)); jpc = np.zeros((n, 6)); jsc = np.zeros((n, 6)); jac = np.zeros((n, 6))
     jt = np.zeros((n, 6)); jtc = np.zeros((n, 6)); jti = np.zeros((n, 6)); jtco = np.zeros((n, 6)); js = np.zeros((n, 6))
+    # the PC's targets: its intent runs 20 ms AHEAD of the commanded path, sent at 50 Hz (a staircase, 5 ticks a step)
+    intent = np.array([offset(x + 0.020 - STILL_S, total, amp, per) for x in tt])
+    jpt = np.zeros((n, 6))
+    jpt[:, 0] = intent[(np.arange(n) // 5) * 5]
     jp[:, 0], jpc[:, 0], jsc[:, 0], jac[:, 0] = meas, cmd, vel, acc
     js[:, 0] = vel + 0.05 * np.sin(2 * np.pi * 4 * tt) + 0.1 * np.sin(2 * np.pi * 25 * tt)   # 4 Hz (visible) + 25 Hz wobble
     ripple = 0.01 * np.sin(2 * np.pi * 40 * tt)
@@ -273,7 +325,7 @@ def selftest():
     f = lambda a, k=5: ",".join(f"{x:.{k}f}" for x in a)
     pk = [(f"j_p:{f(jp[i])},j_pc:{f(jpc[i])},j_s:{f(js[i], 4)},j_sc:{f(jsc[i], 4)},j_ac:{f(jac[i], 3)},"
            f"j_t:{f(jt[i], 3)},j_tc:{f(jtc[i], 3)},j_t_inertia:{f(jti[i], 3)},j_t_coriolis:{f(jtco[i], 3)},"
-           f"tick:{1000 + i},mode:SOFT_RTI").encode() for i in range(n)]
+           f"j_pt:{f(jpt[i])},tick:{1000 + i},mode:SOFT_RTI").encode() for i in range(n)]
     d = to_arrays(pk)
     chk("packets parsed in tick order", d["tick"].size == n, d["tick"].size)
     moves = analyse(d, [{"sender": "soft50", "set": "stream", "joints": [1], "t0": 1000, "t1": 1000 + n - 1}], dt)
@@ -305,6 +357,15 @@ def selftest():
     m0 = analyse(d0, [{"sender": "hard250", "set": "off", "joints": [1], "t0": 1000, "t1": 1000 + n - 1}], dt)
     chk("a block whose published commanded speed is 0 (hard RTI) is still analysed, the same",
         len(m0) == 1 and abs(m0[0]["rms_d"] - m["rms_d"]) < 1e-9 and abs(m0[0]["buzz"] - m["buzz"]) < 1e-9, m0)
+    chk("the commanded path trails the PC's intent by the 20 ms built in (gen_lag), the arm by 20 + 6 ms (arm_lag); "
+        "the arm draws the intent's shape after that shift (err_i < 0.01 deg)",
+        abs(m["gen_lag"] - 20.0) <= 1.0 and abs(m["arm_lag"] - 26.0) <= 1.0 and m["err_i"] < 0.01,
+        (m["gen_lag"], m["arm_lag"], m["err_i"]))
+    d1 = dict(d)
+    d1["j_pt"] = np.zeros_like(d["j_pt"])                                  # a run recorded before j_pt existed
+    m1 = analyse(d1, [{"sender": "soft50", "set": "off", "joints": [1], "t0": 1000, "t1": 1000 + n - 1}], dt)
+    chk("a run without the PC's targets: the intent metrics are left empty, everything else is the same",
+        len(m1) == 1 and m1[0]["gen_lag"] is None and m1[0]["arm_lag"] is None and abs(m1[0]["rms_d"] - m["rms_d"]) < 1e-12)
     chk("set labels: off, stream, off2", label_sets(["off", "stream", "off"]) == ["off", "stream", "off2"])
     sp = np.abs(np.sin(np.linspace(0, 4 * np.pi, 1000)))
     mk = steady_mask(sp)
