@@ -208,6 +208,17 @@ GAP_WINDOW = 12
 # while leaving normal jitter alone.
 SPAN_MARGIN = 1.75
 
+# Inertia / Coriolis FEEDFORWARD in RTI / SOFT_RTI (2026-10-11, TODO/dynamics_feedforward_plan.md F3). The generator's
+# own acceleration (_rl_a) is never fed forward: it switches between its limits as the planner chases each new target
+# (simulated on PAR6: ±1.8 Nm on J1). "stream" feeds forward the STREAM's acceleration instead — the change of the
+# target-velocity estimate between arriving packets, over their interval, smoothed by a critically damped 2nd-order
+# low-pass. Simulated against the torque the commanded motion needs (1.0 = no better than no feedforward): hard RTI
+# 250 Hz 0.12, SOFT_RTI 50 Hz 0.27, wandering 50-60 Hz 0.33, 25 Hz 0.38, 10 Hz 0.69, 5 Hz ~1 (too late to help),
+# ripple <= 0.03 Nm. Opt-in per session (rti_set_dynamics_ff), "off" at every RTI / SOFT_RTI entry.
+DYNAMICS_FF_SOURCES = ("off", "stream")
+STREAM_ACC_LP_HZ = 8.0            # the low-pass: unsmoothed, a wandering sender's estimate was worse than none (1.5)
+STREAM_ACC_HOLD_INTERVALS = 2.0   # no packet for this many intervals: the held estimate drops to 0 (then decays)
+
 TRACKER_GAIN_DEFAULT = 15.0
 TRACKER_GAIN_OVERSHOOT_WARN = 20.0
 TRACKER_GAIN_MIN = 1.0        # below this the tracker is slower than any useful motion
@@ -542,6 +553,18 @@ class RTIModeHandler:
         self._trk_vtgt_from_pc = False
         self._trk_seeded = False
         self._trk_nvcap = np.zeros(joint_num, dtype=np.float64)
+        # Stream-acceleration feedforward (see DYNAMICS_FF_SOURCES). All preallocated: _stream_acceleration runs every
+        # tick of a position stream.
+        self.dynamics_ff_source = "off"
+        self._sacc = np.zeros(joint_num, dtype=np.float64)         # the smoothed estimate — what is fed forward
+        self._sacc_lp1 = np.zeros(joint_num, dtype=np.float64)     # first low-pass stage
+        self._sacc_hold = np.zeros(joint_num, dtype=np.float64)    # the newest packet's raw estimate, held
+        self._sacc_vprev = np.zeros(joint_num, dtype=np.float64)   # the previous packet's velocity
+        self._sacc_tmp = np.zeros(joint_num, dtype=np.float64)
+        self._sacc_cmd_tick = -1
+        self._sacc_n = 0                  # packets taken since the claim: a velocity from the 2nd, an acceleration from the 3rd
+        _tau = 1.0 / (2.0 * np.pi * STREAM_ACC_LP_HZ)
+        self._sacc_alpha = float(delta_t / (_tau + delta_t))
 
         # Auto velocity pacing — the self-tuning form of the velocity cap. Off by default;
         # rti_set_vel_scale stays the shipped behaviour until this is verified on the arm.
@@ -785,6 +808,7 @@ class RTIModeHandler:
         self._trk_ideal_seeded = False
         self._trk_vtgt_from_pc = False
         self._trk_seeded = False
+        self._reset_stream_acceleration(current_tick)
 
         # Rebuild the low-pass so it seeds from THIS session's first command. The engine
         # seeds an ema from its first sample rather than ramping from zero, but that only
@@ -982,16 +1006,23 @@ class RTIModeHandler:
             out.pos_rad = self._limit_position(payload, ctx)
             out.vel_rad = self._feedforward
             out.trq_nm = self._add_gravity(ctx, None)
-            # The generator's (ruckig / ruckig_advancing / tracker) commanded acceleration — PUBLISHED only
-            # (joint_acceleration_commanded, telemetry j_ac); no inertia / Coriolis feedforward from it in RTI /
-            # SOFT_RTI (self._out.acc_feedforward is False, 2026-10-11): it switches between its limits as the
-            # planner chases each new target. With the rate limiter OFF there is no bounded acceleration — none.
-            out.acc_rad = self._rl_a if self.rate_limit_enabled else None
+            # Source "stream" (opt-in): the STREAM's acceleration is published AND fed forward. Otherwise the
+            # generator's (ruckig / ruckig_advancing / tracker) commanded acceleration is PUBLISHED only
+            # (joint_acceleration_commanded, telemetry j_ac) — never fed forward: it switches between its limits as
+            # the planner chases each new target (2026-10-11). With the rate limiter OFF (no target-velocity
+            # estimate, no bounded acceleration) — none either way.
+            if self.dynamics_ff_source == "stream" and self.rate_limit_enabled:
+                out.acc_rad = self._stream_acceleration(ctx)
+                out.acc_feedforward = True
+            else:
+                out.acc_rad = self._rl_a if self.rate_limit_enabled else None
+                out.acc_feedforward = False
         elif ct == CMD_JOINT_VELOCITY:
             out.pos_rad = None
             out.vel_rad = self._limit_velocity(payload, q_meas, ctx)
             out.trq_nm = self._add_gravity(ctx, self._limit_torque(self._feedforward, q_meas))
             out.acc_rad = self._rl_a if self.rate_limit_enabled else None      # the limiter's (see above)
+            out.acc_feedforward = False       # published only — the stream source is for position streams
         elif ct == CMD_JOINT_TORQUE:
             out.pos_rad = None
             out.vel_rad = None
@@ -1772,6 +1803,56 @@ class RTIModeHandler:
         self.gravity_comp_enabled = bool(enabled)
         logger.warning("[RTI] Gravity compensation %s", "ENABLED" if enabled else "DISABLED")
 
+    def set_dynamics_ff_source(self, name):
+        """Inertia / Coriolis feedforward source for RTI / SOFT_RTI position streams: "off" (the default at every
+        RTI / SOFT_RTI entry) or "stream" (the stream's own acceleration — see DYNAMICS_FF_SOURCES). The robot-wide
+        inertia / Coriolis switches still apply on top. An unknown name is refused and leaves the source unchanged."""
+        key = str(name).strip().lower()
+        if key not in DYNAMICS_FF_SOURCES:
+            logger.warning("[RTI] rti_set_dynamics_ff refused: %r — known: %s; source stays %r",
+                           name, ", ".join(DYNAMICS_FF_SOURCES), self.dynamics_ff_source)
+            return False
+        self.dynamics_ff_source = key
+        self._reset_stream_acceleration(self._trk_cmd_tick)
+        logger.warning("[RTI] Dynamics feedforward source: %s", key.upper())
+        return True
+
+    def _reset_stream_acceleration(self, current_tick):
+        self._sacc[:] = 0.0
+        self._sacc_lp1[:] = 0.0
+        self._sacc_hold[:] = 0.0
+        self._sacc_vprev[:] = 0.0
+        self._sacc_cmd_tick = current_tick
+        self._sacc_n = 0
+
+    def _stream_acceleration(self, ctx):
+        """This tick's stream acceleration (rad/s^2) for the feedforward: on a NEW packet (the target-velocity estimator
+        has just run) the velocity's change since the previous packet over their interval, held until the next;
+        dropped to 0 after STREAM_ACC_HOLD_INTERVALS without one; then the 2nd-order low-pass, every tick. The
+        velocity is the PC's own when it sent one, else the estimate. No acceleration before the 3rd packet: the
+        estimator's first velocity is a seeded 0, and a stream that starts moving would read it as a jump."""
+        if self._trk_cmd_tick != self._sacc_cmd_tick:
+            v = self._feedforward if self._trk_vtgt_from_pc else self._trk_vtgt
+            self._sacc_n += 1
+            if self._sacc_n >= 3:
+                span = max(1.0, round((self._trk_cmd_tick - self._sacc_cmd_tick) / self._trk_gap)) * self._trk_gap
+                np.subtract(v, self._sacc_vprev, out=self._sacc_hold)
+                self._sacc_hold *= 1.0 / (span * self.delta_t)
+            else:
+                self._sacc_hold[:] = 0.0
+            self._sacc_vprev[:] = v
+            self._sacc_cmd_tick = self._trk_cmd_tick
+        elif ctx.current_tick - self._sacc_cmd_tick > STREAM_ACC_HOLD_INTERVALS * self._trk_gap:
+            self._sacc_hold[:] = 0.0
+        a = self._sacc_alpha
+        np.subtract(self._sacc_hold, self._sacc_lp1, out=self._sacc_tmp)
+        self._sacc_tmp *= a
+        self._sacc_lp1 += self._sacc_tmp
+        np.subtract(self._sacc_lp1, self._sacc, out=self._sacc_tmp)
+        self._sacc_tmp *= a
+        self._sacc += self._sacc_tmp
+        return self._sacc
+
     def apply_mode_contract(self, soft, rate_hz=None):
         """Configure the handler for the mode being entered. Called by dispatch on enter().
 
@@ -1798,6 +1879,7 @@ class RTIModeHandler:
             self.soft_mode = False
             self._soft_rate_hz = None
             self._soft_refused = 0
+            self.dynamics_ff_source = "off"       # opt-in per session (rti_set_dynamics_ff)
             self.set_command_timeout(COMMAND_TIMEOUT_S)
             self.set_servo_generator(SERVO_RUCKIG)
             self.set_pace(0.0)
@@ -1827,6 +1909,7 @@ class RTIModeHandler:
         self.soft_mode = True
         self._soft_rate_hz = hz
         self._soft_refused = 0
+        self.dynamics_ff_source = "off"           # opt-in per session (rti_set_dynamics_ff)
         if hz is not None:
             self.set_command_timeout(3.0 / hz)
         self.set_servo_generator(SERVO_ADVANCING)

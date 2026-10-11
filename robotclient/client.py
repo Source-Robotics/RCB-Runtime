@@ -364,6 +364,18 @@ class RobotClient:
         """
         self._immediate("rti_set_gravity_comp", [1 if enabled else 0])
 
+    def rti_set_dynamics_ff(self, source: str) -> None:
+        """Inertia / Coriolis feedforward source for RTI / SOFT_RTI POSITION streams: "off" or "stream".
+
+        **"off" at every RTI / SOFT_RTI entry** — set it after `rti_connect`, before claiming. "stream" feeds forward
+        M(q)·q̈ (+ C(q, q̇)·q̇) from the stream's OWN acceleration: the change of the target velocity between your
+        packets over their interval, smoothed (~8 Hz). It helps from ~25 Hz up and is too late to help below ~10 Hz.
+        The robot's generator acceleration is never fed forward (it switches between its limits as it chases each
+        target). The robot-wide `set_inertia_comp` / `set_coriolis_comp` switches still apply on top. Velocity and
+        torque commands get none.
+        """
+        self._immediate("rti_set_dynamics_ff", [str(source).strip().lower()])
+
     def rti_set_tcp_vel_limit(self, mps: float) -> None:
         """Cap the end effector's translational speed at `mps` metres/second. 0 disables.
 

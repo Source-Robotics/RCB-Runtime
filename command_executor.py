@@ -1413,6 +1413,7 @@ IMMEDIATE_HANDLERS = {
     "rti_disconnect":   _forward_to_rti("rti_disconnect", "rti_disconnect"),
     "rti_set_rate_limiter":     _forward_fmt("rti_set_rate_limiter", "rti_set_rate_limiter", 1),
     "rti_set_gravity_comp":     _forward_fmt("rti_set_gravity_comp", "rti_set_gravity_comp", 1),
+    "rti_set_dynamics_ff":      _forward_fmt("rti_set_dynamics_ff", "rti_set_dynamics_ff", 1),
     "rti_set_tcp_vel_limit":    _forward_fmt("rti_set_tcp_vel_limit", "rti_set_tcp_vel_limit", 1),
     "rti_set_command_timeout":  _forward_fmt("rti_set_command_timeout", "rti_set_command_timeout", 1),
     "rti_set_vel_scale":        _forward_fmt("rti_set_vel_scale", "rti_set_vel_scale", 1),

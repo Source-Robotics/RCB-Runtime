@@ -1688,6 +1688,14 @@ def main():
                                         self_lookahead=self_lookahead)
 
 
+    def _handle_rti_set_dynamics_ff(cmd_msg, cmd_dict):
+        """rti_set_dynamics_ff:<off|stream> — inertia / Coriolis feedforward source for RTI / SOFT_RTI position
+        streams (default off at every RTI entry; motion/rti_handler.DYNAMICS_FF_SOURCES, 2026-10-11)."""
+        parts = cmd_msg.split(":", 1)
+        if len(parts) == 2:
+            rti_handler.set_dynamics_ff_source(parts[1].strip())
+
+
     def _handle_rti_set_gravity_comp(cmd_msg, cmd_dict):
         """rti_set_gravity_comp:<0|1> — gravity feedforward on RTI commands (default ON)."""
         parts = cmd_msg.split(":", 1)
@@ -1805,6 +1813,7 @@ def main():
         "rti_disconnect":    _handle_rti_disconnect,
         "rti_set_rate_limiter":     _handle_rti_set_rate_limiter,
         "rti_set_gravity_comp":     _handle_rti_set_gravity_comp,
+        "rti_set_dynamics_ff":      _handle_rti_set_dynamics_ff,
         "rti_set_tcp_vel_limit":    _handle_rti_set_tcp_vel_limit,
         "rti_set_command_timeout":  _handle_rti_set_command_timeout,
         "rti_set_vel_scale":        _handle_rti_set_vel_scale,

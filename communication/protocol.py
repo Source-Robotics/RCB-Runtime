@@ -165,6 +165,7 @@ COMMAND_RULES = {
     # NEXT claim for the start-pose check, immediately for the rate limiter.
     "rti_set_rate_limiter":     (IMMEDIATE, None, None, False),
     "rti_set_gravity_comp":     (IMMEDIATE, None, None, False),
+    "rti_set_dynamics_ff":      (IMMEDIATE, None, None, False),
     "rti_set_tcp_vel_limit":    (IMMEDIATE, None, None, False),
     "rti_set_command_timeout":  (IMMEDIATE, None, None, False),
     "rti_set_vel_scale":        (IMMEDIATE, None, None, False),
