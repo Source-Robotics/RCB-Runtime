@@ -436,7 +436,12 @@ class RobotClient:
     def rti_set_min_duration(self, multiplier: float) -> None:
         """Make each planned move last at least `multiplier` of your command intervals.
 
-        **OFF by default.** A minimum trajectory execution time. The robot
+        **SOFT_RTI sets 1.5 at every entry (since 2026-10-11); hard RTI 0.** Call this after `rti_connect` to choose
+        your own (0 = SOFT_RTI before 2026-10-11). Why the default: with the advancing generator and no pacing, every
+        packet that differs from the robot's extrapolation was corrected with a kick at the full RTI limits — J1 visibly
+        jerky at 50 / 10 Hz on the arm, and an operator's sudden stop overshot 2-7° (simulated); with 1.5, 4-13x
+        smoother, 2-4x more accurate in shape, stop overshoot 0.4° at 50 Hz, none at <= 10 Hz, for more lag (+20 ms at
+        50 Hz, +120 ms at 10 Hz). A minimum trajectory execution time. The robot
         measures your command rate itself, so you state a shape preference rather than a
         speed — no need to know your travel velocity in rad/s.
 
@@ -446,8 +451,8 @@ class RobotClient:
         never reached, and the motion becomes continuous — measured velocity swing at 5 Hz
         drops from 0.874 rad/s to 0.
 
-        Like every pacing option it buys smoothness with lag, and it is the least accurate of
-        the smooth choices. `rti_set_servo_generator("ruckig_advancing")` reaches 0.05°
+        Like every pacing option it buys smoothness with lag. With the plain `ruckig` generator it was the least
+        accurate of the smooth choices (2026-08); `rti_set_servo_generator("ruckig_advancing")` reaches 0.05°
         where this reaches 6.3°. Use this if you want a duration-floor contract; use the
         advancing generator if you want the best tracking.
 

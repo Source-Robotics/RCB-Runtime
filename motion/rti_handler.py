@@ -216,6 +216,17 @@ SPAN_MARGIN = 1.75
 # 250 Hz 0.12, SOFT_RTI 50 Hz 0.27, wandering 50-60 Hz 0.33, 25 Hz 0.38, 10 Hz 0.69, 5 Hz ~1 (too late to help),
 # ripple <= 0.03 Nm. Opt-in per session (rti_set_dynamics_ff), "off" at every RTI / SOFT_RTI entry.
 DYNAMICS_FF_SOURCES = ("off", "stream")
+
+# SOFT_RTI's duration pacing, set at EVERY SOFT_RTI entry (2026-10-11, user; TODO/dynamics_feedforward_plan.md F3). Without
+# it the advancing generator re-plans to each extrapolated target as fast as the RTI limits allow (J1: 32 rad/s^2,
+# 16000 rad/s^3), so every packet that differs from the extrapolation is corrected with a kick: on the arm
+# (api_tests/68, J1 sine 63 deg/s) J1's speed strayed 9.6-13.6 deg/s from its smooth path at 1.5-10 Hz at 50 / 10 Hz
+# (2.1 in hard RTI) — "really jerky", the user — and, simulated, an operator's sudden stop at 60 deg/s overshot
+# 2.0 deg (50 Hz) / 6.8 deg (10 Hz). With 1.5 command intervals (simulated, the real handler, reproducing the arm's
+# commanded wobble to 0.01 deg/s): 4-13x smoother, 2-4x MORE accurate in shape, stop overshoot 0.44 deg (50 Hz) / 0
+# (<= 10 Hz), for more lag (+20 ms at 50 Hz, +50 at 25 Hz, +120 at 10 Hz). A PC may still set its own
+# (rti_set_min_duration; 0 = the old behaviour) after rti_connect. Hard RTI keeps 0 (one setpoint per tick).
+SOFT_MIN_DURATION_DEFAULT = 1.5
 STREAM_ACC_LP_HZ = 8.0            # the low-pass: unsmoothed, a wandering sender's estimate was worse than none (1.5)
 STREAM_ACC_HOLD_INTERVALS = 2.0   # no packet for this many intervals: the held estimate drops to 0 (then decays)
 
@@ -1910,6 +1921,7 @@ class RTIModeHandler:
         self._soft_rate_hz = hz
         self._soft_refused = 0
         self.dynamics_ff_source = "off"           # opt-in per session (rti_set_dynamics_ff)
+        self.set_min_duration(SOFT_MIN_DURATION_DEFAULT)   # the glide, not the kicks (see the constant)
         if hz is not None:
             self.set_command_timeout(3.0 / hz)
         self.set_servo_generator(SERVO_ADVANCING)
@@ -2516,6 +2528,10 @@ class RTIModeHandler:
         # is exactly the robot-clocked contract. In PC-clocked mode it is a duty cycle
         # and warning on it would be pure noise, so don't.
         if self.clock_mode != CLOCK_ROBOT:
+            return
+        # Nor in SOFT_RTI: the PC sends at ITS rate (50 Hz reads as 20 %, 10 Hz as 4 %), and its watchdog is sized from
+        # that rate — the warning fired at every SOFT_RTI claim on the arm (2026-10-11) and meant nothing.
+        if self.soft_mode:
             return
 
         # Don't judge the link until the window has actually filled.
