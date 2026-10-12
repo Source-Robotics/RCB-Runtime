@@ -62,7 +62,8 @@ from communication.rti_protocol import CLOCK_ROBOT, CLOCK_PC, CMD_SIZE
 # System and Configuration
 # ==========================================================================
 from config.system_config import setup_realtime_process
-from hardware.can_hardware import start_can_interface
+from hardware.can_hardware import start_can_interface, keep_can_off_rt_core
+from utility.can_reply_monitor import CanReplyMonitor
 
 # ==========================================================================
 # Hardware
@@ -491,6 +492,9 @@ def main():
     # Start / Restart CAN interface when starting this script
     # ==========================================================================
     start_can_interface()
+    # The CAN chip's interrupt threads are created when can0 comes up: move them off RTI's core, or a tick that
+    # starts while one of them sits there freezes all CAN traffic until RTI sleeps (2026-10-12, api_tests/69).
+    keep_can_off_rt_core(RT_CPU_CORE)
     communication1 = initialize_can_communication(bustype='socketcan', channel='can0', bitrate=1000000)
 
     # ==========================================================================
@@ -776,6 +780,12 @@ def main():
     # [0]=worst, [1]=best CAN frame age this tick. Preallocated: the RX loop writes into it every
     # tick, so it must not allocate.
     _can_age_buf = np.zeros(2, dtype=np.float64)
+    # The data replies the CAN read took from each joint this tick, and the warning when a joint's replies miss the
+    # read too often (2026-10-12, utility/can_reply_monitor.py). The read in tick k holds the answers to tick k-1's
+    # commands (they go out while RTI sleeps), so the monitor is told whether the PREVIOUS tick sent them.
+    _can_reply_buf = [0] * joint_num
+    can_reply_monitor = CanReplyMonitor(joint_num, delta_t)
+    _can_sent_prev = False
     _loop_period_buf = np.zeros(LOOP_STATS_BUFFER_SIZE, dtype=np.float64)
     _loop_exec_buf = np.zeros(LOOP_STATS_BUFFER_SIZE, dtype=np.float64)
     st._loop_stats_buf_pos = 0
@@ -2223,6 +2233,8 @@ def main():
         # Mode dispatch — each handler sends its own CAN commands
         # ==========================================================================
         _tick_result = dispatch_step(MODE_HANDLERS.get(st.current_mode), ctx)
+        # Every mode but HOMING / FLASHING (they send their own way, or nothing) just sent each joint a data command.
+        _can_sent_now = st.current_mode != RobotMode.HOMING and st.current_mode != RobotMode.FLASHING
 
         if _tick_result.pending_mode is not None:
             st.pending_mode_request = _tick_result.pending_mode
@@ -2306,7 +2318,10 @@ def main():
                 st.received_ids, st.latest_commands_id,
                 node_error_bits=node_error_bits,
                 frame_age_out=_can_age_buf,
+                data_reply_count_out=_can_reply_buf,
             )
+        can_reply_monitor.step(_can_reply_buf, _tick_now, _can_sent_prev and not _bus_silent)
+        _can_sent_prev = _can_sent_now
         # [0]=worst, [1]=best age among the frames read this tick. Both published: the SPREAD is
         # what tells a real backlog (min ~= max, both large) from a single stale frame class
         # (min small, max large).
@@ -2539,6 +2554,8 @@ def main():
             rti_link_lost=rti_handler.take_link_lost(),
             # The strict command checks' keys (J{i}:RTI_*_LIMIT), raised once the controlled stop is at rest.
             rti_errors=rti_handler.take_command_errors(),
+            # J{i}:CAN_REPLY_MISSED_WARNING (warn-only) — a joint's replies missing RTI's read too often.
+            can_warnings=can_reply_monitor.warnings,
             loop_degraded=_loop_degraded,
             loop_critical=_loop_critical,
             monitor_errors=_monitor_errors,

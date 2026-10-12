@@ -653,7 +653,7 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
                                      Motor_Kt_data,
                                      joint_num, active_CAN_gripper, loop_tick_cnt,
                                      received_ids, latest_commands_id,
-                                     node_error_bits=None, frame_age_out=None):
+                                     node_error_bits=None, frame_age_out=None, data_reply_count_out=None):
     """
     Receive and process CAN messages from all motors.
     
@@ -671,6 +671,8 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
         loop_tick_cnt (int): Current loop tick counter
         received_ids (np.array): Array to mark received IDs
         latest_commands_id (np.array): Array to store latest command IDs
+        data_reply_count_out (list): if given, filled with the number of data replies (DATA_PACK 3 / 5 / 7) read
+            from each joint this tick (2026-10-12: utility/can_reply_monitor.py counts the ticks that got none)
     
     Returns:
         tuple: (Hall_index, received_ids, latest_commands_id)
@@ -690,6 +692,9 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
     _now = time.time()
     _age_max = 0.0
     _age_min = None     # None until a frame arrives; distinguishes "no frames" from "age 0"
+    if data_reply_count_out is not None:
+        for _j in range(len(data_reply_count_out)):
+            data_reply_count_out[_j] = 0
 
     # DRAIN-WITH-CAP. The old loop read a FIXED loop_range-1 (= 8) frames with a 0.8 ms
     # blocking timeout, which broke in two ways, both measured on this arm:
@@ -733,6 +738,9 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
                 # and so would otherwise only refresh one of two different deques.
                 if node_error_bits is not None:
                     node_error_bits[node_id] = error_bit
+                if data_reply_count_out is not None and command_id in (3, 5, 7) \
+                        and node_id < len(data_reply_count_out):
+                    data_reply_count_out[node_id] += 1
                 
                 # Unpack data
                 Motor[node_id].UnpackData(message, msg_ID)

@@ -99,7 +99,8 @@ LOOP_ERROR_TICK_FACTOR   = 3.0    # ...or ONE tick longer than 3 periods (12 ms 
 # Keys (or key suffixes) that are warnings only — they do not set error_active.
 _WARNING_SUFFIXES = ("CAN_STALE", "HOMING_FAILED", "NOT_HOMED", "LOOP_DEGRADED", "ZONE_WARNING",
                      "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING", "OVERSPEED_WARNING", "TRACKING_WARNING",
-                     "TCP_OVERSPEED_WARNING", "HOLD_OSCILLATION_WARNING", "SELF_COLLISION_WARNING", "SELF_COLLISION_STALE")
+                     "TCP_OVERSPEED_WARNING", "HOLD_OSCILLATION_WARNING", "SELF_COLLISION_WARNING", "SELF_COLLISION_STALE",
+                     "CAN_REPLY_MISSED_WARNING")
 
 
 # The cause/fix catalog lives in utility/error_catalog.py (a leaf module, 2026-10-03); re-exported here so
@@ -367,7 +368,7 @@ _GRIPPER_MOTOR_ERROR_FIELDS = (
 
 
 def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
-                           loop_degraded, loop_critical, monitor_errors, monitor_warnings):
+                           loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings=()):
     """E-STOP, the EXEC / RTI link watchdogs, RT loop health and the safety monitor's events. The caller
     pre-computes every flag; this only turns them into keys."""
     # ------------------------------------------------------------------
@@ -421,6 +422,9 @@ def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_
         current_errors.update(monitor_errors)
     if monitor_warnings:
         current_errors.update(monitor_warnings)
+    # J{i}:CAN_REPLY_MISSED_WARNING (utility/can_reply_monitor.py, 2026-10-12): live, warn-only.
+    if can_warnings:
+        current_errors.update(can_warnings)
 
 
 def _collect_motor_errors(shared_data, joint_num, current_errors):
@@ -535,7 +539,8 @@ def _log_new_error(key):
     if key.startswith("J") and ":" in key:
         joint_idx = key.split(":")[0][1:]      # e.g. "J3:TEMPERATURE" → "3" (the joint's 1-based number)
         if short_key in ("CAN_STALE", "HOMING_FAILED", "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING",
-                         "OVERSPEED_WARNING", "TRACKING_WARNING", "HOLD_OSCILLATION_WARNING"):
+                         "OVERSPEED_WARNING", "TRACKING_WARNING", "HOLD_OSCILLATION_WARNING",
+                         "CAN_REPLY_MISSED_WARNING"):
             logging.warning(f"[WARNING] Joint {joint_idx}: {description}")
         else:
             logging.error(f"[ERROR] Joint {joint_idx}: {description}")
@@ -559,6 +564,7 @@ def check_errors(
     monitor_warnings=(),
     driver_faults: bool = True,
     rti_errors=(),
+    can_warnings=(),
 ) -> tuple:
     """
     Inspect all error sources and update the latched error set.
@@ -585,7 +591,7 @@ def check_errors(
 
     current_errors = set()
     _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
-                           loop_degraded, loop_critical, monitor_errors, monitor_warnings)
+                           loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings)
     if driver_faults:
         _collect_motor_errors(shared_data, joint_num, current_errors)
     _collect_can_errors(shared_data, joint_num, current_errors)
@@ -789,6 +795,7 @@ def process_errors_tick(
     on_hard_error=None,
     driver_faults: bool = True,
     rti_errors=(),
+    can_warnings=(),
 ) -> tuple:
     """Run one tick of error processing in the RTI superloop.
 
@@ -837,6 +844,7 @@ def process_errors_tick(
         monitor_warnings=monitor_warnings,
         driver_faults=driver_faults,
         rti_errors=rti_errors,
+        can_warnings=can_warnings,
     )
     shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
     # rti['safety_violation'] (the status event's "safety" field) finally means something: 1 while

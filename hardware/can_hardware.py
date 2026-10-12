@@ -15,6 +15,7 @@ Contact: petar@source-robotics.com
 """
 
 import logging
+import os
 import socket
 import Spectral_BLDC as Spectral
 import can
@@ -115,6 +116,123 @@ def stop_can_interface(interface='can0'):
         logger.info(f"Interface '{interface}' stopped")
     except subprocess.CalledProcessError as e:
         logger.warning(f"Failed to stop CAN interface: {e}")
+
+
+# ==========================================================================
+# Keep the CAN chip's kernel threads off RTI's core (2026-10-12)
+# ==========================================================================
+# Measured on the arm (api_tests/69_can_gaps.py): the CAN chip (on SPI) has an interrupt THREAD
+# (irq/<n>-spi0.0, SCHED_FIFO 50) that the kernel may run on any core. It landed on RTI's core whenever
+# RTI slept (~21 % of the time), and the send work it then starts is queued on THAT core's per-CPU kernel
+# worker (normal priority), which cannot run while RTI's tick runs — so all CAN traffic stopped until RTI
+# slept again: 2-3 ms freezes, ~10 a second in hard RTI, commands reaching a drive late (it brakes, then
+# catches up), replies read a tick late, frames lost (the chip holds 2). With the interrupt threads on the
+# other cores: 46-120 -> 0-2 freezes per 10 s, no frame lost. The interrupt thread is created when the
+# interface comes UP, so this must run after every start_can_interface().
+# The SPI controller's runtime power saving goes off too: it was NOT the cause, but it woke kernel workers
+# ~19 000 times a second (some on RTI's core), and the verified setup had it off (user, 2026-10-12).
+
+def can_spi_parts(device_path):
+    """The CAN interface's resolved sysfs device path -> (the CAN chip's device name, its SPI controller's
+    sysfs directory), e.g. '/sys/devices/.../1f00050000.spi/spi_master/spi0/spi0.0' ->
+    ('spi0.0', '/sys/devices/.../1f00050000.spi'). None when the chip does not sit on SPI (a USB adapter)."""
+    head, sep, _ = device_path.partition("/spi_master/")
+    if not sep:
+        return None
+    return os.path.basename(device_path), head
+
+
+def irq_numbers(interrupts_text, names):
+    """/proc/interrupts -> the IRQ numbers whose device name (the line's last column) is one of `names`."""
+    out = []
+    for line in interrupts_text.splitlines():
+        head, sep, rest = line.partition(":")
+        fields = rest.split()
+        if sep and head.strip().isdigit() and fields and fields[-1] in names:
+            out.append(int(head))
+    return out
+
+
+def irq_thread_pids(numbers, proc_root="/proc"):
+    """{pid: name} of the kernel's interrupt threads of those IRQs, 'irq/<n>-<device>' (matched on the
+    'irq/<n>-' prefix: a thread name may be cut short)."""
+    prefixes = tuple(f"irq/{n}-" for n in numbers)
+    out = {}
+    if not prefixes:
+        return out
+    for entry in os.listdir(proc_root):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_root, entry, "comm")) as fh:
+                name = fh.read().strip()
+        except OSError:
+            continue
+        if name.startswith(prefixes):
+            out[int(entry)] = name
+    return out
+
+
+def keep_can_off_rt_core(rt_core, interface="can0", sys_root="/sys", proc_root="/proc", run=subprocess.run,
+                         get_affinity=os.sched_getaffinity, n_cpus=None):
+    """Move the CAN chip's and its SPI controller's interrupt threads to every core but `rt_core`, and keep
+    the SPI controller powered. Logs what it did; logs an ERROR naming what it could not do (RTI still runs,
+    but its CAN traffic can then freeze for ~2 ms while its tick runs). Returns
+    {"threads": {name: [cores]}, "power": str | None, "problems": [str]}."""
+    result = {"threads": {}, "power": None, "problems": []}
+    cpus = [c for c in range(n_cpus or os.cpu_count()) if c != rt_core]
+    dev = os.path.realpath(os.path.join(sys_root, "class", "net", interface, "device"))
+    parts = can_spi_parts(dev)
+    if parts is None:
+        logger.info(f"[CAN] '{interface}' is not an SPI CAN chip ({dev}) — no interrupt threads to move")
+        return result
+    chip, controller_dir = parts
+    controller = os.path.basename(controller_dir)
+    try:
+        with open(os.path.join(proc_root, "interrupts")) as fh:
+            interrupts = fh.read()
+    except OSError as e:
+        interrupts = ""
+        result["problems"].append(f"cannot read {proc_root}/interrupts: {e}")
+    threads = {}
+    for name in (chip, controller):              # the CAN chip's interrupt and its SPI controller's: both measured
+        found = irq_thread_pids(irq_numbers(interrupts, (name,)), proc_root)
+        if not found:
+            result["problems"].append(f"no interrupt thread found for {name}")
+        threads.update(found)
+    for pid, name in sorted(threads.items()):
+        try:
+            run(["sudo", "taskset", "-pc", ",".join(str(c) for c in cpus), str(pid)], check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            now = sorted(get_affinity(pid))
+        except (subprocess.CalledProcessError, OSError) as e:
+            result["problems"].append(f"{name} (pid {pid}): {e}")
+            continue
+        result["threads"][name] = now
+        if now != cpus:
+            result["problems"].append(f"{name} (pid {pid}) is on cores {now}, not {cpus}")
+    power = os.path.join(controller_dir, "power", "control")
+    try:
+        with open(power) as fh:
+            state = fh.read().strip()
+        if state != "on":
+            run(["sudo", "tee", power], input=b"on\n", check=True, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE)
+            with open(power) as fh:
+                state = fh.read().strip()
+        result["power"] = state
+        if state != "on":
+            result["problems"].append(f"{power} reads '{state}', not 'on'")
+    except (subprocess.CalledProcessError, OSError) as e:
+        result["problems"].append(f"{power}: {e}")
+    if result["problems"]:
+        logger.error(f"[CAN] could not keep the CAN path off RTI's core {rt_core}: "
+                     f"{'; '.join(result['problems'])} — CAN traffic can freeze ~2 ms while RTI's tick runs "
+                     f"(api_tests/69_can_gaps.py measures it)")
+    else:
+        logger.info(f"[CAN] interrupt threads {', '.join(result['threads'])} on cores {cpus} (RTI on {rt_core}); "
+                    f"{controller} power: {result['power']}")
+    return result
 
 
 # ==========================================================================
