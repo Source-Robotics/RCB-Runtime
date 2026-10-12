@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: can_gaps
+    Which ticks got no fresh reply from a drive, and how long RTI's loop ran on them (api_tests/69_can_gaps.py,
+    2026-10-12): the drive's raw encoder position as RTI last received it (m_p — identical on two ticks while the
+    joint moves = no new reply in between), the measured / commanded joint state, and the loop's own timing.
+    `timestamp` is RTI's time.perf_counter() (CLOCK_MONOTONIC) read in the tick AFTER its CAN read, so a candump log
+    (CLOCK_REALTIME) can be lined up with the ticks to the microsecond.
+    exec_t is the PREVIOUS tick's execution time (RTI computes it after this packet is built).
+    j_p / j_pc at 5 decimals (1e-5 rad = 0.0006 deg), as the tracking recipe.
+-->
+<recipe name="can_gaps">
+    <field tag="j_p"   precision="5"/>
+    <field tag="j_pc"  precision="5"/>
+    <field tag="j_s"   precision="4"/>
+    <field tag="j_t"   precision="3"/>
+    <field tag="m_p"/>
+    <field tag="timestamp" precision="6"/>
+    <field tag="exec_t"    precision="6"/>
+    <field tag="period_ms" precision="3"/>
+    <field tag="tick"/>
+    <field tag="mode"/>
+</recipe>
