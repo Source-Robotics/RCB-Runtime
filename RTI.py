@@ -30,8 +30,7 @@ import json
 # These used to arrive through `from utility.RTI_utils import *` (2026-10-03, refactor Phase 2). `logger` is
 # data_init's module logger — RTI.py has always logged through it, which is why RTI.log labels these lines
 # `utility.data_init`; giving RTI its own logger would change that column and is a separate, visible step.
-from utility.data_init import (initialize_robot_data, logger, process_gripper_joint_data, process_joint_data,
-                                refresh_dispatch_fields)
+from utility.data_init import initialize_robot_data, logger, process_gripper_joint_data, process_joint_data
 from utility.signal_processing import reset_rolling_stats, update_rolling_percentiles, update_rt_loop_stats, pace_deadline
 from utility.RTI_utils import print_heartbeat
 from project_paths import RTI_LOG, SYSTEM_XML, ROBOTS_DIR, TEMP_DATA_DIR, DATA_RECIPE_DIR, GRIPPERS_DIR, CRITICAL_LOG, FILTER_CONFIG_PATH, FLASH_PERFORMED_MARKER, CELLS_DIR
@@ -63,7 +62,7 @@ from communication.rti_protocol import CLOCK_ROBOT, CLOCK_PC, CMD_SIZE
 # System and Configuration
 # ==========================================================================
 from config.system_config import setup_realtime_process
-from hardware.can_hardware import start_can_interface, place_can_path, FirstFrameWait
+from hardware.can_hardware import start_can_interface, place_can_path, FirstFrameWait, FastCanReader
 from config.cpu_cores import CAN_CPU_CORE, GENERAL_CPU_CORES
 from utility.can_reply_monitor import CanReplyMonitor
 from utility.loop_delay_meter import LoopDelayMeter
@@ -100,7 +99,8 @@ from utility.pinocchio_attach import attach_pinocchio
 _sys = read_XML2.load_system_config(SYSTEM_XML, ROBOTS_DIR)
 from data import shared_data
 shared_data.setup(joints=_sys['joint_num'])
-from data.update_shared_data import update_motor_and_gripper_data, update_joint_and_tcp_data
+from data.update_shared_data import (update_motor_and_gripper_data, update_joint_and_tcp_data, update_joint_state,
+                                     update_tcp_pose, update_joint_rest)
 from utility.filter_config import build_filter_banks, load_filter_banks
 from utility.payload import PayloadModel, apply_payload_command
 from hardware.control_box import capabilities as pcb_capabilities, describe as describe_pcb
@@ -502,6 +502,9 @@ def main():
     communication1 = initialize_can_communication(bustype='socketcan', channel='can0', bitrate=1000000)
     # TODO/can_tx_timing_plan.md option B — OFF at every start; `can_read_first:1` turns it on (to measure it).
     first_frame_wait = FirstFrameWait('can0')
+    # Option B's CAN read: python-can's receive without its per-frame select() and Message object, on the same socket
+    # (hardware/can_hardware.FastCanReader, 2026-10-12).
+    fast_can_reader = FastCanReader(communication1)
     # The control loop's delay per joint (a reply -> the command computed from it), sampled live for the GUI's RT
     # Diagnostics (2026-10-12, utility/loop_delay_meter.py): a read-only socket that sees our own frames leave.
     loop_delay_meter = LoopDelayMeter(joint_num)
@@ -1029,7 +1032,8 @@ def main():
     )
 
     # Haptic zone walls for IDLE gravity-comp freedrive (utility/haptic_walls.py). The TCP Jacobian is not in
-    # shared memory, so RTI keeps its own buffer, refreshed by update_joint_and_tcp_data each tick.
+    # shared memory, so RTI keeps its own buffer, refreshed every tick by the measurement (with option B: in IDLE by
+    # update_tcp_pose before the send, then by update_joint_rest after it).
     tcp_jacobian = np.zeros((6, joint_num))
     haptic_walls = HapticWalls(
         joint_num, delta_t, tcp_pose=shared_data.tcp['robot_pose_matrix'], tcp_twist_raw=shared_data.tcp['TCP_speed'],
@@ -1896,6 +1900,7 @@ def main():
                 frame_age_out=_can_age_buf,
                 data_reply_count_out=_can_reply_buf,
                 reply_time_out=_can_reply_time,
+                receive=fast_can_reader.receive_can_messages if _read_first else None,
             )
         loop_delay_meter.on_read(_tick_now, _can_reply_time, _read_first,
                                  st.current_mode != RobotMode.HOMING and st.current_mode != RobotMode.FLASHING)
@@ -1938,8 +1943,8 @@ def main():
             )
         _profile_last = _profile_mark(_profile_last, "can_connection_status")
 
-    def _measure():
-        """The ordered measurement pipeline: motor[] -> joint[] + tcp[] -> the Joint_data history entry."""
+    def _measure_motor():
+        """The CAN deques -> motor[] + gripper[] (the measurement's first step)."""
         nonlocal _profile_last
         # ==========================================================================
         # Fill the latest data shared arrays (Motor level)
@@ -1968,25 +1973,9 @@ def main():
         )
         _profile_last = _profile_mark(_profile_last, "motor_gripper_shared")
 
-        # ==========================================================================
-        # Fill the latest data shared arrays (Joint + TCP level) — via update_shared_data.py
-        # ==========================================================================
-        update_joint_and_tcp_data(
-            shared_data=shared_data,
-            Joint=Joint,
-            Joint_data=Joint_data,
-            filter_banks=st.filter_banks,
-            joint_num=joint_num,
-            delta_t=delta_t,
-            gear_ratio=gear_ratio,
-            gear_efficiency=gear_efficiency,
-            motor_kt=motor_kt,
-            motor_signs=motor_signs,
-            robot=robot,
-            jacobian_out=tcp_jacobian,
-        )
-        _profile_last = _profile_mark(_profile_last, "joint_tcp_shared")
-
+    def _history_entry():
+        """This tick's Joint_data entry (the measurement's last step; the finite differences read it next tick)."""
+        nonlocal _profile_last
         # ==========================================================================
         # Fill queues for joint + TCP level
         # ========================================================================== 
@@ -2046,6 +2035,54 @@ def main():
                            can_read_t=_can_age_buf[2],
                         )
         _profile_last = _profile_mark(_profile_last, "joint_history")
+
+    def _measure():
+        """The ordered measurement pipeline: motor[] -> joint[] + tcp[] -> the Joint_data history entry."""
+        nonlocal _profile_last
+        _measure_motor()
+        # ==========================================================================
+        # Fill the latest data shared arrays (Joint + TCP level) — via update_shared_data.py
+        # ==========================================================================
+        update_joint_and_tcp_data(
+            shared_data=shared_data,
+            Joint=Joint,
+            Joint_data=Joint_data,
+            filter_banks=st.filter_banks,
+            joint_num=joint_num,
+            delta_t=delta_t,
+            gear_ratio=gear_ratio,
+            gear_efficiency=gear_efficiency,
+            motor_kt=motor_kt,
+            motor_signs=motor_signs,
+            robot=robot,
+            jacobian_out=tcp_jacobian,
+        )
+        _profile_last = _profile_mark(_profile_last, "joint_tcp_shared")
+        _history_entry()
+
+    def _measure_fast():
+        """Option B, BEFORE the send (2026-10-12, TODO/can_tx_timing_plan.md §9.10): what this tick's commands need —
+        motor[], the joint position, speed (raw + filtered) and gravity; in IDLE also the TCP pose, Jacobian and raw
+        twist (the haptic walls). Nothing a handler or dispatch reads may come only from _measure_rest()
+        (pinned by test_can_read_first)."""
+        nonlocal _profile_last
+        _measure_motor()
+        update_joint_state(shared_data=shared_data, Joint=Joint, filter_banks=st.filter_banks, joint_num=joint_num,
+                           gear_ratio=gear_ratio, gear_efficiency=gear_efficiency, motor_kt=motor_kt,
+                           motor_signs=motor_signs, robot=robot)
+        if st.current_mode == RobotMode.IDLE:      # the freedrive walls (handle_idle); on a tick that ENTERS IDLE they
+            update_tcp_pose(shared_data=shared_data, robot=robot, jacobian_out=tcp_jacobian)   # use the last tick's
+        _profile_last = _profile_mark(_profile_last, "measure_fast")
+
+    def _measure_rest():
+        """Option B, AFTER the send: the rest of the measurement, then this tick's history entry — which now pairs this
+        tick's measurement with this tick's commands by itself."""
+        nonlocal _profile_last
+        update_joint_rest(shared_data=shared_data, Joint_data=Joint_data, filter_banks=st.filter_banks,
+                          joint_num=joint_num, delta_t=delta_t, gear_ratio=gear_ratio, gear_efficiency=gear_efficiency,
+                          motor_kt=motor_kt, motor_signs=motor_signs, robot=robot, jacobian_out=tcp_jacobian)
+        _profile_last = _profile_mark(_profile_last, "joint_tcp_shared")
+        _history_entry()
 
     def _check_safety():
         """The EXEC link watchdog, the loop monitor, the safety monitor and the error pass (latches, mode)."""
@@ -2265,7 +2302,7 @@ def main():
             _bus_silent = (st.current_mode == RobotMode.FLASHING)
             _can_sent_prev = _can_sent_now       # this read collects the replies to the LAST dispatch's commands
             _can_read()
-            _measure()
+            _measure_fast()
 
         # ==========================================================================
         # ZMQ Check for new commands and send confirmations
@@ -2505,11 +2542,6 @@ def main():
         _profile_last = _profile_mark(_profile_last, "mode_state")
 
 
-        if _read_first:
-            # Option B: the safety monitor + the error pass BEFORE dispatch (user, 2026-10-12) — a trip acts on this
-            # tick's commands; the RTI handler's own keys (raised once its controlled stop is at rest) a tick later.
-            _check_safety()
-
         # ==========================================================================
         # Mode dispatch — each handler sends its own CAN commands
         # ==========================================================================
@@ -2520,6 +2552,7 @@ def main():
             shared_data.rti["loop_delay"][:joint_num] = loop_delay_meter.median
             shared_data.rti["loop_delay_max"][:joint_num] = loop_delay_meter.maximum
         shared_data.rti["can_read_first"][0] = _read_first
+        rti_handler.defer_state = _read_first   # option B: the state packet after the send (flush_state, below)
         if first_frame_wait.enabled:
             first_frame_wait.prepare()           # stale echoes out BEFORE this tick's commands are queued
         _tick_result = dispatch_step(MODE_HANDLERS.get(st.current_mode), ctx)
@@ -2636,31 +2669,10 @@ def main():
         _profile_last = _profile_mark(_profile_last, "motor_reconnect")
 
         if _read_first:
-            # Option B: the history entry was appended at the tick's start (so dispatch's RTI state packet carried
-            # this tick's measurement); now it gets this tick's commanded / target values — the old pairing.
-            refresh_dispatch_fields(
-                Joint_data[-1],
-                shared_data.joint['joint_position_commanded'],
-                shared_data.joint['joint_speed_commanded'],
-                shared_data.joint['joint_acceleration_commanded'],
-                shared_data.joint['joint_torque_commanded'],
-                shared_data.tcp['TCP_pose_commanded'],
-                shared_data.tcp['TCP_speed_commanded'],
-                shared_data.joint['joint_position_target'],
-                shared_data.joint['joint_speed_target'],
-                shared_data.joint['joint_acceleration_target'],
-                shared_data.joint['joint_torque_target'],
-                shared_data.tcp['TCP_pose_target'],
-                shared_data.tcp['TCP_speed_target'],
-                shared_data.joint['joint_inertia_torque'],
-                shared_data.joint['joint_coriolis_torque'],
-                shared_data.rti["rti_seq_rx_last"][0],
-                shared_data.rti["control_success_rate"][0],
-                shared_data.rti["rti_consecutive_misses"][0],
-                shared_data.rti["rti_substate"][0],
-                getattr(st.current_mode, "value", st.current_mode),
-            )
-            _profile_last = _profile_mark(_profile_last, "joint_history_refresh")
+            # Option B: the rest of the measurement and the history entry now, after the commands left; then the RTI
+            # state packet (this tick's measurement with this tick's command).
+            _measure_rest()
+            rti_handler.flush_state(ctx)
         else:
             _measure()
 
@@ -2681,8 +2693,7 @@ def main():
 
 
 
-        if not _read_first:
-            _check_safety()
+        _check_safety()        # both orders here, after the send (user, 2026-10-12: a trip acts on the next tick's commands)
 
         # ==========================================================================
         # Send UDP data — recipe-driven, switchable configuration via .xml

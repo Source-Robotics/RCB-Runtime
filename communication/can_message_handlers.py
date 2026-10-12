@@ -654,7 +654,7 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
                                      joint_num, active_CAN_gripper, loop_tick_cnt,
                                      received_ids, latest_commands_id,
                                      node_error_bits=None, frame_age_out=None, data_reply_count_out=None,
-                                     reply_time_out=None):
+                                     reply_time_out=None, receive=None):
     """
     Receive and process CAN messages from all motors.
     
@@ -674,6 +674,9 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
         latest_commands_id (np.array): Array to store latest command IDs
         data_reply_count_out (list): if given, filled with the number of data replies (DATA_PACK 3 / 5 / 7) read
             from each joint this tick (2026-10-12: utility/can_reply_monitor.py counts the ticks that got none)
+        receive (callable): if given, used instead of communication.receive_can_messages — the same
+            (message, (node, command, error_bit)) contract; option B passes hardware/can_hardware.FastCanReader's
+            (2026-10-12)
         reply_time_out (np.array): if given, each joint's newest data reply's kernel arrival time (CLOCK_REALTIME)
             — KEPT when a joint had none this tick: it is the time of the data RTI works with (2026-10-12,
             utility/loop_delay_meter.py)
@@ -716,8 +719,9 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
     # of surplus so an existing backlog clears in a few ticks and then stays clear. The cap is
     # a safety bound, not a target — steady state exits on the first empty read after ~8
     # frames. Worst case 32 reads x ~28 us = ~0.9 ms, so a catch-up tick still fits the budget.
+    _receive = communication.receive_can_messages if receive is None else receive
     for _ in range(MAX_RX_FRAMES_PER_TICK):
-        message, msg_ID = communication.receive_can_messages(timeout=0)
+        message, msg_ID = _receive(timeout=0)
         if message is None:
             break       # socket drained — nothing more waiting this tick
 

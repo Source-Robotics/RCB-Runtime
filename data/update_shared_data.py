@@ -74,6 +74,11 @@ def update_joint_and_tcp_data(
     ⚠️ MUST be called AFTER update_motor_and_gripper_data() on the same tick — it reads the
     shared_data.motor[] arrays that function writes. See the module docstring.
 
+    Two halves since 2026-10-12 (option B "send early", TODO/can_tx_timing_plan.md §9.10): update_joint_state() —
+    what a command needs: position, speed (raw + filtered), gravity — and update_joint_rest() — everything else. This
+    function calls them in that order: the same values as the single function before (gravity moved ahead of the
+    derivatives — it reads only the position; the external torque now reads it back from shared memory).
+
     Args:
         shared_data:          shared memory module
         Joint:                list of Joint objects
@@ -89,6 +94,20 @@ def update_joint_and_tcp_data(
         gear_ratio, gear_efficiency, motor_kt, motor_signs: drive-train constants
         robot:                robot model (PAR6, INDIGO, etc.)
     """
+    update_joint_state(shared_data=shared_data, Joint=Joint, filter_banks=filter_banks, joint_num=joint_num,
+                       gear_ratio=gear_ratio, gear_efficiency=gear_efficiency, motor_kt=motor_kt,
+                       motor_signs=motor_signs, robot=robot)
+    update_joint_rest(shared_data=shared_data, Joint_data=Joint_data, filter_banks=filter_banks,
+                      joint_num=joint_num, delta_t=delta_t, gear_ratio=gear_ratio, gear_efficiency=gear_efficiency,
+                      motor_kt=motor_kt, motor_signs=motor_signs, robot=robot, jacobian_out=jacobian_out)
+
+
+def update_joint_state(*, shared_data, Joint, filter_banks, joint_num, gear_ratio, gear_efficiency, motor_kt,
+                       motor_signs, robot):
+    """What a command needs, and nothing else (2026-10-12): the joint position, the speed (raw and filtered) and the
+    gravity torque (+ its motor current). Option B computes the tick's commands right after this, BEFORE
+    update_joint_rest(); every measured value a mode handler or dispatch reads must be produced here (pinned by
+    dummy_test_scripts/test_can_read_first.py). update_joint_and_tcp_data() calls it first."""
     # --- Joint position (encoder ticks → radians) ---
     shared_data.joint['joint_position'][:] = [
         Joint[i].get_joint_position(shared_data.motor['motor_position'][i])
@@ -102,6 +121,38 @@ def update_joint_and_tcp_data(
     for i in range(joint_num):
         js[i] = Joint[i].get_joint_speed(shared_data.motor['motor_speed'][i])
     apply_filter_bank(filter_banks['speed'], js, shared_data.joint['joint_speed_filtered'])
+
+    # --- Gravity/dynamics compensation ---
+    grav_torque = gravity_torque_rt(robot, shared_data.joint['joint_position'][:])
+    shared_data.joint['joint_gravity_torque'][:] = grav_torque  # Nm — joint space, always updated
+    if shared_data.rti['gravity_comp_enabled'][0]:
+        shared_data.joint['compensation_torque'][:] = torque_to_motor_current(
+            grav_torque, gear_ratio, gear_efficiency, motor_kt, motor_signs
+        )
+    else:
+        shared_data.joint['compensation_torque'][:] = 0
+
+
+def update_tcp_pose(*, shared_data, robot, jacobian_out=None):
+    """The TCP pose, the Jacobian and the RAW TCP twist at the measured position (2026-10-12) — for the haptic walls
+    in freedrive when option B computes the commands before update_joint_rest(). A position-only kinematics call (no
+    diagnostics); update_joint_rest() then computes and writes the full set as before."""
+    kin = calculate_all_kinematics(robot, shared_data.joint['joint_position'], include_diagnostics=False,
+                                   return_transform=False)
+    J = kin['J']
+    if jacobian_out is not None:
+        jacobian_out[:] = J
+    shared_data.tcp['robot_pose'][:] = kin['tcp_pose']
+    shared_data.tcp['robot_pose_matrix'][:] = kin['tcp_pose_matrix']
+    shared_data.tcp['TCP_speed'][:] = J @ shared_data.joint['joint_speed']
+
+
+def update_joint_rest(*, shared_data, Joint_data, filter_banks, joint_num, delta_t, gear_ratio, gear_efficiency,
+                      motor_kt, motor_signs, robot, jacobian_out=None):
+    """Everything update_joint_state() leaves out (2026-10-12): acceleration and jerk (raw + filtered), torque (raw +
+    filtered), the kinematics (pose, Jacobian, TCP speed / acceleration, quaternion, diagnostics), the external torque
+    and force. Must run AFTER update_joint_state() on the same tick and BEFORE this tick's Joint_data append."""
+    js = shared_data.joint['joint_speed']
     jsf = shared_data.joint['joint_speed_filtered']
 
     # --- Acceleration & jerk: RAW from the raw chain, filtered from the filtered chain ---
@@ -185,21 +236,13 @@ def update_joint_and_tcp_data(
     shared_data.tcp['jacobian_condition'][0] = kin['condition_number']
     shared_data.tcp['jacobian_manipulability'][0] = kin['manipulability']
 
-    # --- Gravity/dynamics compensation ---
-    grav_torque = gravity_torque_rt(robot, shared_data.joint['joint_position'][:])
-    shared_data.joint['joint_gravity_torque'][:] = grav_torque  # Nm — joint space, always updated
-    if shared_data.rti['gravity_comp_enabled'][0]:
-        shared_data.joint['compensation_torque'][:] = torque_to_motor_current(
-            grav_torque, gear_ratio, gear_efficiency, motor_kt, motor_signs
-        )
-    else:
-        shared_data.joint['compensation_torque'][:] = 0
-
     # --- External torque and force estimation ---
     # Uses FILTERED torque: raw motor current is noisy, and torque_external / force_external
     # feed collision/interaction estimates where that noise matters most. (This is the former
     # "consider low-pass filtering torque_external" TODO — now done via the torque filter bank.)
-    shared_data.tcp['torque_external'][:] = shared_data.joint['joint_torque_filtered'][:] - grav_torque
+    # The gravity torque is update_joint_state()'s, read back from shared memory (the same values).
+    shared_data.tcp['torque_external'][:] = (shared_data.joint['joint_torque_filtered'][:]
+                                             - shared_data.joint['joint_gravity_torque'][:])
     f_ext_world = estimate_external_force_tcp(shared_data.tcp['torque_external'], J)
     shared_data.tcp['force_external'][:] = f_ext_world
 
@@ -212,7 +255,6 @@ def update_joint_and_tcp_data(
     ft = shared_data.tcp['force_external_tool']
     ft[:3] = R.T @ f_ext_world[:3]
     ft[3:] = R.T @ f_ext_world[3:]
-
 
 
 def update_motor_and_gripper_data(

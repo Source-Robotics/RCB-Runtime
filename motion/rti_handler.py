@@ -83,6 +83,13 @@ logger = logging.getLogger(__name__)
 # commands in one tick (drain_rti_udp keeps only the newest) or none, which is also why the
 # success-rate warnings below are gated to CLOCK_ROBOT. RTI.py currently hardcodes
 # CLOCK_ROBOT; this is the lever to reach for if command latency ever binds.
+#
+# Option B (`can_read_first`, 2026-10-12, TODO/can_tx_timing_plan.md §9.10) moves the state
+# packet: step() only marks it (defer_state) and RTI sends it with flush_state() AFTER the
+# tick's CAN commands have left and the full measurement exists. The packet then carries
+# THIS tick's measurement (the normal order sends the previous tick's), ~1-2 ms later in the
+# tick — so a robot-clocked PC has that much less time to reply before the next drain. The
+# user chose "send the commands as early as possible"; the reply window is measured on the arm.
 # --------------------------------------------------------------------------- #
 
 # rti['rti_substate'] codes — mirrored to shared memory every tick for the GUI.
@@ -672,6 +679,10 @@ class RTIModeHandler:
         self._trk_gap = 1.0
         self._trk_gaps = []
         self._state_every = 1
+        # Option B "send early" (2026-10-12, RTI.py sets it every tick): the state packet waits for flush_state(),
+        # which RTI calls once the tick's FULL measurement and history entry exist — after the CAN commands have left.
+        self.defer_state = False
+        self._state_pending = False
         self._trk_ideal = 0.0
         self._trk_ideal_seeded = False
         self._trk_vtgt_from_pc = False
@@ -857,6 +868,14 @@ class RTIModeHandler:
         self._reset_bandwidth()   # a new session's traffic, not the previous one's
         logger.info("[RTI] Paired with %s:%s — streaming state", pc_addr[0], pc_addr[1])
 
+    def flush_state(self, ctx):
+        """Option B (defer_state): send the tick's state packet now — RTI calls it after the CAN commands left and the
+        tick's full measurement and history entry exist, so the PC gets this tick's measurement with this tick's
+        command. Nothing when no packet is pending."""
+        if self._state_pending:
+            self._state_pending = False
+            self._send_state(ctx)
+
     def take_link_lost(self):
         """One-shot read of the watchdog flag, for RTI.py to feed process_errors_tick()."""
         ev = self.link_lost_event
@@ -1005,7 +1024,10 @@ class RTIModeHandler:
         if self.pc_addr is not None and (
                 self._state_every == 1
                 or ctx.current_tick % self._state_every == 0):
-            self._send_state(ctx)
+            if self.defer_state:
+                self._state_pending = True          # option B: sent by flush_state() after the CAN send
+            else:
+                self._send_state(ctx)
 
         if self.sub_state == 'control_active':
             out = self._step_active(ctx)

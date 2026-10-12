@@ -379,6 +379,59 @@ class FirstFrameWait:
 
 
 # ==========================================================================
+# The fast CAN read (2026-10-12, option B "send early" — TODO/can_tx_timing_plan.md §9.10)
+# ==========================================================================
+# python-can's receive: a select() on the socket, recvmsg(), then a full Message object (a dozen attributes and
+# checks) and a log call — 15.7 us a frame measured on this Pi, this reader 6.1 (2026-10-12, live bus, the system
+# interpreter, cores 0-1; the empty read that ends each tick's drain ~3 us either way). It reads the SAME socket (the
+# bus's own: nothing is duplicated, sends are untouched) with one non-blocking recvmsg and computes exactly the fields
+# python-can computes — same structs, same arithmetic, error frames included — into a light frame object, and the
+# same (node, command, error bit) the Spectral library derives. RTI's CAN read uses it while option B is on.
+
+class CanFrame:
+    """The fields of a received frame RTI's decode uses (timestamp, arbitration_id, dlc, data) — the values python-can's
+    Message would hold."""
+    __slots__ = ("timestamp", "arbitration_id", "dlc", "data", "is_extended_id", "is_remote_frame", "is_error_frame")
+
+
+class FastCanReader:
+    def __init__(self, communication):
+        import can.interfaces.socketcan.constants as cc
+        import can.interfaces.socketcan.socketcan as sc
+        from Spectral_BLDC.Spectral_BLDC import CanMessage
+        self._sock = communication.bus.socket
+        self._mtu = cc.CANFD_MTU
+        self._anc = sc.RECEIVED_ANCILLARY_BUFFER_SIZE
+        self._hdr = sc.CAN_FRAME_HEADER_STRUCT
+        self._ts = sc.RECEIVED_TIMESTAMP_STRUCT
+        self._eff, self._rtr, self._err = cc.CAN_EFF_FLAG, cc.CAN_RTR_FLAG, cc.CAN_ERR_FLAG
+        self._op_error = can.CanOperationError       # the module's own `import can`
+        self._can_message = CanMessage
+
+    def receive_can_messages(self, timeout=0):
+        """(frame, CanMessage(node_id, command_id, error_bit)), or (None, None) when the socket is empty. Never waits
+        (RTI's read always asked for timeout=0)."""
+        try:
+            cf, ancillary, _, _ = self._sock.recvmsg(self._mtu, self._anc, socket.MSG_DONTWAIT)
+        except (BlockingIOError, InterruptedError):
+            return None, None
+        except OSError as error:                     # as python-can: the interface went down, ...
+            raise self._op_error(f"Error receiving: {error.strerror}", error.errno) from error
+        can_id, dlc, _ = self._hdr.unpack_from(cf)
+        seconds, nanoseconds = self._ts.unpack_from(ancillary[0][2])
+        frame = CanFrame()
+        frame.timestamp = seconds + nanoseconds * 1e-9
+        frame.is_extended_id = bool(can_id & self._eff)
+        frame.is_remote_frame = bool(can_id & self._rtr)
+        frame.is_error_frame = bool(can_id & self._err)
+        frame.arbitration_id = can_id & 0x1FFFFFFF if frame.is_extended_id else can_id & 0x000007FF
+        frame.dlc = dlc
+        frame.data = bytearray(cf[8:8 + dlc])
+        aid = frame.arbitration_id
+        return frame, self._can_message((aid >> 7) & 0xF, (aid >> 1) & 0x3F, aid & 0x1)
+
+
+# ==========================================================================
 # CAN Communication Setup
 # ==========================================================================
 
