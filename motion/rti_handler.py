@@ -33,6 +33,10 @@ instance is reused and its channel fields are re-pointed per tick.
 import logging
 
 import numpy as np
+try:                          # np.clip's own ufunc without its Python wrapper: the same arithmetic, ~2 us less a call
+    from numpy._core.umath import clip as _clip
+except ImportError:           # numpy 1.x
+    from numpy.core.umath import clip as _clip
 
 from communication.rti_protocol import (
     CMD_JOINT_POSITION, CMD_JOINT_VELOCITY, CMD_JOINT_TORQUE,
@@ -592,6 +596,8 @@ class RTIModeHandler:
                      & np.isfinite(self.limit_neg) & np.isfinite(self.limit_pos)
                      & (self.accel_limit > 0) & (self.jerk_limit > 0))
         self._brake_ok = _brake_ok
+        self._brake_not_ok = ~_brake_ok          # the limits never change after construction
+        self._neg = np.zeros(joint_num, dtype=np.float64)   # scratch: a negated bound, right before its clip
         # Substitute BEFORE the arithmetic, not after. `np.where(ok, a/j, 0)` still evaluates
         # a/j for every joint, so an absent limit computes inf/inf = NaN and only then throws
         # it away — the right answer via a NaN the interpreter warns about, which is precisely
@@ -1313,7 +1319,7 @@ class RTIModeHandler:
         # already outside may stay where it is (see RECOVERY above).
         self._effective_limits()
         tgt = self._rl_tgt
-        np.clip(q_des, self._lim_lo_eff, self._lim_hi_eff, out=tgt)
+        _clip(q_des, self._lim_lo_eff, self._lim_hi_eff, out=tgt)
 
         # SOFT_RTI's strict check (2026-10-11, user): a target past a soft limit — or heading for it faster than the
         # joint could still stop before it (the braking curve, on the targets' own speed) — is an ERROR: a controlled
@@ -1447,7 +1453,8 @@ class RTIModeHandler:
             self._trk_gap = sum(self._trk_gaps) / len(self._trk_gaps)
             np.subtract(tgt, self._trk_prev_tgt, out=self._trk_vtgt)
             self._trk_vtgt *= 1.0 / dts
-            np.clip(self._trk_vtgt, -self.vel_limit, self.vel_limit, out=self._trk_vtgt)
+            np.negative(self.vel_limit, out=self._neg)
+            _clip(self._trk_vtgt, self._neg, self.vel_limit, out=self._trk_vtgt)
             self._trk_interval_s = dts
         elif self._trk_seeded and gap > 0:
             # MEDIAN of recent gaps, not this one. The instantaneous gap is an integer
@@ -1495,7 +1502,8 @@ class RTIModeHandler:
             self._trk_vtgt *= 1.0 / (spans * self._trk_gap * self.delta_t)
             # A stale target the PC never updated must not become a velocity estimate that
             # keeps extrapolating forever.
-            np.clip(self._trk_vtgt, -self.vel_limit, self.vel_limit, out=self._trk_vtgt)
+            np.negative(self.vel_limit, out=self._neg)
+            _clip(self._trk_vtgt, self._neg, self.vel_limit, out=self._trk_vtgt)
             self._trk_interval_s = spans * self._trk_gap * self.delta_t
         else:
             spans = 1
@@ -1652,7 +1660,7 @@ class RTIModeHandler:
             np.subtract(ahead, self._trk_da, out=ahead)
         # Extrapolation must not aim outside the workspace, or the tracker would drive at a
         # target the output clamp then refuses — the classic wind-up against a pinned output.
-        np.clip(ahead, self._lim_lo_eff, self._lim_hi_eff, out=ahead)
+        _clip(ahead, self._lim_lo_eff, self._lim_hi_eff, out=ahead)
 
         # a = wn^2 * (ahead - q) - 2*wn*v, written as two fused ops rather than four so the
         # per-call NumPy overhead on 6-element arrays does not dominate the arithmetic.
@@ -1667,9 +1675,9 @@ class RTIModeHandler:
         # build a fresh array, and three of those per tick is exactly the hot-path
         # allocation this file's rules forbid.
         np.subtract(a, self._rl_a, out=self._trk_da)
-        np.clip(self._trk_da, self._trk_njstep, self._trk_jstep, out=self._trk_da)
+        _clip(self._trk_da, self._trk_njstep, self._trk_jstep, out=self._trk_da)
         np.add(self._rl_a, self._trk_da, out=a)
-        np.clip(a, self._trk_naccel, self.accel_limit, out=a)
+        _clip(a, self._trk_naccel, self.accel_limit, out=a)
 
         # --- integrate, bounded at every step ---
         v = self._trk_v
@@ -1677,7 +1685,7 @@ class RTIModeHandler:
         np.add(v, self._rl_v, out=v)
         vcap = self._tcp_velocity_budget(tgt, ctx)
         np.negative(vcap, out=self._trk_nvcap)
-        np.clip(v, self._trk_nvcap, vcap, out=v)
+        _clip(v, self._trk_nvcap, vcap, out=v)
         # The soft-limit brake, same bound the velocity command path uses. Unconditional:
         # a tracker with no arrival phase has nothing else stopping it at a joint limit.
         self._brake_at_limits(v, self._rl_q)
@@ -1685,7 +1693,7 @@ class RTIModeHandler:
         out = self._rl_out
         np.multiply(v, dt, out=out)
         np.add(out, self._rl_q, out=out)
-        np.clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
+        _clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
 
         # Re-derive the state actually achieved after clamping, so the next tick integrates
         # from the truth rather than from what was requested. Skipping this is how a limiter
@@ -1737,7 +1745,7 @@ class RTIModeHandler:
             adv = self._trk_ahead
             np.multiply(self._trk_vtgt, age * self.delta_t, out=adv)
             np.add(adv, tgt, out=adv)
-            np.clip(adv, self._lim_lo_eff, self._lim_hi_eff, out=adv)
+            _clip(adv, self._lim_lo_eff, self._lim_hi_eff, out=adv)
             inp.target_position = adv
             aim = adv
             # Feedforward: the PC's own velocity WINS when it sent one. An earlier version
@@ -1785,7 +1793,8 @@ class RTIModeHandler:
         # velocity above max_velocity outright, and that would be a hot-path exception.
         # Clamped against the ACTIVE budget: when the TCP cap has shrunk max_velocity, a
         # feedforward clipped only to the base limits would still be rejected.
-        np.clip(self._feedforward, -vcap, vcap, out=self._rk_tv)
+        np.negative(vcap, out=self._neg)
+        _clip(self._feedforward, self._neg, vcap, out=self._rk_tv)
         # Never ask to ARRIVE at a soft limit at speed (2026-10-11): the target speed toward a limit at most what the
         # joint can still stop from at the target (the braking curve: 0 on the limit). Without it a stream into a
         # limit made the planner reach the clamped target at speed and the clamp stopped it — SOFT_RTI, J1 at 60 deg/s,
@@ -1812,7 +1821,7 @@ class RTIModeHandler:
         self._rl_a[:] = self._rk_out.new_acceleration
         # Layer 1b: the backstop, same as the cascade path. Ruckig is not given the
         # positional limits (see __init__), so this is the only thing enforcing them here.
-        np.clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
+        _clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
         self._rl_q[:] = out
         return out
 
@@ -1867,7 +1876,7 @@ class RTIModeHandler:
         out[:] = self._rk_out.new_position
         self._rl_v[:] = self._rk_out.new_velocity
         self._rl_a[:] = self._rk_out.new_acceleration
-        np.clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
+        _clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
         self._rl_q[:] = out
         return out
 
@@ -2118,7 +2127,7 @@ class RTIModeHandler:
         np.multiply(v, gate, out=v)
         # Never past a soft limit: the aim clamped (and its speed 0 there), and the speed never more than the joint
         # can still stop from before its limit.
-        np.clip(aim_raw, self._lim_lo_eff, self._lim_hi_eff, out=aim)
+        _clip(aim_raw, self._lim_lo_eff, self._lim_hi_eff, out=aim)
         np.not_equal(aim, aim_raw, out=self._pt_mask)
         np.copyto(v, 0.0, where=self._pt_mask)
         np.copyto(a, 0.0, where=self._pt_mask)
@@ -2127,7 +2136,8 @@ class RTIModeHandler:
         np.not_equal(self._pt_vb, v, out=self._pt_mask)
         np.copyto(a, 0.0, where=self._pt_mask)
         v[:] = self._pt_vb
-        np.clip(a, -self.accel_limit, self.accel_limit, out=a)
+        np.negative(self.accel_limit, out=self._neg)
+        _clip(a, self._neg, self.accel_limit, out=a)
 
         inp = self._rk_in
         vcap = self._tcp_velocity_budget(aim, ctx)
@@ -2138,7 +2148,8 @@ class RTIModeHandler:
         elif self._tcp_cap_applied:
             inp.max_velocity = self.vel_limit
             self._tcp_cap_applied = False
-        np.clip(v, -vcap, vcap, out=v)
+        np.negative(vcap, out=self._neg)
+        _clip(v, self._neg, vcap, out=v)
         # Every tick, not once: a setter (rti_set_min_duration, sent by every servo test's config) may have changed
         # them since — and under Synchronization.No the one-tick minimum duration does not hold (each joint would land
         # early and coast past its aim).
@@ -2172,7 +2183,7 @@ class RTIModeHandler:
             np.copyto(out, aim, where=ok)
             np.copyto(self._rl_v, v, where=ok)
             np.copyto(self._rl_a, a, where=ok)
-        np.clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
+        _clip(out, self._lim_lo_eff, self._lim_hi_eff, out=out)
         self._rl_q[:] = out
         return out
 
@@ -2189,7 +2200,7 @@ class RTIModeHandler:
         np.sqrt(out, out=out)
         np.subtract(out, self._brake_r, out=out)
         np.multiply(out, self._brake_a, out=out)
-        np.copyto(out, np.inf, where=~self._brake_ok)
+        np.copyto(out, np.inf, where=self._brake_not_ok)
         return out
 
     def _brake_at_limits(self, v, q):
@@ -2209,7 +2220,8 @@ class RTIModeHandler:
         self._vstop_into(self._bl_ddn, self._bl_vdn)
 
         # +v moves toward limit_pos, so it is bounded by the upper headroom, and vice versa.
-        np.clip(v, -self._bl_vdn, self._bl_vup, out=v)
+        np.negative(self._bl_vdn, out=self._bl_vdn)        # scratch: recomputed every call
+        _clip(v, self._bl_vdn, self._bl_vup, out=v)
         return v
 
     def _tcp_scale_velocity(self, v, ctx):
@@ -2254,22 +2266,26 @@ class RTIModeHandler:
         dt = self.delta_t
         v, a, j = self._rl_out, self._rl_tmp_a, self._rl_tmp_j
 
-        np.clip(v_des, -self.vel_limit, self.vel_limit, out=v)
+        np.negative(self.vel_limit, out=self._neg)
+        _clip(v_des, self._neg, self.vel_limit, out=v)
 
         np.subtract(v, self._rl_v, out=a)
         np.divide(a, dt, out=a)
 
         np.subtract(a, self._rl_a, out=j)
         np.divide(j, dt, out=j)
-        np.clip(j, -self.jerk_limit, self.jerk_limit, out=j)
+        np.negative(self.jerk_limit, out=self._neg)
+        _clip(j, self._neg, self.jerk_limit, out=j)
 
         np.multiply(j, dt, out=a)
         np.add(self._rl_a, a, out=a)
-        np.clip(a, -self.accel_limit, self.accel_limit, out=a)
+        np.negative(self.accel_limit, out=self._neg)
+        _clip(a, self._neg, self.accel_limit, out=a)
 
         np.multiply(a, dt, out=v)
         np.add(self._rl_v, v, out=v)
-        np.clip(v, -self.vel_limit, self.vel_limit, out=v)
+        np.negative(self.vel_limit, out=self._neg)
+        _clip(v, self._neg, self.vel_limit, out=v)
 
         # TCP cap after the cascade (so the accel clamp cannot re-inflate what it cut),
         # then the soft-limit brake LAST — the hard workspace guard always has the final
@@ -2352,7 +2368,8 @@ class RTIModeHandler:
         d = self._rl_tmp_j
         np.subtract(t_des, self._rl_t, out=d)
         np.divide(d, dt, out=d)
-        np.clip(d, -self.torque_rate_limit, self.torque_rate_limit, out=d)
+        np.negative(self.torque_rate_limit, out=self._neg)
+        _clip(d, self._neg, self.torque_rate_limit, out=d)
         np.multiply(d, dt, out=d)
         np.add(self._rl_t, d, out=self._rl_t)
         if q_meas is not None:
