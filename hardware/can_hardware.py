@@ -275,7 +275,6 @@ class FirstFrameWait:
         self._sock = None
         self._buf = bytearray(16)
         self.enabled = False
-        self._dirty = True
         self.waits = 0
         self.timeouts = 0
         self.wait_sum = 0.0
@@ -296,7 +295,6 @@ class FirstFrameWait:
                 return False
             self.waits = self.timeouts = 0
             self.wait_sum = self.wait_max = 0.0
-            self._dirty = True
             self.enabled = True
             logger.info(f"[CAN] send-wait ON: RTI waits (up to {self.timeout_s * 1e3:.1f} ms) for its first frame "
                         f"to leave each tick (TODO/can_tx_timing_plan.md option A)")
@@ -313,14 +311,15 @@ class FirstFrameWait:
         return True
 
     def prepare(self):
-        """Before the tick's commands are queued: throw away echoes left by ticks that did not wait (or waited in
-        vain), so the next frame the socket gives is this tick's."""
-        if self._dirty:
-            self._drain()
+        """Before the tick's commands are queued: throw away every echo already there, so the next frame the socket
+        gives is this tick's. EVERY tick, not only after a timeout (fixed 2026-10-12, found on the arm): an echo that
+        came later than the next tick's drain was taken as that tick's own, and from then on every wait returned at
+        once on the previous tick's echo — 'one behind' for good, the wait silently doing nothing. Now a late echo
+        costs at most one tick."""
+        self._drain()
 
     def skip(self):
-        """A tick that queued no data commands: echoes of frames sent meanwhile may sit in the socket."""
-        self._dirty = True
+        """A tick that queued no data commands (the next prepare() drains what it left)."""
 
     def wait(self):
         """Right after the tick's commands were queued: sleep until J1's command has left (or timeout_s). Returns the
@@ -330,7 +329,6 @@ class FirstFrameWait:
             self._sock.recv_into(self._buf)
         except OSError:                      # socket.timeout is one
             self.timeouts += 1
-            self._dirty = True
             return -1.0
         dt = time.perf_counter() - t0
         self.waits += 1
@@ -349,7 +347,6 @@ class FirstFrameWait:
             pass
         finally:
             self._sock.settimeout(self.timeout_s)
-        self._dirty = False
 
 
 # ==========================================================================

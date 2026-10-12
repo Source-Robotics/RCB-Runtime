@@ -421,11 +421,22 @@ def can_metrics(c, w0, w1):
             "pauses_over": int(np.sum(pauses > STALL_MS)), "host_stalls": stalls}
 
 
-def reply_freshness(c, read_t, tick):
+def candump_gaps(c, w0, w1, min_ms=8.0):
+    """[(t0, t1)]: stretches of the window with no frame at all in the log. The bus is never that quiet while RTI
+    runs (a frame every ~0.1-0.3 ms) — such a gap is candump missing frames, not the bus: excluded from the counts."""
+    t = c["t"][(c["t"] >= w0) & (c["t"] < w1)]
+    g = np.diff(t)
+    i = np.flatnonzero(g > min_ms * 1e-3)
+    return [(float(t[k]), float(t[k + 1])) for k in i]
+
+
+def reply_freshness(c, read_t, tick, gaps=()):
     """Per joint, from the CAN log and when each of RTI's CAN reads ran (read_t, CLOCK_REALTIME, one per row):
     missed = reads that found no new reply from that joint since the previous tick's read; age = how old the newest
     reply was at the read (ms) — the data the tick works with."""
     ok = np.isfinite(read_t) & (read_t > 0)
+    for g0, g1 in gaps:                      # a read inside or right after a candump gap cannot be judged
+        ok &= ~((read_t > g0) & (read_t < g1 + 0.005))
     pair = (np.diff(tick) == 1) & ok[1:] & ok[:-1]
     out = {}
     for j in range(JOINT_NODES):
@@ -455,9 +466,15 @@ def analyse(run, d, c):
         runs = stale_runs(dd, dt) if blk["kind"] != "idle" else []
         ts, tx_t, rx_t = align(dd, c, fit, offset, mov)
         detail = classify(runs, dd, c, ts, tx_t, rx_t, dt)
+        gaps = candump_gaps(c, blk["t_start"], blk["t_end"])
+        for r in detail:                     # a stale run in a candump gap is not judged from the log
+            t_run = r["t_mono"] + offset
+            if any(g0 - 0.004 < t_run < g1 + 0.004 for g0, g1 in gaps):
+                r["label"] = "candump gap"
         missing_ticks = int(np.sum(np.diff(dd["tick"]) - 1)) if dd["tick"].size > 1 else 0
         moving_s = float(mov.sum()) * dt
         res = {"name": blk["name"], "kind": blk["kind"], "ok": blk.get("ok", True), "rows": int(dd["tick"].size),
+               "fresh": reply_freshness(c, dd["read_t"], dd["tick"], gaps),
                "telemetry_missing": missing_ticks, "moving_s": moving_s, "stale_runs": len(runs),
                "stale_per_min": (len(runs) / moving_s * 60.0) if moving_s > 0 else np.nan,
                "stale_longest": max((r[1] for r in runs), default=0),
@@ -469,7 +486,7 @@ def analyse(run, d, c):
                "matched": int(np.isfinite(tx_t).sum()), "moving_rows": int(mov.sum()),
                "can": can_metrics(c, blk["t_start"], blk["t_end"]),
                "read_rel_ms": _stats((dd["read_t"] - ts) * 1e3),
-               "fresh": reply_freshness(c, dd["read_t"], dd["tick"]),
+               "candump_gaps": candump_gaps(c, blk["t_start"], blk["t_end"]),
                "counters": counter_delta(blk.get("can_before"), blk.get("can_after")),
                "irq": {k: blk["irq_after"].get(k, 0) - v for k, v in blk.get("irq_before", {}).items()}
                if blk.get("irq_after") else {}}
@@ -510,6 +527,10 @@ def print_report(rep, title=""):
               f"{cnt.get('rx_over_errors', '-')}, bus errors {cnt.get('bus_error', '-')}, TX errors "
               f"{cnt.get('tx_errors', '-')}, error-passive {cnt.get('error_passive', '-')}, bus-off {cnt.get('bus_off', '-')}")
         fr = b.get("fresh") or {}
+        cg = b.get("candump_gaps") or []
+        if cg:
+            print(f"  ({len(cg)} candump gap(s), {sum(1e3 * (g1 - g0) for g0, g1 in cg):.0f} ms in all — candump missed "
+                  f"frames there; those reads and stale runs are not judged)")
         if fr:
             print(f"  reads: RTI's CAN read {_f(b['read_rel_ms'].get('med'))} ms from its clock reading | per joint, "
                   f"replies missed / age of the newest reply at the read (median, p5..p99 ms): "
@@ -841,7 +862,7 @@ def run_session(args, cfg, order, out_dir):
     hi_lim = np.degrees(np.asarray(cfg["software_joint_limit_positive"], float))
     robot = RobotClient()
     robot.connect(args.host, args.port)
-    capture = dump = dump_fh = None
+    capture = dump = dump_fh = dump_path = None
     run = {"order": order, "args": vars(args), "delta_t": float(cfg.get("delta_t", 0.004)), "blocks": [],
            "clock_offsets": [], "threads": [], "analysed": False}
     prev_recipe, claimed, ok = None, False, True
@@ -869,8 +890,13 @@ def run_session(args, cfg, order, out_dir):
             robot.enter_idle_mode(wait=True)
             time.sleep(0.5)
         os.makedirs(out_dir, exist_ok=True)
-        dump_fh = open(os.path.join(out_dir, "can0.log"), "w")
-        dump = subprocess.Popen(["candump", "-L", args.iface], stdout=dump_fh, stderr=subprocess.DEVNULL)
+        # candump writes to RAM (tmpfs) while the arm moves, moved to out_dir at the end: on the SD card a slow write
+        # stalled it and it dropped frames — a 221 ms "bus silence" in which RTI read 55 fresh replies (2026-10-12).
+        # -d: candump reports its own drops ("DROPCOUNT" lines).
+        ram = f"/run/user/{os.getuid()}"
+        dump_path = os.path.join(ram if os.access(ram, os.W_OK) else out_dir, f"rcb69_{os.getpid()}_can0.log")
+        dump_fh = open(dump_path, "w")
+        dump = subprocess.Popen(["candump", "-L", "-d", args.iface], stdout=dump_fh, stderr=subprocess.DEVNULL)
         capture = Capture()
         prev_recipe = st.get("recipe")
         robot.reload_recipes()
@@ -942,6 +968,8 @@ def run_session(args, cfg, order, out_dir):
                 dump.kill()
         if dump_fh is not None:
             dump_fh.close()
+            if dump_path != os.path.join(out_dir, "can0.log"):
+                shutil.move(dump_path, os.path.join(out_dir, "can0.log"))
         run["clock_offsets"].append(clock_offset())
         try:
             if prev_recipe and prev_recipe != RECIPE:
@@ -980,7 +1008,12 @@ def analyse_saved(folder):
     with open(os.path.join(folder, "can0.log")) as fh:
         c = parse_candump(fh)
     rep = analyse(run, d, c)
+    with open(os.path.join(folder, "can0.log")) as fh:
+        drops = [ln.strip() for ln in fh if ln.startswith("DROPCOUNT")]
+    rep["candump_drops"] = drops
     print_report(rep, f"=== {folder} ===")
+    if drops:
+        print(f"\ncandump reported dropped frames {len(drops)} time(s); the last: {drops[-1]}")
     if run.get("threads"):
         print("\nthreads at the start (class, priority, core):")
         for ln in run["threads"]:
