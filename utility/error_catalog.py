@@ -61,6 +61,7 @@ ERROR_DESCRIPTIONS = {
 
     # Per-joint CAN communication errors
     "CAN_LOST":                 {"cause": "CAN connection lost — no data received for too long.", "fix": "check CAN bus wiring/termination and joint power."},
+    "RTI_NO_SEND_TIME":         {"cause": "a hard-RTI position command arrived without the PC's send time (a 101-byte packet) — hard RTI follows the PC's own timing and needs it; the arm braked to rest.", "fix": "keep send times on (RTIClient's default, timestamps=True) or send the 109-byte packet; a sender without them belongs in SOFT_RTI (rti_connect with rate_hz). Clear errors to resume."},
     "CAN_STALE":                {"cause": "CAN data is getting stale — motor may be slow to respond.", "fix": "check CAN bus load/wiring; usually resolves on its own."},
     "CAN_REPLY_MISSED_WARNING": {"cause": "the joint's drive replies keep missing RTI's CAN read (5 or more a second, for 3 s in a row, each 1-9 ticks late) — its measured state is a tick old on those ticks; seen when the CAN chip's kernel threads run on RTI's core (2026-10-12). Shorter bursts (load on the Pi) are only logged.", "fix": "RTI.log's '[CAN] interrupt threads ... on cores' line at start-up must not report a problem; api_tests/69_can_gaps.py measures the freezes. Warn only — RTI.log has the peak."},
 

@@ -202,6 +202,8 @@ class RTIClient:
                      target), so the robot follows your real timing instead of the arrival times. An
                      uneven sender (VR, Wi-Fi) left ~3x more chatter without it (simulated, 2026-10-11).
                      No clock synchronisation is needed; only differences are used. TCP never sends it.
+                     REQUIRED for hard RTI since 2026-10-12 (the robot refuses a position target without
+                     it); False is for SOFT_RTI only — connect() raises otherwise.
     """
 
     def __init__(self, robot, clock='robot', listen_port=RTI_PORT_SENDER, transport='udp', timestamps=True):
@@ -273,15 +275,25 @@ class RTIClient:
         `rate_hz` picks the contract, mirroring the hard / soft real-time split of industrial streaming interfaces:
 
         - **omitted → RTI** (hard real-time). You close the loop: one setpoint every tick,
-          40 ms watchdog. Unchanged, and the mode that is hardware-verified.
+          40 ms watchdog. Over UDP with send times only (2026-10-12): the robot refuses a hard-RTI
+          position target without one (RTI_NO_SEND_TIME), so this raises ValueError up front for
+          `timestamps=False` or `transport='tcp'`.
         - **given → SOFT_RTI** (soft real-time). You send targets at *your* rate and the
           robot interpolates. The timeout is sized at three of your command intervals and
-          the generator defaults to `ruckig_advancing`.
+          the generator defaults to `ruckig_advancing`. Send times optional, UDP or TCP.
 
         Prefer a rate that divides evenly into the robot's loop rate — 50, 25 or 10 Hz on a
         250 Hz robot. A non-integer ratio makes commands land alternately on two tick
         counts, corrupting every velocity estimate derived from the stream.
         """
+        if rate_hz is None:
+            if (transport or self.transport) == 'tcp':
+                raise ValueError("hard RTI is UDP only (TCP stalls the stream behind any lost packet); for TCP give "
+                                 "a rate_hz — SOFT_RTI")
+            if not self.timestamps:
+                raise ValueError("hard RTI needs the send time on every position target (the robot refuses one "
+                                 "without it): RTIClient(timestamps=True), the default — or SOFT_RTI (rate_hz) "
+                                 "for a sender without send times")
         self.robot_ip = self.robot.remote_ip()
         if self.robot_ip is None:
             raise RuntimeError("robot is not connected — call robot.connect() first")

@@ -191,7 +191,6 @@ PT_DELAY_RATE_TICKS = 0.002       # per tick: the replay delay drifts at most th
 # controlled stop).
 PT_GATE = 1.5                     # a curvature above 1.5x the acceleration limit is a jump: plan to stop on the aim
 PT_MAX_GAP_TICKS = 25.0           # samples further apart (100 ms) or out of order: a new start
-PT_UNSTAMPED_EXIT = 3             # this many packets in a row without a send time: back to the planner
 
 # STRICT COMMAND CHECKS (2026-10-11, user: as industrial 1 kHz interfaces do). A hard-RTI stream with send times must be motion the arm
 # can do: a sample that moves a joint past its soft limit (or faster than it can still stop before it), faster than its
@@ -512,7 +511,6 @@ class RTIModeHandler:
         self._pt_q = np.zeros((PT_RING, joint_num), dtype=np.float64)
         self._pt_k = 0                    # samples taken since the last start (ring index = k % PT_RING)
         self._pt_last_tick = -1           # the packet the ring last saw
-        self._pt_nost = 0                 # packets in a row without a send time
         self._pt_shift = 0.0              # ticks taken off the send times after a jump of the PC's clock
         self._pt_arrival = 0              # the arrival tick of the newest sample
         self._pt_L = 0.0                  # replay delay: robot tick - send time (ticks), slewed
@@ -1019,6 +1017,8 @@ class RTIModeHandler:
 
     def _step_active(self, ctx):
         got = self._receive_command(ctx)
+        if self.sub_state != 'control_active':      # the packet was refused (no send time in hard RTI): the stop
+            return self._step_stopping(ctx)
 
         if got:
             if self.last_cmd_type == CMD_STOP:
@@ -1818,7 +1818,6 @@ class RTIModeHandler:
     def _pt_reset(self, current_tick):
         """Empty the pass-through ring (a claim, a generator switch): the next three stamped packets start it again."""
         self._pt_k = 0
-        self._pt_nost = 0
         self._pt_shift = 0.0
         self._pt_last_tick = current_tick
         self._pt_restore_rk()
@@ -1931,6 +1930,16 @@ class RTIModeHandler:
             return False
         return self._refuse_command(q3, v, a, jj, bad_pos, bad_v, bad_a, bad_j)
 
+    def _refuse_unstamped(self):
+        """Cold path: a hard-RTI position target without the PC's send time — a controlled stop, then
+        RTI_NO_SEND_TIME (once: the stop has begun, later packets are not read)."""
+        if self.sub_state != 'control_active':
+            return
+        logger.error("[RTI] Hard-RTI position command without the PC's send time (a 101-byte packet, or one not finite) — refused, "
+                     "braking to rest. Hard RTI follows the PC's own timing: keep send times on (RTIClient's "
+                     "default), or use SOFT_RTI (rti_connect with a rate) for a sender without them.")
+        self._begin_stop('stopping_error', errors=("RTI_NO_SEND_TIME",))
+
     def _refuse_command(self, q, v, a, jerk, bad_pos, bad_v, bad_a, bad_j):
         """Cold path: name each offending joint, log it, begin the controlled stop with the error keys."""
         keys, why = [], []
@@ -2010,14 +2019,13 @@ class RTIModeHandler:
         """Hard RTI's generator (see SERVO_PASSTHROUGH / PT_*): the PC's stamped samples replayed a small adaptive
         delay behind their send times, on a quadratic through the last three, each joint landing exactly on it when
         its own one-tick landing is within the limits, else catching up. `q_des` the PC's target (unclamped: the
-        curve is the PC's), `tgt` the same clamped. Until three stamped samples are in — and for a stream without
-        send times — the plain ruckig tick, exactly as before."""
+        curve is the PC's), `tgt` the same clamped. Until three samples are in, the plain ruckig tick (hard RTI refuses a
+        position without a send time since 2026-10-12 — the old planner is no longer a fallback for one)."""
         self._update_target_velocity(tgt)                  # the stream's velocity / interval: the stream feedforward
         dt = self.delta_t
         if self.last_cmd_tick != self._pt_last_tick:       # a new packet
             self._pt_last_tick = self.last_cmd_tick
-            if self._cmd_ts == self._cmd_ts:
-                self._pt_nost = 0
+            if self._cmd_ts == self._cmd_ts:              # always, in hard RTI (an unstamped position is refused)
                 s = self._cmd_ts / dt - self._pt_shift
                 k = self._pt_k
                 if k > 0:
@@ -2050,12 +2058,6 @@ class RTIModeHandler:
                     self._pt_skip_checks -= 1
                 elif self._pt_check_sample(k + 1):
                     return self._rl_q                      # refused: a controlled stop has begun (see _step_active)
-            else:
-                # A position without a time: skipped (the replay coasts over it like a dropped packet); a stream
-                # that stops sending times goes back to the planner.
-                self._pt_nost += 1
-                if self._pt_nost >= PT_UNSTAMPED_EXIT:
-                    self._pt_k = 0
         k = self._pt_k
         if k < 3:
             self._pt_restore_rk()
@@ -2829,7 +2831,7 @@ class RTIModeHandler:
                            "moving target; exact arrival kept, ripple removed)")
         elif key == SERVO_PASSTHROUGH:
             logger.warning("[RTI] Servo generator -> PASSTHROUGH (hard RTI's default: stamped targets replayed "
-                           "exactly, ~1 tick; a stream without send times keeps the planner)")
+                           "exactly, ~1 tick; a position without a send time is refused)")
         else:
             logger.warning("[RTI] Servo generator -> RUCKIG (plans to stop at every target)")
 
@@ -3110,10 +3112,17 @@ class RTIModeHandler:
             if delta > 1:
                 self.seq_rx_gaps += 1             # delta-1 commands never arrived
 
+        _ts = unpack_command_timestamp(data)
+        # HARD RTI NEEDS THE SEND TIME (user, 2026-10-12). Its pass-through follows the PC's own timing; a position
+        # target without it (a 101-byte packet) used to fall back to the old planner — ~20 ms behind the PC instead of
+        # ~6, silently. Refused like the strict checks: a controlled stop, then RTI_NO_SEND_TIME. SOFT_RTI, and
+        # velocity / torque / stop packets, take a packet either way. A stamp that is not finite reads as None.
+        if not self.soft_mode and cmd_type == CMD_JOINT_POSITION and _ts is None:
+            self._refuse_unstamped()
+            return False
         self._rx_applied += 1
         self.seq_rx_last = seq
         self.last_cmd_tick = ctx.current_tick
-        _ts = unpack_command_timestamp(data)
         self._cmd_ts = _NAN if _ts is None else _ts
         self.last_cmd_type = cmd_type
         if cmd_type != CMD_STOP:

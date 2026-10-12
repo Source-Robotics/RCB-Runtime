@@ -20,10 +20,11 @@ anything (user, 2026-10-12): this records
                 buffers were full — a frame lost on OUR side), bus errors, error-passive, bus-off, TX errors / drops;
                 and the SPI / CAN-chip interrupt counts; a snapshot of the SPI / CAN kernel threads (class, priority, core)
 
-around three kinds of J1 motion, each twice (A B C A B C), after 3 s of IDLE as a baseline:
+around two kinds of J1 motion, each twice, with and without the CAN send-wait (option A; see DEFAULT_ORDER), after
+3 s of IDLE as a baseline:
 
-  planner       hard RTI, 250 Hz, 101-byte packets (no send times): the old generator (plain Ruckig)
-  passthrough   hard RTI, 250 Hz, with send times: the pass-through (the hard default since 2026-10-11)
+  passthrough   hard RTI, 250 Hz, with send times: the pass-through (the hard default since 2026-10-11; the old planner
+                block — 101-byte packets — is gone: hard RTI refuses a position without a send time since 2026-10-12)
   exec          EXEC moves J1 +/-15 deg back and forth at 80 % (~57 deg/s peak, ruckig, the default profile)
   The RTI blocks run 68's J1 sine (+/-15 deg, 1.5 s period, ~63 deg/s peak, faded in / out, 8 s); nothing else changes
   (generator / pacing are each contract's defaults, the feedforward as the robot has it).
@@ -58,7 +59,7 @@ analysis would slow RTI's loop): the raw recording is saved, then `--reanalyse` 
     python3 api_tests/69_can_gaps.py --selftest      # the analysis on a synthetic recording with known events
     python3 api_tests/69_can_gaps.py                 # dry run: the plan
     python3 api_tests/69_can_gaps.py --go            # ~2 min
-    python3 api_tests/69_can_gaps.py --go --order planner,passthrough,exec,planner,passthrough,exec
+    python3 api_tests/69_can_gaps.py --go --order passthrough,exec,passthrough,exec
     python3 api_tests/69_can_gaps.py --reanalyse temp_data/can_gaps/<time>    # with the arm DISABLED
 
 Results: temp_data/can_gaps/<time>/ (can0.log, telemetry.raw, run.json; report.json after the analysis).
@@ -89,7 +90,7 @@ CMD_DATA_PACK_1 = 2               # RTI -> drive (Spectral_BLDC SEND_DATA_PACK_1
 CMD_DATA_PACK_PD = 4              # RTI -> drive (SEND_DATA_PACK_PD_ID)
 RESP_DATA_PACK_1 = 3              # drive -> RTI: position 24 b, speed 24 b, current 16 b, big-endian signed
 JOINT_NODES = 6                   # CAN nodes 0..5 = J1..J6
-KINDS = ("planner", "passthrough", "exec", "passthrough_wait", "exec_wait")
+KINDS = ("passthrough", "exec", "passthrough_wait", "exec_wait")   # 'planner' (101 bytes) is refused since 2026-10-12
 DEFAULT_ORDER = "passthrough,passthrough_wait,exec,exec_wait,passthrough,passthrough_wait,exec,exec_wait"
 LOAD_EVERY_S = 2.0                # --load: a Python interpreter (numpy + scipy imports) started this often per block
 IDLE_S = 3.0                      # the baseline before the first block
@@ -812,10 +813,10 @@ class Load:
                 p.kill()
 
 
-def rti_block(robot, ff68, sc, capture, stamps):
+def rti_block(robot, ff68, sc, capture):
     """One RTI block: a hard-RTI session at 250 Hz streaming 68's J1 sine; back to IDLE after."""
     from robotclient import RTIClient
-    rti = RTIClient(robot, clock="pc", timestamps=stamps)
+    rti = RTIClient(robot, clock="pc", timestamps=True)
     try:
         rti.connect(rate_hz=None)
         try:
@@ -823,7 +824,7 @@ def rti_block(robot, ff68, sc, capture, stamps):
         except Exception:
             raise RuntimeError(f"the robot is in {robot.status().get('mode')}, not RTI — refusing the block") from None
         time.sleep(0.4)
-        sc.apply_config(robot, {"gen": "passthrough"})       # the hard contract's generator (101 bytes -> the planner)
+        sc.apply_config(robot, {"gen": "passthrough"})       # the hard contract's generator
         rti.read_once(timeout=2.0)
         rti.claim()
         q0 = list(rti.read_once(timeout=1.0)["j_p"])
@@ -924,7 +925,7 @@ def run_session(args, cfg, order, out_dir):
                 elif base == "exec":
                     exec_block(robot)
                 else:
-                    rti_block(robot, ff68, sc, capture, stamps=(base == "passthrough"))
+                    rti_block(robot, ff68, sc, capture)
                 print("done")
             except (ControlLost, Exception) as exc:             # any failure ends the run; the recording is kept
                 print(f"FAILED: {type(exc).__name__}: {exc}")

@@ -8,14 +8,14 @@ between packets over their interval, smoothed at 8 Hz. Simulated against the tor
 (1.0 = no better than none): hard RTI 250 Hz 0.12, SOFT_RTI 50 Hz 0.27, wandering 50-60 Hz 0.33, 10 Hz 0.69.
 This test measures it. Every SENDER runs every SET in turn:
 
-  senders  hard250 (hard RTI, a command every tick, 101-byte packets: the planner that stops at every target — the
-           26-41 ms lag of the earlier runs; the drive now gets the generator's speed) / hard250_ts (the same PC loop
-           with SEND TIMES: hard RTI's pass-through, TODO/servo_mode_options.md §17.21 — simulated 4-6 ms) /
+  senders  hard250_ts (hard RTI, a command every tick from the PC's own loop, with SEND TIMES: the pass-through,
+           TODO/servo_mode_options.md §17.21 — simulated 4-6 ms; 'hard250', the same without send times — the old
+           planner — is gone: hard RTI refuses a position without a send time since 2026-10-12) /
            hard250_rc (ROBOT-clocked: RTIClient.control() answers every state packet with a target computed from the
            robot's time — the pass-through on the tick grid, simulated exactly one tick) / soft50 (SOFT_RTI 50 Hz) /
            wander (SOFT_RTI, 50-60 Hz wandering, like a VR device) / wander_ts (the same with send times — simulated
            15x less fast chatter, §17.20) / soft10 (SOFT_RTI 10 Hz). Only the _ts / _rc senders send times (the
-           client's default since 2026-10-11): the others stay comparable with the runs before it.
+           client's default since 2026-10-11): the SOFT_RTI ones stay comparable with the runs before it.
   sets     old / off / stream (default order old,off,stream,off — the second off checks the measurement repeats)
            old     SOFT_RTI as it was until 2026-10-11: duration pacing 0 (the jerky kicks); feedforward off
            off     the shipped setup: SOFT_RTI's duration pacing default (1.5 intervals), feedforward off
@@ -60,7 +60,7 @@ so put the arm where J1 has room (the start pose of the other tests: J1 90 deg).
     python3 api_tests/68_rti_feedforward.py                      # dry run: the plan
     python3 api_tests/68_rti_feedforward.py --go                 # ~4 min, J1
     python3 api_tests/68_rti_feedforward.py --go --senders soft50,wander --sets off,stream
-    python3 api_tests/68_rti_feedforward.py --go --senders hard250,hard250_ts,hard250_rc,wander,wander_ts --sets off,stream,off
+    python3 api_tests/68_rti_feedforward.py --go --senders hard250_ts,hard250_rc,wander,wander_ts --sets off,stream,off
     python3 api_tests/68_rti_feedforward.py --reanalyse temp_data/rti_ff/<time>.json   # with the arm DISABLED
 
 As api_tests/66: the RAW packets are saved the moment the run ends; with the arm still ENABLED the analysis waits
@@ -82,7 +82,6 @@ from _tracking_common import Capture, to_arrays, best_delay, robot_enabled  # no
 
 RECIPE = "tracking"
 SENDERS = {                       # name: (lo Hz, hi Hz, soft, send times, robot-clocked)
-    "hard250": (250.0, 250.0, False, False, False),
     "hard250_ts": (250.0, 250.0, False, True, False),
     "hard250_rc": (250.0, 250.0, False, True, True),
     "soft50": (50.0, 50.0, True, False, False),
@@ -364,7 +363,7 @@ def selftest():
         m["cmd_jerk"] < 0.3 and m["cmd_vhf"] < 0.3, (m["cmd_jerk"], m["cmd_vhf"]))
     d0 = dict(d)
     d0["j_sc"] = np.zeros_like(d["j_sc"])                                 # hard RTI: the published j_sc is 0
-    m0 = analyse(d0, [{"sender": "hard250", "set": "off", "joints": [1], "t0": 1000, "t1": 1000 + n - 1}], dt)
+    m0 = analyse(d0, [{"sender": "hard250_ts", "set": "off", "joints": [1], "t0": 1000, "t1": 1000 + n - 1}], dt)
     chk("a block whose published commanded speed is 0 (hard RTI) is still analysed, the same",
         len(m0) == 1 and abs(m0[0]["rms_d"] - m["rms_d"]) < 1e-9 and abs(m0[0]["buzz"] - m["buzz"]) < 1e-9, m0)
     chk("the commanded path trails the PC's intent by the 20 ms built in (gen_lag), the arm by 20 + 6 ms (arm_lag); "
