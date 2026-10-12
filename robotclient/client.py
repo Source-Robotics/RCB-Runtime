@@ -331,11 +331,11 @@ class RobotClient:
         return self._immediate("inertia_comp", [1 if enabled else 0])
 
     def set_can_read_first(self, enabled: bool) -> Any:
-        """EXPERIMENTAL, OFF at every RTI start (TODO/can_tx_timing_plan.md option B, 2026-10-12): RTI reads the
-        joints' CAN replies at the START of each tick and computes that tick's commands from them, then waits until
-        its first command frame has left (at most 1 ms) — ~4 ms less from a drive's measurement to the command
-        computed from it (estimated; measured with api_tests/69 / 66 / 68). Homing keeps the old order. RTI.log
-        reports the waits when it is switched off."""
+        """The CAN tick order (option B, 2026-10-12; RTI starts in the order system.xml <can_read_first> names, ON by
+        default): True = RTI reads the joints' CAN replies at the START of each tick, computes that tick's commands
+        from them and sends them at once — 3.8 instead of 7.8 ms from a drive's measurement to the command computed
+        from it (measured), with the same late-reply rate and tracking; False = the old order. Homing always uses the
+        old order. RTI.log reports the waits when it is switched off."""
         return self._immediate("can_read_first", [1 if enabled else 0])
 
     def set_coriolis_comp(self, enabled: bool) -> Any:

@@ -1227,8 +1227,9 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                         ui.label("Normal tick order: ~7.8 ms. The reply arrives while RTI sleeps, is read in "
                                  "the next tick, used by the tick after that, and that command leaves only when "
                                  "RTI sleeps again — about two ticks.")
-                        ui.label("Option B (read first, send early; set_can_read_first): ~3.8 ms, about one "
-                                 "tick — but more late replies on the last joints under load.")
+                        ui.label("Option B (read first, send early — the default since 2026-10-12, system.xml "
+                                 "<can_read_first>): ~3.8 ms, about one tick: the reply is read at the start of "
+                                 "the next tick and the command computed from it leaves right away.")
                         ui.label(
                             "What it matters for: loops OUR software closes on the measured state — the "
                             "haptic walls in freedrive, a PC's own force / impedance control in hard RTI. "

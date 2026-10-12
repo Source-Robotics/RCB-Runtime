@@ -500,7 +500,9 @@ def main():
     # core they stalled under load (2026-10-12, api_tests/69, config/cpu_cores.py).
     place_can_path(CAN_CPU_CORE, GENERAL_CPU_CORES)
     communication1 = initialize_can_communication(bustype='socketcan', channel='can0', bitrate=1000000)
-    # TODO/can_tx_timing_plan.md option B — OFF at every start; `can_read_first:1` turns it on (to measure it).
+    # TODO/can_tx_timing_plan.md option B (read first, send early): the waiter's state IS the switch — ON at start when
+    # system.xml says <can_read_first>1 (the default since 2026-10-12, §9.11; below, once the meter exists),
+    # `can_read_first:1|0` at runtime.
     first_frame_wait = FirstFrameWait('can0')
     # Option B's CAN read: python-can's receive without its per-frame select() and Message object, on the same socket
     # (hardware/can_hardware.FastCanReader, 2026-10-12).
@@ -510,6 +512,10 @@ def main():
     loop_delay_meter = LoopDelayMeter(joint_num)
     shared_data.rti["loop_delay"][:] = np.nan          # not measured yet (the GUI shows a dash)
     shared_data.rti["loop_delay_max"][:] = np.nan
+    if _sys['can_read_first']:
+        first_frame_wait.set_enabled(True)      # logs "[CAN] read-first ON"; a socket that cannot open: the old order
+    else:
+        logger.info("[CAN] read-first OFF at start (system.xml <can_read_first>0): the old tick order")
 
     # ==========================================================================
     # Motor objects, joint objects, filters, housekeeping — via motor_setup.py
@@ -1208,10 +1214,10 @@ def main():
         _dynamics_switch(cmd_msg, 'inertia_comp_enabled', "inertia")
 
     def _handle_can_read_first(cmd_msg, cmd_dict):
-        """can_read_first:1|0 — TODO/can_tx_timing_plan.md option B (2026-10-12), OFF at every start: the CAN read and
-        the measurement at the START of the tick, the safety pass before dispatch, and after queueing the commands RTI
-        sleeps until its first frame has left (hardware/can_hardware.FirstFrameWait). The waiter's state IS the
-        switch: a socket that cannot open leaves it OFF (the old order)."""
+        """can_read_first:1|0 — TODO/can_tx_timing_plan.md option B (2026-10-12; its start state is system.xml
+        <can_read_first>, ON by default): the CAN read and the minimal measurement at the START of the tick, and after
+        queueing the commands RTI sleeps until its first frame has left (hardware/can_hardware.FirstFrameWait); the rest
+        after the send. The waiter's state IS the switch: a socket that cannot open leaves it OFF (the old order)."""
         parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
         if len(parts) != 2:
             return
@@ -2290,7 +2296,7 @@ def main():
             st.startup_motor_reconfig += 1
 
         # ==========================================================================
-        # OPTION B — read first, send early (TODO/can_tx_timing_plan.md §9; `can_read_first:1`, OFF at every start).
+        # OPTION B — read first, send early (TODO/can_tx_timing_plan.md §9; system.xml <can_read_first>, ON by default).
         # The CAN read and the measurement run HERE, at the tick's start: they collect the replies to the previous
         # tick's commands, which left right after its dispatch (the waiter below), so this tick's commands are
         # computed from them — about a tick fresher — and leave ~0.3 ms after dispatch instead of when RTI sleeps.

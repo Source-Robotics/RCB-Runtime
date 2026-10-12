@@ -37,6 +37,14 @@
          (2026-10-03, as industrial real-time interfaces do). 0 = run anyway (development box). -->
     <realtime_required>1</realtime_required>
 
+    <!-- The CAN tick order RTI starts in (2026-10-12, TODO/can_tx_timing_plan.md §9-9.11). 1 = read first, send early
+         ("option B"): each tick RTI reads the joints' CAN replies first, computes the commands from them and sends them
+         at once (the rest of the tick's work after the send) — half the loop delay of the old order (3.8 vs 7.8 ms from
+         a joint's reply to the command computed from it), measured with no more late replies and the same tracking.
+         0 = the old order (the read after dispatch). Homing always uses the old order. robot.set_can_read_first()
+         switches it at runtime; RTI.log says which order it started in. -->
+    <can_read_first>1</can_read_first>
+
     <!-- The time zone the dashboard and the tools SHOW times in (2026-10-09, user: "it is annoying that this shows UTC
          while I am in Europe/Zagreb"). An IANA name (Europe/Zagreb, America/New_York, UTC) or "system" = the Pi's own
          zone. Display only: logs keep their UTC timestamps (unambiguous, safe across the summer-time change). Set it in

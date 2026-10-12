@@ -265,7 +265,7 @@ def place_can_path(can_core, general_cores, interface="can0", sys_root="/sys", p
 
 # ==========================================================================
 # Wait for the tick's first frame to leave (TODO/can_tx_timing_plan.md option A, 2026-10-12; since then part of
-# option B, read first / send early, §9) — OFF at start
+# option B, read first / send early, §9) — its state is option B's switch (system.xml <can_read_first>, ON by default)
 # ==========================================================================
 # RTI's first command frame of a tick is loaded into the CAN chip by a kernel worker on RTI's own core,
 # which runs only when RTI sleeps: the tick's commands leave ~1.5 ms after they were computed, and the

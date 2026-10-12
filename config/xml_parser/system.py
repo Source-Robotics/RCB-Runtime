@@ -74,6 +74,16 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
     # real-time interfaces do); 0 = log and run degraded (a development box without the RT kernel or caps).
     _rt_text = (root.findtext("realtime_required") or "1").strip()
     realtime_required = 0 if _rt_text in ("0", "false", "no", "off") else 1
+    # <can_read_first>: the CAN tick order at every RTI start (2026-10-12, user: ON after the measurement,
+    # TODO/can_tx_timing_plan.md §9.11) — 1 = read first, send early (option B); 0 = the old order. Missing -> 1; a value
+    # that is not 0/1 -> 1 with a warning. robot.set_can_read_first() still switches it at runtime.
+    _crf_text = (root.findtext("can_read_first") or "1").strip().lower()
+    if _crf_text in ("0", "false", "no", "off"):
+        can_read_first = 0
+    else:
+        if _crf_text not in ("1", "true", "yes", "on"):
+            logging.warning(f"[system.xml] <can_read_first>{_crf_text!r} is not 0/1 — ON (read first, send early)")
+        can_read_first = 1
     # <control_box><pcb_version>: which PCB is fitted (hardware/control_box.py has the capability table; the
     # first consumer is the E-stop channel policy). Missing or not a number -> 1 (the board the fleet has).
     _cb = root.find("control_box")
@@ -102,6 +112,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         "active_gripper": active_gripper,
         "kt_source":      kt_source,
         "realtime_required": realtime_required,
+        "can_read_first": can_read_first,
         "pcb_version":    pcb_version,
         "jog_defaults":   jog_defaults,
         "rti_defaults":   rti_defaults,
