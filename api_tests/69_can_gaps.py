@@ -459,6 +459,33 @@ def reply_freshness(c, read_t, tick, gaps=()):
     return out
 
 
+def loop_delay_per_joint(c, ts, read_t, tick, lag, gaps=()):
+    """Per joint, by TIME alone (no motion needed — every joint gets a command and answers every tick): the newest
+    reply before RTI's read in row k -> the first command to that joint after row k+lag's clock reading (the tick's own
+    command: the frames leave after it in both orders — at RTI's sleep in the old order, after dispatch in option B,
+    which comes after the stamp). lag 1 in the old order (row k's reply feeds tick k+1's command), 0 in option B. A pair
+    is used only when the ticks are consecutive and that command came before the following row's stamp (it is really
+    that tick's). ts / read_t in CLOCK_REALTIME. -> {"J1": stats, ...} in ms."""
+    ok = np.isfinite(read_t) & (read_t > 0) & np.isfinite(ts)
+    for g0, g1 in gaps:                       # a read or a command inside a candump gap cannot be judged
+        ok &= ~((read_t > g0) & (read_t < g1 + 0.005)) & ~((ts > g0 - 0.005) & (ts < g1 + 0.005))
+    n = tick.size
+    out = {}
+    for j in range(JOINT_NODES):
+        tc = node_frames(c, j, (CMD_DATA_PACK_1, CMD_DATA_PACK_PD))[0]
+        tr = node_frames(c, j, (RESP_DATA_PACK_1,))[0]
+        if tc.size == 0 or tr.size == 0 or n <= lag + 1:
+            continue
+        ir = np.searchsorted(tr, read_t, "right") - 1             # the newest reply before each read
+        ic = np.searchsorted(tc, ts, "right")                     # the first command after each stamp
+        rep = np.where(ir >= 0, tr[np.clip(ir, 0, None)], np.nan)
+        cmd = np.where(ic < tc.size, tc[np.clip(ic, None, tc.size - 1)], np.nan)
+        k = np.arange(n - lag - 1)
+        good = ok[k] & ok[k + lag] & ((tick[k + lag] - tick[k]) == lag) & (cmd[k + lag] < ts[k + lag + 1])
+        out[f"J{j + 1}"] = _stats((cmd[k + lag][good] - rep[k][good]) * 1e3)
+    return out
+
+
 def analyse(run, d, c):
     dt = float(run.get("delta_t", 0.004))
     offset = float(np.mean([o for o in run.get("clock_offsets", []) if o is not None] or [0.0]))
@@ -499,6 +526,8 @@ def analyse(run, d, c):
                "tx_rel_ms": _stats((tx_t - ts) * 1e3), "rx_rel_ms": _stats((rx_t - ts) * 1e3),
                "matched": int(np.isfinite(tx_t).sum()), "moving_rows": int(mov.sum()),
                "read_first": bool(blk.get("read_first")), "loop_ms": _stats(loop),
+               "loop_joints": ({} if blk["kind"].endswith("_wait") else
+                               loop_delay_per_joint(c, dd["ts"] + offset, dd["read_t"], dd["tick"], lag, gaps)),
                "can": can_metrics(c, blk["t_start"], blk["t_end"]),
                "read_rel_ms": _stats((dd["read_t"] - ts) * 1e3),
                "candump_gaps": candump_gaps(c, blk["t_start"], blk["t_end"]),
@@ -541,10 +570,13 @@ def print_report(rep, title=""):
               f"{STALL_MS:g} ms {cm['pauses_over']}, host stalls {cm['host_stalls']} | missing {miss} | RX overruns "
               f"{cnt.get('rx_over_errors', '-')}, bus errors {cnt.get('bus_error', '-')}, TX errors "
               f"{cnt.get('tx_errors', '-')}, error-passive {cnt.get('error_passive', '-')}, bus-off {cnt.get('bus_off', '-')}")
+        lj = b.get("loop_joints") or {}
         lp = b.get("loop_ms") or {}
-        if lp.get("n"):
-            print(f"  loop delay (J1's reply -> the command computed from it): {_f(lp.get('med'))} ms median, p99 "
-                  f"{_f(lp.get('p99'))}, max {_f(lp.get('max'))} — {'option B (read first)' if b.get('read_first') else 'old order'}")
+        if lj:
+            print(f"  loop delay ({'option B, read first' if b.get('read_first') else 'old order'}; a joint's reply -> "
+                  f"the command computed from it, median / p99 ms): "
+                  + "  ".join(f"{k} {_f(v.get('med'))}/{_f(v.get('p99'))}" for k, v in lj.items())
+                  + (f"  | J1 by content (moving ticks): {_f(lp.get('med'))}/{_f(lp.get('p99'))}" if lp.get("n") else ""))
         fr = b.get("fresh") or {}
         cg = b.get("candump_gaps") or []
         if cg:
@@ -596,6 +628,14 @@ def print_report(rep, title=""):
         if miss:
             print(f"  {'':12s} replies missed at the read: " + "  ".join(
                 f"{k} {m[0]}/{m[1]}" for k, m in miss.items()))
+        lj = {}
+        for b in bb:
+            for k, v in (b.get("loop_joints") or {}).items():
+                if v.get("n"):
+                    lj.setdefault(k, []).append(v["med"])
+        if lj:
+            print(f"  {'':12s} loop delay, median per joint (ms): " + "  ".join(
+                f"{k} {np.median(v):.2f}" for k, v in lj.items()))
 
 
 # ----------------------------------------------------------------------------- self-test
@@ -734,6 +774,13 @@ def selftest():
     blk_b = analyse(run_b, d_b, parse_candump(lines_b))["blocks"][0]
     chk("loop delay, option B: J1's reply (2.77 ms before the tick) -> the SAME tick's command (1.0 ms into it) = "
         "3.77 ms", abs(blk_b["loop_ms"]["med"] - 3.77) < 0.01 and blk_b["read_first"], blk_b["loop_ms"])
+    lj, lj_b = blk["loop_joints"], blk_b["loop_joints"]
+    chk("loop delay by time, every joint: 7.77 ms old order, 3.77 ms option B (J1..J3 of the synthetic bus)",
+        set(lj) == {"J1", "J2", "J3"} and all(abs(v["med"] - 7.77) < 0.01 for v in lj.values())
+        and all(abs(v["med"] - 3.77) < 0.01 for v in lj_b.values()), ({k: v.get("med") for k, v in lj.items()},
+                                                                       {k: v.get("med") for k, v in lj_b.items()}))
+    chk("...J1 by time == J1 by content (the two methods agree)", abs(lj["J1"]["med"] - blk["loop_ms"]["med"]) < 0.01
+        and abs(lj_b["J1"]["med"] - blk_b["loop_ms"]["med"]) < 0.01, (lj["J1"], blk["loop_ms"]))
     run_x = {"delta_t": 0.004, "clock_offsets": [offset], "blocks": [dict(run["blocks"][0], read_first=True)]}
     blk_x = analyse(run_x, d, c)["blocks"][0]
     chk("...a block's order matters: the old-order recording judged as option B pairs each reply with the command of "
