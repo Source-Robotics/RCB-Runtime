@@ -435,6 +435,15 @@ def candump_gaps(c, w0, w1, min_ms=8.0):
     return [(float(t[k]), float(t[k + 1])) for k in i]
 
 
+def tick_anchor(read_t, ts):
+    """Where each row's commands are looked for from: its CAN read (`can_read_t`) where recorded, else its clock reading.
+    A tick's commands leave after its own read and before the next one in both orders; the clock reading (the history
+    entry's stamp) does not: with option B's send-early order (2026-10-12, §9.10) the entry is made AFTER the commands
+    left, so J1's / J2's went out before it and the first command after it was the NEXT tick's (J1 / J2 read 100 %
+    late and 7.8 ms of loop delay, while by content J1's was 3.8)."""
+    return np.where(np.isfinite(read_t) & (read_t > 0), read_t, ts)
+
+
 def tick_commands(tc, ts):
     """Each row's own command among a node's command times tc. A row owns the commands within +/-2 ms of where its
     command usually leaves (its clock reading + the median offset of the first command after a reading, this block):
@@ -474,7 +483,7 @@ def tick_commands(tc, ts):
 def reply_freshness(c, read_t, tick, ts, gaps=()):
     """Per joint, from the CAN log, when each of RTI's CAN reads ran (read_t) and each row's clock reading (ts; both
     CLOCK_REALTIME, one per row): missed = reads at which the reply to the PREVIOUS tick's command (the joint's first
-    command after that row's clock reading — the tick's own in both orders) was not in yet, or never came: that tick
+    command around that row's read — the tick's own in both orders, tick_anchor) was not in yet, or never came: that tick
     the joint's data is a tick old. (Until 2026-10-12 this counted reads that found NO NEW reply at all, which misses
     lateness that lasts: each read then finds the previous tick's late reply — option B under load read J6 12.8 %
     that way, 40 % this way. The old order's numbers hardly change: its lateness never lasted.) margin = the reply
@@ -489,7 +498,7 @@ def reply_freshness(c, read_t, tick, ts, gaps=()):
         tc = node_frames(c, j, (CMD_DATA_PACK_1, CMD_DATA_PACK_PD))[0]
         if tr.size == 0 or tc.size == 0 or not ok.any():
             continue
-        prev = tick_commands(tc, ts)[:-1]                                         # the previous row's own command
+        prev = tick_commands(tc, tick_anchor(read_t, ts))[:-1]                    # the previous row's own command
         valid = pair & np.isfinite(prev)
         ir = np.searchsorted(tr, np.where(np.isfinite(prev), prev, 0.0), "right")
         rep = np.where(ir < tr.size, tr[np.clip(ir, None, tr.size - 1)], np.inf)
@@ -509,14 +518,15 @@ def reply_freshness(c, read_t, tick, ts, gaps=()):
 
 def loop_delay_per_joint(c, ts, read_t, tick, lag, gaps=()):
     """Per joint, by TIME alone (no motion needed — every joint gets a command and answers every tick): the newest
-    reply before RTI's read in row k -> the first command to that joint after row k+lag's clock reading (the tick's own
-    command: the frames leave after it in both orders — at RTI's sleep in the old order, after dispatch in option B,
-    which comes after the stamp). lag 1 in the old order (row k's reply feeds tick k+1's command), 0 in option B. A pair
+    reply before RTI's read in row k -> the first command to that joint after row k+lag's READ (the tick's own command:
+    the frames leave after it in both orders — at RTI's sleep in the old order, after dispatch in option B; the clock
+    reading is no anchor since option B makes the history entry after the send, 2026-10-12). lag 1 in the old order (row k's reply feeds tick k+1's command), 0 in option B. A pair
     is used only when the ticks are consecutive and that command came before the following row's stamp (it is really
     that tick's). ts / read_t in CLOCK_REALTIME. -> {"J1": stats, ...} in ms."""
     ok = np.isfinite(read_t) & (read_t > 0) & np.isfinite(ts)
     for g0, g1 in gaps:                       # a read or a command inside a candump gap cannot be judged
         ok &= ~((read_t > g0) & (read_t < g1 + 0.005)) & ~((ts > g0 - 0.005) & (ts < g1 + 0.005))
+    anchor = tick_anchor(read_t, ts)          # the tick's read (see tick_anchor)
     n = tick.size
     out = {}
     for j in range(JOINT_NODES):
@@ -525,11 +535,11 @@ def loop_delay_per_joint(c, ts, read_t, tick, lag, gaps=()):
         if tc.size == 0 or tr.size == 0 or n <= lag + 1:
             continue
         ir = np.searchsorted(tr, read_t, "right") - 1             # the newest reply before each read
-        ic = np.searchsorted(tc, ts, "right")                     # the first command after each stamp
+        ic = np.searchsorted(tc, anchor, "right")                 # the first command after each tick's read
         rep = np.where(ir >= 0, tr[np.clip(ir, 0, None)], np.nan)
         cmd = np.where(ic < tc.size, tc[np.clip(ic, None, tc.size - 1)], np.nan)
         k = np.arange(n - lag - 1)
-        good = ok[k] & ok[k + lag] & ((tick[k + lag] - tick[k]) == lag) & (cmd[k + lag] < ts[k + lag + 1])
+        good = ok[k] & ok[k + lag] & ((tick[k + lag] - tick[k]) == lag) & (cmd[k + lag] < anchor[k + lag + 1])
         out[f"J{j + 1}"] = _stats((cmd[k + lag][good] - rep[k][good]) * 1e3)
     return out
 
@@ -578,6 +588,7 @@ def analyse(run, d, c):
                                loop_delay_per_joint(c, dd["ts"] + offset, dd["read_t"], dd["tick"], lag, gaps)),
                "can": can_metrics(c, blk["t_start"], blk["t_end"]),
                "read_rel_ms": _stats((dd["read_t"] - ts) * 1e3),
+               "tx_read_ms": _stats((tx_t - dd["read_t"]) * 1e3),          # J1's command after the tick's read
                "candump_gaps": candump_gaps(c, blk["t_start"], blk["t_end"]),
                "counters": counter_delta(blk.get("can_before"), blk.get("can_after")),
                "irq": {k: blk["irq_after"].get(k, 0) - v for k, v in blk.get("irq_before", {}).items()}
@@ -631,7 +642,8 @@ def print_report(rep, title=""):
             print(f"  ({len(cg)} candump gap(s), {sum(1e3 * (g1 - g0) for g0, g1 in cg):.0f} ms in all — candump missed "
                   f"frames there; those reads and stale runs are not judged)")
         if fr:
-            print(f"  reads: RTI's CAN read {_f(b['read_rel_ms'].get('med'))} ms from its clock reading | per joint, "
+            print(f"  reads: RTI's CAN read {_f(b['read_rel_ms'].get('med'))} ms from its clock reading, J1's command "
+                  f"{_f((b.get('tx_read_ms') or {}).get('med'))} ms after the read | per joint, "
                   f"replies missed / age of the newest reply at the read (median, p5..p99 ms): "
                   + "  ".join(f"{k} {v['missed']} / {_f(v['age_ms'].get('med'), 1)} ({_f(v['age_p5'], 1)}.."
                               f"{_f(v['age_ms'].get('p99'), 1)})" for k, v in fr.items()))
@@ -687,15 +699,18 @@ def print_report(rep, title=""):
 
 
 # ----------------------------------------------------------------------------- self-test
-def _synth(seed=1, read_first=False):
+def _synth(seed=1, read_first=False, stamp_after_send=False):
     """A recording with known events, built the way RTI and the bus work: each tick RTI sends its commands, reads what
     arrived, then reads its clock (the telemetry stamp); the commands go out after it and the replies come back
     ~0.23 ms after each; the reply RTI uses at tick k is the newest one that arrived before its read.
     Every 10th tick a temperature poll after the joints, answered 2.5 ms later. Events: tick 199 a fresh reply whose speed and current equal the one before (not stale: the position moved), 300 a host stall (J1's reply and every later frame of that exchange 3 ms late, in a bunch), 600 the
     whole exchange 2.8 ms late (command late), 900 J1's reply lost, 1100 J1's reply alone 2.8 ms late (drive slow).
     read_first: option B's timing — the read 0.1 ms into the tick, the clock reading 0.6, the commands from 1.0 (the old
-    order: 0.4 / 0.9 / 1.5)."""
+    order: 0.4 / 0.9 / 1.5). stamp_after_send: option B as built on 2026-10-12 evening (§9.10) — the history entry,
+    and so the clock reading, after the commands left (1.8 ms)."""
     t_read, t_stamp, t_send = (0.0001, 0.0006, 0.0010) if read_first else (0.0004, 0.0009, 0.0015)
+    if stamp_after_send:
+        t_stamp = 0.0018
     rng = np.random.default_rng(seed)
     dt, n, nodes = 0.004, 1300, 3
     mono0, offset = 5000.0, 1.7e9
@@ -848,6 +863,18 @@ def selftest():
                                                                        {k: v.get("med") for k, v in lj_b.items()}))
     chk("...J1 by time == J1 by content (the two methods agree)", abs(lj["J1"]["med"] - blk["loop_ms"]["med"]) < 0.01
         and abs(lj_b["J1"]["med"] - blk_b["loop_ms"]["med"]) < 0.01, (lj["J1"], blk["loop_ms"]))
+    lines_s, d_s, off_s, _ = _synth(read_first=True, stamp_after_send=True)
+    run_s = {"delta_t": 0.004, "clock_offsets": [off_s], "blocks": [dict(run_b["blocks"][0], name="synthetic_rf_late")]}
+    blk_s = analyse(run_s, d_s, parse_candump(lines_s))["blocks"][0]
+    same_fresh = {k: v["missed"] for k, v in blk_s["fresh"].items()} == {k: v["missed"] for k, v in blk_b["fresh"].items()}
+    chk("option B with the clock reading AFTER the commands (the send-early order): the same late replies and the same "
+        "3.77 ms on every joint — the tick's read anchors its commands, not the stamp", same_fresh
+        and all(abs(v["med"] - 3.77) < 0.01 for v in blk_s["loop_joints"].values())
+        and abs(blk_s["loop_ms"]["med"] - 3.77) < 0.01,
+        ({k: v["missed"] for k, v in blk_s["fresh"].items()}, {k: v.get("med") for k, v in blk_s["loop_joints"].items()}))
+    chk("...and J1's command 0.9 ms after the read in both option B timings",
+        abs(blk_s["tx_read_ms"]["med"] - 0.9) < 0.01 and abs(blk_b["tx_read_ms"]["med"] - 0.9) < 0.01,
+        (blk_s["tx_read_ms"], blk_b["tx_read_ms"]))
     run_x = {"delta_t": 0.004, "clock_offsets": [offset], "blocks": [dict(run["blocks"][0], read_first=True)]}
     blk_x = analyse(run_x, d, c)["blocks"][0]
     chk("...a block's order matters: the old-order recording judged as option B pairs each reply with the command of "
