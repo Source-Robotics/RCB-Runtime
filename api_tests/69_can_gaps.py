@@ -82,6 +82,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _tracking_common import Capture, robot_enabled  # noqa: E402
+from config.cpu_cores import GENERAL_CPU_CORES  # noqa: E402
 
 RECIPE = "can_gaps"
 CMD_DATA_PACK_1 = 2               # RTI -> drive (Spectral_BLDC SEND_DATA_PACK_1_ID)
@@ -786,7 +787,7 @@ def newest_tick(capture):
 class Load:
     """--load: starts a Python interpreter (numpy + scipy imports — what made the late replies on 2026-10-12: a
     program starting) every LOAD_EVERY_S on cores 0-2 at nice 19, until stop()."""
-    def __init__(self, cores="0-2"):
+    def __init__(self, cores="0,1"):
         import threading
         self.cores = cores
         self._stop = threading.Event()
@@ -1035,8 +1036,8 @@ def main():
     ap.add_argument("--iface", default="can0")
     ap.add_argument("--load", action="store_true", help="start a Python interpreter every 2 s during each block "
                     "(nice 19): the load that made replies late on 2026-10-12")
-    ap.add_argument("--load-cores", default="0-2", help="the cores --load runs on (taskset list; e.g. 0,1 when core 2 "
-                    "is kept for the CAN interrupt threads)")
+    ap.add_argument("--load-cores", default=",".join(str(c) for c in GENERAL_CPU_CORES),
+                    help="the cores --load runs on (taskset list; default the general cores of config/cpu_cores.py)")
     ap.add_argument("--reanalyse", metavar="FOLDER")
     args = ap.parse_args()
     if args.selftest:

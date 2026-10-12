@@ -70,7 +70,9 @@ from utility.activity_log import get_exec_activity_logger, log_activity
 # ========================================================================== #
 DEBUG = True
 setup_logging(str(HIGH_LEVEL_LOG), log_to_console=DEBUG)
-setup_process(core=2, rt=False)  # HIGH_LEVEL: own core, normal scheduling
+from config.cpu_cores import GENERAL_CPU_CORES  # noqa: E402
+setup_process(core=GENERAL_CPU_CORES, rt=False)  # HIGH_LEVEL: the general cores, normal scheduling — off the CAN
+                                                 # core since 2026-10-12 (a planning burst must not stall CAN)
 
 # Activity log — separate mechanism from the above (see TODO/activity_log_design.md).
 _exec_activity_logger = get_exec_activity_logger()

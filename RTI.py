@@ -62,7 +62,8 @@ from communication.rti_protocol import CLOCK_ROBOT, CLOCK_PC, CMD_SIZE
 # System and Configuration
 # ==========================================================================
 from config.system_config import setup_realtime_process
-from hardware.can_hardware import start_can_interface, keep_can_off_rt_core, FirstFrameWait
+from hardware.can_hardware import start_can_interface, place_can_path, FirstFrameWait
+from config.cpu_cores import CAN_CPU_CORE, GENERAL_CPU_CORES
 from utility.can_reply_monitor import CanReplyMonitor
 
 # ==========================================================================
@@ -492,9 +493,10 @@ def main():
     # Start / Restart CAN interface when starting this script
     # ==========================================================================
     start_can_interface()
-    # The CAN chip's interrupt threads are created when can0 comes up: move them off RTI's core, or a tick that
-    # starts while one of them sits there freezes all CAN traffic until RTI sleeps (2026-10-12, api_tests/69).
-    keep_can_off_rt_core(RT_CPU_CORE)
+    # The CAN chip's interrupt threads are created when can0 comes up: give them core 2 alone and keep interactive
+    # programs on the general cores — on RTI's core they froze all CAN traffic while RTI's tick ran, on a shared
+    # core they stalled under load (2026-10-12, api_tests/69, config/cpu_cores.py).
+    place_can_path(CAN_CPU_CORE, GENERAL_CPU_CORES)
     communication1 = initialize_can_communication(bustype='socketcan', channel='can0', bitrate=1000000)
     # TODO/can_tx_timing_plan.md option A — OFF at every start; `can_send_wait:1` turns it on (to measure it).
     first_frame_wait = FirstFrameWait('can0')

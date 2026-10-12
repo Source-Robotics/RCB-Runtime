@@ -44,6 +44,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # RCB_PROGRAM_LOCK moves it (the nets use their own, so a test never blocks a real program or the reverse)
 LOCK_PATH = os.environ.get("RCB_PROGRAM_LOCK") or os.path.join(ROOT, "temp_data", ".program.runlock")
 RT_CORE = 3                 # RTI.py's core (SCHED_FIFO 99); a program never runs there
+from config.cpu_cores import GENERAL_CPU_CORES   # noqa: E402  the cores a program runs on (2026-10-12)
 NICE = 10
 NICE_CHECK = 19             # a Check loads and runs the planner: the lowest priority there is
 
@@ -219,7 +220,9 @@ def _be_polite(nice):
     except OSError:
         pass
     try:
-        cores = os.sched_getaffinity(0) - {RT_CORE}
+        cores = os.sched_getaffinity(0) & set(GENERAL_CPU_CORES)   # off RTI's core and the CAN core
+        if not cores:
+            cores = os.sched_getaffinity(0) - {RT_CORE}
         if cores:
             os.sched_setaffinity(0, cores)
     except (AttributeError, OSError):

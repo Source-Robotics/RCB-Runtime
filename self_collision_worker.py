@@ -59,7 +59,8 @@ from project_paths import GRIPPERS_DIR, HIGH_LEVEL_LOG, ROBOTS_DIR, SYSTEM_XML  
 from utility.logger_setup import setup_logging                                   # noqa: E402
 
 LOG_FILE = os.path.join(os.path.dirname(str(HIGH_LEVEL_LOG)), "self_collision.log")
-CORES = {0, 1, 2}                 # never RTI's core (3)
+from config.cpu_cores import GENERAL_CPU_CORES                            # noqa: E402
+CORES = set(GENERAL_CPU_CORES)    # never RTI's core (3), nor the CAN core (2) — config/cpu_cores.py
 from robotics.jog import ray_soft_free                                   # noqa: E402  the jog's own soft-limit length
 STATS_EVERY_S = 60.0
 _stop = False

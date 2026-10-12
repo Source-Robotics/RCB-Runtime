@@ -43,7 +43,8 @@ _META_KEY = "__meta__"
 _log = logging.getLogger(__name__)
 
 
-OTHER_CORES = (0, 1, 2)          # never RTI's core (3); see the module docstring
+from config.cpu_cores import GENERAL_CPU_CORES  # noqa: E402
+OTHER_CORES = tuple(GENERAL_CPU_CORES)   # never RTI's core (3) nor the CAN core (2); see the module docstring
 
 
 def _leave_the_rt_core(cores=OTHER_CORES) -> tuple[int, set] | None:

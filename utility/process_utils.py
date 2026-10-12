@@ -47,10 +47,10 @@ def policy_name(policy):
 # ==========================================================================
 # SETTER — called once per process at startup
 # ==========================================================================
-def setup_process(core: int, rt: bool = False, priority: int = 0) -> bool:
+def setup_process(core, rt: bool = False, priority: int = 0) -> bool:
     """
-    Pin this process to `core`. If rt=True, also request SCHED_FIFO at `priority`
-    (1-99); otherwise leave normal (SCHED_OTHER) scheduling.
+    Pin this process to `core` — one core, or several (an iterable, e.g. config/cpu_cores.GENERAL_CPU_CORES).
+    If rt=True, also request SCHED_FIFO at `priority` (1-99); otherwise leave normal (SCHED_OTHER) scheduling.
 
     Only RTI.py should use rt=True — every other process is non-real-time and
     just gets a dedicated core so it never lands on RTI's.
@@ -59,9 +59,10 @@ def setup_process(core: int, rt: bool = False, priority: int = 0) -> bool:
     sched_setscheduler can be silently rejected by rlimit/capability checks.
     """
     pid = os.getpid()
+    cores = [core] if isinstance(core, int) else sorted(core)
 
     try:
-        psutil.Process(pid).cpu_affinity([core])
+        psutil.Process(pid).cpu_affinity(cores)
         if rt:
             os.sched_setscheduler(pid, os.SCHED_FIFO, os.sched_param(priority))
     except Exception as exc:
@@ -76,7 +77,7 @@ def setup_process(core: int, rt: bool = False, priority: int = 0) -> bool:
 
     want_policy = os.SCHED_FIFO if rt else os.SCHED_OTHER
     want_prio = priority if rt else 0
-    ok = (actual_policy == want_policy and actual_prio == want_prio and actual_aff == [core])
+    ok = (actual_policy == want_policy and actual_prio == want_prio and actual_aff == cores)
 
     if ok:
         logger.info(f"[proc setup] OK — {summary}")

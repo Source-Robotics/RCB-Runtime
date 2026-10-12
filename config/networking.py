@@ -98,11 +98,12 @@ ZMQ_EXEC_STATUS_SOCKET     = "ipc:///tmp/robot_exec_status"      # RTI→executo
 
 # You can also add other constants here later
 
-# The core RTI.py pins its real-time loop to (SCHED_FIFO 99). Everything else should stay off it.
-RT_CPU_CORE = 3
+# The core plan (RTI 3, the CAN path 2, everything else 0-1) lives in config/cpu_cores.py; RT_CPU_CORE is
+# re-exported here for the modules that have always imported it from this one.
+from config.cpu_cores import RT_CPU_CORE, GENERAL_CPU_CORES  # noqa: E402,F401
 
 
-def background_zmq_context(ctx=None, rt_core=RT_CPU_CORE):
+def background_zmq_context(ctx=None, cores=GENERAL_CPU_CORES):
     """A ZMQ context whose C++ I/O and reaper threads run at NORMAL priority, OFF the RT core (2026-10-01).
 
     RTI's main thread is SCHED_FIFO 99 on core 3 and every thread it starts inherits that, so each
@@ -118,9 +119,8 @@ def background_zmq_context(ctx=None, rt_core=RT_CPU_CORE):
     ctx = zmq.Context() if ctx is None else ctx
     ctx.set(zmq.THREAD_SCHED_POLICY, os.SCHED_OTHER)
     ctx.set(zmq.THREAD_PRIORITY, 0)
-    for cpu in range(os.cpu_count() or 1):
-        if cpu != rt_core:
-            ctx.set(zmq.THREAD_AFFINITY_CPU_ADD, cpu)
+    for cpu in cores:                       # the general cores: off RTI's core AND the CAN core (2026-10-12)
+        ctx.set(zmq.THREAD_AFFINITY_CPU_ADD, cpu)
     return ctx
 
 
