@@ -435,10 +435,50 @@ def candump_gaps(c, w0, w1, min_ms=8.0):
     return [(float(t[k]), float(t[k + 1])) for k in i]
 
 
-def reply_freshness(c, read_t, tick, gaps=()):
-    """Per joint, from the CAN log and when each of RTI's CAN reads ran (read_t, CLOCK_REALTIME, one per row):
-    missed = reads that found no new reply from that joint since the previous tick's read; age = how old the newest
-    reply was at the read (ms) — the data the tick works with."""
+def tick_commands(tc, ts):
+    """Each row's own command among a node's command times tc. A row owns the commands within +/-2 ms of where its
+    command usually leaves (its clock reading + the median offset of the first command after a reading, this block):
+    the windows tile the time axis, so a frame that leaves a little EARLY (before the reading — seen in the old order
+    when RTI's thread yields mid-tick) or late still lands in its own row. A row with none whose next row holds two gets
+    the first of them (its own, sent more than 2 ms late). Local: one missing frame shifts nothing else (a chained rule
+    did, on the arm's log). NaN where a row has none."""
+    n = ts.size
+    cmd = np.full(n, np.nan)
+    fin = np.isfinite(ts)
+    if tc.size == 0 or not fin.any():
+        return cmd
+    first = np.searchsorted(tc, ts[fin], "right")
+    ok = first < tc.size
+    if not ok.any():
+        return cmd
+    off = float(np.median(tc[first[ok]] - ts[fin][ok]))
+    e = np.where(fin, ts + off, np.nan)
+    lo = np.searchsorted(tc, np.where(fin, e - 0.002, np.inf), "left")
+    hi = np.searchsorted(tc, np.where(fin, e + 0.002, np.inf), "left")
+    cnt = np.where(fin, hi - lo, 0)
+    for k in range(n):
+        if cnt[k] == 0:
+            if k + 1 < n and cnt[k + 1] >= 2:
+                cmd[k] = tc[lo[k + 1]]               # its own, late — the next row keeps the one nearest its time
+            continue
+        if cnt[k] == 1:
+            cmd[k] = tc[lo[k]]
+        else:
+            cand = tc[lo[k]:hi[k]]
+            if k > 0 and cnt[k - 1] == 0:
+                cand = cand[1:]                      # the first went to the previous row
+            cmd[k] = cand[np.argmin(np.abs(cand - e[k]))]
+    return cmd
+
+
+def reply_freshness(c, read_t, tick, ts, gaps=()):
+    """Per joint, from the CAN log, when each of RTI's CAN reads ran (read_t) and each row's clock reading (ts; both
+    CLOCK_REALTIME, one per row): missed = reads at which the reply to the PREVIOUS tick's command (the joint's first
+    command after that row's clock reading — the tick's own in both orders) was not in yet, or never came: that tick
+    the joint's data is a tick old. (Until 2026-10-12 this counted reads that found NO NEW reply at all, which misses
+    lateness that lasts: each read then finds the previous tick's late reply — option B under load read J6 12.8 %
+    that way, 40 % this way. The old order's numbers hardly change: its lateness never lasted.) margin = the reply
+    minus the read, median (ms; negative = in time); age = how old the newest reply was at the read (ms)."""
     ok = np.isfinite(read_t) & (read_t > 0)
     for g0, g1 in gaps:                      # a read inside or right after a candump gap cannot be judged
         ok &= ~((read_t > g0) & (read_t < g1 + 0.005))
@@ -446,15 +486,23 @@ def reply_freshness(c, read_t, tick, gaps=()):
     out = {}
     for j in range(JOINT_NODES):
         tr = node_frames(c, j, (RESP_DATA_PACK_1,))[0]
-        if tr.size == 0 or not ok.any():
+        tc = node_frames(c, j, (CMD_DATA_PACK_1, CMD_DATA_PACK_PD))[0]
+        if tr.size == 0 or tc.size == 0 or not ok.any():
             continue
+        prev = tick_commands(tc, ts)[:-1]                                         # the previous row's own command
+        valid = pair & np.isfinite(prev)
+        ir = np.searchsorted(tr, np.where(np.isfinite(prev), prev, 0.0), "right")
+        rep = np.where(ir < tr.size, tr[np.clip(ir, None, tr.size - 1)], np.inf)
+        rep = np.where(rep - prev < 0.02, rep, np.inf)                              # no reply within 20 ms: lost
+        late = valid & (rep > read_t[1:])
+        missed = int(late.sum())
+        rel = (rep - read_t[1:])[valid & np.isfinite(rep)] * 1e3
         idx = np.searchsorted(tr, np.where(ok, read_t, 0.0), "right")
-        new = idx[1:] - idx[:-1]
-        missed = int(np.sum((new == 0) & pair))
         good = ok & (idx > 0)
         age = (read_t[good] - tr[idx[good] - 1]) * 1e3
-        out[f"J{j + 1}"] = {"reads": int(pair.sum()), "missed": missed,
-                            "missed_pct": 100.0 * missed / pair.sum() if pair.sum() else np.nan,
+        out[f"J{j + 1}"] = {"reads": int(valid.sum()), "missed": missed,
+                            "missed_pct": 100.0 * missed / valid.sum() if valid.sum() else np.nan,
+                            "margin_ms": float(np.median(rel)) if rel.size else np.nan,
                             "age_ms": _stats(age), "age_p5": float(np.percentile(age, 5)) if age.size else np.nan}
     return out
 
@@ -515,7 +563,7 @@ def analyse(run, d, c):
             loop = (tx_t[k + lag][okk] - rx_t[k][okk]) * 1e3
         moving_s = float(mov.sum()) * dt
         res = {"name": blk["name"], "kind": blk["kind"], "ok": blk.get("ok", True), "rows": int(dd["tick"].size),
-               "fresh": reply_freshness(c, dd["read_t"], dd["tick"], gaps),
+               "fresh": reply_freshness(c, dd["read_t"], dd["tick"], dd["ts"] + offset, gaps),
                "telemetry_missing": missing_ticks, "moving_s": moving_s, "stale_runs": len(runs),
                "stale_per_min": (len(runs) / moving_s * 60.0) if moving_s > 0 else np.nan,
                "stale_longest": max((r[1] for r in runs), default=0),
@@ -758,9 +806,28 @@ def selftest():
     chk("the stall's pause (~3.2 ms) and its bunch measured", 3.0 < r300["pause_ms"] < 3.4 and r300["bunch"] >= 2,
         r300)
     fr = blk["fresh"]
-    chk("per joint, reads that found no new reply: J1 4 (300 / 600 / 900 / 1100), J2 and J3 2 (the stall and the late "
+    chk("per joint, reads the previous tick's reply had not reached: J1 4 (300 / 600 / 900 / 1100), J2 and J3 2 (the stall and the late "
         "exchange delayed theirs too)", (fr["J1"]["missed"], fr["J2"]["missed"], fr["J3"]["missed"]) == (4, 2, 2),
         {k: v["missed"] for k, v in fr.items()})
+    sync = []                                  # 20 ticks of J1 alone; ticks 5-14: every reply 0.2 ms after the next read
+    for k in range(20):
+        T = 100.0 + 0.004 * k
+        tr_ = T + 0.0015 + 0.00023 if not 5 <= k <= 14 else T + 0.004 + 0.0006
+        sync += [f"({T + 0.0015:.6f}) can0 004#0000000000000000", f"({tr_:.6f}) can0 006#0000000000000000"]
+    cs_ = parse_candump(sorted(sync, key=lambda ln: float(ln[1:ln.index(")")])))
+    ks = np.arange(20)
+    fr_s = reply_freshness(cs_, 100.0 + 0.004 * ks + 0.0004, ks, 100.0 + 0.004 * ks + 0.0009)
+    chk("late replies that LAST (ticks 5-14 each 0.2 ms after the read): 10 stale reads, not 1 (each read found the "
+        "previous tick's late reply — the old count's blind spot)", fr_s["J1"]["missed"] == 10, fr_s["J1"])
+    early = []                                 # 20 ticks of J1; tick 10's command leaves 0.7 ms BEFORE its clock reading
+    for k in range(20):
+        T = 100.0 + 0.004 * k
+        tc_ = T + 0.0015 if k != 10 else T + 0.0002
+        early += [f"({tc_:.6f}) can0 004#0000000000000000", f"({tc_ + 0.00023:.6f}) can0 006#0000000000000000"]
+    ce_ = parse_candump(sorted(early, key=lambda ln: float(ln[1:ln.index(")")])))
+    fr_e = reply_freshness(ce_, 100.0 + 0.004 * ks + 0.0004, ks, 100.0 + 0.004 * ks + 0.0009)
+    chk("a command that leaves BEFORE its tick's clock reading (RTI yielding mid-tick, seen in the old order) is still its "
+        "tick's: no false late reply", fr_e["J1"]["missed"] == 0 and fr_e["J1"]["reads"] == 19, fr_e["J1"])
     chk("the newest J1 reply is 2.67 ms old at the read (median)", abs(fr["J1"]["age_ms"]["med"] - 2.67) < 0.01,
         fr["J1"]["age_ms"])
     chk("RTI's read sits 0.5 ms before its clock reading", abs(blk["read_rel_ms"]["med"] + 0.5) < 0.01,
