@@ -57,6 +57,11 @@ def setup_process(core, rt: bool = False, priority: int = 0) -> bool:
 
     Always reads back and logs the ACTUAL applied state (OK vs DEGRADED), because
     sched_setscheduler can be silently rejected by rlimit/capability checks.
+
+    The affinity goes to EVERY thread the process already has, not just the caller (2026-10-12): Linux keeps an
+    affinity per thread, and threads that libraries start while the process imports (before this call) kept all four
+    cores — the supervisor had two waking ~2600 and ~80 times a second, half the time on the CAN core (2) or RTI's (3).
+    Threads started after this call inherit the caller's affinity.
     """
     pid = os.getpid()
     cores = [core] if isinstance(core, int) else sorted(core)
@@ -68,16 +73,19 @@ def setup_process(core, rt: bool = False, priority: int = 0) -> bool:
     except Exception as exc:
         logger.warning(f"[proc setup] FAILED to set affinity/scheduling: {exc}")
         print(f"[proc setup] FAILED: {exc}")
+    elsewhere = pin_all_threads(cores)
 
     # Verify what actually applied — single source of truth post-call.
     actual_policy = os.sched_getscheduler(pid)
     actual_prio = os.sched_getparam(pid).sched_priority
     actual_aff = sorted(psutil.Process(pid).cpu_affinity())
     summary = f"SCHED_{policy_name(actual_policy)} prio={actual_prio} affinity={actual_aff}"
+    if elsewhere:
+        summary += f"; {elsewhere} other thread(s) NOT on {cores}"
 
     want_policy = os.SCHED_FIFO if rt else os.SCHED_OTHER
     want_prio = priority if rt else 0
-    ok = (actual_policy == want_policy and actual_prio == want_prio and actual_aff == cores)
+    ok = (actual_policy == want_policy and actual_prio == want_prio and actual_aff == cores and not elsewhere)
 
     if ok:
         logger.info(f"[proc setup] OK — {summary}")
@@ -87,6 +95,26 @@ def setup_process(core, rt: bool = False, priority: int = 0) -> bool:
         logger.warning(f"[proc setup] DEGRADED — wanted {want}, got {summary}")
         print(f"[proc setup] DEGRADED — wanted {want}, got {summary}")
     return ok
+
+
+def pin_all_threads(cores, task_dir="/proc/self/task", set_affinity=os.sched_setaffinity,
+                    get_affinity=os.sched_getaffinity) -> int:
+    """Give every thread of this process the affinity `cores`, then read each back. Returns how many threads are
+    still allowed elsewhere (0 = all pinned). A thread that ends meanwhile is skipped."""
+    want = set(cores)
+    elsewhere = 0
+    for name in os.listdir(task_dir):
+        tid = int(name)
+        try:
+            set_affinity(tid, want)
+            if set(get_affinity(tid)) != want:
+                elsewhere += 1
+        except ProcessLookupError:
+            continue                     # the thread ended between the listing and now
+        except OSError as exc:
+            logger.warning(f"[proc setup] thread {tid}: cannot set its affinity: {exc}")
+            elsewhere += 1
+    return elsewhere
 
 
 # ==========================================================================

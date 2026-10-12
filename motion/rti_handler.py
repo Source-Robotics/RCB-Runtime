@@ -179,8 +179,9 @@ SERVO_GENERATORS = (SERVO_RUCKIG, SERVO_TRACKER, SERVO_ADVANCING, SERVO_PASSTHRO
 # uneven 200-250 Hz sender, drops / late / mixed packets clean, steps never overshoot, soft limits within a / j. The
 # costs: a PC that stops dead at speed overshoots by the braking distance (J1 at 60 deg/s ~1 deg; the old planner
 # trailed by that much all the time), and target noise passes through more (3.5 vs 2.9 deg/s above 10 Hz).
-# A 101-byte packet carries no time: such a stream keeps the old planner exactly (simulated pass-through on arrival
-# ticks with a jittery PC: 13 / 39 deg/s of wobble, 2 deg peaks).
+# A 101-byte packet carries no time, and arrival ticks are no substitute (simulated pass-through on arrival ticks with
+# a jittery PC: 13 / 39 deg/s of wobble, 2 deg peaks): hard RTI refuses such a position target (2026-10-12,
+# _refuse_unstamped); until then it silently got the old planner.
 PT_RING = 8                       # samples kept
 PT_DELAY_DECAY_TICKS = 0.002      # per packet: the slowest recent delivery is forgotten slowly
 PT_DELAY_RATE_TICKS = 0.002       # per tick: the replay delay drifts at most this much (a 0.2 % time warp, in the speed)
