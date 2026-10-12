@@ -144,6 +144,7 @@ COMMAND_RULES = {
     "friction_comp":    (IMMEDIATE, None, None, False),   # freedrive friction compensation switch (OWNED)
     "inertia_comp":     (IMMEDIATE, None, None, False),   # inertia feedforward switch (OWNED, 2026-10-10)
     "coriolis_comp":    (IMMEDIATE, None, None, False),   # Coriolis feedforward switch (OWNED, 2026-10-10)
+    "can_send_wait":    (IMMEDIATE, None, None, False),   # RTI waits for its first CAN frame to leave (OWNED, 2026-10-12)
     "set_pid_gains":    (IMMEDIATE, None, None, False),
     # --- RTI mode session control (TODO/RTI_mode_plan.md §3). Only the handshake goes
     # through here; the UDP setpoint stream never touches command_executor.

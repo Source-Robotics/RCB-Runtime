@@ -62,7 +62,7 @@ from communication.rti_protocol import CLOCK_ROBOT, CLOCK_PC, CMD_SIZE
 # System and Configuration
 # ==========================================================================
 from config.system_config import setup_realtime_process
-from hardware.can_hardware import start_can_interface, keep_can_off_rt_core
+from hardware.can_hardware import start_can_interface, keep_can_off_rt_core, FirstFrameWait
 from utility.can_reply_monitor import CanReplyMonitor
 
 # ==========================================================================
@@ -496,6 +496,8 @@ def main():
     # starts while one of them sits there freezes all CAN traffic until RTI sleeps (2026-10-12, api_tests/69).
     keep_can_off_rt_core(RT_CPU_CORE)
     communication1 = initialize_can_communication(bustype='socketcan', channel='can0', bitrate=1000000)
+    # TODO/can_tx_timing_plan.md option A — OFF at every start; `can_send_wait:1` turns it on (to measure it).
+    first_frame_wait = FirstFrameWait('can0')
 
     # ==========================================================================
     # Motor objects, joint objects, filters, housekeeping — via motor_setup.py
@@ -779,7 +781,7 @@ def main():
     LOOP_STATS_WARMUP_TICKS = 350
     # [0]=worst, [1]=best CAN frame age this tick. Preallocated: the RX loop writes into it every
     # tick, so it must not allocate.
-    _can_age_buf = np.zeros(2, dtype=np.float64)
+    _can_age_buf = np.zeros(3, dtype=np.float64)        # + [2]: time.time() of the read (telemetry can_read_t)
     # The data replies the CAN read took from each joint this tick, and the warning when a joint's replies miss the
     # read too often (2026-10-12, utility/can_reply_monitor.py). The read in tick k holds the answers to tick k-1's
     # commands (they go out while RTI sleeps), so the monitor is told whether the PREVIOUS tick sent them.
@@ -1185,6 +1187,14 @@ def main():
 
     def _handle_inertia_comp(cmd_msg, cmd_dict):
         _dynamics_switch(cmd_msg, 'inertia_comp_enabled', "inertia")
+
+    def _handle_can_send_wait(cmd_msg, cmd_dict):
+        """can_send_wait:1|0 — TODO/can_tx_timing_plan.md option A (2026-10-12), OFF at every start: after queueing
+        the tick's commands RTI sleeps until its first frame has left (hardware/can_hardware.FirstFrameWait)."""
+        parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
+        if len(parts) != 2:
+            return
+        first_frame_wait.set_enabled(parts[1].strip() == "1")
 
     def _handle_coriolis_comp(cmd_msg, cmd_dict):
         _dynamics_switch(cmd_msg, 'coriolis_comp_enabled', "Coriolis")
@@ -1802,6 +1812,7 @@ def main():
         "gravity_comp":      _handle_gravity_comp,
         "friction_comp":     _handle_friction_comp,
         "inertia_comp":      _handle_inertia_comp,
+        "can_send_wait":     _handle_can_send_wait,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
@@ -2232,9 +2243,17 @@ def main():
         # ==========================================================================
         # Mode dispatch — each handler sends its own CAN commands
         # ==========================================================================
+        if first_frame_wait.enabled:
+            first_frame_wait.prepare()           # stale echoes out BEFORE this tick's commands are queued
         _tick_result = dispatch_step(MODE_HANDLERS.get(st.current_mode), ctx)
         # Every mode but HOMING / FLASHING (they send their own way, or nothing) just sent each joint a data command.
         _can_sent_now = st.current_mode != RobotMode.HOMING and st.current_mode != RobotMode.FLASHING
+        if first_frame_wait.enabled:
+            # Option A: sleep until J1's command has left, so the joints' exchange runs during this tick.
+            if _can_sent_now:
+                first_frame_wait.wait()
+            else:
+                first_frame_wait.skip()
 
         if _tick_result.pending_mode is not None:
             st.pending_mode_request = _tick_result.pending_mode
@@ -2494,6 +2513,8 @@ def main():
                            mode=getattr(st.current_mode, "value", st.current_mode),
                            # MEASURED period, not delta_t — see the tag registry for why.
                            period_ms=shared_data.rti["loop_period"][0] * 1e3,
+                           # when this tick's CAN read ran (CLOCK_REALTIME, the clock candump stamps frames with)
+                           can_read_t=_can_age_buf[2],
                         )
         _profile_last = _profile_mark(_profile_last, "joint_history")
 

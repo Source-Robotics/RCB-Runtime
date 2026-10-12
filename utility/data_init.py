@@ -168,6 +168,7 @@ def get_default_joint_data(num_joints: int) -> dict:
         "rti_state": 0,
         "mode": "",
         "period_ms": 0.0,
+        "can_read_t": 0.0,
     }
 
 # --------------------------------------------------------------------------- #
@@ -227,7 +228,8 @@ def process_joint_data(Joint_data: deque, position: np.ndarray, speed: np.ndarra
                        timestamp: float, exec_time: float, tick: float, error: np.ndarray,
                        rti_seq: float = 0, rti_ok: float = 0.0, rti_miss: float = 0,
                        rti_state: float = 0, mode: str = "", period_ms: float = 0.0,
-                       torque_inertia: np.ndarray | None = None, torque_coriolis: np.ndarray | None = None) -> None:
+                       torque_inertia: np.ndarray | None = None, torque_coriolis: np.ndarray | None = None,
+                       can_read_t: float = 0.0) -> None:
     Joint_data.append({
         "j_p":    position.copy(),
         "j_s":    speed.copy(),
@@ -279,6 +281,7 @@ def process_joint_data(Joint_data: deque, position: np.ndarray, speed: np.ndarra
         "rti_state": rti_state,
         "mode":      mode,
         "period_ms": period_ms,
+        "can_read_t": can_read_t,
     })
 
 

@@ -18,6 +18,7 @@
     <field tag="timestamp" precision="6"/>
     <field tag="exec_t"    precision="6"/>
     <field tag="period_ms" precision="3"/>
+    <field tag="can_read_t" precision="6"/>  <!-- when RTI's CAN read ran, time.time() = candump's clock (2026-10-12) -->
     <field tag="tick"/>
     <field tag="mode"/>
 </recipe>

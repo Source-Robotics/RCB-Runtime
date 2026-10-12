@@ -765,6 +765,8 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
     if frame_age_out is not None:
         frame_age_out[0] = _age_max
         frame_age_out[1] = _age_min if _age_min is not None else 0.0
+        if len(frame_age_out) > 2:
+            frame_age_out[2] = _now          # when this read ran (telemetry can_read_t, 2026-10-12)
 
     return Hall_index, additional_pin2, Edge_detect, received_ids, latest_commands_id
 

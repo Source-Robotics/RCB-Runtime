@@ -90,6 +90,9 @@ TAGS = {
     # on a 100 Hz robot. The measured period belongs in every control callback for
     # exactly this reason.
     "period_ms": {"src": "joint",   "prec": 3, "desc": "measured loop period of this tick (ms)"},
+    # When this tick's CAN read ran, time.time() — the clock candump stamps frames with — so a CAN log tells which
+    # replies each read took (api_tests/69_can_gaps.py, TODO/can_tx_timing_plan.md, 2026-10-12).
+    "can_read_t": {"src": "joint",  "prec": 6, "desc": "when this tick's CAN read ran (time.time(), s)"},
 
     # ================================================================
     # Motor tags  (raw per-node deques, arm joints 0..joint_num-1 only)

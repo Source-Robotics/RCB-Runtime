@@ -17,6 +17,7 @@ Contact: petar@source-robotics.com
 import logging
 import os
 import socket
+import struct
 import Spectral_BLDC as Spectral
 import can
 import time
@@ -233,6 +234,122 @@ def keep_can_off_rt_core(rt_core, interface="can0", sys_root="/sys", proc_root="
         logger.info(f"[CAN] interrupt threads {', '.join(result['threads'])} on cores {cpus} (RTI on {rt_core}); "
                     f"{controller} power: {result['power']}")
     return result
+
+
+# ==========================================================================
+# Wait for the tick's first frame to leave (TODO/can_tx_timing_plan.md option A, 2026-10-12) — OFF at start
+# ==========================================================================
+# RTI's first command frame of a tick is loaded into the CAN chip by a kernel worker on RTI's own core,
+# which runs only when RTI sleeps: the tick's commands leave ~1.5 ms after they were computed, and the
+# joints' exchange must fit in RTI's sleep (the last replies miss the next read when a tick runs long).
+# With this on, RTI sleeps right after queueing its commands until its own first frame (J1's data
+# command) has actually gone out — seen on a second raw socket, which the kernel hands our own frames
+# when they finish sending (candump sees them the same way) — and the rest of the exchange runs during
+# RTI's tick on the other cores. NEVER a fixed short sleep instead: waking RTI while that worker is
+# halfway through loading a frame holds the CAN driver until RTI sleeps again — the freeze of 2026-10-12.
+
+_CAN_EFF_FLAG, _CAN_RTR_FLAG, _CAN_SFF_MASK = 0x80000000, 0x40000000, 0x7FF
+FIRST_FRAME_IDS = (0x004, 0x008)        # node 0 (J1): data pack 1 (command 2), data pack PD (command 4)
+
+
+def open_first_frame_socket(interface="can0", can_ids=FIRST_FRAME_IDS):
+    """A raw CAN socket that receives only those standard data frames — our own included (the sending socket's
+    loopback, on by default, hands every other socket of the interface each frame once it has been sent)."""
+    sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+    mask = _CAN_SFF_MASK | _CAN_EFF_FLAG | _CAN_RTR_FLAG
+    sock.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_FILTER, b"".join(struct.pack("=II", i, mask) for i in can_ids))
+    sock.bind((interface,))
+    return sock
+
+
+class FirstFrameWait:
+    """Off until set_enabled(True) (RTI's `can_send_wait:1`). Per tick: prepare() before the commands are queued,
+    then wait() right after — or skip() on a tick that queued none (HOMING / FLASHING)."""
+
+    DRAIN_MAX = 512
+
+    def __init__(self, interface="can0", timeout_s=0.001, open_socket=open_first_frame_socket):
+        self.interface = interface
+        self.timeout_s = timeout_s
+        self._open = open_socket
+        self._sock = None
+        self._buf = bytearray(16)
+        self.enabled = False
+        self._dirty = True
+        self.waits = 0
+        self.timeouts = 0
+        self.wait_sum = 0.0
+        self.wait_max = 0.0
+
+    def set_enabled(self, on):
+        """Cold path (a command): open / close the socket, log the change and, when switching off, the waits."""
+        on = bool(on)
+        if on == self.enabled:
+            return True
+        if on:
+            try:
+                self._sock = self._open(self.interface)
+                self._sock.settimeout(self.timeout_s)
+            except OSError as e:
+                self._sock = None
+                logger.error(f"[CAN] send-wait: cannot open a socket on {self.interface}: {e} — stays OFF")
+                return False
+            self.waits = self.timeouts = 0
+            self.wait_sum = self.wait_max = 0.0
+            self._dirty = True
+            self.enabled = True
+            logger.info(f"[CAN] send-wait ON: RTI waits (up to {self.timeout_s * 1e3:.1f} ms) for its first frame "
+                        f"to leave each tick (TODO/can_tx_timing_plan.md option A)")
+            return True
+        self.enabled = False
+        mean = self.wait_sum / self.waits * 1e3 if self.waits else 0.0
+        logger.info(f"[CAN] send-wait OFF after {self.waits} waits: mean {mean:.3f} ms, max {self.wait_max * 1e3:.3f} ms, "
+                    f"{self.timeouts} timed out")
+        try:
+            self._sock.close()
+        except (OSError, AttributeError):
+            pass
+        self._sock = None
+        return True
+
+    def prepare(self):
+        """Before the tick's commands are queued: throw away echoes left by ticks that did not wait (or waited in
+        vain), so the next frame the socket gives is this tick's."""
+        if self._dirty:
+            self._drain()
+
+    def skip(self):
+        """A tick that queued no data commands: echoes of frames sent meanwhile may sit in the socket."""
+        self._dirty = True
+
+    def wait(self):
+        """Right after the tick's commands were queued: sleep until J1's command has left (or timeout_s). Returns the
+        seconds waited, -1.0 on a timeout."""
+        t0 = time.perf_counter()
+        try:
+            self._sock.recv_into(self._buf)
+        except OSError:                      # socket.timeout is one
+            self.timeouts += 1
+            self._dirty = True
+            return -1.0
+        dt = time.perf_counter() - t0
+        self.waits += 1
+        self.wait_sum += dt
+        if dt > self.wait_max:
+            self.wait_max = dt
+        return dt
+
+    def _drain(self):
+        """Cold path: read everything waiting, without blocking."""
+        self._sock.setblocking(False)
+        try:
+            for _ in range(self.DRAIN_MAX):
+                self._sock.recv_into(self._buf)
+        except OSError:                      # BlockingIOError: empty
+            pass
+        finally:
+            self._sock.settimeout(self.timeout_s)
+        self._dirty = False
 
 
 # ==========================================================================

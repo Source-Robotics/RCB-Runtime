@@ -88,8 +88,9 @@ CMD_DATA_PACK_1 = 2               # RTI -> drive (Spectral_BLDC SEND_DATA_PACK_1
 CMD_DATA_PACK_PD = 4              # RTI -> drive (SEND_DATA_PACK_PD_ID)
 RESP_DATA_PACK_1 = 3              # drive -> RTI: position 24 b, speed 24 b, current 16 b, big-endian signed
 JOINT_NODES = 6                   # CAN nodes 0..5 = J1..J6
-KINDS = ("planner", "passthrough", "exec")
-DEFAULT_ORDER = "planner,passthrough,exec,planner,passthrough,exec"
+KINDS = ("planner", "passthrough", "exec", "passthrough_wait", "exec_wait")
+DEFAULT_ORDER = "passthrough,passthrough_wait,exec,exec_wait,passthrough,passthrough_wait,exec,exec_wait"
+LOAD_EVERY_S = 2.0                # --load: a Python interpreter (numpy + scipy imports) started this often per block
 IDLE_S = 3.0                      # the baseline before the first block
 AMP_DEG, PERIOD_S, SINE_S = 15.0, 1.5, 8.0     # the RTI blocks: 68's J1 sine
 EXEC_SPEED, EXEC_MOVES = 80.0, 8                # % of the EXEC limits; 30 deg each (~1.04 s, ~57 deg/s peak)
@@ -152,6 +153,7 @@ def to_rows(packets, joint_num=6):
          "ts": np.array([float(rows[k]["timestamp"]) for k in ticks]),
          "exec_ms": np.array([float(rows[k]["exec_t"]) * 1e3 for k in ticks]),
          "period_ms": np.array([float(rows[k].get("period_ms", 0.0)) for k in ticks]),
+         "read_t": np.array([float(rows[k].get("can_read_t", np.nan)) for k in ticks]),
          "mode": np.array([str(rows[k].get("mode", "")) for k in ticks])}
     for key in ("j_p", "j_pc", "j_s", "j_t", "m_p"):
         d[key] = np.array([np.resize(np.asarray(rows[k].get(key, np.nan), float), joint_num) for k in ticks]) \
@@ -419,6 +421,28 @@ def can_metrics(c, w0, w1):
             "pauses_over": int(np.sum(pauses > STALL_MS)), "host_stalls": stalls}
 
 
+def reply_freshness(c, read_t, tick):
+    """Per joint, from the CAN log and when each of RTI's CAN reads ran (read_t, CLOCK_REALTIME, one per row):
+    missed = reads that found no new reply from that joint since the previous tick's read; age = how old the newest
+    reply was at the read (ms) — the data the tick works with."""
+    ok = np.isfinite(read_t) & (read_t > 0)
+    pair = (np.diff(tick) == 1) & ok[1:] & ok[:-1]
+    out = {}
+    for j in range(JOINT_NODES):
+        tr = node_frames(c, j, (RESP_DATA_PACK_1,))[0]
+        if tr.size == 0 or not ok.any():
+            continue
+        idx = np.searchsorted(tr, np.where(ok, read_t, 0.0), "right")
+        new = idx[1:] - idx[:-1]
+        missed = int(np.sum((new == 0) & pair))
+        good = ok & (idx > 0)
+        age = (read_t[good] - tr[idx[good] - 1]) * 1e3
+        out[f"J{j + 1}"] = {"reads": int(pair.sum()), "missed": missed,
+                            "missed_pct": 100.0 * missed / pair.sum() if pair.sum() else np.nan,
+                            "age_ms": _stats(age), "age_p5": float(np.percentile(age, 5)) if age.size else np.nan}
+    return out
+
+
 def analyse(run, d, c):
     dt = float(run.get("delta_t", 0.004))
     offset = float(np.mean([o for o in run.get("clock_offsets", []) if o is not None] or [0.0]))
@@ -444,6 +468,8 @@ def analyse(run, d, c):
                "tx_rel_ms": _stats((tx_t - ts) * 1e3), "rx_rel_ms": _stats((rx_t - ts) * 1e3),
                "matched": int(np.isfinite(tx_t).sum()), "moving_rows": int(mov.sum()),
                "can": can_metrics(c, blk["t_start"], blk["t_end"]),
+               "read_rel_ms": _stats((dd["read_t"] - ts) * 1e3),
+               "fresh": reply_freshness(c, dd["read_t"], dd["tick"]),
                "counters": counter_delta(blk.get("can_before"), blk.get("can_after")),
                "irq": {k: blk["irq_after"].get(k, 0) - v for k, v in blk.get("irq_before", {}).items()}
                if blk.get("irq_after") else {}}
@@ -483,6 +509,12 @@ def print_report(rep, title=""):
               f"{STALL_MS:g} ms {cm['pauses_over']}, host stalls {cm['host_stalls']} | missing {miss} | RX overruns "
               f"{cnt.get('rx_over_errors', '-')}, bus errors {cnt.get('bus_error', '-')}, TX errors "
               f"{cnt.get('tx_errors', '-')}, error-passive {cnt.get('error_passive', '-')}, bus-off {cnt.get('bus_off', '-')}")
+        fr = b.get("fresh") or {}
+        if fr:
+            print(f"  reads: RTI's CAN read {_f(b['read_rel_ms'].get('med'))} ms from its clock reading | per joint, "
+                  f"replies missed / age of the newest reply at the read (median, p5..p99 ms): "
+                  + "  ".join(f"{k} {v['missed']} / {_f(v['age_ms'].get('med'), 1)} ({_f(v['age_p5'], 1)}.."
+                              f"{_f(v['age_ms'].get('p99'), 1)})" for k, v in fr.items()))
     print("\nStale runs (the first 60): late = the refreshing reply after RTI's clock reading; tx = its command after the "
           "sending tick's reading; resp = reply after command; pause = longest inside that tick's exchange (ms)")
     print(f"  {'block':15s} {'tick':>9s} {'len':>4s} {'exc_deg':>8s} {'late':>6s} {'tx':>6s} {'resp':>6s} "
@@ -515,6 +547,15 @@ def print_report(rep, title=""):
         rate = f" ({nr / mv * 60:.1f}/min)" if mv > 0 else ""
         print(f"  {kind:12s} {len(bb)} block(s), {mv:5.1f} s moving: {nr} stale run(s){rate} {labels or ''}; "
               f"RX overruns {over}, host stalls {stalls} in {frames} frames")
+        miss = {}
+        for b in bb:
+            for k, v in (b.get("fresh") or {}).items():
+                m = miss.setdefault(k, [0, 0])
+                m[0] += v["missed"]
+                m[1] += v["reads"]
+        if miss:
+            print(f"  {'':12s} replies missed at the read: " + "  ".join(
+                f"{k} {m[0]}/{m[1]}" for k, m in miss.items()))
 
 
 # ----------------------------------------------------------------------------- self-test
@@ -563,7 +604,7 @@ def _synth(seed=1):
         data = (int(p) & 0xFFFFFF).to_bytes(3, "big") + (int(s) & 0xFFFFFF).to_bytes(3, "big") \
             + (int(cur) & 0xFFFF).to_bytes(2, "big")
         lines.append(f"({t:.6f}) can0 {(j << 7) | (cm << 1):03X}#{data.hex().upper()}")
-    rows = {k: [] for k in ("tick", "ts", "exec_ms", "period_ms", "mode", "j_p", "j_pc", "j_s", "j_t", "m_p")}
+    rows = {k: [] for k in ("tick", "ts", "exec_ms", "period_ms", "mode", "j_p", "j_pc", "j_s", "j_t", "m_p", "read_t")}
     got = sorted(reply.values())
     rt = np.array([g[0] for g in got])
     for k in range(1, n):
@@ -572,6 +613,7 @@ def _synth(seed=1):
         _, rp, sp, cu = got[i]
         rows["tick"].append(10000 + k)
         rows["ts"].append(round(T + 0.0009, 6))
+        rows["read_t"].append(T + offset + 0.0004)
         rows["exec_ms"].append(round(1.8 + rng.uniform(0, 0.3), 3))
         rows["period_ms"].append(4.0)
         rows["mode"].append("RTI")
@@ -632,6 +674,14 @@ def selftest():
     r300 = [r for r in blk["runs"] if r["tick"] == 10301][0]
     chk("the stall's pause (~3.2 ms) and its bunch measured", 3.0 < r300["pause_ms"] < 3.4 and r300["bunch"] >= 2,
         r300)
+    fr = blk["fresh"]
+    chk("per joint, reads that found no new reply: J1 4 (300 / 600 / 900 / 1100), J2 and J3 2 (the stall and the late "
+        "exchange delayed theirs too)", (fr["J1"]["missed"], fr["J2"]["missed"], fr["J3"]["missed"]) == (4, 2, 2),
+        {k: v["missed"] for k, v in fr.items()})
+    chk("the newest J1 reply is 2.67 ms old at the read (median)", abs(fr["J1"]["age_ms"]["med"] - 2.67) < 0.01,
+        fr["J1"]["age_ms"])
+    chk("RTI's read sits 0.5 ms before its clock reading", abs(blk["read_rel_ms"]["med"] + 0.5) < 0.01,
+        blk["read_rel_ms"])
     r600 = [r for r in blk["runs"] if r["tick"] == 10601][0]
     chk("the late command: 3.4 ms after RTI's clock reading (usual 0.6)", abs(r600["tx_ms"] - 3.4) < 0.01, r600)
     ipj = json.dumps([{"linkinfo": {"info_data": {"state": "ERROR-ACTIVE"}, "info_xstats": {"bus_error": 2}},
@@ -710,6 +760,33 @@ def newest_tick(capture):
         if "tick" in r and "m_p" in r:
             return int(r["tick"])
     return None
+
+
+class Load:
+    """--load: starts a Python interpreter (numpy + scipy imports — what made the late replies on 2026-10-12: a
+    program starting) every LOAD_EVERY_S on cores 0-2 at nice 19, until stop()."""
+    def __init__(self):
+        import threading
+        self._stop = threading.Event()
+        self._procs = []
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._procs.append(subprocess.Popen(["nice", "-n", "19", "taskset", "-c", "0-2", sys.executable, "-c",
+                                                 "import numpy, scipy.signal"], stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL))
+            self._stop.wait(LOAD_EVERY_S)
+
+    def stop(self):
+        self._stop.set()
+        self._t.join(timeout=2.0)
+        for p in self._procs:
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
 
 
 def rti_block(robot, ff68, sc, capture, stamps):
@@ -806,16 +883,20 @@ def run_session(args, cfg, order, out_dir):
         run["clock_offsets"].append(clock_offset())
         for name in ["idle"] + [f"{k}_{i + 1}" for i, k in enumerate(order)]:
             kind = name.rsplit("_", 1)[0] if name != "idle" else "idle"
+            base = kind[:-len("_wait")] if kind.endswith("_wait") else kind
             blk = {"name": name, "kind": kind, "can_before": read_counters(args.iface), "irq_before": read_irqs(),
-                   "t_start": time.time(), "tick0": newest_tick(capture), "ok": True}
+                   "t_start": time.time(), "tick0": newest_tick(capture), "ok": True, "load": bool(args.load)}
             print(f"  {name:15s} ... ", end="", flush=True)
+            load = Load() if args.load and kind != "idle" else None
             try:
+                if base != kind:
+                    robot.set_can_send_wait(True)          # TODO/can_tx_timing_plan.md option A, this block only
                 if kind == "idle":
                     time.sleep(IDLE_S)
-                elif kind == "exec":
+                elif base == "exec":
                     exec_block(robot)
                 else:
-                    rti_block(robot, ff68, sc, capture, stamps=(kind == "passthrough"))
+                    rti_block(robot, ff68, sc, capture, stamps=(base == "passthrough"))
                 print("done")
             except (ControlLost, Exception) as exc:             # any failure ends the run; the recording is kept
                 print(f"FAILED: {type(exc).__name__}: {exc}")
@@ -824,6 +905,14 @@ def run_session(args, cfg, order, out_dir):
                     robot.rti_disconnect()
                 except Exception:
                     pass
+            finally:
+                if load is not None:
+                    load.stop()
+                if base != kind:
+                    try:
+                        robot.set_can_send_wait(False)
+                    except Exception as exc:
+                        print(f"!!! could not switch the send-wait off ({exc}) — it goes off at the next RTI start")
             blk.update({"t_end": time.time(), "tick1": newest_tick(capture), "can_after": read_counters(args.iface),
                         "irq_after": read_irqs()})
             run["blocks"].append(blk)
@@ -910,6 +999,8 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--order", default=DEFAULT_ORDER, help=f"blocks in order, of {list(KINDS)}")
     ap.add_argument("--iface", default="can0")
+    ap.add_argument("--load", action="store_true", help="start a Python interpreter every 2 s during each block "
+                    "(on cores 0-2, nice 19): the load that made replies late on 2026-10-12")
     ap.add_argument("--reanalyse", metavar="FOLDER")
     args = ap.parse_args()
     if args.selftest:
@@ -926,10 +1017,13 @@ def main():
         return 2
     rti_s = SINE_S + 2 * 1.0 + 1.5
     exec_s = EXEC_MOVES * 1.04 + 2.0
-    total = IDLE_S + sum(exec_s if k == "exec" else rti_s for k in order)
+    total = IDLE_S + sum(exec_s if k.startswith("exec") else rti_s for k in order)
     print(f"Plan: {IDLE_S:g} s IDLE (baseline), then {order}: RTI blocks J1 sine +/-{AMP_DEG:g} deg, {PERIOD_S:g} s period "
           f"(~63 deg/s), {SINE_S:g} s each; EXEC blocks {EXEC_MOVES} moves of {2 * AMP_DEG:g} deg at {EXEC_SPEED:g} % "
-          f"(~57 deg/s). candump on {args.iface} (read-only) + RTI telemetry ({RECIPE}) the whole time, ~{total / 60:.1f} min.")
+          f"(~57 deg/s). candump on {args.iface} (read-only) + RTI telemetry ({RECIPE}) the whole time, ~{total / 60:.1f} min."
+          + (" '_wait' blocks: RTI's send-wait ON (TODO/can_tx_timing_plan.md option A)." if any(
+              k.endswith("_wait") for k in order) else "")
+          + (f" --load: a Python interpreter started every {LOAD_EVERY_S:g} s in each block." if args.load else ""))
     if not args.go:
         print("DRY RUN: re-run with --go to move the arm. Nothing moved.")
         return 0
