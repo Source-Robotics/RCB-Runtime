@@ -367,7 +367,7 @@ class FirstFrameWait:
         return dt
 
     def _drain(self):
-        """Cold path: read everything waiting, without blocking."""
+        """Read everything waiting, without blocking — every tick while the switch is on (a few syscalls)."""
         self._sock.setblocking(False)
         try:
             for _ in range(self.DRAIN_MAX):

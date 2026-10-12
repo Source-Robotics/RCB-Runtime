@@ -281,7 +281,11 @@ instead of a traceback.
 
 Only `RTI.py` is intended to request real-time scheduling and a pinned core. The
 service grants permission for that child process but does not make every process
-real-time.
+real-time. The core plan is `config/cpu_cores.py`: the real-time loop on core 3, the
+CAN chip's interrupt threads alone on core 2 (RTI places them at every start), every
+other process and interactive session on cores 0-1. Start and restart the runtime
+with the service, not RTI.py from a shell: RTI confines interactive sessions to
+cores 0-1, so an RTI started from one cannot get its real-time core.
 
 ## Configuration
 

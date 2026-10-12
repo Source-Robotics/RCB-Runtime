@@ -2526,7 +2526,8 @@ def main():
         # Every mode but HOMING / FLASHING (they send their own way, or nothing) just sent each joint a data command.
         _can_sent_now = st.current_mode != RobotMode.HOMING and st.current_mode != RobotMode.FLASHING
         if first_frame_wait.enabled:
-            # Option A: sleep until J1's command has left, so the joints' exchange runs during this tick.
+            # Option B's wait (option A's waiter): sleep until J1's command has left, so the joints' exchange runs
+            # during this tick.
             if _can_sent_now:
                 first_frame_wait.wait()
             else:

@@ -18,6 +18,11 @@ HOMING / FLASHING — those send their own way or nothing) and RTI is past its s
 150 / 300 in RTI.py put ~170 frames on the bus each and delay replies on purpose).
 
 Per tick: a few integer operations per joint, nothing allocated; the warning and its log line are the cold path.
+
+Blind spot (2026-10-12): a "miss" is a read that took NO reply from the joint, so lateness that LASTS — every reply a
+tick late, each read finding the previous one — is not counted. In the normal tick order lateness never lasts
+(measured with api_tests/69's strict count: J6 0.3-0.4 % of reads, isolated); with option B under load it does (J6
+40 %) and this would undercount. B is off; the strict count needs each command's departure (69 has it from candump).
 """
 import logging
 
