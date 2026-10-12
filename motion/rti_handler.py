@@ -511,7 +511,6 @@ class RTIModeHandler:
         self._pt_s = np.zeros(PT_RING, dtype=np.float64)
         self._pt_q = np.zeros((PT_RING, joint_num), dtype=np.float64)
         self._pt_k = 0                    # samples taken since the last start (ring index = k % PT_RING)
-        self._pt_live = False             # this tick's output came from the pass-through (not the planner fallback)
         self._pt_last_tick = -1           # the packet the ring last saw
         self._pt_nost = 0                 # packets in a row without a send time
         self._pt_shift = 0.0              # ticks taken off the send times after a jump of the PC's clock
@@ -1221,16 +1220,11 @@ class RTIModeHandler:
             # the planner chases each new target (2026-10-11). With the rate limiter OFF (no target-velocity
             # estimate, no bounded acceleration) — none either way.
             if self.dynamics_ff_source == "stream" and self.rate_limit_enabled:
-                sacc = self._stream_acceleration(ctx)      # every tick: a hand-over to the planner stays continuous
-                if self._pt_live and not self.soft_mode:
-                    # Hard RTI's pass-through (2026-10-11): its OWN acceleration — the same curve as its position, in
-                    # phase with what the drives are commanded. The stream's estimate (8 Hz smoothed) ran 44 ms behind
-                    # it on the arm and still helped (J1 tracking 0.80x); simulated, the own one matches the commanded
-                    # acceleration within 0.5 % of its RMS. The planner (a stream without send times, SOFT_RTI) keeps
-                    # the estimate: it helped there too (0.68-0.98x on the arm).
-                    out.acc_rad = self._rl_a
-                else:
-                    out.acc_rad = sacc
+                # The stream's estimate for every generator, the pass-through included. Tried and measured on the arm
+                # (2026-10-12, J1): the pass-through's own in-phase acceleration was no better than none (0.98-1.07x
+                # tracking) where this 8 Hz-smoothed, ~44 ms-late estimate gave 0.91x — its lag likely adds a
+                # speed-proportional part that offsets some of J1's friction.
+                out.acc_rad = self._stream_acceleration(ctx)
                 out.acc_feedforward = True
             else:
                 out.acc_rad = self._rl_a if self.rate_limit_enabled else None
@@ -1826,7 +1820,6 @@ class RTIModeHandler:
         self._pt_k = 0
         self._pt_nost = 0
         self._pt_shift = 0.0
-        self._pt_live = False
         self._pt_last_tick = current_tick
         self._pt_restore_rk()
 
@@ -2065,10 +2058,8 @@ class RTIModeHandler:
                     self._pt_k = 0
         k = self._pt_k
         if k < 3:
-            self._pt_live = False                          # the planner this tick: no feedforward (see _command_output)
             self._pt_restore_rk()
             return self._limit_position_ruckig(tgt, ctx)
-        self._pt_live = True
 
         # The replay clock: L moves toward the slowest recent delivery at most PT_DELAY_RATE_TICKS per tick; the
         # time warp it makes is in the target speed (warp) so position and speed stay one curve.
