@@ -653,7 +653,8 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
                                      Motor_Kt_data,
                                      joint_num, active_CAN_gripper, loop_tick_cnt,
                                      received_ids, latest_commands_id,
-                                     node_error_bits=None, frame_age_out=None, data_reply_count_out=None):
+                                     node_error_bits=None, frame_age_out=None, data_reply_count_out=None,
+                                     reply_time_out=None):
     """
     Receive and process CAN messages from all motors.
     
@@ -673,6 +674,9 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
         latest_commands_id (np.array): Array to store latest command IDs
         data_reply_count_out (list): if given, filled with the number of data replies (DATA_PACK 3 / 5 / 7) read
             from each joint this tick (2026-10-12: utility/can_reply_monitor.py counts the ticks that got none)
+        reply_time_out (np.array): if given, each joint's newest data reply's kernel arrival time (CLOCK_REALTIME)
+            — KEPT when a joint had none this tick: it is the time of the data RTI works with (2026-10-12,
+            utility/loop_delay_meter.py)
     
     Returns:
         tuple: (Hall_index, received_ids, latest_commands_id)
@@ -741,6 +745,8 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
                 if data_reply_count_out is not None and command_id in (3, 5, 7) \
                         and node_id < len(data_reply_count_out):
                     data_reply_count_out[node_id] += 1
+                if reply_time_out is not None and command_id in (3, 5, 7) and node_id < len(reply_time_out):
+                    reply_time_out[node_id] = message.timestamp
                 
                 # Unpack data
                 Motor[node_id].UnpackData(message, msg_ID)

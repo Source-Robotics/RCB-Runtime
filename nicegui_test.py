@@ -1212,6 +1212,33 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 ui.label("")
                 can_age_peak_label = ui.label("—")
 
+            # The control loop's delay per joint (2026-10-12, utility/loop_delay_meter.py, RTI writes it 5x a second).
+            with ui.row().classes("items-center gap-1 no-wrap mt-2 font-mono text-sm"):
+                ui.label("Loop delay (ms)")
+                with ui.icon("help_outline").classes("text-gray-400 cursor-help text-sm"):
+                    with ui.tooltip().classes("max-w-md"), ui.column().classes("gap-1 py-1"):
+                        ui.label("How old a joint's measurement is when the command computed from it reaches "
+                                 "the drive.").classes("font-semibold")
+                        ui.label(
+                            "Per joint: from the moment the joint's CAN reply (its position, speed, current) "
+                            "arrives to the moment the CAN command RTI computed from that reply leaves. Measured "
+                            "live: RTI's CAN read timestamps every reply, a read-only socket sees our own "
+                            "commands leave; sampled 5 times a second, median / max of the last ~5 s.")
+                        ui.label("Normal tick order: ~7.8 ms. The reply arrives while RTI sleeps, is read in "
+                                 "the next tick, used by the tick after that, and that command leaves only when "
+                                 "RTI sleeps again — about two ticks.")
+                        ui.label("Option B (read first, send early; set_can_read_first): ~3.8 ms, about one "
+                                 "tick — but more late replies on the last joints under load.")
+                        ui.label(
+                            "What it matters for: loops OUR software closes on the measured state — the "
+                            "haptic walls in freedrive, a PC's own force / impedance control in hard RTI. "
+                            "The drives close their position loops themselves, so path tracking does not "
+                            "depend on it (measured: 66 / 68 unchanged with option B).").classes("italic")
+                        ui.label("A max one tick (~4 ms) above the median = a reply that came after RTI's read "
+                                 "now and then; often = load on the Pi.")
+                loop_delay_order_label = ui.label("—").classes("text-gray-500 ml-2")
+            loop_delay_label = ui.label("—").classes("font-mono text-sm")
+
             with ui.row().classes("mt-2 gap-2"):
                 ui.button("Reset Loop Stats (peaks)", icon="restart_alt",
                           on_click=handle_reset_loop_stats).props("color=grey outline size=sm")
@@ -3911,6 +3938,13 @@ def update_tables():
         # is old and the bus view is otherwise current.
         can_age_min_label.text  = f"min {_cage_min:.2f}"
         can_age_peak_label.text = f"{shared_data.rti['can_frame_age_peak'][0]*1e3:.2f}"
+        _ld = shared_data.rti['loop_delay'] * 1e3
+        _ldm = shared_data.rti['loop_delay_max'] * 1e3
+        loop_delay_label.text = "   ".join(
+            f"J{j + 1} {_ld[j]:.1f}/{_ldm[j]:.1f}" if _ld[j] == _ld[j] else f"J{j + 1} —"      # NaN: not measured yet
+            for j in range(_ld.size)) + "   (median / max)"
+        loop_delay_order_label.text = ("order: option B (read first)" if shared_data.rti['can_read_first'][0] > 0.5
+                                       else "order: normal")
         # Colour the live value: green = current, amber = drifting, red = acting on the past.
         can_age_label.classes(replace='font-mono ' + (
             'text-red-500' if _cage > 50 else 'text-orange-500' if _cage > 15 else 'text-green-500'))

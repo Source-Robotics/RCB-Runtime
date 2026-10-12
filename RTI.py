@@ -66,6 +66,7 @@ from config.system_config import setup_realtime_process
 from hardware.can_hardware import start_can_interface, place_can_path, FirstFrameWait
 from config.cpu_cores import CAN_CPU_CORE, GENERAL_CPU_CORES
 from utility.can_reply_monitor import CanReplyMonitor
+from utility.loop_delay_meter import LoopDelayMeter
 
 # ==========================================================================
 # Hardware
@@ -501,6 +502,11 @@ def main():
     communication1 = initialize_can_communication(bustype='socketcan', channel='can0', bitrate=1000000)
     # TODO/can_tx_timing_plan.md option B — OFF at every start; `can_read_first:1` turns it on (to measure it).
     first_frame_wait = FirstFrameWait('can0')
+    # The control loop's delay per joint (a reply -> the command computed from it), sampled live for the GUI's RT
+    # Diagnostics (2026-10-12, utility/loop_delay_meter.py): a read-only socket that sees our own frames leave.
+    loop_delay_meter = LoopDelayMeter(joint_num)
+    shared_data.rti["loop_delay"][:] = np.nan          # not measured yet (the GUI shows a dash)
+    shared_data.rti["loop_delay_max"][:] = np.nan
 
     # ==========================================================================
     # Motor objects, joint objects, filters, housekeeping — via motor_setup.py
@@ -789,6 +795,8 @@ def main():
     # read too often (2026-10-12, utility/can_reply_monitor.py). The read in tick k holds the answers to tick k-1's
     # commands (they go out while RTI sleeps), so the monitor is told whether the PREVIOUS tick sent them.
     _can_reply_buf = [0] * joint_num
+    _can_reply_time = np.full(joint_num, np.nan)        # each joint's newest data reply's arrival (the loop-delay meter)
+    _loop_delay_published = -1
     can_reply_monitor = CanReplyMonitor(joint_num, delta_t)
     _can_sent_prev = False
     _can_sent_now = False         # option B reads before the first dispatch has set it
@@ -1887,7 +1895,10 @@ def main():
                 node_error_bits=node_error_bits,
                 frame_age_out=_can_age_buf,
                 data_reply_count_out=_can_reply_buf,
+                reply_time_out=_can_reply_time,
             )
+        loop_delay_meter.on_read(_tick_now, _can_reply_time, _read_first,
+                                 st.current_mode != RobotMode.HOMING and st.current_mode != RobotMode.FLASHING)
         can_reply_monitor.step(_can_reply_buf, _tick_now, _can_sent_prev and not _bus_silent)
         _can_sent_prev = _can_sent_now
         # [0]=worst, [1]=best age among the frames read this tick. Both published: the SPREAD is
@@ -2502,6 +2513,13 @@ def main():
         # ==========================================================================
         # Mode dispatch — each handler sends its own CAN commands
         # ==========================================================================
+        loop_delay_meter.before_dispatch(_tick_now, _read_first,
+                                         st.current_mode != RobotMode.HOMING and st.current_mode != RobotMode.FLASHING)
+        if loop_delay_meter.samples != _loop_delay_published:          # a sample finished: publish (5 times a second)
+            _loop_delay_published = loop_delay_meter.samples
+            shared_data.rti["loop_delay"][:joint_num] = loop_delay_meter.median
+            shared_data.rti["loop_delay_max"][:joint_num] = loop_delay_meter.maximum
+        shared_data.rti["can_read_first"][0] = _read_first
         if first_frame_wait.enabled:
             first_frame_wait.prepare()           # stale echoes out BEFORE this tick's commands are queued
         _tick_result = dispatch_step(MODE_HANDLERS.get(st.current_mode), ctx)

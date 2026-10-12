@@ -699,7 +699,11 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # negative = overlap) while it is within the MONITOR margin on the measured pose, +inf otherwise. Written by the
     # collision worker; RTI's monitor keeps what was already within the margin when an active mode began and
     # stops only if a pair gets closer than that, or another pair comes within the margin.
-    for name, count in [("sc_pair_gaps", 49), ("jog_ref", joint_num), ("jog_dir", joint_num)]:
+    # The control loop's delay per joint (2026-10-12, utility/loop_delay_meter.py): a reply's arrival -> the departure of
+    # the command computed from it [s], median / max of the last ~5 s; NaN until measured. can_read_first: 1 while
+    # RTI runs option B's tick order (read first, send early), 0 in the normal order.
+    for name, count in [("sc_pair_gaps", 49), ("jog_ref", joint_num), ("jog_dir", joint_num),
+                        ("loop_delay", joint_num), ("loop_delay_max", joint_num), ("can_read_first", 1)]:
         shm, arr = _attach_or_create(name, np.float64, count)
         rti_shms[name] = shm
         rti[name] = arr
