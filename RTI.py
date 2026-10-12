@@ -30,7 +30,8 @@ import json
 # These used to arrive through `from utility.RTI_utils import *` (2026-10-03, refactor Phase 2). `logger` is
 # data_init's module logger — RTI.py has always logged through it, which is why RTI.log labels these lines
 # `utility.data_init`; giving RTI its own logger would change that column and is a separate, visible step.
-from utility.data_init import initialize_robot_data, logger, process_gripper_joint_data, process_joint_data
+from utility.data_init import (initialize_robot_data, logger, process_gripper_joint_data, process_joint_data,
+                                refresh_dispatch_fields)
 from utility.signal_processing import reset_rolling_stats, update_rolling_percentiles, update_rt_loop_stats, pace_deadline
 from utility.RTI_utils import print_heartbeat
 from project_paths import RTI_LOG, SYSTEM_XML, ROBOTS_DIR, TEMP_DATA_DIR, DATA_RECIPE_DIR, GRIPPERS_DIR, CRITICAL_LOG, FILTER_CONFIG_PATH, FLASH_PERFORMED_MARKER, CELLS_DIR
@@ -498,7 +499,7 @@ def main():
     # core they stalled under load (2026-10-12, api_tests/69, config/cpu_cores.py).
     place_can_path(CAN_CPU_CORE, GENERAL_CPU_CORES)
     communication1 = initialize_can_communication(bustype='socketcan', channel='can0', bitrate=1000000)
-    # TODO/can_tx_timing_plan.md option A — OFF at every start; `can_send_wait:1` turns it on (to measure it).
+    # TODO/can_tx_timing_plan.md option B — OFF at every start; `can_read_first:1` turns it on (to measure it).
     first_frame_wait = FirstFrameWait('can0')
 
     # ==========================================================================
@@ -790,6 +791,10 @@ def main():
     _can_reply_buf = [0] * joint_num
     can_reply_monitor = CanReplyMonitor(joint_num, delta_t)
     _can_sent_prev = False
+    _can_sent_now = False         # option B reads before the first dispatch has set it
+    Hall_index = additional_pin2 = Edge_detect = 0   # bound before the loop: _can_read() keeps them across ticks
+    _bus_silent = False
+    _profile_last = 0.0
     _loop_period_buf = np.zeros(LOOP_STATS_BUFFER_SIZE, dtype=np.float64)
     _loop_exec_buf = np.zeros(LOOP_STATS_BUFFER_SIZE, dtype=np.float64)
     st._loop_stats_buf_pos = 0
@@ -1190,9 +1195,11 @@ def main():
     def _handle_inertia_comp(cmd_msg, cmd_dict):
         _dynamics_switch(cmd_msg, 'inertia_comp_enabled', "inertia")
 
-    def _handle_can_send_wait(cmd_msg, cmd_dict):
-        """can_send_wait:1|0 — TODO/can_tx_timing_plan.md option A (2026-10-12), OFF at every start: after queueing
-        the tick's commands RTI sleeps until its first frame has left (hardware/can_hardware.FirstFrameWait)."""
+    def _handle_can_read_first(cmd_msg, cmd_dict):
+        """can_read_first:1|0 — TODO/can_tx_timing_plan.md option B (2026-10-12), OFF at every start: the CAN read and
+        the measurement at the START of the tick, the safety pass before dispatch, and after queueing the commands RTI
+        sleeps until its first frame has left (hardware/can_hardware.FirstFrameWait). The waiter's state IS the
+        switch: a socket that cannot open leaves it OFF (the old order)."""
         parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
         if len(parts) != 2:
             return
@@ -1814,7 +1821,7 @@ def main():
         "gravity_comp":      _handle_gravity_comp,
         "friction_comp":     _handle_friction_comp,
         "inertia_comp":      _handle_inertia_comp,
-        "can_send_wait":     _handle_can_send_wait,
+        "can_read_first":    _handle_can_read_first,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
@@ -1853,6 +1860,236 @@ def main():
         "rti_set_start_pose_check": _handle_rti_set_start_pose_check,
         "rti_set_lowpass":          _handle_rti_set_lowpass,
     }
+
+    # ==========================================================================
+    # The tick's CAN read, its measurement and its safety pass, as functions (2026-10-12): option B runs them at the
+    # START of the tick and before dispatch, the old order where they always were (TODO/can_tx_timing_plan.md §9).
+    # Their bodies are the loop's own blocks, moved verbatim.
+    # ==========================================================================
+    def _can_read():
+        """Drain and decode the CAN replies; the reply monitor; the connection status."""
+        nonlocal Hall_index, additional_pin2, Edge_detect, _can_sent_prev, _profile_last
+        # ==========================================================================
+        # Mainloop CAN receive and fill queues
+        # ==========================================================================
+        if _bus_silent:
+            # Someone else owns the bus. Drop everything on the floor rather than
+            # decoding it — flash stream frames alias onto real motor node IDs.
+            drain_can_discard(communication1)
+        else:
+            Hall_index, additional_pin2, Edge_detect, st.received_ids, st.latest_commands_id = receive_and_process_can_messages(
+                communication1, Motor, Motor_data, Gripper_data,
+                Motor_temperature_data, Motor_voltage_data,
+                Motor_errors_data, Motor_info_data, Motor_Kt_data,
+                joint_num, active_CAN_gripper,
+                _tick_now,
+                st.received_ids, st.latest_commands_id,
+                node_error_bits=node_error_bits,
+                frame_age_out=_can_age_buf,
+                data_reply_count_out=_can_reply_buf,
+            )
+        can_reply_monitor.step(_can_reply_buf, _tick_now, _can_sent_prev and not _bus_silent)
+        _can_sent_prev = _can_sent_now
+        # [0]=worst, [1]=best age among the frames read this tick. Both published: the SPREAD is
+        # what tells a real backlog (min ~= max, both large) from a single stale frame class
+        # (min small, max large).
+        shared_data.rti["can_frame_age"][0] = _can_age_buf[0]
+        shared_data.rti["can_frame_age_min"][0] = _can_age_buf[1]
+        if _can_age_buf[0] > shared_data.rti["can_frame_age_peak"][0]:
+            shared_data.rti["can_frame_age_peak"][0] = _can_age_buf[0]
+        shared_data.motor["HALL_INDEX"][0] = Hall_index
+        shared_data.rti["received_ids"][:] = st.received_ids[:] #Update the shared memory
+        shared_data.rti["latest_commands_id"][:] = st.latest_commands_id[:]  #Update the shared memory
+        # Live per-node fault bit (mutated in place at the CAN decode) — arm joints + gripper.
+        shared_data.rti["node_error_bits"][:] = node_error_bits[:]
+
+        st.received_ids[:]       = 0   # reset in-place — no allocation
+        st.latest_commands_id[:] = -1  # reset in-place — no allocation
+        _profile_last = _profile_mark(_profile_last, "can_receive_process")
+
+        # ==========================================================================
+        # CAN connection Safety and debug stuff
+        # ==========================================================================
+        # Skipped while the bus is handed over: nodes are silent BY DESIGN in
+        # FLASHING, so freshness counting would latch CAN_node_connection_error on
+        # every joint within error_threshold ticks, force ACTIVE_ERROR, and kick us
+        # straight back out of the mode. The counters are re-based on exit — see the
+        # FLASHING teardown in the mode-change block above.
+        if not _bus_silent:
+            update_can_connection_status(
+                Motor_data=Motor_data,
+                Motor=Motor,
+                shared_data=shared_data,
+                joint_num=joint_num,
+                active_CAN_gripper=active_CAN_gripper,
+                warning_threshold = 10,
+                error_threshold = 50, #Number of loop ticks
+            )
+        _profile_last = _profile_mark(_profile_last, "can_connection_status")
+
+    def _measure():
+        """The ordered measurement pipeline: motor[] -> joint[] + tcp[] -> the Joint_data history entry."""
+        nonlocal _profile_last
+        # ==========================================================================
+        # Fill the latest data shared arrays (Motor level)
+        #
+        # ⚠️ These next three calls are an ORDERED PIPELINE — do not reorder them:
+        #   motor[] (here) -> joint[]+tcp[] (reads motor[]) -> Joint_data append (feeds
+        #   the accel/jerk finite differences with THIS tick's values, so it must come
+        #   last or [-1] stops being the previous tick).
+        # Reordering breaks them silently — stale-by-one-tick data, no exception.
+        # See data/update_shared_data.py's module docstring.
+        # ==========================================================================
+        update_motor_and_gripper_data(
+            shared_data=shared_data,
+            Motor_data=Motor_data,
+            Motor_temperature_data=Motor_temperature_data,
+            Motor_voltage_data=Motor_voltage_data,
+            Motor_info_data=Motor_info_data,
+            Motor_errors_data=Motor_errors_data,
+            Motor_Kt_data=Motor_Kt_data,
+            Gripper_data=Gripper_data,
+            motor_error_bytes=motor_error_bytes,
+            joint_num=joint_num,
+            active_CAN_gripper=active_CAN_gripper,
+            gripper_kt=float(gripper_kt),
+            gripper_speed_bank=st.filter_banks['gripper_speed'],
+        )
+        _profile_last = _profile_mark(_profile_last, "motor_gripper_shared")
+
+        # ==========================================================================
+        # Fill the latest data shared arrays (Joint + TCP level) — via update_shared_data.py
+        # ==========================================================================
+        update_joint_and_tcp_data(
+            shared_data=shared_data,
+            Joint=Joint,
+            Joint_data=Joint_data,
+            filter_banks=st.filter_banks,
+            joint_num=joint_num,
+            delta_t=delta_t,
+            gear_ratio=gear_ratio,
+            gear_efficiency=gear_efficiency,
+            motor_kt=motor_kt,
+            motor_signs=motor_signs,
+            robot=robot,
+            jacobian_out=tcp_jacobian,
+        )
+        _profile_last = _profile_mark(_profile_last, "joint_tcp_shared")
+
+        # ==========================================================================
+        # Fill queues for joint + TCP level
+        # ========================================================================== 
+        process_joint_data(Joint_data,
+                           shared_data.joint['joint_position'],
+                           shared_data.joint['joint_speed'],
+                           shared_data.joint['joint_torque'],
+                           shared_data.joint['joint_acceleration'],
+                           shared_data.joint['joint_jerk'],
+                           shared_data.joint['joint_speed_filtered'],
+                           shared_data.joint['joint_torque_filtered'],
+                           shared_data.joint['joint_acceleration_filtered'],
+                           shared_data.joint['joint_jerk_filtered'],
+                           shared_data.tcp['robot_pose'],
+                           shared_data.tcp['robot_pose_matrix'],
+                           shared_data.tcp['robot_pose_quaternion'],
+                           shared_data.tcp['TCP_speed'],
+                           shared_data.tcp['torque_external'],
+                           shared_data.tcp['force_external'],
+                           shared_data.tcp['TCP_speed_filtered'],
+                           shared_data.tcp['TCP_acceleration_raw'],
+                           shared_data.tcp['TCP_acceleration_filtered'],
+                           shared_data.tcp['force_external_tool'],
+                           shared_data.joint['joint_position_commanded'],
+                           shared_data.joint['joint_speed_commanded'],
+                           shared_data.joint['joint_acceleration_commanded'],
+                           shared_data.joint['joint_torque_commanded'],
+                           shared_data.tcp['TCP_pose_commanded'],
+                           shared_data.tcp['TCP_speed_commanded'],
+                           shared_data.joint['joint_position_target'],
+                           shared_data.joint['joint_speed_target'],
+                           shared_data.joint['joint_acceleration_target'],
+                           shared_data.joint['joint_torque_target'],
+                           shared_data.tcp['TCP_pose_target'],
+                           shared_data.tcp['TCP_speed_target'],
+                           time.perf_counter(),
+                           st.loop_execution_time,
+                           _tick_now,
+                           motor_error_bytes,
+                           # RTI link diagnostics — read from shared memory rather than the
+                           # handler so the value is whatever was published this tick, and so
+                           # this call site does not care which mode is active. All zero
+                           # outside RTI mode (RTI.py zeroes them at startup and on disconnect).
+                           # inertia / Coriolis feedforward added this tick (0 when off; mode_dispatch._add_dynamics_ff)
+                           torque_inertia=shared_data.joint['joint_inertia_torque'],
+                           torque_coriolis=shared_data.joint['joint_coriolis_torque'],
+                           rti_seq=shared_data.rti["rti_seq_rx_last"][0],
+                           rti_ok=shared_data.rti["control_success_rate"][0],
+                           rti_miss=shared_data.rti["rti_consecutive_misses"][0],
+                           rti_state=shared_data.rti["rti_substate"][0],
+                           # .value, not str(): RobotMode is a (str, Enum), and str() on it
+                           # yields "RobotMode.IDLE" rather than the bare name the PC expects.
+                           mode=getattr(st.current_mode, "value", st.current_mode),
+                           # MEASURED period, not delta_t — see the tag registry for why.
+                           period_ms=shared_data.rti["loop_period"][0] * 1e3,
+                           # when this tick's CAN read ran (CLOCK_REALTIME, the clock candump stamps frames with)
+                           can_read_t=_can_age_buf[2],
+                        )
+        _profile_last = _profile_mark(_profile_last, "joint_history")
+
+    def _check_safety():
+        """The EXEC link watchdog, the loop monitor, the safety monitor and the error pass (latches, mode)."""
+        nonlocal _profile_last
+        # ==========================================================================
+        # Error checking — latched: each error is logged once when it appears and
+        # stays latched until the user clears it. See utility/error_checks.py.
+        # ==========================================================================
+        # EXEC control-link watchdog: has command_executor's heartbeat stalled while EXEC motion
+        # is in flight? Gated on EXEC + buffered samples so a dead/idle executor (nothing moving)
+        # is never tripped — only a control link lost mid-motion. The heartbeat comes off the
+        # executor's dedicated thread, so a long TOPPRA solve does NOT look like death.
+        _exec_link_lost = _exec_link_watchdog.update(
+            heartbeat=float(shared_data.rti["exec_heartbeat"][0]),
+            tick=int(_tick_now),
+            in_exec=(st.current_mode == RobotMode.EXEC),
+            samples_remaining=float(shared_data.rti["exec_samples_remaining"][0]),
+        )
+
+        # RT loop health: LOOP_DEGRADED (warning, self-clearing) and LOOP_CRITICAL (hard,
+        # latching → DISABLED + hold). Fed p99, so a slow burst only warns; critical = a sustained
+        # loss (p99 > 1.5x for 1 s) or ONE stalled tick (> 3x). See error_checks.LOOP_ERROR_*.
+        _loop_degraded, _loop_critical = _loop_monitor.update(
+            p99_period=float(shared_data.rti["p99_loop_period"][0]),
+            tick=int(_tick_now),
+            period=float(shared_data.rti["loop_period"][0]),
+        )
+
+        # Safety monitor BEFORE the error pass, so a trip latches — and disables the robot — this tick.
+        _monitor_errors = safety_monitor.step(st.current_mode)
+        _profile_last = _profile_mark(_profile_last, "safety_monitor")
+
+        st.clear_error_countdown, st.latched_errors, st.error_metadata, st.current_mode = process_errors_tick(
+            shared_data, Motor, Motor_errors_data, joint_num,
+            st.clear_error_countdown, st.latched_errors, st.error_metadata,
+            active_CAN_gripper, st.current_mode, homing_ctrl,
+            check_estop_active(),
+            Gripper_data=Gripper_data,
+            exec_link_lost=_exec_link_lost,
+            # RTI command watchdog. A KEY, not a direct error_active write — this
+            # function owns that flag and recomputes it every tick.
+            rti_link_lost=rti_handler.take_link_lost(),
+            # The strict command checks' keys (J{i}:RTI_*_LIMIT), raised once the controlled stop is at rest.
+            rti_errors=rti_handler.take_command_errors(),
+            # J{i}:CAN_REPLY_MISSED_WARNING (warn-only) — a joint's replies missing RTI's read too often.
+            can_warnings=can_reply_monitor.warnings,
+            loop_degraded=_loop_degraded,
+            loop_critical=_loop_critical,
+            monitor_errors=_monitor_errors,
+            monitor_warnings=safety_monitor.warnings,
+            on_hard_error=_incident_hook,
+            # The settle after the start-up clear: a driver reports the LAST run's fault until the clear lands.
+            driver_faults=_tick_now > CLEAR_ERROR_SETTLE_TICKS,
+        )
+        _profile_last = _profile_mark(_profile_last, "error_checks")
 
     # ==========================================================================
     # RTI superloop
@@ -2003,6 +2240,21 @@ def main():
             _reload_motor_config()
             _reload_gripper_config()
             st.startup_motor_reconfig += 1
+
+        # ==========================================================================
+        # OPTION B — read first, send early (TODO/can_tx_timing_plan.md §9; `can_read_first:1`, OFF at every start).
+        # The CAN read and the measurement run HERE, at the tick's start: they collect the replies to the previous
+        # tick's commands, which left right after its dispatch (the waiter below), so this tick's commands are
+        # computed from them — about a tick fresher — and leave ~0.3 ms after dispatch instead of when RTI sleeps.
+        # HOMING keeps the old order (user, 2026-10-12): it sends its own frames, which the waiter does not watch.
+        # Off: the same functions run where they always did (below), the old order exactly.
+        # ==========================================================================
+        _read_first = first_frame_wait.enabled and st.current_mode != RobotMode.HOMING
+        if _read_first:
+            _bus_silent = (st.current_mode == RobotMode.FLASHING)
+            _can_sent_prev = _can_sent_now       # this read collects the replies to the LAST dispatch's commands
+            _can_read()
+            _measure()
 
         # ==========================================================================
         # ZMQ Check for new commands and send confirmations
@@ -2242,6 +2494,11 @@ def main():
         _profile_last = _profile_mark(_profile_last, "mode_state")
 
 
+        if _read_first:
+            # Option B: the safety monitor + the error pass BEFORE dispatch (user, 2026-10-12) — a trip acts on this
+            # tick's commands; the RTI handler's own keys (raised once its controlled stop is at rest) a tick later.
+            _check_safety()
+
         # ==========================================================================
         # Mode dispatch — each handler sends its own CAN commands
         # ==========================================================================
@@ -2322,63 +2579,8 @@ def main():
         _profile_last = _profile_mark(_profile_last, "secondary_send")
 
 
-        # ==========================================================================
-        # Mainloop CAN receive and fill queues
-        # ==========================================================================
-        if _bus_silent:
-            # Someone else owns the bus. Drop everything on the floor rather than
-            # decoding it — flash stream frames alias onto real motor node IDs.
-            drain_can_discard(communication1)
-        else:
-            Hall_index, additional_pin2, Edge_detect, st.received_ids, st.latest_commands_id = receive_and_process_can_messages(
-                communication1, Motor, Motor_data, Gripper_data,
-                Motor_temperature_data, Motor_voltage_data,
-                Motor_errors_data, Motor_info_data, Motor_Kt_data,
-                joint_num, active_CAN_gripper,
-                _tick_now,
-                st.received_ids, st.latest_commands_id,
-                node_error_bits=node_error_bits,
-                frame_age_out=_can_age_buf,
-                data_reply_count_out=_can_reply_buf,
-            )
-        can_reply_monitor.step(_can_reply_buf, _tick_now, _can_sent_prev and not _bus_silent)
-        _can_sent_prev = _can_sent_now
-        # [0]=worst, [1]=best age among the frames read this tick. Both published: the SPREAD is
-        # what tells a real backlog (min ~= max, both large) from a single stale frame class
-        # (min small, max large).
-        shared_data.rti["can_frame_age"][0] = _can_age_buf[0]
-        shared_data.rti["can_frame_age_min"][0] = _can_age_buf[1]
-        if _can_age_buf[0] > shared_data.rti["can_frame_age_peak"][0]:
-            shared_data.rti["can_frame_age_peak"][0] = _can_age_buf[0]
-        shared_data.motor["HALL_INDEX"][0] = Hall_index
-        shared_data.rti["received_ids"][:] = st.received_ids[:] #Update the shared memory
-        shared_data.rti["latest_commands_id"][:] = st.latest_commands_id[:]  #Update the shared memory
-        # Live per-node fault bit (mutated in place at the CAN decode) — arm joints + gripper.
-        shared_data.rti["node_error_bits"][:] = node_error_bits[:]
-
-        st.received_ids[:]       = 0   # reset in-place — no allocation
-        st.latest_commands_id[:] = -1  # reset in-place — no allocation
-        _profile_last = _profile_mark(_profile_last, "can_receive_process")
-
-        # ==========================================================================
-        # CAN connection Safety and debug stuff
-        # ==========================================================================
-        # Skipped while the bus is handed over: nodes are silent BY DESIGN in
-        # FLASHING, so freshness counting would latch CAN_node_connection_error on
-        # every joint within error_threshold ticks, force ACTIVE_ERROR, and kick us
-        # straight back out of the mode. The counters are re-based on exit — see the
-        # FLASHING teardown in the mode-change block above.
-        if not _bus_silent:
-            update_can_connection_status(
-                Motor_data=Motor_data,
-                Motor=Motor,
-                shared_data=shared_data,
-                joint_num=joint_num,
-                active_CAN_gripper=active_CAN_gripper,
-                warning_threshold = 10,
-                error_threshold = 50, #Number of loop ticks
-            )
-        _profile_last = _profile_mark(_profile_last, "can_connection_status")
+        if not _read_first:
+            _can_read()
 
         # ==========================================================================
         # Motor reconnect config reload — see communication/can_message_handlers.py
@@ -2414,111 +2616,34 @@ def main():
             )
         _profile_last = _profile_mark(_profile_last, "motor_reconnect")
 
-        # ==========================================================================
-        # Fill the latest data shared arrays (Motor level)
-        #
-        # ⚠️ These next three calls are an ORDERED PIPELINE — do not reorder them:
-        #   motor[] (here) -> joint[]+tcp[] (reads motor[]) -> Joint_data append (feeds
-        #   the accel/jerk finite differences with THIS tick's values, so it must come
-        #   last or [-1] stops being the previous tick).
-        # Reordering breaks them silently — stale-by-one-tick data, no exception.
-        # See data/update_shared_data.py's module docstring.
-        # ==========================================================================
-        update_motor_and_gripper_data(
-            shared_data=shared_data,
-            Motor_data=Motor_data,
-            Motor_temperature_data=Motor_temperature_data,
-            Motor_voltage_data=Motor_voltage_data,
-            Motor_info_data=Motor_info_data,
-            Motor_errors_data=Motor_errors_data,
-            Motor_Kt_data=Motor_Kt_data,
-            Gripper_data=Gripper_data,
-            motor_error_bytes=motor_error_bytes,
-            joint_num=joint_num,
-            active_CAN_gripper=active_CAN_gripper,
-            gripper_kt=float(gripper_kt),
-            gripper_speed_bank=st.filter_banks['gripper_speed'],
-        )
-        _profile_last = _profile_mark(_profile_last, "motor_gripper_shared")
-
-        # ==========================================================================
-        # Fill the latest data shared arrays (Joint + TCP level) — via update_shared_data.py
-        # ==========================================================================
-        update_joint_and_tcp_data(
-            shared_data=shared_data,
-            Joint=Joint,
-            Joint_data=Joint_data,
-            filter_banks=st.filter_banks,
-            joint_num=joint_num,
-            delta_t=delta_t,
-            gear_ratio=gear_ratio,
-            gear_efficiency=gear_efficiency,
-            motor_kt=motor_kt,
-            motor_signs=motor_signs,
-            robot=robot,
-            jacobian_out=tcp_jacobian,
-        )
-        _profile_last = _profile_mark(_profile_last, "joint_tcp_shared")
-
-        # ==========================================================================
-        # Fill queues for joint + TCP level
-        # ========================================================================== 
-        process_joint_data(Joint_data,
-                           shared_data.joint['joint_position'],
-                           shared_data.joint['joint_speed'],
-                           shared_data.joint['joint_torque'],
-                           shared_data.joint['joint_acceleration'],
-                           shared_data.joint['joint_jerk'],
-                           shared_data.joint['joint_speed_filtered'],
-                           shared_data.joint['joint_torque_filtered'],
-                           shared_data.joint['joint_acceleration_filtered'],
-                           shared_data.joint['joint_jerk_filtered'],
-                           shared_data.tcp['robot_pose'],
-                           shared_data.tcp['robot_pose_matrix'],
-                           shared_data.tcp['robot_pose_quaternion'],
-                           shared_data.tcp['TCP_speed'],
-                           shared_data.tcp['torque_external'],
-                           shared_data.tcp['force_external'],
-                           shared_data.tcp['TCP_speed_filtered'],
-                           shared_data.tcp['TCP_acceleration_raw'],
-                           shared_data.tcp['TCP_acceleration_filtered'],
-                           shared_data.tcp['force_external_tool'],
-                           shared_data.joint['joint_position_commanded'],
-                           shared_data.joint['joint_speed_commanded'],
-                           shared_data.joint['joint_acceleration_commanded'],
-                           shared_data.joint['joint_torque_commanded'],
-                           shared_data.tcp['TCP_pose_commanded'],
-                           shared_data.tcp['TCP_speed_commanded'],
-                           shared_data.joint['joint_position_target'],
-                           shared_data.joint['joint_speed_target'],
-                           shared_data.joint['joint_acceleration_target'],
-                           shared_data.joint['joint_torque_target'],
-                           shared_data.tcp['TCP_pose_target'],
-                           shared_data.tcp['TCP_speed_target'],
-                           time.perf_counter(),
-                           st.loop_execution_time,
-                           _tick_now,
-                           motor_error_bytes,
-                           # RTI link diagnostics — read from shared memory rather than the
-                           # handler so the value is whatever was published this tick, and so
-                           # this call site does not care which mode is active. All zero
-                           # outside RTI mode (RTI.py zeroes them at startup and on disconnect).
-                           # inertia / Coriolis feedforward added this tick (0 when off; mode_dispatch._add_dynamics_ff)
-                           torque_inertia=shared_data.joint['joint_inertia_torque'],
-                           torque_coriolis=shared_data.joint['joint_coriolis_torque'],
-                           rti_seq=shared_data.rti["rti_seq_rx_last"][0],
-                           rti_ok=shared_data.rti["control_success_rate"][0],
-                           rti_miss=shared_data.rti["rti_consecutive_misses"][0],
-                           rti_state=shared_data.rti["rti_substate"][0],
-                           # .value, not str(): RobotMode is a (str, Enum), and str() on it
-                           # yields "RobotMode.IDLE" rather than the bare name the PC expects.
-                           mode=getattr(st.current_mode, "value", st.current_mode),
-                           # MEASURED period, not delta_t — see the tag registry for why.
-                           period_ms=shared_data.rti["loop_period"][0] * 1e3,
-                           # when this tick's CAN read ran (CLOCK_REALTIME, the clock candump stamps frames with)
-                           can_read_t=_can_age_buf[2],
-                        )
-        _profile_last = _profile_mark(_profile_last, "joint_history")
+        if _read_first:
+            # Option B: the history entry was appended at the tick's start (so dispatch's RTI state packet carried
+            # this tick's measurement); now it gets this tick's commanded / target values — the old pairing.
+            refresh_dispatch_fields(
+                Joint_data[-1],
+                shared_data.joint['joint_position_commanded'],
+                shared_data.joint['joint_speed_commanded'],
+                shared_data.joint['joint_acceleration_commanded'],
+                shared_data.joint['joint_torque_commanded'],
+                shared_data.tcp['TCP_pose_commanded'],
+                shared_data.tcp['TCP_speed_commanded'],
+                shared_data.joint['joint_position_target'],
+                shared_data.joint['joint_speed_target'],
+                shared_data.joint['joint_acceleration_target'],
+                shared_data.joint['joint_torque_target'],
+                shared_data.tcp['TCP_pose_target'],
+                shared_data.tcp['TCP_speed_target'],
+                shared_data.joint['joint_inertia_torque'],
+                shared_data.joint['joint_coriolis_torque'],
+                shared_data.rti["rti_seq_rx_last"][0],
+                shared_data.rti["control_success_rate"][0],
+                shared_data.rti["rti_consecutive_misses"][0],
+                shared_data.rti["rti_substate"][0],
+                getattr(st.current_mode, "value", st.current_mode),
+            )
+            _profile_last = _profile_mark(_profile_last, "joint_history_refresh")
+        else:
+            _measure()
 
         if active_CAN_gripper:
             process_gripper_joint_data(
@@ -2537,57 +2662,8 @@ def main():
 
 
 
-        # ==========================================================================
-        # Error checking — latched: each error is logged once when it appears and
-        # stays latched until the user clears it. See utility/error_checks.py.
-        # ==========================================================================
-        # EXEC control-link watchdog: has command_executor's heartbeat stalled while EXEC motion
-        # is in flight? Gated on EXEC + buffered samples so a dead/idle executor (nothing moving)
-        # is never tripped — only a control link lost mid-motion. The heartbeat comes off the
-        # executor's dedicated thread, so a long TOPPRA solve does NOT look like death.
-        _exec_link_lost = _exec_link_watchdog.update(
-            heartbeat=float(shared_data.rti["exec_heartbeat"][0]),
-            tick=int(_tick_now),
-            in_exec=(st.current_mode == RobotMode.EXEC),
-            samples_remaining=float(shared_data.rti["exec_samples_remaining"][0]),
-        )
-
-        # RT loop health: LOOP_DEGRADED (warning, self-clearing) and LOOP_CRITICAL (hard,
-        # latching → DISABLED + hold). Fed p99, so a slow burst only warns; critical = a sustained
-        # loss (p99 > 1.5x for 1 s) or ONE stalled tick (> 3x). See error_checks.LOOP_ERROR_*.
-        _loop_degraded, _loop_critical = _loop_monitor.update(
-            p99_period=float(shared_data.rti["p99_loop_period"][0]),
-            tick=int(_tick_now),
-            period=float(shared_data.rti["loop_period"][0]),
-        )
-
-        # Safety monitor BEFORE the error pass, so a trip latches — and disables the robot — this tick.
-        _monitor_errors = safety_monitor.step(st.current_mode)
-        _profile_last = _profile_mark(_profile_last, "safety_monitor")
-
-        st.clear_error_countdown, st.latched_errors, st.error_metadata, st.current_mode = process_errors_tick(
-            shared_data, Motor, Motor_errors_data, joint_num,
-            st.clear_error_countdown, st.latched_errors, st.error_metadata,
-            active_CAN_gripper, st.current_mode, homing_ctrl,
-            check_estop_active(),
-            Gripper_data=Gripper_data,
-            exec_link_lost=_exec_link_lost,
-            # RTI command watchdog. A KEY, not a direct error_active write — this
-            # function owns that flag and recomputes it every tick.
-            rti_link_lost=rti_handler.take_link_lost(),
-            # The strict command checks' keys (J{i}:RTI_*_LIMIT), raised once the controlled stop is at rest.
-            rti_errors=rti_handler.take_command_errors(),
-            # J{i}:CAN_REPLY_MISSED_WARNING (warn-only) — a joint's replies missing RTI's read too often.
-            can_warnings=can_reply_monitor.warnings,
-            loop_degraded=_loop_degraded,
-            loop_critical=_loop_critical,
-            monitor_errors=_monitor_errors,
-            monitor_warnings=safety_monitor.warnings,
-            on_hard_error=_incident_hook,
-            # The settle after the start-up clear: a driver reports the LAST run's fault until the clear lands.
-            driver_faults=_tick_now > CLEAR_ERROR_SETTLE_TICKS,
-        )
-        _profile_last = _profile_mark(_profile_last, "error_checks")
+        if not _read_first:
+            _check_safety()
 
         # ==========================================================================
         # Send UDP data — recipe-driven, switchable configuration via .xml

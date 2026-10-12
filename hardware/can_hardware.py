@@ -264,7 +264,8 @@ def place_can_path(can_core, general_cores, interface="can0", sys_root="/sys", p
 
 
 # ==========================================================================
-# Wait for the tick's first frame to leave (TODO/can_tx_timing_plan.md option A, 2026-10-12) — OFF at start
+# Wait for the tick's first frame to leave (TODO/can_tx_timing_plan.md option A, 2026-10-12; since then part of
+# option B, read first / send early, §9) — OFF at start
 # ==========================================================================
 # RTI's first command frame of a tick is loaded into the CAN chip by a kernel worker on RTI's own core,
 # which runs only when RTI sleeps: the tick's commands leave ~1.5 ms after they were computed, and the
@@ -290,8 +291,9 @@ def open_first_frame_socket(interface="can0", can_ids=FIRST_FRAME_IDS):
 
 
 class FirstFrameWait:
-    """Off until set_enabled(True) (RTI's `can_send_wait:1`). Per tick: prepare() before the commands are queued,
-    then wait() right after — or skip() on a tick that queued none (HOMING / FLASHING)."""
+    """Off until set_enabled(True) (RTI's `can_read_first:1`, option B — whose switch this object's state is). Per
+    tick: prepare() before the commands are queued, then wait() right after — or skip() on a tick that queued none
+    (HOMING / FLASHING)."""
 
     DRAIN_MAX = 512
 
@@ -318,17 +320,17 @@ class FirstFrameWait:
                 self._sock.settimeout(self.timeout_s)
             except OSError as e:
                 self._sock = None
-                logger.error(f"[CAN] send-wait: cannot open a socket on {self.interface}: {e} — stays OFF")
+                logger.error(f"[CAN] read-first: cannot open a socket on {self.interface}: {e} — stays OFF (the old tick order)")
                 return False
             self.waits = self.timeouts = 0
             self.wait_sum = self.wait_max = 0.0
             self.enabled = True
-            logger.info(f"[CAN] send-wait ON: RTI waits (up to {self.timeout_s * 1e3:.1f} ms) for its first frame "
-                        f"to leave each tick (TODO/can_tx_timing_plan.md option A)")
+            logger.info(f"[CAN] read-first ON: RTI reads CAN at the start of each tick and waits (up to "
+                        f"{self.timeout_s * 1e3:.1f} ms) for its first frame to leave (TODO/can_tx_timing_plan.md option B)")
             return True
         self.enabled = False
         mean = self.wait_sum / self.waits * 1e3 if self.waits else 0.0
-        logger.info(f"[CAN] send-wait OFF after {self.waits} waits: mean {mean:.3f} ms, max {self.wait_max * 1e3:.3f} ms, "
+        logger.info(f"[CAN] read-first OFF after {self.waits} waits: mean {mean:.3f} ms, max {self.wait_max * 1e3:.3f} ms, "
                     f"{self.timeouts} timed out")
         try:
             self._sock.close()

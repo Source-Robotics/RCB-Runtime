@@ -54,6 +54,7 @@ the XML's), and the XML gains are ALWAYS put back at the end, whatever happens. 
     python3 api_tests/66_tracking.py --go --sets new --joints 4,5,6 --speeds 30,60
     python3 api_tests/66_tracking.py --go --sets off,inertia,inertia+coriolis,off      # the feedforward A/B
     python3 api_tests/66_tracking.py --go --sets trapezoid,ruckig,trapezoid           # the profile A/B
+    python3 api_tests/66_tracking.py --go --sets ruckig,ruckig_rf,ruckig         # option B A/B (read first, send early)
     python3 api_tests/66_tracking.py --compare temp_data/tracking/A.json temp_data/tracking/B.json
     python3 api_tests/66_tracking.py --reanalyse temp_data/tracking/A.json   # recompute a saved run (no robot)
 
@@ -135,6 +136,12 @@ def apply_set(robot, name, gain_sets):
     apply_gains(robot, gain_sets["new"])
     set_comp(robot, *(COMP_SETS[name] if name in COMP_SETS else (True, True)))
     return False
+
+
+def split_rf(name):
+    """'ruckig_rf' -> ('ruckig', True): any set with the suffix '_rf' runs with option B ON — RTI reads CAN first and
+    sends early (TODO/can_tx_timing_plan.md §9, `set_can_read_first`); without it, the old tick order."""
+    return (name[:-3], True) if name.endswith("_rf") else (name, False)
 
 
 def move_options(set_name, speed):
@@ -525,7 +532,8 @@ def run_session(args, cfg, gain_sets, set_order):
     robot = RobotClient(sync=False)
     robot.connect(args.host, args.port)
     capture, prev_recipe, claimed, gains_changed = None, None, False, False
-    comp_used = any(n in COMP_SETS or n in PROFILE_SETS for n in set_order)
+    comp_used = any(split_rf(n)[0] in COMP_SETS or split_rf(n)[0] in PROFILE_SETS for n in set_order)
+    rf_used = any(split_rf(n)[1] for n in set_order)
     comp0, applied = (False, False), False
     records, ok = [], True
     names = label_sets(set_order)
@@ -542,7 +550,11 @@ def run_session(args, cfg, gain_sets, set_order):
         print(f"Plan per set: {len(moves)} moves at {speeds} % of the EXEC limits, {HOLD_S} s hold after each; "
               f"sets in order: {names}.")
         print("Sets (the current and velocity LIMITS stay the XML's):")
-        for nm in dict.fromkeys(set_order):
+        for nm_full in dict.fromkeys(set_order):
+            nm, rf = split_rf(nm_full)
+            if rf:
+                print(f"  {nm_full:16s} = '{nm}' with option B ON (RTI reads CAN first, sends early)")
+                continue
             if nm in PROFILE_SETS:
                 print(f"  {nm:16s} XML gains, inertia + Coriolis feedforward ON, every move planned with profile='{nm}'")
             elif nm in COMP_SETS:
@@ -586,9 +598,12 @@ def run_session(args, cfg, gain_sets, set_order):
         if capture.last_tick() is None:
             print("No telemetry with the tracking fields is arriving on UDP 30003. Nothing moved.")
             return 2, None
-        for set_name, label in zip(set_order, names):
+        for set_full, label in zip(set_order, names):
+            set_name, rf = split_rf(set_full)
             print(f"\n=== set '{label}' ===")
             applied = True
+            if rf_used:
+                robot.set_can_read_first(rf)              # option B for this set only (OFF at every RTI start)
             gains_changed = apply_set(robot, set_name, gain_sets) or gains_changed
             time.sleep(1.0)                               # let the hold settle on the new setup
             for i, mv in enumerate(moves, 1):
@@ -613,6 +628,11 @@ def run_session(args, cfg, gain_sets, set_order):
         except Exception:
             pass
     finally:
+        if rf_used:
+            try:
+                robot.set_can_read_first(False)
+            except Exception as exc:
+                print(f"!!! could not switch read-first off ({exc}) — it goes off at the next RTI start")
         if gains_changed:
             try:
                 apply_gains(robot, gain_sets["new"])
@@ -654,7 +674,8 @@ def main():
     ap.add_argument("--selftest", action="store_true", help="check the analysis on synthetic data and exit")
     ap.add_argument("--sets", default="new,old,new",
                     help="sets in order: gains new / old, feedforward off / inertia / coriolis / inertia+coriolis, "
-                         "or profile trapezoid / ruckig / s_curve / quintic / toppra")
+                         "or profile trapezoid / ruckig / s_curve / quintic / toppra; any + '_rf': option B ON "
+                         "(read first, send early)")
     ap.add_argument("--joints", default="1,2,3,4,5,6", help="1-based joints to move")
     ap.add_argument("--speeds", default=",".join(f"{s:g}" for s in DEFAULT_SPEEDS), help="percent of the EXEC limits")
     ap.add_argument("--amp-scale", type=float, default=1.0, help="scale the default amplitudes (<= 1 to be gentler)")
@@ -687,8 +708,10 @@ def main():
     cfg = xp.load_full_robot_config(str(sysc["robot_xml_path"]), grippers_dir=GRIPPERS_DIR,
                                     active_gripper=sysc["active_gripper"])
     gain_sets = read_gain_sets(str(sysc["robot_xml_path"]))
-    if any(s not in gain_sets and s not in COMP_SETS and s not in PROFILE_SETS for s in set_order):
-        print(f"Unknown set in {set_order}; known: {list(gain_sets) + list(COMP_SETS) + list(PROFILE_SETS)}.")
+    if any(split_rf(s)[0] not in gain_sets and split_rf(s)[0] not in COMP_SETS and split_rf(s)[0] not in PROFILE_SETS
+           for s in set_order):
+        print(f"Unknown set in {set_order}; known: {list(gain_sets) + list(COMP_SETS) + list(PROFILE_SETS)} (each "
+              f"may end in '_rf': option B ON for that set).")
         return 2
     rc, got = run_session(args, cfg, gain_sets, set_order)
     if got is None:

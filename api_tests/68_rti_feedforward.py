@@ -61,6 +61,7 @@ so put the arm where J1 has room (the start pose of the other tests: J1 90 deg).
     python3 api_tests/68_rti_feedforward.py --go                 # ~4 min, J1
     python3 api_tests/68_rti_feedforward.py --go --senders soft50,wander --sets off,stream
     python3 api_tests/68_rti_feedforward.py --go --senders hard250_ts,hard250_rc,wander,wander_ts --sets off,stream,off
+    python3 api_tests/68_rti_feedforward.py --go --senders hard250_ts,soft50 --sets stream,stream_rf,stream   # option B
     python3 api_tests/68_rti_feedforward.py --reanalyse temp_data/rti_ff/<time>.json   # with the arm DISABLED
 
 As api_tests/66: the RAW packets are saved the moment the run ends; with the arm still ENABLED the analysis waits
@@ -89,7 +90,12 @@ SENDERS = {                       # name: (lo Hz, hi Hz, soft, send times, robot
     "wander_ts": (50.0, 60.0, True, True, False),
     "soft10": (10.0, 10.0, True, False, False),
 }
-SETS = ("old", "off", "stream")
+SETS = ("old", "off", "stream")   # each may end in '_rf': option B ON for that block (read first, send early)
+
+
+def split_rf(name):
+    """'stream_rf' -> ('stream', True): option B (TODO/can_tx_timing_plan.md §9, `set_can_read_first`) for the block."""
+    return (name[:-3], True) if name.endswith("_rf") else (name, False)
 SOFT_MIN_DURATION = 1.5           # motion/rti_handler.SOFT_MIN_DURATION_DEFAULT (what SOFT_RTI's contract sets)
 SAFE_JOINTS1 = (1, 4, 5, 6)       # 1-based; the servo tests' rule (api_tests/_servo_common.SAFE_JOINTS)
 CLEARANCE_DEG = 10.0
@@ -268,14 +274,17 @@ def print_report(moves, senders, set_labels, title=""):
                 v = next((m for m in moves if m["joint"] == j and m["sender"] == snd and m["set"] == lab), None)
                 if v is not None:
                     print(f"    {snd:>8s} {lab:>8s}  " + "  ".join(_fmt(v.get(c), nd) for c, nd in cols))
-    base = [lab for lab in set_labels if lab.startswith("off")]
-    others = [lab for lab in set_labels if not lab.startswith("off")]          # old, stream
+    # the reference: the 'off' sets when there are any, else the first set and its repeats ('stream', 'stream2' against
+    # 'stream_rf'); a set's repeats are its label + a number (label_sets), so 'off_rf' is NOT an 'off' set
+    ref = "off" if "off" in set_labels else (set_labels[0] if set_labels else "")
+    base = [lab for lab in set_labels if lab == ref or (lab.startswith(ref) and lab[len(ref):].isdigit())]
+    others = [lab for lab in set_labels if lab not in base]          # old, stream, *_rf
     if base and others:
         for key, what in (("rms_d", "tracking error after the time shift"), ("buzz", "buzz (torque above ~10 Hz)"),
                           ("pid", "torque the drive's own loops added"),
                           ("arm_jerk", "JERKINESS: the arm's speed off its smooth path at 1.5-10 Hz (deg/s)"),
                           ("arm_vhf", "the arm's speed above 10 Hz (deg/s)")):
-            print(f"\n  {what}, per sender, relative to 'off' (mean of the off sets):")
+            print(f"\n  {what}, per sender, relative to '{ref}' (mean of its sets):")
             for j in joints:
                 for snd in senders:
                     offs = [m[key] for m in moves if m["joint"] == j and m["sender"] == snd and m["set"] in base
@@ -289,7 +298,7 @@ def print_report(moves, senders, set_labels, title=""):
                                   and m.get(key) is not None), None)
                         if v is not None and b > 0:
                             cells.append(f"{lab} {v / b:.2f}x")
-                    print(f"    J{j} {snd:>8s}: off {b:.4f}   " + "   ".join(cells))
+                    print(f"    J{j} {snd:>8s}: {ref} {b:.4f}   " + "   ".join(cells))
         if not any(m["ff"] for m in moves if m["set"].startswith("stream") and m.get("ff") is not None):
             print("\n  !!! The 'stream' sets added NO feedforward — the running RTI does not know rti_set_dynamics_ff "
                   "(restart the service), or the inertia switch was off.")
@@ -495,14 +504,18 @@ def run_session(args, cfg, senders, set_order):
             return 2, None
         robot.set_inertia_comp(True)
         robot.set_coriolis_comp(True)
+        rf_used = any(split_rf(n)[1] for n in set_order)
         for snd in senders:
             lo, hi, soft, stamps, rclock = SENDERS[snd]
-            for set_name, label in zip(set_order, labels):
+            for set_full, label in zip(set_order, labels):
+                set_name, rf = split_rf(set_full)
                 print(f"  {snd:>8s} {label:>7s} ... ", end="", flush=True)
                 rng = random.Random(args.seed)
                 rti = RTIClient(robot, clock="robot" if rclock else "pc", timestamps=stamps)
                 want = "SOFT_RTI" if soft else "RTI"
                 try:
+                    if rf_used:
+                        robot.set_can_read_first(rf)          # option B for this block only (switched in IDLE)
                     rti.connect(rate_hz=lo if soft else None)
                     try:
                         robot.wait(lambda st_: st_.get("mode") == want, 3.0, f"mode {want}")
@@ -554,6 +567,11 @@ def run_session(args, cfg, senders, set_order):
         except Exception:
             pass
     finally:
+        if any(split_rf(n)[1] for n in set_order):
+            try:
+                robot.set_can_read_first(False)
+            except Exception as exc:
+                print(f"!!! could not switch read-first off ({exc}) — it goes off at the next RTI start")
         try:
             robot.rti_set_dynamics_ff("off")
             sc.clear_config(robot)
@@ -611,7 +629,7 @@ def main():
     ap.add_argument("--go", action="store_true", help="actually move the arm")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--senders", default=",".join(SENDERS), help=f"in order, of {list(SENDERS)}")
-    ap.add_argument("--sets", default="old,off,stream,off", help=f"in order, of {list(SETS)}")
+    ap.add_argument("--sets", default="old,off,stream,off", help=f"in order, of {list(SETS)}; any + '_rf': option B ON")
     ap.add_argument("--joints", default="1", help=f"1-based, of {SAFE_JOINTS1}")
     ap.add_argument("--amp", type=float, default=15.0, help="deg, around where the arm is (at most 20)")
     ap.add_argument("--period", type=float, default=1.5, help="s (at least 1.0)")
@@ -629,7 +647,7 @@ def main():
     senders = [s.strip() for s in args.senders.split(",") if s.strip()]
     set_order = [s.strip() for s in args.sets.split(",") if s.strip()]
     joints1 = [int(x) for x in args.joints.split(",") if x.strip()]
-    bad = [s for s in senders if s not in SENDERS] + [s for s in set_order if s not in SETS] \
+    bad = [s for s in senders if s not in SENDERS] + [s for s in set_order if split_rf(s)[0] not in SETS] \
         + [f"J{j}" for j in joints1 if j not in SAFE_JOINTS1]
     if bad or args.amp > 20.0 or args.period < 1.0 or args.seconds < 2.5 * 1.0:
         print(f"Refused: unknown / not allowed {bad}, or --amp > 20, --period < 1, --seconds < 2.5. Nothing moved.")

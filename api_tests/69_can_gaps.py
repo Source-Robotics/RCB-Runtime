@@ -20,8 +20,8 @@ anything (user, 2026-10-12): this records
                 buffers were full — a frame lost on OUR side), bus errors, error-passive, bus-off, TX errors / drops;
                 and the SPI / CAN-chip interrupt counts; a snapshot of the SPI / CAN kernel threads (class, priority, core)
 
-around two kinds of J1 motion, each twice, with and without the CAN send-wait (option A; see DEFAULT_ORDER), after
-3 s of IDLE as a baseline:
+around two kinds of J1 motion, each twice, in the old tick order and with option B (`_rf` blocks: RTI reads CAN first
+and sends early, TODO/can_tx_timing_plan.md §9; see DEFAULT_ORDER), after 3 s of IDLE as a baseline:
 
   passthrough   hard RTI, 250 Hz, with send times: the pass-through (the hard default since 2026-10-11; the old planner
                 block — 101-byte packets — is gone: hard RTI refuses a position without a send time since 2026-10-12)
@@ -40,6 +40,8 @@ WHAT IS REPORTED, per block:
                 the waiting frames come in a bunch)
   timing        J1's command echo and the reply RTI used, relative to RTI's clock reading after its read (ms): whether
                 our frames go out while RTI still runs (negative) or only after it (positive)
+  loop delay    J1's reply -> the command computed from it (its echo), ms: in the old order the reply read in tick k
+                feeds tick k+1's command, with option B tick k's — the delay the control loop adds
   counters      what changed during the block (RX overruns above all)
 and every stale run on its own line: when, how long, how late the reply that would have refreshed J1 came, when its
 command went out, the drive's response time, missing replies, the longest pause inside its tick's exchange, RTI's
@@ -90,8 +92,9 @@ CMD_DATA_PACK_1 = 2               # RTI -> drive (Spectral_BLDC SEND_DATA_PACK_1
 CMD_DATA_PACK_PD = 4              # RTI -> drive (SEND_DATA_PACK_PD_ID)
 RESP_DATA_PACK_1 = 3              # drive -> RTI: position 24 b, speed 24 b, current 16 b, big-endian signed
 JOINT_NODES = 6                   # CAN nodes 0..5 = J1..J6
-KINDS = ("passthrough", "exec", "passthrough_wait", "exec_wait")   # 'planner' (101 bytes) is refused since 2026-10-12
-DEFAULT_ORDER = "passthrough,passthrough_wait,exec,exec_wait,passthrough,passthrough_wait,exec,exec_wait"
+KINDS = ("passthrough", "exec", "passthrough_rf", "exec_rf")   # 'planner' (101 bytes) is refused since 2026-10-12;
+#   '_rf': option B (read first, send early) ON for the block; option A's '_wait' blocks retired 2026-10-12
+DEFAULT_ORDER = "passthrough,passthrough_rf,exec,exec_rf,passthrough,passthrough_rf,exec,exec_rf"
 LOAD_EVERY_S = 2.0                # --load: a Python interpreter (numpy + scipy imports) started this often per block
 IDLE_S = 3.0                      # the baseline before the first block
 AMP_DEG, PERIOD_S, SINE_S = 15.0, 1.5, 8.0     # the RTI blocks: 68's J1 sine
@@ -474,6 +477,15 @@ def analyse(run, d, c):
             if any(g0 - 0.004 < t_run < g1 + 0.004 for g0, g1 in gaps):
                 r["label"] = "candump gap"
         missing_ticks = int(np.sum(np.diff(dd["tick"]) - 1)) if dd["tick"].size > 1 else 0
+        # J1's loop delay: the reply a row read -> the command computed from it. Each row pairs the tick's measurement
+        # with the tick's command in both orders, and the command computed from row k's measurement is row k+1's in
+        # the old order, row k's with option B. Option A's old '_wait' blocks fit neither: not judged.
+        lag = 0 if blk.get("read_first") else 1
+        loop = []
+        if not blk["kind"].endswith("_wait") and dd["tick"].size > lag:
+            k = np.arange(dd["tick"].size - lag)
+            okk = ((dd["tick"][k + lag] - dd["tick"][k]) == lag) & np.isfinite(rx_t[k]) & np.isfinite(tx_t[k + lag])
+            loop = (tx_t[k + lag][okk] - rx_t[k][okk]) * 1e3
         moving_s = float(mov.sum()) * dt
         res = {"name": blk["name"], "kind": blk["kind"], "ok": blk.get("ok", True), "rows": int(dd["tick"].size),
                "fresh": reply_freshness(c, dd["read_t"], dd["tick"], gaps),
@@ -486,6 +498,7 @@ def analyse(run, d, c):
                "period_max_ms": float(np.max(dd["period_ms"])) if dd["tick"].size else np.nan,
                "tx_rel_ms": _stats((tx_t - ts) * 1e3), "rx_rel_ms": _stats((rx_t - ts) * 1e3),
                "matched": int(np.isfinite(tx_t).sum()), "moving_rows": int(mov.sum()),
+               "read_first": bool(blk.get("read_first")), "loop_ms": _stats(loop),
                "can": can_metrics(c, blk["t_start"], blk["t_end"]),
                "read_rel_ms": _stats((dd["read_t"] - ts) * 1e3),
                "candump_gaps": candump_gaps(c, blk["t_start"], blk["t_end"]),
@@ -528,6 +541,10 @@ def print_report(rep, title=""):
               f"{STALL_MS:g} ms {cm['pauses_over']}, host stalls {cm['host_stalls']} | missing {miss} | RX overruns "
               f"{cnt.get('rx_over_errors', '-')}, bus errors {cnt.get('bus_error', '-')}, TX errors "
               f"{cnt.get('tx_errors', '-')}, error-passive {cnt.get('error_passive', '-')}, bus-off {cnt.get('bus_off', '-')}")
+        lp = b.get("loop_ms") or {}
+        if lp.get("n"):
+            print(f"  loop delay (J1's reply -> the command computed from it): {_f(lp.get('med'))} ms median, p99 "
+                  f"{_f(lp.get('p99'))}, max {_f(lp.get('max'))} — {'option B (read first)' if b.get('read_first') else 'old order'}")
         fr = b.get("fresh") or {}
         cg = b.get("candump_gaps") or []
         if cg:
@@ -582,12 +599,15 @@ def print_report(rep, title=""):
 
 
 # ----------------------------------------------------------------------------- self-test
-def _synth(seed=1):
+def _synth(seed=1, read_first=False):
     """A recording with known events, built the way RTI and the bus work: each tick RTI sends its commands, reads what
     arrived, then reads its clock (the telemetry stamp); the commands go out after it and the replies come back
     ~0.23 ms after each; the reply RTI uses at tick k is the newest one that arrived before its read.
     Every 10th tick a temperature poll after the joints, answered 2.5 ms later. Events: tick 199 a fresh reply whose speed and current equal the one before (not stale: the position moved), 300 a host stall (J1's reply and every later frame of that exchange 3 ms late, in a bunch), 600 the
-    whole exchange 2.8 ms late (command late), 900 J1's reply lost, 1100 J1's reply alone 2.8 ms late (drive slow)."""
+    whole exchange 2.8 ms late (command late), 900 J1's reply lost, 1100 J1's reply alone 2.8 ms late (drive slow).
+    read_first: option B's timing — the read 0.1 ms into the tick, the clock reading 0.6, the commands from 1.0 (the old
+    order: 0.4 / 0.9 / 1.5)."""
+    t_read, t_stamp, t_send = (0.0001, 0.0006, 0.0010) if read_first else (0.0004, 0.0009, 0.0015)
     rng = np.random.default_rng(seed)
     dt, n, nodes = 0.004, 1300, 3
     mono0, offset = 5000.0, 1.7e9
@@ -597,7 +617,7 @@ def _synth(seed=1):
     reply = {}                                                    # tick -> (t realtime, pos, speed, current)
     for k in range(n):
         T = mono0 + k * dt + offset
-        base = T + 0.0015
+        base = T + t_send
         delays = [0.0] * (2 * nodes)
         if k == 600:
             delays = [0.0028] * (2 * nodes)
@@ -632,11 +652,11 @@ def _synth(seed=1):
     rt = np.array([g[0] for g in got])
     for k in range(1, n):
         T = mono0 + k * dt
-        i = np.searchsorted(rt, T + offset + 0.0004) - 1             # the read, 0.4 ms into the tick
+        i = np.searchsorted(rt, T + offset + t_read) - 1             # the read
         _, rp, sp, cu = got[i]
         rows["tick"].append(10000 + k)
-        rows["ts"].append(round(T + 0.0009, 6))
-        rows["read_t"].append(T + offset + 0.0004)
+        rows["ts"].append(round(T + t_stamp, 6))
+        rows["read_t"].append(T + offset + t_read)
         rows["exec_ms"].append(round(1.8 + rng.uniform(0, 0.3), 3))
         rows["period_ms"].append(4.0)
         rows["mode"].append("RTI")
@@ -705,6 +725,26 @@ def selftest():
         fr["J1"]["age_ms"])
     chk("RTI's read sits 0.5 ms before its clock reading", abs(blk["read_rel_ms"]["med"] + 0.5) < 0.01,
         blk["read_rel_ms"])
+    chk("loop delay, old order: J1's reply (2.27 ms before the tick) -> the NEXT tick's command (1.5 ms into it) = "
+        "7.77 ms", abs(blk["loop_ms"]["med"] - 7.77) < 0.01 and not blk["read_first"], blk["loop_ms"])
+    lines_b, d_b, off_b, _ = _synth(read_first=True)
+    run_b = {"delta_t": 0.004, "clock_offsets": [off_b], "blocks": [
+        {"name": "synthetic_rf", "kind": "passthrough_rf", "read_first": True, "t_start": -np.inf, "t_end": np.inf,
+         "tick0": 0, "tick1": 10 ** 9}]}
+    blk_b = analyse(run_b, d_b, parse_candump(lines_b))["blocks"][0]
+    chk("loop delay, option B: J1's reply (2.77 ms before the tick) -> the SAME tick's command (1.0 ms into it) = "
+        "3.77 ms", abs(blk_b["loop_ms"]["med"] - 3.77) < 0.01 and blk_b["read_first"], blk_b["loop_ms"])
+    run_x = {"delta_t": 0.004, "clock_offsets": [offset], "blocks": [dict(run["blocks"][0], read_first=True)]}
+    blk_x = analyse(run_x, d, c)["blocks"][0]
+    chk("...a block's order matters: the old-order recording judged as option B pairs each reply with the command of "
+        "its OWN tick (1.5 + 2.27 = 3.77 ms, not 7.77)", abs(blk_x["loop_ms"]["med"] - 3.77) < 0.01, blk_x["loop_ms"])
+    src = open(os.path.abspath(__file__)).read()
+    code = [ln.strip() for ln in src.splitlines()]   # whole code lines: this check's own strings never equal one
+    chk("the session runner records each block's order and switches option B for '_rf' blocks only (on, then off in "
+        "its finally) — the analysis pairs reply and command by it",
+        '"read_first": base != kind}' in code and 'base = kind[:-len("_rf")] if kind.endswith("_rf") else kind' in code
+        and any(ln.startswith("robot.set_can_read_first(True)") for ln in code)
+        and "robot.set_can_read_first(False)" in code)
     r600 = [r for r in blk["runs"] if r["tick"] == 10601][0]
     chk("the late command: 3.4 ms after RTI's clock reading (usual 0.6)", abs(r600["tx_ms"] - 3.4) < 0.01, r600)
     ipj = json.dumps([{"linkinfo": {"info_data": {"state": "ERROR-ACTIVE"}, "info_xstats": {"bus_error": 2}},
@@ -912,14 +952,16 @@ def run_session(args, cfg, order, out_dir):
         run["clock_offsets"].append(clock_offset())
         for name in ["idle"] + [f"{k}_{i + 1}" for i, k in enumerate(order)]:
             kind = name.rsplit("_", 1)[0] if name != "idle" else "idle"
-            base = kind[:-len("_wait")] if kind.endswith("_wait") else kind
+            base = kind[:-len("_rf")] if kind.endswith("_rf") else kind
             blk = {"name": name, "kind": kind, "can_before": read_counters(args.iface), "irq_before": read_irqs(),
-                   "t_start": time.time(), "tick0": newest_tick(capture), "ok": True, "load": bool(args.load)}
+                   "t_start": time.time(), "tick0": newest_tick(capture), "ok": True, "load": bool(args.load),
+                   "read_first": base != kind}
             print(f"  {name:15s} ... ", end="", flush=True)
             load = Load(args.load_cores) if args.load and kind != "idle" else None
             try:
                 if base != kind:
-                    robot.set_can_send_wait(True)          # TODO/can_tx_timing_plan.md option A, this block only
+                    robot.set_can_read_first(True)         # TODO/can_tx_timing_plan.md option B, this block only
+                    time.sleep(0.2)
                 if kind == "idle":
                     time.sleep(IDLE_S)
                 elif base == "exec":
@@ -939,9 +981,9 @@ def run_session(args, cfg, order, out_dir):
                     load.stop()
                 if base != kind:
                     try:
-                        robot.set_can_send_wait(False)
+                        robot.set_can_read_first(False)
                     except Exception as exc:
-                        print(f"!!! could not switch the send-wait off ({exc}) — it goes off at the next RTI start")
+                        print(f"!!! could not switch read-first off ({exc}) — it goes off at the next RTI start")
             blk.update({"t_end": time.time(), "tick1": newest_tick(capture), "can_after": read_counters(args.iface),
                         "irq_after": read_irqs()})
             run["blocks"].append(blk)
@@ -1059,8 +1101,8 @@ def main():
     print(f"Plan: {IDLE_S:g} s IDLE (baseline), then {order}: RTI blocks J1 sine +/-{AMP_DEG:g} deg, {PERIOD_S:g} s period "
           f"(~63 deg/s), {SINE_S:g} s each; EXEC blocks {EXEC_MOVES} moves of {2 * AMP_DEG:g} deg at {EXEC_SPEED:g} % "
           f"(~57 deg/s). candump on {args.iface} (read-only) + RTI telemetry ({RECIPE}) the whole time, ~{total / 60:.1f} min."
-          + (" '_wait' blocks: RTI's send-wait ON (TODO/can_tx_timing_plan.md option A)." if any(
-              k.endswith("_wait") for k in order) else "")
+          + (" '_rf' blocks: option B ON — RTI reads CAN first, sends early (TODO/can_tx_timing_plan.md §9)." if any(
+              k.endswith("_rf") for k in order) else "")
           + (f" --load: a Python interpreter started every {LOAD_EVERY_S:g} s in each block, on cores "
              f"{args.load_cores}." if args.load else ""))
     if not args.go:

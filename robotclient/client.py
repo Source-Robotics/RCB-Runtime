@@ -330,12 +330,13 @@ class RobotClient:
         (ON as shipped); status() reports "inertia_comp". Separate from set_coriolis_comp and set_gravity_comp."""
         return self._immediate("inertia_comp", [1 if enabled else 0])
 
-    def set_can_send_wait(self, enabled: bool) -> Any:
-        """EXPERIMENTAL, OFF at every RTI start (TODO/can_tx_timing_plan.md option A, 2026-10-12): after queueing a
-        tick's motor commands RTI sleeps until its first CAN frame has actually left (at most 1 ms), so the joints'
-        command / reply exchange runs during the tick instead of only while RTI sleeps. For measuring it
-        (api_tests/69_can_gaps.py); RTI.log reports the waits when it is switched off."""
-        return self._immediate("can_send_wait", [1 if enabled else 0])
+    def set_can_read_first(self, enabled: bool) -> Any:
+        """EXPERIMENTAL, OFF at every RTI start (TODO/can_tx_timing_plan.md option B, 2026-10-12): RTI reads the
+        joints' CAN replies at the START of each tick and computes that tick's commands from them, then waits until
+        its first command frame has left (at most 1 ms) — ~4 ms less from a drive's measurement to the command
+        computed from it (estimated; measured with api_tests/69 / 66 / 68). Homing keeps the old order. RTI.log
+        reports the waits when it is switched off."""
+        return self._immediate("can_read_first", [1 if enabled else 0])
 
     def set_coriolis_comp(self, enabled: bool) -> Any:
         """Robot-wide CORIOLIS / centripetal feedforward: the torque C(q, qd)·qd the joints exert on each other when

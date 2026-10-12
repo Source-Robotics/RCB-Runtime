@@ -1399,7 +1399,7 @@ IMMEDIATE_HANDLERS = {
     "gravity_comp":     _forward_fmt("gravity_comp", "gravity_comp", 1),
     "friction_comp":    _forward_fmt("friction_comp", "friction_comp", 1),
     "inertia_comp":     _forward_fmt("inertia_comp", "inertia_comp", 1),
-    "can_send_wait":    _forward_fmt("can_send_wait", "can_send_wait", 1),   # TODO/can_tx_timing_plan.md option A
+    "can_read_first":   _forward_fmt("can_read_first", "can_read_first", 1),   # TODO/can_tx_timing_plan.md option B
     "coriolis_comp":    _forward_fmt("coriolis_comp", "coriolis_comp", 1),
     "set_pid_gains":    _handle_set_pid_gains,
     # --- RTI mode handshake (TODO/RTI_mode_plan.md §4d). The UDP setpoint stream

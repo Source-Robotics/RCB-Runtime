@@ -285,6 +285,40 @@ def process_joint_data(Joint_data: deque, position: np.ndarray, speed: np.ndarra
     })
 
 
+def refresh_dispatch_fields(entry: dict, position_commanded: np.ndarray, speed_commanded: np.ndarray,
+                            acceleration_commanded: np.ndarray, torque_commanded: np.ndarray,
+                            TCP_pose_commanded: np.ndarray, TCP_speed_commanded: np.ndarray,
+                            position_target: np.ndarray, speed_target: np.ndarray, acceleration_target: np.ndarray,
+                            torque_target: np.ndarray, TCP_pose_target: np.ndarray, TCP_speed_target: np.ndarray,
+                            torque_inertia: np.ndarray, torque_coriolis: np.ndarray,
+                            rti_seq: float, rti_ok: float, rti_miss: float, rti_state: float, mode: str) -> None:
+    """Overwrite, in place, the fields of a Joint_data entry that DISPATCH produces (TODO/can_tx_timing_plan.md §9,
+    option B, 2026-10-12). With the CAN read at the start of the tick the entry is appended BEFORE dispatch — so the
+    RTI state packet built in dispatch carries this tick's measurement — and then gets this tick's commanded / target
+    values, feedforward torques, RTI link diagnostics and mode here, after dispatch: the same pairing as the old order
+    appends in one go (this tick's measurement with this tick's commands). Every field process_joint_data takes from
+    something dispatch writes, and nothing else. Hot path: copies into the entry's own arrays, nothing allocated."""
+    np.copyto(entry["j_pc"], position_commanded)
+    np.copyto(entry["j_sc"], speed_commanded)
+    np.copyto(entry["j_ac"], acceleration_commanded)
+    np.copyto(entry["j_tc"], torque_commanded)
+    np.copyto(entry["TCP_p_c"], TCP_pose_commanded)
+    np.copyto(entry["TCP_s_c"], TCP_speed_commanded)
+    np.copyto(entry["j_pt"], position_target)
+    np.copyto(entry["j_st"], speed_target)
+    np.copyto(entry["j_at"], acceleration_target)
+    np.copyto(entry["j_tt"], torque_target)
+    np.copyto(entry["j_t_inertia"], torque_inertia)
+    np.copyto(entry["j_t_coriolis"], torque_coriolis)
+    np.copyto(entry["TCP_p_t"], TCP_pose_target)
+    np.copyto(entry["TCP_s_t"], TCP_speed_target)
+    entry["rti_seq"] = rti_seq
+    entry["rti_ok"] = rti_ok
+    entry["rti_miss"] = rti_miss
+    entry["rti_state"] = rti_state
+    entry["mode"] = mode
+
+
 def process_gripper_joint_data(Gripper_data: dict[int, deque], gripper_id: int,
                                joint_position: float, joint_speed: float, joint_force: float,
                                joint_position_target: float, joint_speed_target: float, joint_force_target: float,
