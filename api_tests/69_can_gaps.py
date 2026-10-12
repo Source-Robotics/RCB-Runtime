@@ -786,8 +786,9 @@ def newest_tick(capture):
 class Load:
     """--load: starts a Python interpreter (numpy + scipy imports — what made the late replies on 2026-10-12: a
     program starting) every LOAD_EVERY_S on cores 0-2 at nice 19, until stop()."""
-    def __init__(self):
+    def __init__(self, cores="0-2"):
         import threading
+        self.cores = cores
         self._stop = threading.Event()
         self._procs = []
         self._t = threading.Thread(target=self._run, daemon=True)
@@ -795,7 +796,7 @@ class Load:
 
     def _run(self):
         while not self._stop.is_set():
-            self._procs.append(subprocess.Popen(["nice", "-n", "19", "taskset", "-c", "0-2", sys.executable, "-c",
+            self._procs.append(subprocess.Popen(["nice", "-n", "19", "taskset", "-c", self.cores, sys.executable, "-c",
                                                  "import numpy, scipy.signal"], stdout=subprocess.DEVNULL,
                                                 stderr=subprocess.DEVNULL))
             self._stop.wait(LOAD_EVERY_S)
@@ -913,7 +914,7 @@ def run_session(args, cfg, order, out_dir):
             blk = {"name": name, "kind": kind, "can_before": read_counters(args.iface), "irq_before": read_irqs(),
                    "t_start": time.time(), "tick0": newest_tick(capture), "ok": True, "load": bool(args.load)}
             print(f"  {name:15s} ... ", end="", flush=True)
-            load = Load() if args.load and kind != "idle" else None
+            load = Load(args.load_cores) if args.load and kind != "idle" else None
             try:
                 if base != kind:
                     robot.set_can_send_wait(True)          # TODO/can_tx_timing_plan.md option A, this block only
@@ -1033,7 +1034,9 @@ def main():
     ap.add_argument("--order", default=DEFAULT_ORDER, help=f"blocks in order, of {list(KINDS)}")
     ap.add_argument("--iface", default="can0")
     ap.add_argument("--load", action="store_true", help="start a Python interpreter every 2 s during each block "
-                    "(on cores 0-2, nice 19): the load that made replies late on 2026-10-12")
+                    "(nice 19): the load that made replies late on 2026-10-12")
+    ap.add_argument("--load-cores", default="0-2", help="the cores --load runs on (taskset list; e.g. 0,1 when core 2 "
+                    "is kept for the CAN interrupt threads)")
     ap.add_argument("--reanalyse", metavar="FOLDER")
     args = ap.parse_args()
     if args.selftest:
@@ -1056,7 +1059,8 @@ def main():
           f"(~57 deg/s). candump on {args.iface} (read-only) + RTI telemetry ({RECIPE}) the whole time, ~{total / 60:.1f} min."
           + (" '_wait' blocks: RTI's send-wait ON (TODO/can_tx_timing_plan.md option A)." if any(
               k.endswith("_wait") for k in order) else "")
-          + (f" --load: a Python interpreter started every {LOAD_EVERY_S:g} s in each block." if args.load else ""))
+          + (f" --load: a Python interpreter started every {LOAD_EVERY_S:g} s in each block, on cores "
+             f"{args.load_cores}." if args.load else ""))
     if not args.go:
         print("DRY RUN: re-run with --go to move the arm. Nothing moved.")
         return 0
