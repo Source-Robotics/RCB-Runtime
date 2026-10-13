@@ -7,6 +7,8 @@
     cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/sim_run.py                # boots, reports, waits for Ctrl-C
         --seconds N      stop by itself after N s
         --gui            also the dashboard (port 8081; it shows the SIMULATED robot)
+        --faults all|a,b fault injection after the boot (sim/faults.py): node_lost, drive_fault, reply_loss,
+                         drive_reboot, executor_lost (homes first), rti_lost (ends the run)
         --tests a,b,..   after the boot, run these api_tests in order — the file name without .py, plus its
                          arguments: --tests "00_status,01_mode --go,02_joint --go --assume-ready"
                          'smoke' = tools/arm_smoke.py against the simulated robot (home it first):
@@ -39,6 +41,9 @@ SHM_MODE = "/dev/shm/robot_mode"
 BOOT_TIMEOUT_S = 40.0
 VENV_PY = os.path.join(ROOT, ".venv", "bin", "python")
 EXECUTOR_PORT = 29000
+ARGV = {"drives": ["python3", "-m", "sim.drives"], "RTI": ["python3", "RTI.py"],
+        "executor": ["python3", "command_executor.py"], "worker": ["python3", "self_collision_worker.py"],
+        "GUI": ["python3", "nicegui_test.py"]}
 
 
 def _service_active(unit="autorun.service"):
@@ -100,6 +105,7 @@ def main():
     ap.add_argument("--seconds", type=float, default=0.0, help="stop after this long (0 = wait for Ctrl-C)")
     ap.add_argument("--gui", action="store_true", help="also start the dashboard")
     ap.add_argument("--tests", default="", help="api_tests to run after the boot, e.g. 00_status,49_is_reachable")
+    ap.add_argument("--faults", default="", help="fault scenarios after the boot (and the tests): all, or names")
     args = ap.parse_args()
 
     if _service_active():
@@ -122,13 +128,10 @@ def main():
     procs = []
     ok = True
     try:
-        procs.append(("drives", *_start("drives", ["python3", "-m", "sim.drives"], run_dir, env)))
+        procs.append(("drives", *_start("drives", ARGV["drives"], run_dir, env)))
         time.sleep(1.0)
-        procs.append(("RTI", *_start("RTI", ["python3", "RTI.py"], run_dir, env)))
-        procs.append(("executor", *_start("executor", ["python3", "command_executor.py"], run_dir, env)))
-        procs.append(("worker", *_start("worker", ["python3", "self_collision_worker.py"], run_dir, env)))
-        if args.gui:
-            procs.append(("GUI", *_start("GUI", ["python3", "nicegui_test.py"], run_dir, env)))
+        for name in ("RTI", "executor", "worker") + (("GUI",) if args.gui else ()):
+            procs.append((name, *_start(name, ARGV[name], run_dir, env)))
 
         t0 = time.monotonic()
         mode = ""
@@ -172,7 +175,51 @@ def main():
                     r = subprocess.run(argv, cwd=ROOT, env=env, stdout=fh, stderr=subprocess.STDOUT, timeout=900)
                 print(f"    {'PASS' if r.returncode == 0 else 'FAIL'} (exit {r.returncode})", flush=True)
                 ok = ok and r.returncode == 0
-        elif ok:
+        if ok and args.faults:
+            from sim import faults as fl
+
+            def _kill(name, sig):
+                for n, p, _ in procs:
+                    if n == name and p.poll() is None:          # only this run's own process, by its handle
+                        p.send_signal(sig)
+                        p.wait(10)
+
+            def _restart(name):
+                for k, (n, p, out) in enumerate(procs):
+                    if n == name:
+                        out.close()
+                        procs[k] = (name, *_start(name, ARGV[name], run_dir, env))
+
+            def _wait_executor(timeout):
+                t1 = time.monotonic()
+                while time.monotonic() - t1 < timeout:
+                    if _port_open(EXECUTOR_PORT):
+                        return True
+                    time.sleep(0.5)
+                return False
+
+            ctx = fl.Context(ROOT, _kill, _restart, _wait_executor)
+            names = list(fl.ORDER) if args.faults.strip() == "all" else \
+                [x.strip() for x in args.faults.split(",") if x.strip()]
+            names = sorted(names, key=lambda x: fl.ORDER.index(x) if x in fl.ORDER else 99)
+            for name in names:
+                if name not in fl.SCENARIOS:
+                    print(f"\n--- fault {name}: unknown (one of {', '.join(fl.ORDER)})")
+                    ok = False
+                    continue
+                print(f"\n--- fault {name}: {fl.SCENARIOS[name].__doc__.split(chr(10))[0]}", flush=True)
+                notes = []
+                t1 = time.monotonic()
+                try:
+                    good = fl.SCENARIOS[name](ctx, notes)
+                except Exception as e:                       # noqa: BLE001 — a scenario that crashes failed
+                    good = False
+                    notes.append(f"crashed: {type(e).__name__}: {e}")
+                for ln in notes:
+                    print("    " + ln, flush=True)
+                print(f"    {'PASS' if good else 'FAIL'} ({time.monotonic() - t1:.1f} s)", flush=True)
+                ok = ok and good
+        elif ok and not args.tests:
             print("\nThe simulated robot is up" + (f" for {args.seconds:.0f} s" if args.seconds else
                                                    " — Ctrl-C to stop") + ".", flush=True)
             end = time.monotonic() + args.seconds if args.seconds else None

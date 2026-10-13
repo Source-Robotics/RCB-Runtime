@@ -24,6 +24,8 @@ OUT_IN_TEMPERATURE, OUT_IN_VOLTAGE, OUT_IN_DEVICE_INFO, OUT_IN_ERRORS, OUT_IN_IQ
 IN_HALL, OUT_HALL, OUT_IN_KT, IN_VLIM = 31, 32, 33, 34
 OUT_GRIPPER, IN_GRIPPER, IN_GRIPPER_CALIB = 60, 61, 62
 
+FAULTS = ("temperature", "encoder", "vbus", "driver", "velocity", "current")   # the errors poll's flags, S4
+
 POLLS = (OUT_IN_PING, OUT_IN_TEMPERATURE, OUT_IN_VOLTAGE, OUT_IN_DEVICE_INFO, OUT_IN_ERRORS, OUT_IN_IQ,
          OUT_IN_ENCODER, OUT_IN_KT)
 CONFIG = (IN_KP_KD, IN_KIIQ_KPIQ, IN_KPV_KIV, IN_KPP, IN_IQ, IN_KT, IN_VLIM)
@@ -31,6 +33,7 @@ CONFIG = (IN_KP_KD, IN_KIIQ_KPIQ, IN_KPV_KIV, IN_KPP, IN_IQ, IN_KT, IN_VLIM)
 # Controller modes (the firmware's Controller_mode)
 IDLE, POSITION, SPEED, CURRENT, PD, HALL = 0, 1, 2, 3, 4, 8
 
+SPEED_TAU_S = 0.004             # the reported speed's low-pass (the joint jumps to each 4 ms target in one step)
 GRIPPER_COUNTS_PER_S = 300.0     # the simulated jaws: the full 0-255 stroke in under a second
 
 
@@ -95,6 +98,9 @@ class SimDrive:
         self.info = (hw_version, batch, sw_version, serial)
         self.estop_error = False
         self.watchdog_error = False
+        self.fault = None                       # S4: a lasting drive fault (FAULTS) — a CAN clear does not remove it
+        self.last_cmd_ms = None                 # S4: the last frame that restarted the watchdog (data / Hall / gripper / poll)
+        self.trip_ms = None                     # S4: when the watchdog last tripped from a clear state
         self.wd_time_ms = 0                     # 0 = off (the firmware's EEPROM default)
         self.wd_action = 0
         self._wd_last = 0
@@ -114,7 +120,18 @@ class SimDrive:
 
     @property
     def error(self):
-        return self.estop_error or self.watchdog_error
+        return self.estop_error or self.watchdog_error or self.fault is not None
+
+    def reboot(self):
+        """S4: the drive lost power and came back: its RAM config is gone (the watchdog off — the EEPROM default —, no
+        limits from RTI, the gains), its errors cleared, idle. The position is kept (S4 does not model the encoder)."""
+        self.mode = IDLE
+        self.velocity_limit = self.current_limit = 1.0e9
+        self.config = {}
+        self.wd_time_ms, self.wd_action, self._wd_reset = 0, 0, True
+        self.estop_error = self.watchdog_error = False
+        self.fault = None
+        self.trip_ms = None
 
     # ------------------------------------------------------------------------------------------------ the watchdog
     def _watchdog(self, ms):
@@ -124,6 +141,8 @@ class SimDrive:
                 self._wd_last = ms
                 self._wd_reset = False
             if ms - self._wd_last >= self.wd_time_ms:
+                if not self.watchdog_error:
+                    self.trip_ms = ms
                 self.watchdog_error = True
                 self._wd_last = ms
 
@@ -146,8 +165,10 @@ class SimDrive:
             hw, batch, sw, serial = self.info
             return self._reply(cmd, bytes([hw & 0xFF, batch & 0xFF, sw & 0xFF]) + _s(serial, 4))
         if cmd == OUT_IN_ERRORS:
+            f = self.fault
             return self._reply(cmd, bytes([
-                _bits([self.error, 0, 0, 0, 0, 0, 0, self.estop_error]),
+                _bits([self.error, f == "temperature", f == "encoder", f == "vbus", f == "driver", f == "velocity",
+                       f == "current", self.estop_error]),
                 _bits([1, 1, self.watchdog_error, 0, 0, 0, 0, 0])]))        # calibrated, activated, watchdog
         if cmd == OUT_IN_IQ:
             return self._reply(cmd, _s(round(self.current), 2))
@@ -170,9 +191,10 @@ class SimDrive:
         self.frames += 1
         data = bytes(data)
         out = []
+        resets = False
         if remote:
             if cmd in POLLS:
-                self._wd_reset = True
+                self._wd_reset = resets = True
                 out.append(self._poll_reply(cmd))
         elif cmd == IN_DATA_PACK_1:
             if len(data) == 8:
@@ -185,14 +207,14 @@ class SimDrive:
             elif len(data) == 2:
                 self.iq_setpoint = float(_from(data[0:2]))
                 self.mode = CURRENT
-            self._wd_reset = True
+            self._wd_reset = resets = True
             out.append(self._data_pack_reply())
         elif cmd == IN_DATA_PACK_PD:
             if len(data) == 8:
                 self.target, self.target_speed = float(_from(data[0:3])), float(_from(data[3:6]))
                 self.ff_current = float(_from(data[6:8]))
                 self.mode = PD
-            self._wd_reset = True
+            self._wd_reset = resets = True
             out.append(self._data_pack_reply())
         elif cmd == IN_HALL:
             if len(data) == 4:
@@ -202,14 +224,14 @@ class SimDrive:
                     self.hall_trigger, self.hall_index = 1, 0
                     self._hall_needs_init = True
                 self.mode = HALL
-                self._wd_reset = True
+                self._wd_reset = resets = True
             out.append(self._hall_reply())
         elif cmd == IN_GRIPPER:
             if len(data) == 5:
                 self.g_target = data[0]
                 flags = [(data[4] >> i) & 1 for i in range(7, -1, -1)]     # activate, action, estop, release_dir
                 self.g_activated, self.g_action = flags[0], flags[1]
-            self._wd_reset = True
+            self._wd_reset = resets = True
             out.append(self._gripper_reply())
         elif cmd == IN_GRIPPER_CALIB:
             self.g_calibrated = 1
@@ -228,6 +250,8 @@ class SimDrive:
             self.mode = IDLE
         elif cmd in CONFIG:
             self.config[cmd] = data
+        if resets:
+            self.last_cmd_ms = ms
         self._watchdog(ms)
         return out
 
@@ -286,7 +310,8 @@ class SimDrive:
             else:
                 nx = self.position
             self.position, self.pushing = self._clamp_stop(nx)
-        self.speed = (self.position - prev) / dt if dt > 0 else 0.0
+        if dt > 0:                                       # the firmware reports a filtered speed (Velocity_Filter)
+            self.speed += ((self.position - prev) / dt - self.speed) * (dt / (SPEED_TAU_S + dt))
         if self.error or self.mode == IDLE:
             self.current = 0.0
         elif self.pushing:                               # leaning on the endstop: the loop saturates at its limit
