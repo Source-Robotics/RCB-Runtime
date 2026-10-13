@@ -210,8 +210,8 @@ PT_MAX_GAP_TICKS = 25.0           # samples further apart (100 ms) or out of ord
 # DISCONTINUITY) is an ERROR — a controlled stop, then J{i}:RTI_POSITION_LIMIT / RTI_VELOCITY_LIMIT /
 # RTI_ACCELERATION_LIMIT / RTI_JERK_LIMIT latched — instead of being absorbed (a step, a dead stop, a wild packet:
 # the pass-through caught up within the limits and carried on). Checked on the PC's samples over their TRUE intervals
-# (send times), so a stream without them (101 bytes: the robot cannot tell jitter from motion) keeps the forgiving
-# planner. SOFT_RTI: only the position check (the robot fills in between sparse targets, so the stream's speed is not
+# (send times) — a hard-RTI position stream always has them (one without is refused since 2026-10-12: the robot cannot
+# tell jitter from motion). SOFT_RTI: only the position check (the robot fills in between sparse targets, so the stream's speed is not
 # the arm's). Noise in the targets reads as acceleration (0.02 deg per sample ~ 44 rad/s^2): filter on the PC or
 # rti_set_lowpass. The limits are the RTI ceilings (<rti_limits>), not a vel_scale preference (that only limits).
 CMD_CHECK_TOL = 0.10              # 10 % over a limit before a sample is refused (a jerk-limited plan at the limit passes)
@@ -1010,7 +1010,7 @@ class RTIModeHandler:
         # PC flooding garbage appear to go silent the moment its garbage tripped the timeout.
         n = getattr(ctx, "rti_udp_count", 0) or 0
         if ctx.rti_udp_data is not None:
-            # Every command packet is the same 101 bytes, so counting the survivor's length
+            # Every command packet of a stream has the same length (101, or 109 with a send time), so counting the survivor's length
             # n times is exact — and it closes the RX-bandwidth undercount that existed
             # while the drain discarded packets without telling anyone.
             self._rx_acc += len(ctx.rti_udp_data) * max(1, n)
@@ -2530,8 +2530,8 @@ class RTIModeHandler:
         only the streaming contract, and it is all set here:
 
             RTI       the PC closes the loop, one setpoint per tick. 40 ms watchdog, the
-                      pass-through (stamped targets replayed one tick behind; a stream without
-                      send times gets the point-to-point Ruckig planner, as before 2026-10-11).
+                      pass-through (stamped targets replayed one tick behind; a position target
+                      without a send time is refused since 2026-10-12 — _refuse_unstamped).
             SOFT_RTI  the PC sends targets at its own rate and the robot fills in between
                       them. Timeout sized from the rate, ruckig_advancing (best measured
                       accuracy, §13.6), pacing left to the operator.
@@ -2550,7 +2550,7 @@ class RTIModeHandler:
             self._soft_refused = 0
             self.dynamics_ff_source = DYNAMICS_FF_DEFAULT   # every entry (a PC may choose: rti_set_dynamics_ff)
             self.set_command_timeout(COMMAND_TIMEOUT_S)
-            self.set_servo_generator(SERVO_PASSTHROUGH)     # the old planner for 101-byte streams (2026-10-11)
+            self.set_servo_generator(SERVO_PASSTHROUGH)     # needs send times: an unstamped position is refused
             self.set_pace(0.0)
             self.set_min_duration(0.0)
             self._state_every = 1     # hard RTI closes the loop per tick; it needs every one
