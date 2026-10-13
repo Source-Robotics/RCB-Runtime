@@ -67,7 +67,7 @@ ERROR_DESCRIPTIONS = {
 
     # Homing
     "NOT_HOMED":                {"cause": "robot is not homed — home the robot before operating.", "fix": "run the home command."},
-    "HOMING_FAILED":            {"cause": "homing failed — could not find the endstop.", "fix": "check the endstop/limit switch wiring for this joint, then retry homing."},
+    "HOMING_FAILED":            {"cause": "homing of this joint failed — RTI.log's '[Homing] ... FAILED' line says why: the endstop or Hall sensor was not reached in time, the Hall sensor stayed triggered, the two passes stopped too far apart (a stall that did not repeat), or the arm check: the joint homed more than 1 deg from where this arm's joint always homes (a skipped belt, a false stall, a slipping coupling — or a deliberate mechanical change).", "fix": "endstop / Hall sensor: check its wiring, the joint's homing direction and J6's magnet, then home again. Arm check, by accident (belt, coupling): fix it and home again — the joint should come back to its usual spot. Arm check after a DELIBERATE change: System Info > 'Arms (homing)' > 'Accept as new reference', then home again."},
 
     # Gripper errors
     "GRIPPER_DISCONNECTED":     {"cause": "gripper is not connected — no CAN reply from the gripper.", "fix": "check the gripper's CAN wiring/power."},
