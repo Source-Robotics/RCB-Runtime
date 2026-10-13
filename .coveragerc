@@ -6,6 +6,8 @@
 [run]
 branch = True
 parallel = True
+# a process stopped by SIGTERM without its own handler still saves its data (sim_run.py stops the runtime so)
+sigterm = True
 concurrency = thread,multiprocessing
 data_file = ${RCB_ROOT-.}/temp_data/coverage/.coverage
 source = ${RCB_ROOT-.}

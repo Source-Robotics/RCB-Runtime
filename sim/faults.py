@@ -1,6 +1,6 @@
 """Fault injection against the simulated robot (TODO/simulated_robot_plan.md S4, 2026-10-13): each scenario makes
 something go wrong — a drive drops off the bus, reports a fault, loses replies, reboots; the executor or RTI dies in
-the middle of a motion — and checks the runtime's reaction in the simulated activity log and the drives' real state
+the middle of a motion; the E-stop is pressed (the simulated I/O, hardware/gpio_handler.py) — and checks the runtime's reaction in the simulated activity log and the drives' real state
 (the simulator's control channel, sim/drives.request). Run by tools/sim_run.py --faults; RTI's death ends the run, so
 'rti_lost' runs last.
 """
@@ -12,10 +12,30 @@ import os
 import signal
 import time
 
+from data.shared_memory_index import ESTOP_1, ESTOP_2
 from sim.drives import request
+from utility import sim_mode
 
 ACTIVITY = os.path.join("temp_data", "sim", "logs", "activity_rti.log")
-ORDER = ("node_lost", "drive_fault", "reply_loss", "drive_reboot", "executor_lost", "rti_lost")
+ORDER = ("node_lost", "drive_fault", "reply_loss", "drive_reboot", "executor_lost", "estop", "rti_lost")
+# gpio_states (uint8[16], data/shared_data.py) read as a FILE, with the name prefix shared_data applies — never
+# attached (importing data.shared_data attaches every segment). In simulation the inputs live here.
+GPIO_SHM = "/dev/shm/" + os.environ.get("RCB_SHM_PREFIX", "") + "GPIO"   # nosec B108 — shared memory, not a temp file
+
+
+def _all_rtis_simulated(proc_root="/proc"):
+    """True when at least one RTI runs and EVERY running RTI has RCB_SIM=1 — the GPIO segment is a simulated one."""
+    pids = sim_mode.other_rti_pids(proc_root)
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, str(pid), "environ"), "rb") as fh:
+                if b"RCB_SIM=1" not in fh.read().split(b"\0"):
+                    return False
+        except OSError:
+            return False
+    return True
 
 
 class Context:
@@ -37,6 +57,17 @@ class Context:
 
     def sim(self, **msg):
         return request(msg)
+
+    def gpio(self, index, value):
+        """Set a SIMULATED input (one byte of the GPIO segment). Refused unless every running RTI is a simulated one:
+        a real robot's inputs are never written."""
+        if not _all_rtis_simulated():
+            raise RuntimeError("refusing to write GPIO inputs: the running RTI is not a simulated one")
+        fd = os.open(GPIO_SHM, os.O_WRONLY)
+        try:
+            os.pwrite(fd, bytes([int(value)]), int(index))
+        finally:
+            os.close(fd)
 
     def nodes(self):
         return {int(k): v for k, v in self.sim(cmd="state")["nodes"].items()}
@@ -204,6 +235,57 @@ def executor_lost(ctx, notes):
     return moving and bool(got) and abs(p2 - p1) < 5.0 and ok_rec
 
 
+def estop(ctx, notes):
+    """The E-stop pressed in the middle of an EXEC move (the simulated I/O, both channels): ESTOP latches, the robot
+    disables and J1 stops; Clear Errors does NOT clear it while the button is pressed; released + Clear Errors +
+    Enable, the robot works again."""
+    r = ctx.robot()
+    try:
+        ctx.ready(r, home=True)
+        r.enter_exec_mode(wait=True)
+        q = [float(v) for v in r.get_joints()]
+        q[0] += 25.0
+        p_start = ctx.nodes()[0]["position"]
+        r.move_joints(*q, speed=30)
+        _wait(lambda: abs(ctx.nodes()[0]["position"] - p_start) > 500, 6.0)
+        p0 = ctx.nodes()[0]["position"]
+        time.sleep(0.2)
+        moving = abs(ctx.nodes()[0]["position"] - p0) > 20.0
+        mark = ctx.activity_mark()
+        ctx.gpio(ESTOP_1, 0)                          # pressed = LOW, both channels as a real button does
+        ctx.gpio(ESTOP_2, 0)
+        got = _wait(lambda: ctx.has(mark, "ESTOP"), 2.0)
+        _wait(lambda: r.status().get("err") == 1, 1.5)
+        p1 = ctx.nodes()[0]["position"]
+        time.sleep(0.5)
+        p2 = ctx.nodes()[0]["position"]
+        st = r.status()
+        r.clear_errors(wait=False)                    # still pressed: must not clear
+        time.sleep(0.5)
+        held = r.status().get("err") == 1
+        notes.append(f"J1 moving before: {moving}; ESTOP {'latched' if got else 'NOT latched'}; state={st.get('state')} "
+                     f"err={st.get('err')}; J1 after: {abs(p2 - p1):.1f} ticks in 0.5 s; Clear Errors while pressed "
+                     f"{'refused (err stays 1)' if held else 'CLEARED IT'}")
+        ctx.gpio(ESTOP_1, 1)
+        ctx.gpio(ESTOP_2, 1)
+        time.sleep(0.2)
+        r.clear_errors(wait=True)
+        rec = _wait(lambda: r.status().get("err") == 0, 3.0)
+        r.enable(wait=True)
+        st2 = r.status()
+        notes.append(f"released + Clear Errors + Enable: err={st2.get('err')} state={st2.get('state')} "
+                     f"homed={st2.get('homed')}")
+        return (moving and bool(got) and st.get("state") == "DISABLED" and abs(p2 - p1) < 5.0 and held
+                and bool(rec) and st2.get("state") == "ENABLED")
+    finally:
+        try:
+            ctx.gpio(ESTOP_1, 1)                      # never leave the simulated button pressed
+            ctx.gpio(ESTOP_2, 1)
+        except (OSError, RuntimeError):
+            pass
+        r.disconnect()
+
+
 def rti_lost(ctx, notes):
     """RTI killed while J1 approaches its endstop in SPEED mode (homing): every drive's CAN watchdog (100 ms) must trip
     ~100 ms after the last command, and J1 stop there — not run on to the endstop (with 5 s it would have)."""
@@ -231,4 +313,5 @@ def rti_lost(ctx, notes):
     return ok and still < 1.0 and abs(speed) > 1000 and not math.isnan(speed)
 
 
-SCENARIOS = {f.__name__: f for f in (node_lost, drive_fault, reply_loss, drive_reboot, executor_lost, rti_lost)}
+SCENARIOS = {f.__name__: f for f in (node_lost, drive_fault, reply_loss, drive_reboot, executor_lost, estop,
+                                     rti_lost)}

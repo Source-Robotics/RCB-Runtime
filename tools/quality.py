@@ -168,13 +168,13 @@ def static_checks(update=False):
 
 
 # ------------------------------------------------------------------------------------------------ coverage
-def coverage_prepare():
-    """Fresh data; the .venv startup hook that makes every Python process with COVERAGE_PROCESS_START measure itself
-    (a net's runner subprocess, the block programs, ...). The hook does nothing without that variable."""
-    os.makedirs(COVDIR, exist_ok=True)
-    for f in os.listdir(COVDIR):
+def coverage_prepare(covdir=COVDIR):
+    """Fresh data in `covdir`; the .venv startup hook that makes every Python process with COVERAGE_PROCESS_START
+    measure itself (a net's runner subprocess, the block programs, ...). The hook does nothing without that variable."""
+    os.makedirs(covdir, exist_ok=True)
+    for f in os.listdir(covdir):
         if f.startswith(".coverage"):
-            os.unlink(os.path.join(COVDIR, f))
+            os.unlink(os.path.join(covdir, f))
     sp = [p for p in site.getsitepackages() if p.startswith(os.path.join(ROOT, ".venv"))]
     if sp:
         hook = os.path.join(sp[0], HOOK_NAME)
@@ -230,6 +230,48 @@ def coverage_finish(update=False, ratchet=True):
                why=f"{total} % (baseline {base['total']} %)" + (" — the TOTAL DROPPED" if total_drop else "")
                + (f"; {len(drops)} file(s) dropped" if drops else ""))
     return res
+
+
+def coverage_report(covdir, union_with=None):
+    """For a run measured outside the nets (tools/sim_run.py --coverage): combine the parallel data in `covdir`, write
+    report.txt / coverage.json / html/ there, and with `union_with` (the nets' combined data file) the union of both in
+    covdir/union/ — what the nets AND that run reach together. No baseline, no ratchet: a report.
+    Returns {"total", "files", "union_total", "union_files"} (None where there is nothing)."""
+    env = {**os.environ, "RCB_ROOT": ROOT}
+    data = os.path.join(covdir, ".coverage")
+
+    def cov(*a, data_file=data):
+        return subprocess.run([sys.executable, "-m", "coverage", *a, f"--rcfile={RCFILE}", f"--data-file={data_file}"],
+                              cwd=ROOT, env=env, capture_output=True, text=True, timeout=900)
+
+    def read_json(path):
+        try:
+            d = json.load(open(path))
+        except (OSError, ValueError):
+            return None, {}
+        return (round(d["totals"]["percent_covered"], 1),
+                {p: round(v["summary"]["percent_covered"], 1) for p, v in d["files"].items()})
+
+    cov("combine")
+    rep = cov("report")
+    with open(os.path.join(covdir, "report.txt"), "w") as fh:
+        fh.write(rep.stdout or rep.stderr)
+    cov("json", "-o", os.path.join(covdir, "coverage.json"))
+    cov("html", "-d", os.path.join(covdir, "html"))
+    total, files = read_json(os.path.join(covdir, "coverage.json"))
+    utotal, ufiles = None, {}
+    if union_with and os.path.exists(union_with) and os.path.exists(data):
+        udir = os.path.join(covdir, "union")
+        os.makedirs(udir, exist_ok=True)
+        udata = os.path.join(udir, ".coverage")
+        if os.path.exists(udata):
+            os.unlink(udata)
+        subprocess.run([sys.executable, "-m", "coverage", "combine", "--keep", f"--rcfile={RCFILE}",
+                        f"--data-file={udata}", union_with, data], cwd=ROOT, env=env, capture_output=True, timeout=900)
+        cov("json", "-o", os.path.join(udir, "coverage.json"), data_file=udata)
+        cov("html", "-d", os.path.join(udir, "html"), data_file=udata)
+        utotal, ufiles = read_json(os.path.join(udir, "coverage.json"))
+    return {"total": total, "files": files, "union_total": utotal, "union_files": ufiles}
 
 
 def coverage_by_package(files):

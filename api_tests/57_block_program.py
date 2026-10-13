@@ -6,9 +6,9 @@ the runner (`python3 -m blockly.runner`), which drives command_executor — and 
 
   1. a program [J5 +step (joint values), wait 0.5 s, back (a named point)]: blocks announced in order, J5 back where
      it began (0.2 deg), exit 0;
-  2. PAUSE --into seconds into a move: the COMMANDED position freezes and the arm settles on it (it creeps a little
+  2. PAUSE once J5 has gone --into of the step (a quarter): the COMMANDED position freezes and the arm settles on it (it creeps a little
      while it catches up — seen on the arm 2026-10-05: 0.08 deg); RESUME finishes the program;
-  3. STOP --into seconds into a move: the program ends "stopped" (exit 2), J5 stops on its way, the robot leaves EXEC;
+  3. STOP the same way: the program ends "stopped" (exit 2), J5 stops on its way, the robot leaves EXEC;
   4. a move past J5's software limit: refused JOINT_LIMIT on ITS block, J5 does not go on toward it, the arm HOLDS in
      EXEC (as an EXEC program leaves it — user, 2026-10-05); errors cleared;
   5. RT timing across the runner start-ups: RTI's overrun counter before / after (an interpreter start-up costs the
@@ -145,7 +145,8 @@ def main():
     p.add_argument("--speed", type=float, default=10.0, help="move speed, percent")
     p.add_argument("--step", type=float, default=5.0, help="degrees J5 moves")
     p.add_argument("--margin", type=float, default=5.0, help="deg inside the soft limit for the approach pose")
-    p.add_argument("--into", type=float, default=0.6, help="seconds into the move to pause / stop it")
+    p.add_argument("--into", type=float, default=0.25,
+                   help="pause / stop once J5 has gone this fraction of the step (0..1; was seconds until 2026-10-13)")
     p.add_argument("--skip-limit", action="store_true",
                    help="skip test 4 (it moves J5 to --margin degrees inside its NEARER soft limit — maybe a long way)")
     args = p.parse_args()
@@ -195,9 +196,22 @@ def main():
         print("2. pause mid-move")
         held = {}
 
+        def when_moving(action):
+            """`action` once J5 has really gone --into of the step — not after a fixed time: the EXEC default profile's
+            jerk-limited start (ruckig, since 2026-10-11) had J5 only 0.1 deg along after the old 0.6 s at 10 %
+            (2026-10-13, the simulated suite)."""
+            gone = max(0.3, abs(target[J] - j0) * min(max(args.into, 0.05), 0.9))
+
+            def wait():
+                end = time.monotonic() + 20.0
+                while time.monotonic() < end and abs(robot.get_joints()[J] - j0) < gone:
+                    time.sleep(0.02)
+                action()
+            threading.Thread(target=wait, daemon=True).start()
+
         def pause_soon(bid):
             if bid == "m1":
-                threading.Timer(args.into, runs.pause).start()
+                when_moving(runs.pause)
 
         def watch():
             end = time.monotonic() + 10
@@ -230,7 +244,7 @@ def main():
 
         def stop_soon(bid):
             if bid == "m1":
-                threading.Timer(args.into, runs.stop).start()
+                when_moving(runs.stop)
         r, ev = run("api57 stop", program(move_to("m1", target, args.speed), move_to_point("m2", "start", args.speed)),
                     point, on_block=stop_soon)
         time.sleep(0.5)

@@ -494,7 +494,11 @@ with ui.card().classes("w-full mb-2"):
         robot_mode_badge  = ui.badge("MODE: ---")
         robot_state_badge = ui.badge("STATE: ---").props("color=blue outline")
         homed_badge       = ui.badge("NOT HOMED").props("color=orange outline")
-        sim_badge         = ui.badge("SIM: ---").props("color=purple outline")
+        # Shown only while RTI runs the SIMULATED robot (tools/sim_run.py; RTI writes sim_mode at start, 2026-10-13).
+        sim_badge         = ui.badge("SIMULATION").props("color=purple").tooltip(
+            "RTI runs the SIMULATED robot (tools/sim_run.py): simulated drives on a virtual CAN bus — no arm moves, "
+            "and the I/O is simulated too")
+        sim_badge.visible = False
         error_badge       = ui.badge("ERR: 0").props("color=grey outline")
         safety_badge      = ui.badge("SAFETY: OK").props("color=positive outline")
         rti_process_badge = ui.badge("RTI: ---").props("color=grey outline")
@@ -3628,7 +3632,7 @@ def update_tables():
     homed = shared_data.homed_state.get()
     homed_badge.text = homed
     homed_badge.props(f"color={'positive' if homed == 'HOMED' else 'orange'} outline")
-    sim_badge.text = f"SIM: {shared_data.sim_mode.get()}"
+    sim_badge.visible = shared_data.sim_mode.get() == "ON"
     err_val = int(shared_data.rti['error_active'][0])
     error_badge.text = f"ERR: {err_val}"
     error_badge.props(f"color={'negative' if err_val else 'positive'} outline")

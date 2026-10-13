@@ -312,6 +312,9 @@ def main():
     # temp_data/sim/. Refused while another RTI runs (the robot service) or without the virtual bus.
     _SIM = sim_mode.enabled()
     _CAN_IF = sim_mode.can_interface()
+    # The dashboard's SIMULATION badge reads this (2026-10-13): until then the string said "ON" for ever — set once
+    # when the segment was created — so the real robot's dashboard showed "SIM: ON".
+    shared_data.sim_mode.set("ON" if _SIM else "OFF")
     if _SIM:
         _why = sim_mode.refuse_reason()
         if _why:
@@ -340,7 +343,8 @@ def main():
     logging.info(f"[RTI] code: {describe_code(PROJECT_ROOT)}")
     if _SIM:
         logging.warning(f"[SIM] SIMULATION — the simulated drives on {_CAN_IF}, NOT the arm; no real-time core or "
-                        f"priority; logs and data under {TEMP_DATA_DIR.parent}")
+                        f"priority; the I/O simulated (no real pin read or written); logs and data under "
+                        f"{TEMP_DATA_DIR.parent}")
     # The last two seconds before a hard error -> temp_data/incidents/*.npz (utility/incident_dump.py,
     # 2026-10-03). Its worker thread starts here for the same reason the log listener does; it yields between
     # channels, so it never holds the interpreter for more than ~one channel of the 500-tick history.

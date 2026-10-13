@@ -24,6 +24,7 @@ from data.shared_memory_index import (
     ESTOP_2, ESTOP_1, GPIO_1, GPIO_2, GPIO_3, GPIO_4
 )
 from data import shared_data
+from utility import sim_mode
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,13 @@ LOW = 0
 _gpio_handle = None
 _gpio_chip = None
 _claimed_pins = set()
+
+# The simulated robot (RCB_SIM=1, utility/sim_mode.py; 2026-10-13): NO real pin is read or written. A simulated run
+# must not switch the control box's isolated outputs (real equipment may hang on them) nor depend on its real E-stop:
+# until then RTI in simulation read the Pi's real inputs and drove its real outputs. The inputs live in shared memory
+# only (gpio_states — set at start: E-stop released, inputs off); a tool changes them by writing the GPIO segment
+# (sim/faults.py presses the E-stop that way); the outputs stay in shared memory.
+_simulated = False
 
 # ==========================================================================
 # BCM pin numbers for Raspberry Pi-compatible 40-pin header
@@ -140,8 +148,18 @@ def init_gpio():
 
 def initialize_gpio():
     """
-    Initialize GPIO pins for robot I/O.
+    Initialize GPIO pins for robot I/O — or, in simulation, the simulated I/O (no real pin touched).
     """
+    global _simulated
+    _simulated = sim_mode.enabled()
+    if _simulated:
+        for idx in (ISOLATED_INPUT_1, ISOLATED_INPUT_2, ISOLATED_INPUT_3, GPIO_1, GPIO_2, GPIO_3, GPIO_4):
+            shared_data.gpio_states[idx] = LOW
+        shared_data.gpio_states[ESTOP_1] = HIGH          # active LOW: HIGH = released
+        shared_data.gpio_states[ESTOP_2] = HIGH
+        logger.info("[SIM] GPIO simulated: no real pin is read or written — inputs and outputs live in shared memory "
+                    "(E-stop released, inputs off)")
+        return
     init_gpio()
     logger.info(f"GPIO pins initialized on gpiochip{_gpio_chip}")
 
@@ -210,6 +228,8 @@ def _apply_debounce(input_index, raw_value):
 def read_inputs_into_shared():
     """Read every input pin with debouncing into shared memory — the RT loop's per-tick call (2026-10-03).
     read_all_inputs() below adds the dict the GUI and scripts want; the loop never used it."""
+    if _simulated:                       # simulation: the inputs are whatever shared memory holds
+        return
     # Read isolated inputs with debounce filter
     raw_input_1 = lgpio.gpio_read(_gpio_handle, ISOLATED_INPUT_1_PIN)
     shared_data.gpio_states[ISOLATED_INPUT_1] = _apply_debounce(ISOLATED_INPUT_1, raw_input_1)
@@ -338,6 +358,8 @@ def write_all_outputs():
     """
     Write the GPIO outputs from shared memory to the physical pins — each one only when its level changed.
     """
+    if _simulated:                       # simulation: the level stays in shared memory, no pin is driven
+        return
     for idx, pin in _OUTPUTS:
         value = int(shared_data.gpio_states[idx])
         if value != _last_written[idx]:
@@ -362,7 +384,7 @@ def set_output(output_index, value):
         ISOLATED_OUTPUT_3: ISOLATED_OUTPUT_3_PIN
     }
 
-    if output_index in pin_map:
+    if output_index in pin_map and not _simulated:
         lgpio.gpio_write(_gpio_handle, pin_map[output_index], int(value))
         _last_written[output_index] = int(value)
 
@@ -523,9 +545,10 @@ def emergency_stop_all_outputs():
     Emergency function to set all outputs LOW immediately.
     Call this when E-stop is triggered or error occurs.
     """
-    lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_1_PIN, 0)
-    lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_2_PIN, 0)
-    lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_3_PIN, 0)
+    if not _simulated:
+        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_1_PIN, 0)
+        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_2_PIN, 0)
+        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_3_PIN, 0)
     for idx in _last_written:
         _last_written[idx] = 0
 

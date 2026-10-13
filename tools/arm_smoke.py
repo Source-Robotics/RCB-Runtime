@@ -5,7 +5,10 @@ set of api_tests on the arm and saves the results with the commit they ran on.
     cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/arm_smoke.py          # asks before anything moves
         --yes          no question (you are at the arm anyway)
         --list         what it runs, then exit
-        --only a,b     just these (names from --list)
+        --only a,b     just these (names from --list; a+b too — inside sim_run.py --tests, whose list splits on ',')
+        --suite sim    the SIMULATED suite (refused on the real arm): these tests + 21 more api_tests that move the
+                       arm far (blends, Cartesian lines and curves, G-code, pause / stop mid-chain, SOFT_RTI, block
+                       programs ...) — run by tools/sim_run.py --tests suite (2026-10-13)
 
 Before: the arm ENABLED, homed, error-free, in IDLE or EXEC (the dashboard); the workspace clear, the E-stop in reach.
 What moves: every joint to the api_tests' start pose at 10 % (2026-10-13), then J1 by +1 deg and back, J1 5 deg
@@ -32,6 +35,7 @@ sys.path.insert(0, ROOT)
 
 from project_paths import RTI_LOG, TEMP_DATA_DIR                          # noqa: E402
 from utility.code_version import git_commit                               # noqa: E402
+from utility import sim_mode                                              # noqa: E402
 sys.path.insert(0, os.path.join(ROOT, "api_tests"))
 from _common import START_POSE_DEG                                        # noqa: E402  (the api_tests' one start pose)
 
@@ -57,6 +61,62 @@ TESTS = [
      "J5 small moves, a refused limit, a jog", None),
 ]
 
+# The simulated suite (--suite sim, 2026-10-13, TODO/simulated_robot_plan.md S3): TESTS + these. They move the arm far
+# and fast, so they run ONLY against the simulated robot; there each EXEC test starts from the start pose and a test
+# that leaves an error or an abort latch behind gets a note, and the next one starts clean.
+SIM_EXTRA = [
+    ("blend",           "03_blend.py",            ["--go", "--assume-ready"], "a blended joint chain", "EXEC"),
+    ("cart_dry",        "04_cart_dry.py",         ["--go", "--assume-ready"], None, "EXEC"),
+    ("cart",            "05_cart.py",             ["--go", "--assume-ready", "--cartesian-hardware-ack"],
+     "TCP lines in WRF and TRF", "EXEC"),
+    ("io",              "06_io.py",               ["--all"], None, None),
+    ("gripper",         "06_io.py",               ["--go", "--assume-ready", "--gripper-all"], "the gripper suite", "EXEC"),
+    ("errors",          "07_errors.py",           [], None, None),
+    ("callbacks",       "08_callbacks.py",        ["--go", "--assume-ready"], "J1", "EXEC"),
+    ("completion",      "09_completion.py",       ["--go", "--assume-ready"], "J1 + settle policies", "EXEC"),
+    ("state",           "10_state.py",            ["--go", "--disable-cycle", "--disable-hardware-ack"],
+     "a disable / re-enable cycle", None),
+    ("pause_resume",    "11_pause_resume.py",     ["--go", "--assume-ready"], "J1 paused mid-move", "EXEC"),
+    ("pose",            "13_pose.py",             ["--go", "--assume-ready", "--pose-hardware-ack"], "move_pose",
+     "EXEC"),
+    ("motion_failure",  "16_motion_failure.py",   ["--go", "--assume-ready"], "a burst with a failing move", "EXEC"),
+    ("rolling_buffer",  "17_rolling_buffer.py",   ["--go", "--assume-ready"], "commands spliced in flight", "EXEC"),
+    ("gcode",           "18_gcode.py",            ["--go", "--assume-ready"], "a G-code toolpath", "EXEC"),
+    ("ruckig_corner",   "20_ruckig_corner.py",    ["--go", "--assume-ready"], "jerk-limited corners", "EXEC"),
+    ("blend_interrupt", "21_blend_interrupt.py",  ["--go", "--assume-ready"], "pause / stop mid-chain", "EXEC"),
+    ("cart_curves",     "22_cartesian_curves.py", ["--go", "--assume-ready", "--curve-hardware-ack"],
+     "arcs and curves", "EXEC"),
+    ("dry_run_preview", "23_dry_run_preview.py",  [], None, None),
+    ("soft_rti",        "27_soft_rti.py",         ["--move", "--seconds", "5"], "J1 streamed", "IDLE"),
+    ("soft_rti_safety", "34_soft_rti_safety.py",  ["--go"], None, "IDLE"),
+    ("block_program",   "57_block_program.py",    ["--go"], "J5 block programs", None),
+]
+SIM_POSE_SPEED = 30          # the simulated suite's moves to the start pose (%)
+NO_HOST = {"23_dry_run_preview.py"}     # offline tests: no robot, no --host
+
+
+def _to_start_pose(robot, speed):
+    """Every joint to START_POSE_DEG; (0, "reached") or (1, why)."""
+    try:
+        robot.move_joints(*START_POSE_DEG, speed=speed)
+        f = robot.wait_idle(timeout=TIMEOUT_S, raise_on_error=False)
+        return (0, "reached") if not f else (1, f"FAIL  {f}")
+    except Exception as e:                          # noqa: BLE001 — a refused or failed move fails the step
+        return 1, f"FAIL  {type(e).__name__}: {e}"
+
+
+def _wait_executor_idle(robot, timeout=30.0):
+    """Until the executor runs nothing: a test can exit with a queued move still in flight (its failure — and the abort
+    latch — then land after the test; 16_motion_failure's last move did, 2026-10-13)."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        s = _status(robot)
+        if s.get("active_command") is None and s.get("executing_seq") == s.get("completed_seq") \
+                and not s.get("queue_depth"):
+            return True
+        time.sleep(0.2)
+    return False
+
 
 def _client():
     from robotclient.client import RobotClient
@@ -67,7 +127,12 @@ def _client():
 
 def _status(robot):
     s = robot.get_status()
-    return s if isinstance(s, dict) else {}
+    if not isinstance(s, dict):
+        return {}
+    # get_status nests the planner's fields — motion_aborted, executing / completed seq, the active command, the queue
+    # depth — under "planner" (the event stream's status() has them at the top). Until 2026-10-13 this read the top
+    # level only, so the stale-abort-latch check never saw a latch (found by the simulated suite).
+    return {**(s.get("planner") or {}), **s}
 
 
 def _ready_problems(s):
@@ -146,18 +211,26 @@ def main():
     ap.add_argument("--yes", action="store_true", help="do not ask before starting")
     ap.add_argument("--list", action="store_true", help="print the tests and exit")
     ap.add_argument("--only", default="", help="comma-separated names (see --list)")
+    ap.add_argument("--suite", default="arm", choices=("arm", "sim"),
+                    help="arm = the smoke routine; sim = + 21 api_tests, the SIMULATED robot only")
     args = ap.parse_args()
 
-    tests = TESTS
+    simulated_suite = args.suite == "sim"
+    if simulated_suite and not sim_mode.enabled():
+        print("REFUSED: --suite sim moves the arm far and fast — it runs against the SIMULATED robot only "
+              "(tools/sim_run.py --tests suite)")
+        return 2
+    all_tests = TESTS + (SIM_EXTRA if simulated_suite else [])
+    tests = all_tests
     if args.only:
-        want = {w.strip() for w in args.only.split(",") if w.strip()}
-        unknown = want - {t[0] for t in TESTS}
+        want = {w.strip() for w in args.only.replace("+", ",").split(",") if w.strip()}   # '+' too: sim_run --tests splits on ','
+        unknown = want - {t[0] for t in all_tests}
         if unknown:
             print(f"unknown test(s): {sorted(unknown)} — see --list")
             return 2
-        tests = [t for t in TESTS if t[0] in want]
+        tests = [t for t in all_tests if t[0] in want]
     if args.list:
-        for name, script, extra, moves, _ in TESTS:
+        for name, script, extra, moves, _ in all_tests:
             print(f"  {name:15s} {('api_tests/' + script) if script else '(this tool)':32s} {' '.join(extra):34s} "
                   f"{moves or 'nothing moves'}")
         return 0
@@ -213,7 +286,20 @@ def main():
     results = []
     aborted = None
     for name, script, extra, moves, mode in tests:
+        if simulated_suite and results:
+            _wait_executor_idle(robot)
+            time.sleep(0.3)                                 # a failure event right at the end reaches the latch
         s = _status(robot)
+        if simulated_suite and results and (s.get("err") or s.get("motion_aborted") or s.get("state") != "ENABLED"):
+            # the previous test left the robot unusable: say so on ITS result, start the next one clean (simulation)
+            left = (f"left behind: err={s.get('err')} motion_aborted={bool(s.get('motion_aborted'))} "
+                    f"state={s.get('state')} — cleared for the next test")
+            results[-1]["note"] = (results[-1]["note"] + "; " if results[-1]["note"] else "") + left
+            print(f"    note: {left}", flush=True)
+            robot.clear_errors(wait=False)
+            time.sleep(0.5)
+            robot.enable(wait=True)
+            s = _status(robot)
         problems = _ready_problems(s)
         if problems:
             aborted = f"before '{name}': " + "; ".join(problems)
@@ -230,12 +316,7 @@ def main():
         if script is None:                                  # the start pose: this tool moves the arm itself
             print(f"\n--- {name}: move_joints{tuple(START_POSE_DEG)} at 10 %", flush=True)
             t0 = time.monotonic()
-            try:
-                robot.move_joints(*START_POSE_DEG, speed=10)
-                f = robot.wait_idle(timeout=TIMEOUT_S, raise_on_error=False)
-                code, text = (0, "reached") if not f else (1, f"FAIL  {f}")
-            except Exception as e:                          # noqa: BLE001 — a refused or failed move fails the step
-                code, text = 1, f"FAIL  {type(e).__name__}: {e}"
+            code, text = _to_start_pose(robot, 10)
             try:
                 robot.release_control()
             except Exception:                               # noqa: BLE001
@@ -251,7 +332,15 @@ def main():
                 aborted = "the start pose was not reached — the motion tests were not run"
                 break
             continue
-        cmd = [PY, os.path.join("api_tests", script), "--host", "127.0.0.1"] + extra
+        if simulated_suite and mode == "EXEC" and name not in {t[0] for t in TESTS}:
+            pc, ptext = _to_start_pose(robot, SIM_POSE_SPEED)       # each simulated EXEC test from the same pose
+            try:
+                robot.release_control()
+            except Exception:                               # noqa: BLE001
+                pass
+            if pc:
+                print(f"\n--- {name}: the start pose was not reached ({ptext[:120]}) — the test runs from here", flush=True)
+        cmd = [PY, os.path.join("api_tests", script)] + ([] if script in NO_HOST else ["--host", "127.0.0.1"]) + extra
         print(f"\n--- {name}: {' '.join(cmd[1:])}", flush=True)
         t0 = time.monotonic()
         try:

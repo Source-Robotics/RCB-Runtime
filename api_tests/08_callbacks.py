@@ -52,10 +52,10 @@ def run():
         robot.wait_idle(timeout=args.timeout)
 
         rejected = []
+        # `accel` and `blend_mode` WERE here — both are supported per-command options now (motion/exec_commands.py);
+        # the simulated suite found the stale cases 2026-10-13. This is the option move_joints still refuses.
         rejection_cases = [
-            ("accel", {"accel": 1.0}),
             ("completion_policy", {"completion_policy": "strict"}),
-            ("blend_mode", {"blend_mode": "zone"}),
         ]
         for label, options in rejection_cases:
             try:

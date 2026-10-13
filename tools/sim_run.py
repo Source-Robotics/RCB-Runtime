@@ -8,11 +8,18 @@
         --seconds N      stop by itself after N s
         --gui            also the dashboard (port 8081; it shows the SIMULATED robot)
         --faults all|a,b fault injection after the boot (sim/faults.py): node_lost, drive_fault, reply_loss,
-                         drive_reboot, executor_lost (homes first), rti_lost (ends the run)
+                         drive_reboot, executor_lost (homes first), estop (the simulated E-stop button),
+                         rti_lost (ends the run)
         --tests a,b,..   after the boot, run these api_tests in order — the file name without .py, plus its
                          arguments: --tests "00_status,01_mode --go,02_joint --go --assume-ready"
                          'smoke' = tools/arm_smoke.py against the simulated robot (home it first):
                          --tests "01_mode --go,smoke"
+                         'suite' = the SIMULATED suite: the smoke routine + 21 more api_tests that move the arm far
+                         (tools/arm_smoke.py --suite sim): --tests "01_mode --go,suite"
+        --coverage       measure the runtime (RTI, the executor, the worker, the drives, the GUI) with coverage: run
+                         under the venv's Python, data + report in temp_data/sim/coverage/ and, with the nets' last
+                         coverage run, their union in temp_data/sim/coverage/union/ (docs/testing.md). A process
+                         killed with SIGKILL (the executor_lost / rti_lost faults) loses its data: run those without it.
     sudo systemctl start autorun.service         # afterwards; then re-home the arm
 
 Everything the runtime writes goes under temp_data/sim/ (project_paths.SIMULATION); each run's process output under
@@ -34,8 +41,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from utility import sim_mode                                              # noqa: E402
+import quality                                                            # noqa: E402  tools/quality.py
 
 SIM_DIR = os.path.join(ROOT, "temp_data", "sim")
+SIM_COVDIR = os.path.join(SIM_DIR, "coverage")
+NETS_COVERAGE = os.path.join(quality.COVDIR, ".coverage")      # the nets' combined data (run_nets.py --coverage)
 SIM_RTI_LOG = os.path.join(SIM_DIR, "logs", "RTI.log")
 SHM_MODE = "/dev/shm/robot_mode"
 BOOT_TIMEOUT_S = 40.0
@@ -44,6 +54,15 @@ EXECUTOR_PORT = 29000
 ARGV = {"drives": ["python3", "-m", "sim.drives"], "RTI": ["python3", "RTI.py"],
         "executor": ["python3", "command_executor.py"], "worker": ["python3", "self_collision_worker.py"],
         "GUI": ["python3", "nicegui_test.py"]}
+
+
+def _argv(name, coverage=False):
+    """The process's command line; with coverage the same program under the venv's Python and `coverage run`."""
+    argv = ARGV[name]
+    if not coverage:
+        return argv
+    head = [VENV_PY, "-m", "coverage", "run", f"--rcfile={quality.RCFILE}"]
+    return head + (["-m", argv[2]] if argv[1] == "-m" else argv[1:])
 
 
 def _service_active(unit="autorun.service"):
@@ -106,6 +125,7 @@ def main():
     ap.add_argument("--gui", action="store_true", help="also start the dashboard")
     ap.add_argument("--tests", default="", help="api_tests to run after the boot, e.g. 00_status,49_is_reachable")
     ap.add_argument("--faults", default="", help="fault scenarios after the boot (and the tests): all, or names")
+    ap.add_argument("--coverage", action="store_true", help="measure the runtime with coverage (temp_data/sim/coverage)")
     args = ap.parse_args()
 
     if _service_active():
@@ -123,15 +143,20 @@ def main():
     run_dir = os.path.join(SIM_DIR, "runs", time.strftime("%Y%m%d_%H%M%S", time.gmtime()))
     os.makedirs(run_dir, exist_ok=True)
     env = dict(os.environ, RCB_SIM="1", PYTHONUNBUFFERED="1")
+    if args.coverage:
+        quality.coverage_prepare(SIM_COVDIR)
+        env.update(COVERAGE_FILE=os.path.join(SIM_COVDIR, ".coverage"), RCB_ROOT=ROOT,
+                   COVERAGE_PROCESS_START=quality.RCFILE)          # the venv children (a block program) measure too
+        print("COVERAGE: the runtime runs under the venv's Python + coverage (slower; timing is not what is tested)")
     log_offset = os.path.getsize(SIM_RTI_LOG) if os.path.exists(SIM_RTI_LOG) else 0
     print(f"SIMULATED RUN — the arm is not involved. Output: {os.path.relpath(run_dir, ROOT)}", flush=True)
     procs = []
     ok = True
     try:
-        procs.append(("drives", *_start("drives", ARGV["drives"], run_dir, env)))
+        procs.append(("drives", *_start("drives", _argv("drives", args.coverage), run_dir, env)))
         time.sleep(1.0)
         for name in ("RTI", "executor", "worker") + (("GUI",) if args.gui else ()):
-            procs.append((name, *_start(name, ARGV[name], run_dir, env)))
+            procs.append((name, *_start(name, _argv(name, args.coverage), run_dir, env)))
 
         t0 = time.monotonic()
         mode = ""
@@ -161,21 +186,26 @@ def main():
         if ok and not any("[Selfcheck] ✓ PASSED" in ln for ln in lines):
             print("FAILED: the start-up self-check did not pass")
             ok = False
+        booted = ok                  # a failed TEST does not stop the fault scenarios (2026-10-13): report both
 
         if ok and args.tests:
             for spec in [x.strip() for x in args.tests.split(",") if x.strip()]:
                 name, *extra = shlex.split(spec)
+                limit = 900
                 if name == "smoke":          # the real-arm smoke routine, against the simulated robot
                     script, argv = "tools/arm_smoke.py", [VENV_PY, "tools/arm_smoke.py", "--yes"] + extra
+                elif name == "suite":        # the smoke routine + the api_tests that run only against the simulator
+                    script, argv = "tools/arm_smoke.py", [VENV_PY, "tools/arm_smoke.py", "--yes", "--suite", "sim"] + extra
+                    limit = 3600
                 else:
                     script = os.path.join("api_tests", name if name.endswith(".py") else name + ".py")
                     argv = [VENV_PY, script, "--host", "127.0.0.1"] + extra
                 print(f"\n--- {script} {' '.join(extra)}", flush=True)
                 with open(os.path.join(run_dir, f"test_{os.path.basename(script)}.log"), "w") as fh:
-                    r = subprocess.run(argv, cwd=ROOT, env=env, stdout=fh, stderr=subprocess.STDOUT, timeout=900)
+                    r = subprocess.run(argv, cwd=ROOT, env=env, stdout=fh, stderr=subprocess.STDOUT, timeout=limit)
                 print(f"    {'PASS' if r.returncode == 0 else 'FAIL'} (exit {r.returncode})", flush=True)
                 ok = ok and r.returncode == 0
-        if ok and args.faults:
+        if booted and args.faults:
             from sim import faults as fl
 
             def _kill(name, sig):
@@ -188,7 +218,7 @@ def main():
                 for k, (n, p, out) in enumerate(procs):
                     if n == name:
                         out.close()
-                        procs[k] = (name, *_start(name, ARGV[name], run_dir, env))
+                        procs[k] = (name, *_start(name, _argv(name, args.coverage), run_dir, env))
 
             def _wait_executor(timeout):
                 t1 = time.monotonic()
@@ -219,7 +249,7 @@ def main():
                     print("    " + ln, flush=True)
                 print(f"    {'PASS' if good else 'FAIL'} ({time.monotonic() - t1:.1f} s)", flush=True)
                 ok = ok and good
-        elif ok and not args.tests:
+        elif booted and not args.tests and not args.faults:
             print("\nThe simulated robot is up" + (f" for {args.seconds:.0f} s" if args.seconds else
                                                    " — Ctrl-C to stop") + ".", flush=True)
             end = time.monotonic() + args.seconds if args.seconds else None
@@ -239,6 +269,14 @@ def main():
             code = _stop(name, p)
             out.close()
             print(f"  stopped {name} (exit {code})", flush=True)
+    if args.coverage:
+        rep = quality.coverage_report(SIM_COVDIR, union_with=NETS_COVERAGE)
+        f = rep["files"]
+        print(f"\ncoverage of this simulated run: {rep['total']} % (lines + branches); RTI.py {f.get('RTI.py')} %, "
+              f"command_executor.py {f.get('command_executor.py')} %, self_collision_worker.py "
+              f"{f.get('self_collision_worker.py')} % — temp_data/sim/coverage/html/index.html")
+        if rep["union_total"] is not None:
+            print(f"the nets AND this run together: {rep['union_total']} % — temp_data/sim/coverage/union/html/index.html")
     print("RESULT:", "OK" if ok else "FAILED", f"— output in {os.path.relpath(run_dir, ROOT)}")
     print("Afterwards: sudo systemctl start autorun.service, then re-home the arm.")
     return 0 if ok else 1

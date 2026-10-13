@@ -211,7 +211,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
                                 robot_command, force_confirm_who)
     )
     if strings_created:
-        sim_mode.set("ON")
+        sim_mode.set("OFF")             # RTI writes the truth at its start (RCB_SIM; the dashboard's SIMULATION badge)
         robot_command.set("HOME")
         force_confirm_who.set("")
         robot_mode.set("IDLE")

@@ -345,6 +345,8 @@ environment, which carries different versions and is **not** what runs the robot
 | RTI command stream (UDP) | 30001 | `0.0.0.0` | source IP must match the paired PC |
 | RTI state stream (UDP) | → 30002 | — | unicast to the paired PC |
 | telemetry broadcast (UDP) | → 30003 | — | **the entire subnet**, unauthenticated |
+| operator dashboard (HTTP) | 8081 | `0.0.0.0` | **anyone who can reach it** — no login, no allowlist |
+| motor tuner / firmware flasher (HTTP, tools) | 8082 / 8083 | `0.0.0.0` | anyone, while the tool runs |
 
 Consequences worth stating plainly:
 
@@ -357,10 +359,16 @@ Consequences worth stating plainly:
   WiFi degradation documented there).
 - **`ALLOWED_IPS` gates the TCP hub only.** The RTI UDP return path follows whatever
   address the PC's TCP socket reports, so it needs no entry.
+- **The dashboard has no login.** Anyone who can open `http://<robot>:8081` can enable the
+  arm, jog it, run programs and change settings — the allowlist does not apply to it. Its
+  web libraries also carry published security advisories from time to time (the
+  development check `tools/run_nets.py --audit` lists them); on an isolated network they
+  are not reachable by an attacker.
 
-**Run this on an isolated or trusted network segment.** Do not expose port 29000 or 30001
-to an untrusted LAN, and never to the internet. If you need real authentication, the
-natural place is an HMAC over the command packet plus a session key issued at
+**Run the robot on an isolated network — the recommendation for every installation**: the
+robot, its control PC and nothing else (a dedicated switch, or a direct cable). Do not expose
+ports 8081, 29000 or 30001 to a shared LAN, and never to the internet. If you need real
+authentication, the natural place is an HMAC over the command packet plus a session key issued at
 `rti_connect` — not built, and there is a note in `config/networking.py` where it would go.
 
 `ALLOWED_IPS` ships with the development addresses. Add your own control PC without
