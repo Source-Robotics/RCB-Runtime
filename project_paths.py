@@ -13,6 +13,7 @@ Usage:
     xml_path = ROBOTS_DIR / "PAR6.xml"
 """
 
+import os
 from pathlib import Path
 
 # Root of the RCB Control Runtime project
@@ -31,6 +32,16 @@ UTILITY_DIR      = PROJECT_ROOT / "utility"
 IMAGES_DIR       = PROJECT_ROOT / "images"
 TEMP_DATA_DIR    = PROJECT_ROOT / "temp_data"
 DUMMY_TESTS_DIR  = PROJECT_ROOT / "dummy_test_scripts"
+
+# ─── Simulated robot (utility/sim_mode.py, 2026-10-13) ───────────────────────
+# RCB_SIM=1: the runtime talks to the simulated drives, and everything it WRITES — logs, incident dumps, the homing
+# arm table, markers — goes under temp_data/sim/, so a simulated run never touches the real arm's records.
+SIMULATION = os.environ.get("RCB_SIM", "") == "1"
+if SIMULATION:
+    LOGS_DIR      = PROJECT_ROOT / "temp_data" / "sim" / "logs"
+    TEMP_DATA_DIR = PROJECT_ROOT / "temp_data" / "sim" / "data"
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    os.makedirs(TEMP_DATA_DIR, exist_ok=True)
 
 # ─── Common files ────────────────────────────────────────────────────────────
 SYSTEM_XML     = CONFIG_DIR  / "system.xml"           # Top-level: selects active robot

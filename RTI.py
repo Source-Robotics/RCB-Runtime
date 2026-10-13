@@ -35,6 +35,7 @@ from utility.signal_processing import reset_rolling_stats, update_rolling_percen
 from utility.RTI_utils import print_heartbeat
 from project_paths import RTI_LOG, SYSTEM_XML, ROBOTS_DIR, TEMP_DATA_DIR, DATA_RECIPE_DIR, GRIPPERS_DIR, CRITICAL_LOG, FILTER_CONFIG_PATH, FLASH_PERFORMED_MARKER, CELLS_DIR, PROJECT_ROOT
 from utility.code_version import describe as describe_code
+from utility import sim_mode
 import logging
 import sys
 import numpy as np
@@ -306,11 +307,23 @@ def main():
     # Activity log — separate mechanism from the above (see TODO/activity_log_design.md).
     _rti_activity_logger = get_rti_activity_logger()
 
+    # The simulated robot (utility/sim_mode.py, TODO/simulated_robot_plan.md, 2026-10-13): RCB_SIM=1 = the simulated
+    # drives on the virtual bus instead of the arm, no real-time core, the real CAN chip left alone, logs and data under
+    # temp_data/sim/. Refused while another RTI runs (the robot service) or without the virtual bus.
+    _SIM = sim_mode.enabled()
+    _CAN_IF = sim_mode.can_interface()
+    if _SIM:
+        _why = sim_mode.refuse_reason()
+        if _why:
+            print(f"[SIM] RTI refused: {_why}", file=sys.stderr, flush=True)
+            sys.exit(2)
+
     # RT scheduling + CPU affinity. Runs AFTER setup_logging so the verified
     # RT-state line lands in RTI.log instead of disappearing.
     # enforce (2026-10-03): <realtime_required> in system.xml, default 1 — a control loop without SCHED_FIFO is
     # not the robot anyone tested; refusing is loud and safe (the arm never moves), as industrial real-time interfaces do.
-    setup_realtime_process(cpu_core=RT_CPU_CORE, priority=99, enforce=bool(_sys.get('realtime_required', 1)))
+    if not _SIM:
+        setup_realtime_process(cpu_core=RT_CPU_CORE, priority=99, enforce=bool(_sys.get('realtime_required', 1)))
     # The logging thread starts HERE, after the RT scheduling, so it inherits SCHED_FIFO 99 on core 3 like the
     # ZMQ listener thread does (2026-10-01): a Python thread at normal priority on another core can be preempted
     # while holding the GIL, and the loop would wait for it. At FIFO 99 on core 3 it only runs while the loop
@@ -325,6 +338,9 @@ def main():
     logging.info(f"[control box] {describe_pcb(_sys.get('pcb_version', 1))}")
     # Which commit this RTI runs (2026-10-13; tools/arm_smoke.py records it) — read from the .git files, no subprocess.
     logging.info(f"[RTI] code: {describe_code(PROJECT_ROOT)}")
+    if _SIM:
+        logging.warning(f"[SIM] SIMULATION — the simulated drives on {_CAN_IF}, NOT the arm; no real-time core or "
+                        f"priority; logs and data under {TEMP_DATA_DIR.parent}")
     # The last two seconds before a hard error -> temp_data/incidents/*.npz (utility/incident_dump.py,
     # 2026-10-03). Its worker thread starts here for the same reason the log listener does; it yields between
     # channels, so it never holds the interpreter for more than ~one channel of the 500-tick history.
@@ -498,22 +514,26 @@ def main():
     # ==========================================================================
     # Start / Restart CAN interface when starting this script
     # ==========================================================================
-    start_can_interface()
-    # The CAN chip's interrupt threads are created when can0 comes up: give them core 2 alone and keep interactive
-    # programs on the general cores — on RTI's core they froze all CAN traffic while RTI's tick ran, on a shared
-    # core they stalled under load (2026-10-12, api_tests/69, config/cpu_cores.py).
-    place_can_path(CAN_CPU_CORE, GENERAL_CPU_CORES)
-    communication1 = initialize_can_communication(bustype='socketcan', channel='can0', bitrate=1000000)
+    if _SIM:
+        logging.warning(f"[SIM] {_CAN_IF}: no bring-up (bit rate, bus-off restart) and no CAN core placement — a "
+                        f"virtual bus; the real can0 is left alone")
+    else:
+        start_can_interface()
+        # The CAN chip's interrupt threads are created when can0 comes up: give them core 2 alone and keep interactive
+        # programs on the general cores — on RTI's core they froze all CAN traffic while RTI's tick ran, on a shared
+        # core they stalled under load (2026-10-12, api_tests/69, config/cpu_cores.py).
+        place_can_path(CAN_CPU_CORE, GENERAL_CPU_CORES)
+    communication1 = initialize_can_communication(bustype='socketcan', channel=_CAN_IF, bitrate=1000000)
     # TODO/can_tx_timing_plan.md option B (read first, send early): the waiter's state IS the switch — ON at start when
     # system.xml says <can_read_first>1 (the default since 2026-10-12, §9.11; below, once the meter exists),
     # `can_read_first:1|0` at runtime.
-    first_frame_wait = FirstFrameWait('can0')
+    first_frame_wait = FirstFrameWait(_CAN_IF)
     # Option B's CAN read: python-can's receive without its per-frame select() and Message object, on the same socket
     # (hardware/can_hardware.FastCanReader, 2026-10-12).
     fast_can_reader = FastCanReader(communication1)
     # The control loop's delay per joint (a reply -> the command computed from it), sampled live for the GUI's RT
     # Diagnostics (2026-10-12, utility/loop_delay_meter.py): a read-only socket that sees our own frames leave.
-    loop_delay_meter = LoopDelayMeter(joint_num)
+    loop_delay_meter = LoopDelayMeter(joint_num, interface=_CAN_IF)
     shared_data.rti["loop_delay"][:] = np.nan          # not measured yet (the GUI shows a dash)
     shared_data.rti["loop_delay_max"][:] = np.nan
     if _sys['can_read_first']:
