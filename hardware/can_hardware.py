@@ -188,6 +188,31 @@ def parse_cpu_list(text):
     return out
 
 
+def can_path_tasks(interface="can0", sys_root="/sys", proc_root="/proc"):
+    """READER for the dashboard (2026-10-13): what place_can_path places — the CAN chip's and its SPI controller's
+    interrupt threads, found the same way ({pid: (role, thread name)}, role "CAN chip IRQ" / "CAN SPI IRQ"), and the SPI
+    controller's runtime-power setting ("on" as RTI sets it; None if unknown). Reads only."""
+    out = {"threads": {}, "power": None}
+    parts = can_spi_parts(os.path.realpath(os.path.join(sys_root, "class", "net", interface, "device")))
+    if parts is None:
+        return out
+    chip, controller_dir = parts
+    try:
+        with open(os.path.join(proc_root, "interrupts")) as fh:
+            interrupts = fh.read()
+    except OSError:
+        interrupts = ""
+    for role, name in (("CAN chip IRQ", chip), ("CAN SPI IRQ", os.path.basename(controller_dir))):
+        for pid, tname in irq_thread_pids(irq_numbers(interrupts, (name,)), proc_root).items():
+            out["threads"][pid] = (role, tname)
+    try:
+        with open(os.path.join(controller_dir, "power", "control")) as fh:
+            out["power"] = fh.read().strip()
+    except OSError:
+        pass
+    return out
+
+
 def place_can_path(can_core, general_cores, interface="can0", sys_root="/sys", proc_root="/proc",
                    run=subprocess.run, get_affinity=os.sched_getaffinity):
     """Give the CAN path a core of its own: the CAN chip's and its SPI controller's interrupt threads to

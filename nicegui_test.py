@@ -33,7 +33,7 @@ from utility.signal_filters import FILTER_KINDS
 # that can drift (TODO/RTI_mode_plan.md §9.1 is what happens when numbers get retyped).
 from motion.rti_handler import COMMAND_TIMEOUT_S, SUCCESS_WINDOW_TICKS, SUCCESS_WARN, SUCCESS_BAD
 from utility.filter_config import ALL_SIGNALS, default_filter_config
-from utility.process_utils import process_info
+from gui_processes import PROCESS_COLUMNS, add_processes_card, process_rows   # System Info: processes / threads / cores
 from data.shared_memory_index import ESTOP_1 as _ESTOP_1   # for plot event markers
 
 shared_data.setup(joints=6)
@@ -452,22 +452,8 @@ rti_columns = [
     {'name': 'conn_err', 'label': 'Conn Err', 'field': 'conn_err'},
 ]
 
-# Processes panel (System Info tab). Pattern = the script's command-line basename.
-process_columns = [
-    {'name': 'name',  'label': 'Name',  'field': 'name', 'align': 'left'},
-    {'name': 'pid',   'label': 'PID',   'field': 'pid'},
-    {'name': 'cores', 'label': 'Core',  'field': 'cores'},
-    {'name': 'sched', 'label': 'Sched', 'field': 'sched'},
-    {'name': 'prio',  'label': 'Prio',  'field': 'prio'},
-    {'name': 'cpu',   'label': 'CPU%',  'field': 'cpu'},
-    {'name': 'mem',   'label': 'Mem',   'field': 'mem'},
-]
-PROCESS_PATTERNS = {
-    "RTI":        "RTI.py",
-    "GUI":        "nicegui_test.py",
-    "HIGH_LEVEL": "command_executor.py",
-    "SUPERVISOR": "supervisor.py",
-}
+# Processes panel (System Info tab): gui_processes.py (processes, threads, the core plan; 2026-10-13).
+process_columns = PROCESS_COLUMNS
 
 activity_columns = [
     {'name': 'time',    'label': 'Time',    'field': 'time',    'align': 'left'},
@@ -1452,17 +1438,9 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 ui.label("CB Status");        sysinfo_cb_stat_lbl = ui.label("---")
                 ui.label("CB Current Error"); sysinfo_cb_err_lbl  = ui.label("---")
 
-        # ─── Processes (core / scheduler / priority / load) ──────
-        # RTI is the only real-time process (SCHED_FIFO 99 on its own core 3);
-        # the others run normal scheduling on dedicated cores. Reads LIVE kernel
-        # state via utility.process_utils.process_info. Refreshed at 1 Hz only
-        # while the System Info tab is active (see update_tables()).
-        with ui.card().classes("w-full"):
-            with ui.row().classes("items-center gap-2"):
-                ui.label("Processes").classes("text-sm font-semibold text-gray-600 uppercase tracking-wide")
-                ui.label("(RTI = real-time, others normal)").classes("text-xs text-gray-400")
-            process_table = ui.table(columns=process_columns, rows=[], row_key="name") \
-                .classes("w-full").props("dense flat")
+        # ─── Processes, threads and the core plan (gui_processes.py, 2026-10-13) ──────
+        # Reads LIVE kernel state; refreshed at 1 Hz only while this tab is active (refresh_processes()).
+        refresh_process_card = add_processes_card()
 
         # Which arm homing recognised, the learned arms, rename / forget / accept (gui_homing_arms.py, 2026-10-09)
         try:
@@ -4498,41 +4476,13 @@ def refresh_plots():
 # AUTO REFRESH
 # ─────────────────────────────────────────────────────────────
 def refresh_processes():
-    """1 Hz refresh of the Processes table. Scans only when a tab that shows it
-    is active (System Info, or the Plots tab's TEMP diagnostic copy) — process
-    state changes slowly and cpu_percent() wants ~1 s between samples.
-    The same rows feed both tables (a NiceGUI element can only live in one
-    place, so the diagnostic table is a separate widget sharing this data)."""
+    """1 Hz refresh of the processes / threads / core-plan card (gui_processes.py). Reads only while a tab that shows
+    it is active (System Info, or the Plots tab's TEMP diagnostic copy) — cpu_percent() wants ~1 s between samples."""
     _tab = _active_tab_name(tabs.value)
-    if _tab not in ('System Info', 'Plots'):
-        return
-    rows = []
-    for info in process_info(PROCESS_PATTERNS):
-        if not info["running"]:
-            rows.append({"name": info["name"], "pid": "—", "cores": "—",
-                         "sched": "NOT RUNNING", "prio": "—", "cpu": "—", "mem": "—"})
-            continue
-        rt = info["sched"] in ("FIFO", "RR")
-        # CPU% is per-core (100% = one full core saturated). Tag it with the
-        # core(s) the process runs on, e.g. "38% (c3)", so it's unambiguous.
-        if info["cpu"] is not None:
-            _cpu = f"{info['cpu']:.0f}% (c{info['cores']})"
-        else:
-            _cpu = "—"
-        rows.append({
-            "name": info["name"],
-            "pid": info["pid"],
-            "cores": info["cores"],
-            "sched": f"{info['sched']} {'RT' if rt else ''}".strip(),
-            "prio": info["prio"],
-            "cpu": _cpu,
-            "mem": f"{info['mem_mb']}MB" if info["mem_mb"] is not None else "—",
-        })
     if _tab == 'System Info':
-        process_table.rows = rows
-        process_table.update()
-    else:  # Plots — TEMP diagnostic copy
-        process_table_diag.rows = rows
+        refresh_process_card()
+    elif _tab == 'Plots':  # TEMP diagnostic copy
+        process_table_diag.rows = process_rows()
         process_table_diag.update()
 
 
