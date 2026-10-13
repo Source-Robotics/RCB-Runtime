@@ -9,6 +9,7 @@ Runs at normal priority on the general cores; SIGTERM / Ctrl-C stops it.
 """
 from __future__ import annotations
 
+import math
 import os
 import signal
 import sys
@@ -24,19 +25,48 @@ STEP_S = 0.001
 REPORT_S = 10.0
 
 
+REACH_S = 3.0          # an endstop / the magnet sits this long (at the homing speed) from the start, on the homing side
+
+
+def _num(v, default):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return float(default)
+    return float(default) if math.isnan(v) else v
+
+
+def homing_layout(speed, direction, timeout_s, hall):
+    """(stop, stop_dir, hall_centre) for one actuator starting at 0 ticks: its endstop (or, with a Hall sensor, its
+    magnet and no endstop) REACH_S at its homing speed along its homing direction (0 = positive), at most 40 % of its
+    homing timeout away. The joints are ideal (no gravity), so where the arm starts does not matter: homing defines
+    the angles from these stops, as on the arm."""
+    s = 1 if int(_num(direction, 1)) == 0 else -1
+    dist = abs(_num(speed, 5000.0)) * min(REACH_S, 0.4 * _num(timeout_s, 6.0))
+    if hall:
+        return None, s, s * dist
+    return s * dist, s, None
+
+
 def build_drives():
-    """{node: SimDrive} for the active robot's joints (+ its CAN gripper), Kt from the robot / gripper XMLs."""
-    import math
+    """{node: SimDrive} for the active robot's joints (+ its CAN gripper): Kt from the robot / gripper XMLs, the
+    endstops and J6's magnet placed from the homing fields (the same defaults as robotics/homing/config.py)."""
     import config.xml_parser as xp
     from project_paths import GRIPPERS_DIR, ROBOTS_DIR, SYSTEM_XML
     sysc = xp.load_system_config(SYSTEM_XML, ROBOTS_DIR)
     cfg = xp.load_full_robot_config(str(sysc["robot_xml_path"]), grippers_dir=GRIPPERS_DIR,
                                     active_gripper=sysc["active_gripper"])
     n = int(sysc["joint_num"])
-    drives = {i: SimDrive(i, kt=float(cfg["motor_kt"][i])) for i in range(n)}
+    drives = {}
+    for i in range(n):
+        stop, s, hall = homing_layout(cfg["homing_speed"][i], cfg["homing_direction"][i], cfg["homing_timeout_s"][i],
+                                      int(_num(cfg["has_hall_sensor"][i], 0)) == 1)
+        drives[i] = SimDrive(i, kt=float(cfg["motor_kt"][i]), stop=stop, stop_dir=s, hall=hall)
     raw = cfg.get("gripper_CAN_gripper")
     if raw is not None and not (isinstance(raw, float) and math.isnan(raw)) and int(raw):
-        drives[n] = SimDrive(n, gripper=True, kt=float(cfg["gripper_kt"]))
+        stop, s, hall = homing_layout(cfg.get("gripper_homing_speed"), cfg.get("gripper_homing_direction"),
+                                      cfg.get("gripper_homing_timeout_s"), False)
+        drives[n] = SimDrive(n, gripper=True, kt=float(cfg["gripper_kt"]), stop=stop, stop_dir=s)
     return drives
 
 

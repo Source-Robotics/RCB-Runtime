@@ -37,18 +37,18 @@ PY = os.path.join(ROOT, ".venv", "bin", "python")
 OUT = os.path.join(str(TEMP_DATA_DIR), "smoke")
 TIMEOUT_S = 240
 
-# (name, script, extra args, what moves (None = nothing), needs EXEC first)
+# (name, script, extra args, what moves (None = nothing), the mode it must start in (None = IDLE or EXEC))
 TESTS = [
-    ("status",         "00_status.py",         [],                                        None, False),
-    ("is_reachable",   "49_is_reachable.py",   [],                                        None, False),
-    ("arbitration",    "42_arbitration.py",    [],                                        None, False),
-    ("self_collision", "60_self_collision.py", ["--go"],                                  None, False),
-    ("rti_link",       "25_rti_comm.py",       [],                                        None, False),
-    ("joint_nudge",    "02_joint.py",          ["--go", "--assume-ready", "--speed", "10"], "J1 +1 deg and back", True),
+    ("status",         "00_status.py",         [],                                        None, None),
+    ("is_reachable",   "49_is_reachable.py",   [],                                        None, None),
+    ("arbitration",    "42_arbitration.py",    [],                                        None, None),
+    ("self_collision", "60_self_collision.py", ["--go"],                                  None, None),
+    ("rti_link",       "25_rti_comm.py",       [],                                        None, "IDLE"),   # RTI only from IDLE
+    ("joint_nudge",    "02_joint.py",          ["--go", "--assume-ready", "--speed", "10"], "J1 +1 deg and back", "EXEC"),
     ("stop",           "12_stop.py",           ["--go", "--assume-ready", "--speed", "10"],
-     "J1 5 deg, stopped mid-move, back", True),
+     "J1 5 deg, stopped mid-move, back", "EXEC"),
     ("exec_abort",     "45_exec_abort.py",     ["--go"],
-     "J5 small moves, a refused limit, a jog", False),
+     "J5 small moves, a refused limit, a jog", None),
 ]
 
 
@@ -199,14 +199,16 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     results = []
     aborted = None
-    for name, script, extra, moves, needs_exec in tests:
+    for name, script, extra, moves, mode in tests:
         s = _status(robot)
         problems = _ready_problems(s)
         if problems:
             aborted = f"before '{name}': " + "; ".join(problems)
             break
-        if needs_exec and s.get("mode") != "EXEC":
+        if mode == "EXEC" and s.get("mode") != "EXEC":
             robot.enter_exec_mode(wait=True)
+        elif mode == "IDLE" and s.get("mode") != "IDLE":
+            robot.enter_idle_mode(wait=True)
         try:
             robot.release_control()
         except Exception:                                           # noqa: BLE001 — not holding it is fine

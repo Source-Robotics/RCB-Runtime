@@ -177,10 +177,17 @@ def main():
             robot.move_joints(*[float(x) for x in with_j5(q0, past)], speed=args.speed)
         except CommandRejected as e:
             sync_reject = e
+        late_abort = None
         if sync_reject is None:
-            robot.move_joints(*[float(x) for x in q0], speed=args.speed)
+            # ... and the third outcome (seen in the simulator, 2026-10-13): the refusal lands between the two acks,
+            # so the abort refuses the next command AT ITS ACK — the program stops at the failure all the same.
+            try:
+                robot.move_joints(*[float(x) for x in q0], speed=args.speed)
+            except CommandRejected as e:
+                late_abort = e
         f = robot.wait_idle(timeout=args.timeout, raise_on_error=False)
-        got = (["JOINT_LIMIT"] if sync_reject is not None else []) + codes(f)
+        got = (["JOINT_LIMIT"] if sync_reject is not None else []) + codes(f) \
+            + (["ABORTED"] if late_abort is not None and late_abort.code == "ABORTED" else [])
         check("failures are [JOINT_LIMIT, ABORTED] (or JOINT_LIMIT at the ack, program not continued)",
               got in (["JOINT_LIMIT", "ABORTED"], ["JOINT_LIMIT"]),
               f"{got}" + (" — rejected at the ack" if sync_reject is not None else ""))

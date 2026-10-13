@@ -2181,8 +2181,10 @@ def main():
             rti_errors=rti_handler.take_command_errors(),
             # J{i}:CAN_REPLY_MISSED_WARNING (warn-only) — a joint's replies missing RTI's read too often.
             can_warnings=can_reply_monitor.warnings,
-            loop_degraded=_loop_degraded,
-            loop_critical=_loop_critical,
+            # In simulation (utility/sim_mode) the loop has no real-time core or priority and shares two cores with the
+            # simulator: a critically slow loop is reported as LOOP_DEGRADED, never latched — timing is not simulated.
+            loop_degraded=_loop_degraded or (_SIM and _loop_critical),
+            loop_critical=_loop_critical and not _SIM,
             monitor_errors=_monitor_errors,
             monitor_warnings=safety_monitor.warnings,
             on_hard_error=_incident_hook,

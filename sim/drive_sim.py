@@ -2,10 +2,13 @@
 the joint firmware's communication_CAN.cpp, V106). The CAN library's own decoder is the contract:
 dummy_test_scripts/test_sim_drives.py decodes every reply built here with Spectral_BLDC.UnpackData.
 
-The model (S1, "simple first"): a joint follows its command like an ideal motor — position mode moves toward the target
+The model ("simple first"): a joint follows its command like an ideal motor — position mode moves toward the target
 at up to the drive's velocity limit, speed mode at the commanded speed (clamped to it), current mode and idle hold
 still (nothing pushes the joint: no gravity, no hand). A current limit of 0 holds it still in every mode (the Hall
-sensor check relies on that). No endstops, no magnet (S2). The drive's CAN watchdog is the firmware's: data packs,
+sensor check relies on that). S2 (2026-10-13): a one-sided endstop on the homing side — the joint stops there and,
+pushed into it, reports its current limit (homing's stall test: the limit is homing_current_ma, the threshold 70 % of
+it); J6's magnet holds its Hall pin LOW within HALL_HALF_WIDTH ticks, with the firmware's edge / level detection and
+latch (Hall_Indexing_mode). The drive's CAN watchdog is the firmware's: data packs,
 Hall / gripper packs and polls restart its timer, IN_WATCHDOG_TIMEOUT only sets the time, a clear removes a trip but
 does not restart the timer, and a tripped (or E-stopped) drive goes idle.
 """
@@ -58,11 +61,23 @@ def _from(b):
     return int.from_bytes(b, "big", signed=True)
 
 
+HALL_HALF_WIDTH = 1000         # ticks: the magnet holds the Hall pin LOW within this of its centre (the homing net's)
+FREE_MA = 40                   # mA a free joint draws moving in speed mode (below every homing stall threshold)
+
+
 class SimDrive:
     def __init__(self, node, gripper=False, kt=0.1, position=0.0, temperature=38, vbus_mv=23500, sw_version=103,
-                 hw_version=1, batch=1, serial=1):
+                 hw_version=1, batch=1, serial=1, stop=None, stop_dir=1, hall=None):
+        """stop: the endstop's position (ticks) on the `stop_dir` (+1 / -1) side — homing pushes into it; the joint is
+        free the other way (S2: one-sided, as the homing net's arm). hall: the magnet's centre (ticks), J6."""
         self.node = node
         self.gripper = gripper
+        self.stop = None if stop is None else float(stop)
+        self.stop_dir = 1 if stop_dir >= 0 else -1
+        self.hall = None if hall is None else float(hall)
+        self.pushing = False
+        self._hall_prev = None                  # the firmware's additional2_var_prev (edge mode)
+        self._hall_needs_init = True
         self.kt = float(kt)
         self.position = float(position)        # motor ticks
         self.speed = 0.0                        # ticks / s, measured
@@ -185,6 +200,7 @@ class SimDrive:
                 self.hall_trigger_value = data[3]
                 if self.mode != HALL:                   # re-armed only when entering the mode
                     self.hall_trigger, self.hall_index = 1, 0
+                    self._hall_needs_init = True
                 self.mode = HALL
                 self._wd_reset = True
             out.append(self._hall_reply())
@@ -216,23 +232,70 @@ class SimDrive:
         return out
 
     # ------------------------------------------------------------------------------------------------ the model
+    def _hall_pin(self):
+        return 0 if self.hall is not None and abs(self.position - self.hall) <= HALL_HALF_WIDTH else 1
+
+    def _hall_mode(self):
+        """motor_control.cpp Hall_Indexing_mode(): the pin read, then edge (trigger 2) or level (0 / 1) detection; a
+        detection latches the position (the drive then holds it) — any other trigger value (3: the Hall sensor check)
+        never matches, so the speed loop runs on. Returns the mode the loop runs this step: SPEED or POSITION."""
+        self.hall_pin = self._hall_pin()
+        if self.hall_trigger_value == 2:
+            if self._hall_needs_init:
+                self._hall_prev = self.hall_pin
+                self._hall_needs_init = False
+            elif self.hall_trigger == 1:
+                if self.hall_pin != self._hall_prev:
+                    self.target = self.position
+                    self.hall_trigger, self.hall_index = 0, 1
+                self._hall_prev = self.hall_pin
+            return POSITION if self.hall_trigger == 0 else SPEED
+        if self.hall_pin == self.hall_trigger_value:
+            if self.hall_trigger == 1:
+                self.target = self.position
+                self.hall_trigger, self.hall_index = 0, 1
+            return POSITION
+        self.hall_trigger = 1
+        return SPEED
+
+    def _clamp_stop(self, x):
+        """The endstop: the joint cannot pass it on its side. Returns (position, pushed against it)."""
+        if self.stop is None:
+            return x, False
+        if self.stop_dir > 0 and x > self.stop:
+            return self.stop, True
+        if self.stop_dir < 0 and x < self.stop:
+            return self.stop, True
+        return x, False
+
     def step(self, dt, ms):
         """Advance the joint by dt seconds (and run the watchdog at ms)."""
         self._watchdog(ms)
         prev = self.position
         vmax = abs(self.velocity_limit)
         limp = self.error or self.current_limit == 0 or self.mode in (IDLE, CURRENT)
+        run = self.mode
+        if self.mode == HALL:
+            run = self._hall_mode()
+        self.pushing = False
         if not limp and dt > 0:
-            if self.mode in (POSITION, PD):
-                step = max(-vmax * dt, min(vmax * dt, self.target - self.position))
-                self.position += step
-            elif self.mode in (SPEED, HALL):
-                self.position += max(-vmax, min(vmax, self.target_speed)) * dt
+            if run in (POSITION, PD):
+                nx = self.position + max(-vmax * dt, min(vmax * dt, self.target - self.position))
+            elif run == SPEED:
+                nx = self.position + max(-vmax, min(vmax, self.target_speed)) * dt
+            else:
+                nx = self.position
+            self.position, self.pushing = self._clamp_stop(nx)
         self.speed = (self.position - prev) / dt if dt > 0 else 0.0
         if self.error or self.mode == IDLE:
             self.current = 0.0
+        elif self.pushing:                               # leaning on the endstop: the loop saturates at its limit
+            self.current = self.stop_dir * self.current_limit
         elif self.mode == CURRENT:
             self.current = max(-self.current_limit, min(self.current_limit, self.iq_setpoint))
+        elif run == SPEED and self.target_speed != 0:
+            self.current = max(-self.current_limit, min(self.current_limit,
+                                                         self.ff_current + (FREE_MA if self.target_speed > 0 else -FREE_MA)))
         else:
             self.current = max(-self.current_limit, min(self.current_limit, self.ff_current))
         if self.gripper and self.g_activated and self.g_action and not self.error and dt > 0:
