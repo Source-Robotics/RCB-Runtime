@@ -6,7 +6,7 @@ set of api_tests on the arm and saves the results with the commit they ran on.
         --yes          no question (you are at the arm anyway)
         --list         what it runs, then exit
         --only a,b     just these (names from --list; a+b too — inside sim_run.py --tests, whose list splits on ',')
-        --suite sim    the SIMULATED suite (refused on the real arm): these tests + 21 more api_tests that move the
+        --suite sim    the SIMULATED suite (refused on the real arm): these tests + 28 more api_tests that move the
                        arm far (blends, Cartesian lines and curves, G-code, pause / stop mid-chain, SOFT_RTI, block
                        programs ...) — run by tools/sim_run.py --tests suite (2026-10-13)
 
@@ -90,9 +90,21 @@ SIM_EXTRA = [
     ("soft_rti",        "27_soft_rti.py",         ["--move", "--seconds", "5"], "J1 streamed", "IDLE"),
     ("soft_rti_safety", "34_soft_rti_safety.py",  ["--go"], None, "IDLE"),
     ("block_program",   "57_block_program.py",    ["--go"], "J5 block programs", None),
+    # 2026-10-13, the second pass (user: "item 7"): zone blending, multi-joint and TCP streaming, a read-only glitch
+    # hunt, a block Check's load, the profile demo; and every setting command once (72). Not 26 (pick and place):
+    # it asks the operator to place a part (input()), so it cannot run unattended.
+    ("zone_blend",      "14_zone_blend.py",       ["--go", "--assume-ready"], "a zone-blended burst", "EXEC"),
+    ("multi_joint",     "32_multi_joint.py",      ["--go", "--freqs", "0.5", "--rates", "25", "--seconds", "3"],
+     "J1 / J4 / J5 / J6 streamed together (SOFT_RTI)", "IDLE"),
+    ("transport",       "41_transport.py",        ["--go", "--seconds", "6"], "SOFT_RTI over UDP, then TCP", "IDLE"),
+    ("glitch_hunt",     "43_glitch_hunt.py",      ["--seconds", "10"], None, None),
+    ("check_load",      "58_block_check_load.py", ["--enabled-ok", "--checks", "1", "--baseline", "2"], None, None),
+    ("profile_demo",    "67_profile_demo.py",     ["--go", "--auto", "--steps", "0,1"],
+     "the default profile, then ruckig vs trapezoid", "EXEC"),
+    ("command_sweep",   "72_command_sweep.py",    [], None, "IDLE"),
 ]
 SIM_POSE_SPEED = 30          # the simulated suite's moves to the start pose (%)
-NO_HOST = {"23_dry_run_preview.py"}     # offline tests: no robot, no --host
+NO_HOST = {"23_dry_run_preview.py", "43_glitch_hunt.py"}     # offline / shared-memory-only tests: no --host
 
 
 def _to_start_pose(robot, speed):
@@ -212,7 +224,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="print the tests and exit")
     ap.add_argument("--only", default="", help="comma-separated names (see --list)")
     ap.add_argument("--suite", default="arm", choices=("arm", "sim"),
-                    help="arm = the smoke routine; sim = + 21 api_tests, the SIMULATED robot only")
+                    help="arm = the smoke routine; sim = + 28 api_tests, the SIMULATED robot only")
     args = ap.parse_args()
 
     simulated_suite = args.suite == "sim"

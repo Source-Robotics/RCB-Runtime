@@ -35,7 +35,7 @@ from collections.abc import Sequence
 
 import math
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:            # hints only — this module stays numpy-free at run time (pure-math hot path)
     import numpy as np
@@ -63,7 +63,7 @@ def zone_key(zone: dict, suffix: str) -> str:
 
 
 # --------------------------------------------------------------------------------------- building
-def _vec(value: Sequence[float], n: int, what: str) -> tuple[float, ...]:
+def _vec(value: Any, n: int, what: str) -> tuple[float, ...]:      # validates untrusted XML (None included)
     try:
         v = tuple(float(x) for x in value)
     except (TypeError, ValueError):
@@ -73,7 +73,7 @@ def _vec(value: Sequence[float], n: int, what: str) -> tuple[float, ...]:
     return v
 
 
-def _positive(value: float, what: str) -> float:
+def _positive(value: Any, what: str) -> float:                     # validates untrusted XML (None included)
     try:
         v = float(value)
     except (TypeError, ValueError):
@@ -144,7 +144,9 @@ def make_zone(name: str, shape: str, kind: str, reaction: str = "stop", checks: 
     if not (math.isfinite(margin) and 0.0 <= margin <= MAX_MARGIN_M):
         raise ValueError(f"{what}: margin must be 0..{MAX_MARGIN_M} m, got {margin!r}")
 
-    g = dict(geometry)
+    g: dict[str, Any] = dict(geometry)            # values checked one by one below (_vec, _positive, ...)
+    public: dict[str, Any]
+    compiled: tuple[Any, ...]
     expected = {"box": {"min", "max"}, "prism": {"vertices", "z_min", "z_max"},
                 "cylinder": {"p1", "p2", "radius", "rounded"}, "sphere": {"center", "radius"},
                 "plane": {"point", "normal"}}[shape]
@@ -205,7 +207,7 @@ def make_zone(name: str, shape: str, kind: str, reaction: str = "stop", checks: 
         compiled = (_PLANE, p[0], p[1], p[2], n[0], n[1], n[2])
 
     if shape == "box":
-        bound = (compiled[1], compiled[2], compiled[3], math.sqrt(compiled[4] ** 2 + compiled[5] ** 2 + compiled[6] ** 2))
+        bound = (compiled[1], compiled[2], compiled[3], math.sqrt(compiled[4] ** 2 + compiled[5] ** 2 + compiled[6] ** 2))  # type: ignore[misc]  # the box's 7-tuple
     elif shape == "prism":
         xs, ys = [v[0] for v in verts], [v[1] for v in verts]
         bx, by = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
@@ -215,7 +217,7 @@ def make_zone(name: str, shape: str, kind: str, reaction: str = "stop", checks: 
         reach = 0.5 * length + r if rounded else math.sqrt((0.5 * length) ** 2 + r * r)
         bound = (mid[0], mid[1], mid[2], reach)
     elif shape == "sphere":
-        bound = (compiled[1], compiled[2], compiled[3], compiled[4])
+        bound = (compiled[1], compiled[2], compiled[3], compiled[4])  # type: ignore[misc]  # the sphere's 5-tuple
     else:
         bound = None
     return {"name": name, "shape": shape, "kind": kind, "reaction": reaction, "checks": checks,
@@ -344,7 +346,8 @@ def penetration(zone: dict, x: float, y: float, z: float, radius: float = 0.0, m
     return sd + radius + m if zone["_allowed"] else radius + m - sd
 
 
-def sphere_centres(m: np.ndarray, spheres: Sequence[Sequence[float]], cx: np.ndarray, cy: np.ndarray, cz: np.ndarray) -> None:
+def sphere_centres(m: np.ndarray, spheres: Sequence[Sequence[float]], cx: np.ndarray | list[float],
+                   cy: np.ndarray | list[float], cz: np.ndarray | list[float]) -> None:
     """World centres of the robot spheres for TCP pose `m` (a flat 16-value row-major 4x4 — a
     shared-memory view or a list), written INTO the lists cx, cy, cz (len >= len(spheres)). Reads each
     pose element once as a Python float: arithmetic on numpy scalars is several times slower."""
@@ -358,8 +361,8 @@ def sphere_centres(m: np.ndarray, spheres: Sequence[Sequence[float]], cx: np.nda
         cz[k] = m8 * sx + m9 * sy + m10 * sz + m11
 
 
-def penetration_at(zone: dict, cx: np.ndarray, cy: np.ndarray, cz: np.ndarray, spheres: Sequence[Sequence[float]], n: int,
-                   margin: float | None) -> tuple[float, int]:
+def penetration_at(zone: dict, cx: np.ndarray | list[float], cy: np.ndarray | list[float], cz: np.ndarray | list[float],
+                   spheres: Sequence[Sequence[float]], n: int, margin: float) -> tuple[float, int]:
     """Worst penetration of `zone` over robot spheres 0..n-1 whose centres are in cx, cy, cz.
     Returns (pen, sphere_index). For a FORBIDDEN zone a sphere far outside its bounding sphere is not
     evaluated exactly: its penetration is replaced by an upper bound that is still < 0 — so every

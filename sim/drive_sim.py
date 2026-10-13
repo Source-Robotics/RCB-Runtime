@@ -11,9 +11,15 @@ it); J6's magnet holds its Hall pin LOW within HALL_HALF_WIDTH ticks, with the f
 latch (Hall_Indexing_mode). The drive's CAN watchdog is the firmware's: data packs,
 Hall / gripper packs and polls restart its timer, IN_WATCHDOG_TIMEOUT only sets the time, a clear removes a trip but
 does not restart the timer, and a tripped (or E-stopped) drive goes idle.
+
+S6 (2026-10-13) — DISTURBANCES, each set by the control channel's "physics" command until a time: what a real arm does
+that the ideal joint does not, so the safety monitor's checks can trip in simulation: a hand turning a limp joint
+(push), the joint moving on its own whatever it is told (runaway), a drive following its position target with a lag
+(lag), and the measured current swinging while the joint holds (buzz).
 """
 from __future__ import annotations
 
+import math
 import struct
 
 # Command ids (the CAN library's / the firmware's numbers)
@@ -117,6 +123,11 @@ class SimDrive:
         self.g_calibrated = 1
         self.g_object = 0
         self.frames = 0
+        # S6 disturbances, each until its *_until_ms (the control channel's "physics" command)
+        self.push_speed, self.push_until_ms = 0.0, -1          # ticks/s: a hand turning a LIMP joint (idle / current)
+        self.runaway_speed, self.runaway_until_ms = 0.0, -1    # ticks/s: the joint moving on its own (a powered drive)
+        self.lag_tau, self.lag_until_ms = 0.0, -1              # s: position / PD mode follows its target with this lag
+        self.buzz_ma, self.buzz_hz, self.buzz_until_ms = 0.0, 0.0, -1   # the measured current swinging
 
     @property
     def error(self):
@@ -292,6 +303,36 @@ class SimDrive:
             return self.stop, True
         return x, False
 
+    def _powered_position(self, run, vmax, dt, ms):
+        """Where a POWERED joint goes in dt: its runaway (S6), else its mode's motion toward its command."""
+        if ms < self.runaway_until_ms:                   # S6: moving on its own — its command is ignored
+            return self.position + self.runaway_speed * dt
+        if run in (POSITION, PD):
+            to_go = self.target - self.position
+            if ms < self.lag_until_ms and self.lag_tau > 0:              # S6: a lagging drive
+                to_go *= dt / (self.lag_tau + dt)
+            return self.position + max(-vmax * dt, min(vmax * dt, to_go))
+        if run == SPEED:
+            return self.position + max(-vmax, min(vmax, self.target_speed)) * dt
+        return self.position
+
+    def _measured_current(self, run, ms):
+        """The current the drive reports (mA): its mode's, saturated on an endstop, plus a buzz (S6)."""
+        if self.error or self.mode == IDLE:
+            cur = 0.0
+        elif self.pushing:                               # leaning on the endstop: the loop saturates at its limit
+            cur = self.stop_dir * self.current_limit
+        elif self.mode == CURRENT:
+            cur = max(-self.current_limit, min(self.current_limit, self.iq_setpoint))
+        elif run == SPEED and self.target_speed != 0:
+            cur = max(-self.current_limit, min(self.current_limit,
+                                               self.ff_current + (FREE_MA if self.target_speed > 0 else -FREE_MA)))
+        else:
+            cur = max(-self.current_limit, min(self.current_limit, self.ff_current))
+        if ms < self.buzz_until_ms and self.buzz_ma and not self.error:   # S6: a buzzing hold (the drive's Iq swings)
+            cur += self.buzz_ma * math.sin(2.0 * math.pi * self.buzz_hz * ms / 1000.0)
+        return cur
+
     def step(self, dt, ms):
         """Advance the joint by dt seconds (and run the watchdog at ms)."""
         self._watchdog(ms)
@@ -303,26 +344,12 @@ class SimDrive:
             run = self._hall_mode()
         self.pushing = False
         if not limp and dt > 0:
-            if run in (POSITION, PD):
-                nx = self.position + max(-vmax * dt, min(vmax * dt, self.target - self.position))
-            elif run == SPEED:
-                nx = self.position + max(-vmax, min(vmax, self.target_speed)) * dt
-            else:
-                nx = self.position
-            self.position, self.pushing = self._clamp_stop(nx)
+            self.position, self.pushing = self._clamp_stop(self._powered_position(run, vmax, dt, ms))
+        if dt > 0 and limp and not self.error and ms < self.push_until_ms:     # S6: a hand on a limp joint
+            self.position, _ = self._clamp_stop(self.position + self.push_speed * dt)
         if dt > 0:                                       # the firmware reports a filtered speed (Velocity_Filter)
             self.speed += ((self.position - prev) / dt - self.speed) * (dt / (SPEED_TAU_S + dt))
-        if self.error or self.mode == IDLE:
-            self.current = 0.0
-        elif self.pushing:                               # leaning on the endstop: the loop saturates at its limit
-            self.current = self.stop_dir * self.current_limit
-        elif self.mode == CURRENT:
-            self.current = max(-self.current_limit, min(self.current_limit, self.iq_setpoint))
-        elif run == SPEED and self.target_speed != 0:
-            self.current = max(-self.current_limit, min(self.current_limit,
-                                                         self.ff_current + (FREE_MA if self.target_speed > 0 else -FREE_MA)))
-        else:
-            self.current = max(-self.current_limit, min(self.current_limit, self.ff_current))
+        self.current = self._measured_current(run, ms)
         if self.gripper and self.g_activated and self.g_action and not self.error and dt > 0:
             d = self.g_target - self._g_pos
             self._g_pos += max(-GRIPPER_COUNTS_PER_S * dt, min(GRIPPER_COUNTS_PER_S * dt, d))

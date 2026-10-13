@@ -34,7 +34,7 @@ class SharedString:
         self.size = size
         try:
             self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
-            self.shm.buf[:size] = b'\x00' * size
+            self.shm.buf[:size] = b'\x00' * size  # type: ignore[index]  # SharedMemory.buf is typed Optional; a created segment always has one
             self.created = True
             print(f"[INFO] Shared string '{name}' created ({size} bytes).")
         except FileExistsError:
@@ -43,7 +43,7 @@ class SharedString:
             print(f"[INFO] Shared string '{name}' attached (already exists).")
         # Prevent resource_tracker from unlinking this segment on process exit;
         # lifetime is managed explicitly (shared across processes).
-        resource_tracker.unregister(self.shm._name, "shared_memory")
+        resource_tracker.unregister(self.shm._name, "shared_memory")  # type: ignore[attr-defined]  # the private name the resource tracker registered
         self.name = name
 
     def set_json(self, data):
@@ -66,11 +66,11 @@ class SharedString:
         byte_data = value.encode("utf-8")
         if len(byte_data) > self.size - 4:
             raise ValueError("String too long for shared memory block")
-        self.shm.buf[:4] = len(byte_data).to_bytes(4, "little")
-        self.shm.buf[4:4+len(byte_data)] = byte_data
+        self.shm.buf[:4] = len(byte_data).to_bytes(4, "little")  # type: ignore[index]  # SharedMemory.buf is typed Optional; a created segment always has one
+        self.shm.buf[4:4+len(byte_data)] = byte_data  # type: ignore[index]  # SharedMemory.buf is typed Optional; a created segment always has one
         end = 4 + len(byte_data)
         pad_len = self.size - end
-        self.shm.buf[end:end+pad_len] = b"\x00" * pad_len
+        self.shm.buf[end:end+pad_len] = b"\x00" * pad_len  # type: ignore[index]  # SharedMemory.buf is typed Optional; a created segment always has one
 
     def set_truncated(self, value: str):
         """set(), cut to fit the block at a character boundary — for DISPLAY strings that must never raise.
@@ -82,8 +82,8 @@ class SharedString:
         self.set(value)
 
     def get(self) -> str:
-        length = int.from_bytes(self.shm.buf[:4], "little")
-        return bytes(self.shm.buf[4:4+length]).decode("utf-8")
+        length = int.from_bytes(self.shm.buf[:4], "little")  # type: ignore[index]  # SharedMemory.buf is typed Optional; a created segment always has one
+        return bytes(self.shm.buf[4:4+length]).decode("utf-8")  # type: ignore[index]  # SharedMemory.buf is typed Optional; a created segment always has one
 
     def close(self):
         self.shm.close()
@@ -97,6 +97,13 @@ joint_num = 6
 _initialized = False
 
 # Global containers – filled by setup()
+# The segments as dicts of arrays, by name. A bare annotation creates no name: they exist once setup() has run, as
+# before; declared here for readers and the type checker (2026-10-13).
+motor: dict[str, np.ndarray]
+joint: dict[str, np.ndarray]
+tcp: dict[str, np.ndarray]
+rti: dict[str, np.ndarray]
+gripper: dict[str, np.ndarray]
 robot_mode = robot_state = error_state = None
 homed_state = sim_mode = robot_command = None  # SharedString globals
 force_confirm_who = None                   # SharedString: who is asking to force a control
@@ -127,7 +134,7 @@ def _attach_or_create(name: str, dtype, count: int):
         shm = shared_memory.SharedMemory(name=name)
         # --- FIX FOR LINUX ---
         # Stop the resource tracker from destroying this memory when this process exits
-        resource_tracker.unregister(shm._name, "shared_memory")
+        resource_tracker.unregister(shm._name, "shared_memory")  # type: ignore[attr-defined]  # the private name the resource tracker registered
 
         expected_size = np.dtype(dtype).itemsize * count
         if shm.size != expected_size:
@@ -145,7 +152,7 @@ def _attach_or_create(name: str, dtype, count: int):
         shm = shared_memory.SharedMemory(create=True, size=size, name=name)
         # --- FIX FOR LINUX ---
         # Stop the resource tracker from destroying this memory when this process exits
-        resource_tracker.unregister(shm._name, "shared_memory")
+        resource_tracker.unregister(shm._name, "shared_memory")  # type: ignore[attr-defined]  # the private name the resource tracker registered
         
         arr = np.ndarray((count,), dtype=dtype, buffer=shm.buf)
         arr[:] = 0
@@ -186,11 +193,11 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # Clean up old per-joint blocks if changing joint count
     if _initialized and joints != joint_num:
         print(f"[RTI] Reconfiguring from {joint_num} → {joints} joints – cleaning old blocks...")
-        for shm in motor_shms.values():
+        for shm in motor_shms.values():  # type: ignore[attr-defined]  # only reached after setup() filled it (re-setup with another joint count)
             shm.close()
-        for shm in joint_shms.values():
+        for shm in joint_shms.values():  # type: ignore[attr-defined]  # only reached after setup() filled it (re-setup with another joint count)
             shm.close()
-        ext_shms["torque_external"].close()
+        ext_shms["torque_external"].close()  # type: ignore[index]  # only reached after setup() filled it (re-setup with another joint count)
 
     joint_num = max(1, joints)
     print(f"\n[RTI] Initializing shared memory for {joint_num}-DOF robot...\n")

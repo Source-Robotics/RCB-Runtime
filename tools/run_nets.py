@@ -102,7 +102,10 @@ def unlink_prefixed(prefix):
 def run_one(path, index, timeout, coverage=False):
     name = os.path.basename(path)[:-3]
     prefix = f"nets{os.getpid()}_{index}_"
-    env = dict(os.environ, RCB_SHM_PREFIX=prefix, PYTHONUNBUFFERED="1", PYTHONPATH=ROOT)
+    # RCB_LOGS_DIR (project_paths): the test's logs in a folder of its own, never the robot's logs/ (2026-10-13)
+    logs = os.path.join(OUT_DIR, "logs", name)
+    shutil.rmtree(logs, ignore_errors=True)
+    env = dict(os.environ, RCB_SHM_PREFIX=prefix, PYTHONUNBUFFERED="1", PYTHONPATH=ROOT, RCB_LOGS_DIR=logs)
     cmd = [sys.executable, path]
     if coverage:                                       # measured: lines + branches, its subprocesses too
         cmd = quality.coverage_command(path)

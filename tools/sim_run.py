@@ -7,14 +7,15 @@
     cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/sim_run.py                # boots, reports, waits for Ctrl-C
         --seconds N      stop by itself after N s
         --gui            also the dashboard (port 8081; it shows the SIMULATED robot)
-        --faults all|a,b fault injection after the boot (sim/faults.py): node_lost, drive_fault, reply_loss,
-                         drive_reboot, executor_lost (homes first), estop (the simulated E-stop button),
+        --faults all|a,b fault injection after the boot (sim/faults.py): node_lost, drive_fault, drive_flags,
+                         reply_loss, drive_reboot, hand_push, push_through, runaway, tracking_lag, hold_buzz (the
+                         S6 disturbances), executor_lost (homes first), estop (the simulated E-stop button),
                          rti_lost (ends the run)
         --tests a,b,..   after the boot, run these api_tests in order — the file name without .py, plus its
                          arguments: --tests "00_status,01_mode --go,02_joint --go --assume-ready"
                          'smoke' = tools/arm_smoke.py against the simulated robot (home it first):
                          --tests "01_mode --go,smoke"
-                         'suite' = the SIMULATED suite: the smoke routine + 21 more api_tests that move the arm far
+                         'suite' = the SIMULATED suite: the smoke routine + 28 more api_tests that move the arm far
                          (tools/arm_smoke.py --suite sim): --tests "01_mode --go,suite"
         --coverage       measure the runtime (RTI, the executor, the worker, the drives, the GUI) with coverage: run
                          under the venv's Python, data + report in temp_data/sim/coverage/ and, with the nets' last
@@ -100,9 +101,17 @@ def _log_lines_since(path, offset):
         return []
 
 
+# Simulation has no real-time core: every process shares the general cores. RTI and the simulated drives run at
+# normal priority; the dashboard, the executor and the collision worker are niced, so a busy dashboard cannot starve
+# the drives — it did once (2026-10-13: every node went silent in the same ms mid-homing, a CAN_LOST on all of them).
+NICE = {"GUI": 10, "executor": 5, "worker": 5}
+
+
 def _start(name, argv, run_dir, env):
     out = open(os.path.join(run_dir, f"{name}.out.log"), "w")
-    p = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    nice = NICE.get(name, 0)
+    p = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                         preexec_fn=(lambda: os.nice(nice)) if nice else None)
     print(f"  started {name} (pid {p.pid})", flush=True)
     return p, out
 
@@ -143,11 +152,15 @@ def main():
     run_dir = os.path.join(SIM_DIR, "runs", time.strftime("%Y%m%d_%H%M%S", time.gmtime()))
     os.makedirs(run_dir, exist_ok=True)
     env = dict(os.environ, RCB_SIM="1", PYTHONUNBUFFERED="1")
+    selfcov = None
     if args.coverage:
         quality.coverage_prepare(SIM_COVDIR)
         env.update(COVERAGE_FILE=os.path.join(SIM_COVDIR, ".coverage"), RCB_ROOT=ROOT,
                    COVERAGE_PROCESS_START=quality.RCFILE)          # the venv children (a block program) measure too
         print("COVERAGE: the runtime runs under the venv's Python + coverage (slower; timing is not what is tested)")
+        import coverage
+        selfcov = coverage.Coverage(config_file=quality.RCFILE, data_file=os.path.join(SIM_COVDIR, ".coverage"))
+        selfcov.start()                    # this process too: the fault scenarios (sim/faults.py) run in it
     log_offset = os.path.getsize(SIM_RTI_LOG) if os.path.exists(SIM_RTI_LOG) else 0
     print(f"SIMULATED RUN — the arm is not involved. Output: {os.path.relpath(run_dir, ROOT)}", flush=True)
     procs = []
@@ -270,6 +283,9 @@ def main():
             out.close()
             print(f"  stopped {name} (exit {code})", flush=True)
     if args.coverage:
+        if selfcov is not None:
+            selfcov.stop()
+            selfcov.save()
         rep = quality.coverage_report(SIM_COVDIR, union_with=NETS_COVERAGE)
         f = rep["files"]
         print(f"\ncoverage of this simulated run: {rep['total']} % (lines + branches); RTI.py {f.get('RTI.py')} %, "

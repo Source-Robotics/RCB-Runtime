@@ -86,7 +86,7 @@ def measured_jaws_refusal(cfg: dict, tool_geo: dict | None):
     if not jaws:
         return "its collision file lists no jaws (re-export it: tools/self_collision_capsules.py fit + export)"
     try:
-        xml_mm = float(cfg.get("gripper_stroke"))
+        xml_mm = float(cfg.get("gripper_stroke"))      # type: ignore[arg-type]  # None -> TypeError, caught below
     except (TypeError, ValueError):
         return "the gripper XML declares no <Stroke>"
     file_mm = 1e3 * sum(float(j["stroke_m"]) for j in jaws)
@@ -242,7 +242,7 @@ def main() -> int:
     t_next = time.monotonic()
     while not _stop:
         t0 = time.perf_counter()
-        homed = bool(np.all(homed_view[:joint_num] == 1)) and shared_data.homed_state.get() == "HOMED"
+        homed = bool(np.all(homed_view[:joint_num] == 1)) and shared_data.homed_state.get() == "HOMED"  # type: ignore[union-attr]  # set by shared_data.setup() at start
         if homed != homed_live:
             homed_live = homed
             logging.info("[SC] robot homed — watching the measured pose" if homed else
@@ -265,7 +265,7 @@ def main() -> int:
         # 0. the jaws: where the gripper says they are (measured), else swept over their stroke
         active = model
         if measured is not None:
-            c = jaw_closed_fraction(rti, gripper, joint_num, shared_data.homed_state.get(), motor_ok)
+            c = jaw_closed_fraction(rti, gripper, joint_num, shared_data.homed_state.get(), motor_ok)  # type: ignore[union-attr]  # (the same)
             src = "measured" if c is not None else "swept"
             if src != jaws_live:
                 jaws_live = src
@@ -292,7 +292,7 @@ def main() -> int:
                 hit_live = True
                 logging.warning(f"[SC] within the monitor margin: {active.describe(a, b)} {1e3 * gap:.1f} mm apart "
                                 f"(q = {np.round(np.degrees(q), 1).tolist()} deg"
-                                + (f", jaws {100 * active.jaw_closed:.0f} % closed" if active.jaws == "measured" else "") + ")")
+                                + (f", jaws {100 * active.jaw_closed:.0f} % closed" if active.jaws == "measured" else "") + ")")  # type: ignore[operator]  # jaws == 'measured' -> jaw_closed is a float
         else:
             rti["sc_hit"][0] = 0.0                        # the flag BEFORE the gaps (see above)
             rti["sc_pair_gaps"][:] = np.inf

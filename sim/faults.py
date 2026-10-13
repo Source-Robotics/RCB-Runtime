@@ -1,6 +1,8 @@
 """Fault injection against the simulated robot (TODO/simulated_robot_plan.md S4, 2026-10-13): each scenario makes
 something go wrong — a drive drops off the bus, reports a fault, loses replies, reboots; the executor or RTI dies in
-the middle of a motion; the E-stop is pressed (the simulated I/O, hardware/gpio_handler.py) — and checks the runtime's reaction in the simulated activity log and the drives' real state
+the middle of a motion; the E-stop is pressed (the simulated I/O, hardware/gpio_handler.py); S6 (2026-10-13): the five
+drive faults no other scenario raised, and the disturbances of sim/drive_sim.py — a hand pushing a joint past its soft
+limit, a runaway, a lagging drive, a buzzing hold — each tripping its safety-monitor check — and checks the runtime's reaction in the simulated activity log and the drives' real state
 (the simulator's control channel, sim/drives.request). Run by tools/sim_run.py --faults; RTI's death ends the run, so
 'rti_lost' runs last.
 """
@@ -17,7 +19,8 @@ from sim.drives import request
 from utility import sim_mode
 
 ACTIVITY = os.path.join("temp_data", "sim", "logs", "activity_rti.log")
-ORDER = ("node_lost", "drive_fault", "reply_loss", "drive_reboot", "executor_lost", "estop", "rti_lost")
+ORDER = ("node_lost", "drive_fault", "drive_flags", "reply_loss", "drive_reboot", "hand_push", "push_through",
+         "runaway", "tracking_lag", "hold_buzz", "executor_lost", "estop", "rti_lost")
 # gpio_states (uint8[16], data/shared_data.py) read as a FILE, with the name prefix shared_data applies — never
 # attached (importing data.shared_data attaches every segment). In simulation the inputs live here.
 GPIO_SHM = "/dev/shm/" + os.environ.get("RCB_SHM_PREFIX", "") + "GPIO"   # nosec B108 — shared memory, not a temp file
@@ -109,6 +112,45 @@ class Context:
             robot.home(wait=True)          # waits WAIT_HOMED_TIMEOUT (robotclient)
             self.homed = True
         return robot.status()
+
+
+_CFG: dict = {}
+
+
+def _cfg():
+    """The active robot's config (read once): ticks per radian, speed ceilings, soft limits — for the S6 scenarios."""
+    if not _CFG:
+        import config.xml_parser as xp
+        from project_paths import GRIPPERS_DIR, ROBOTS_DIR, SYSTEM_XML
+        sysc = xp.load_system_config(SYSTEM_XML, ROBOTS_DIR)
+        _CFG.update(xp.load_full_robot_config(str(sysc["robot_xml_path"]), grippers_dir=GRIPPERS_DIR,
+                                              active_gripper=sysc["active_gripper"]))
+    return _CFG
+
+
+def _ticks_per_rad(j):
+    c = _cfg()
+    return (2 ** float(c["motor_encoder"][j])) * abs(float(c["gear_ratio"][j])) / (2 * math.pi)
+
+
+def _push_to(ctx, robot, j, target_deg, deg_per_s=15.0, timeout=25.0):
+    """Turn joint j (0-based) by HAND (the simulator's push: a limp joint only) until it reads target_deg. The motor's
+    direction is found by trying: a short push of +ticks, and whether the joint's ANGLE went up or down."""
+    speed = math.radians(deg_per_s) * _ticks_per_rad(j)
+    t0 = time.monotonic()
+    a0 = float(robot.get_joints()[j])
+    ctx.sim(cmd="physics", node=j, kind="push", speed=speed, ms=300)
+    time.sleep(0.35)
+    a1 = float(robot.get_joints()[j])
+    sign = 1.0 if a1 > a0 else -1.0                      # the tick direction that RAISES the angle
+    while time.monotonic() - t0 < timeout:
+        a = float(robot.get_joints()[j])
+        if abs(a - target_deg) < 0.4:
+            break
+        ctx.sim(cmd="physics", node=j, kind="push", speed=(sign if a < target_deg else -sign) * speed, ms=120)
+        time.sleep(0.1)
+    ctx.sim(cmd="physics", node=j, kind="clear")
+    return float(robot.get_joints()[j])
 
 
 def _wait(pred, timeout, step=0.05):
@@ -286,6 +328,162 @@ def estop(ctx, notes):
         r.disconnect()
 
 
+def drive_flags(ctx, notes):
+    """The five drive faults no other scenario raises — temperature, encoder, vbus, velocity, current — each on its own
+    joint: the matching J{n}:<FAULT> latches (the robot disables), and clears once the fault is gone and Clear Errors."""
+    r = ctx.robot()
+    ok = True
+    try:
+        for kind, node in (("temperature", 0), ("encoder", 1), ("vbus", 2), ("velocity", 3), ("current", 4)):
+            ctx.ready(r)
+            mark = ctx.activity_mark()
+            ctx.sim(cmd="fault", node=node, kind=kind)
+            got = _wait(lambda k=kind, n=node: ctx.has(mark, k.upper(), n + 1), 2.0)
+            ctx.sim(cmd="fault", node=node, kind="clear")
+            time.sleep(0.2)
+            r.clear_errors(wait=True)
+            rec = _wait(lambda: r.status().get("err") == 0, 3.0)
+            notes.append(f"J{node + 1}:{kind.upper()} {'latched' if got else 'NOT latched'}; after Clear Errors "
+                         f"err={r.status().get('err')}")
+            ok = ok and bool(got) and bool(rec)
+    finally:
+        for node in range(5):
+            ctx.sim(cmd="fault", node=node, kind="clear")
+        r.disconnect()
+    return ok
+
+
+def hand_push(ctx, notes):
+    """A hand turns J5 past its soft limit in freedrive (IDLE, the joint limp): J5:SOFT_LIMIT_WARNING — a warning, never
+    an error (the robot commands no motion there) — and turned back inside it clears; then the robot can move again."""
+    r = ctx.robot()
+    try:
+        ctx.ready(r, home=True)
+        r.enter_idle_mode(wait=True)
+        lim = math.degrees(float(_cfg()["software_joint_limit_positive"][4]))
+        mark = ctx.activity_mark()
+        past = _push_to(ctx, r, 4, lim + 1.5)
+        warned = _wait(lambda: ctx.has(mark, "SOFT_LIMIT_WARNING", 5), 2.0)
+        err = r.status().get("err")
+        inside = _push_to(ctx, r, 4, lim - 4.0)
+        time.sleep(0.5)
+        live = [e for e in (r.status().get("errors") or []) if "SOFT_LIMIT_WARNING" in str(e)]
+        notes.append(f"J5 pushed to {past:.1f} deg (soft limit {lim:.1f}): SOFT_LIMIT_WARNING "
+                     f"{'raised' if warned else 'NOT raised'}, err={err}; back to {inside:.1f}: still live: {bool(live)}")
+        return bool(warned) and err == 0 and past > lim + 0.5 and inside < lim and not live
+    finally:
+        ctx.sim(cmd="physics", node=4, kind="clear")
+        r.disconnect()
+
+
+def push_through(ctx, notes):
+    """A hand pushes J5 through everything freedrive has (IDLE): past its soft limit -> SOFT_LIMIT_WARNING, through its
+    wall's breakthrough -> JOINT_WALL_WARNING (both warnings, no stop), past its hard limit + the endstop tolerance ->
+    BEYOND_ENDSTOP (an error: the robot disables and homing is invalidated). Pushed back, cleared and re-homed, the
+    robot works. (Found by accident 2026-10-13, when a scenario pushed the wrong way — the stack behaved; now pinned.)"""
+    r = ctx.robot()
+    try:
+        ctx.ready(r, home=True)
+        r.enter_idle_mode(wait=True)
+        c = _cfg()
+        soft, hard = (math.degrees(float(c["software_joint_limit_positive"][4])),
+                      math.degrees(float(c["joint_limit_positive"][4])))
+        wall = soft + min(hard - soft, 15.0)                  # the auto breakthrough (docs/safety_zones.md §2b)
+        mark = ctx.activity_mark()
+        _push_to(ctx, r, 4, soft + 2.0)
+        w1 = _wait(lambda: ctx.has(mark, "SOFT_LIMIT_WARNING", 5), 2.0)
+        _push_to(ctx, r, 4, wall + 2.0)
+        w2 = _wait(lambda: ctx.has(mark, "JOINT_WALL_WARNING", 5), 2.0)
+        err_mid = r.status().get("err")
+        _push_to(ctx, r, 4, hard + 12.0)
+        e3 = _wait(lambda: ctx.has(mark, "BEYOND_ENDSTOP", 5), 2.0)
+        _wait(lambda: r.status().get("err") == 1, 2.0)
+        st = r.status()
+        _push_to(ctx, r, 4, soft - 5.0)
+        r.clear_errors(wait=True)
+        st2 = ctx.ready(r, home=True)
+        notes.append(f"soft {soft:.1f} / wall {wall:.1f} / hard {hard:.1f} deg: SOFT_LIMIT_WARNING {w1}, JOINT_WALL_WARNING "
+                     f"{w2} (err {err_mid}), BEYOND_ENDSTOP {e3} (err {st.get('err')}, homed {st.get('homed')}); "
+                     f"pushed back, cleared, re-homed: err={st2.get('err')} homed={st2.get('homed')}")
+        return (bool(w1) and bool(w2) and err_mid == 0 and bool(e3) and st.get("err") == 1 and st.get("homed") is not True
+                and st2.get("err") == 0 and st2.get("homed") is True)
+    finally:
+        ctx.sim(cmd="physics", node=4, kind="clear")
+        r.disconnect()
+
+
+def runaway(ctx, notes):
+    """J6 runs away for 0.15 s at 1.6x its speed ceiling while EXEC holds it (a drive moving on its own):
+    J6:OVERSPEED_WARNING (the shipped mode is warn — no stop), and the hold brings it back."""
+    r = ctx.robot()
+    try:
+        ctx.ready(r, home=True)
+        r.enter_exec_mode(wait=True)
+        a0 = float(r.get_joints()[5])
+        speed = 1.6 * float(_cfg()["joint_velocity_limit"][5]) * _ticks_per_rad(5)
+        mark = ctx.activity_mark()
+        ctx.sim(cmd="physics", node=5, kind="runaway", speed=speed, ms=150)
+        got = _wait(lambda: ctx.has(mark, "OVERSPEED_WARNING", 6), 2.0)
+        back = _wait(lambda: abs(float(r.get_joints()[5]) - a0) < 0.5, 5.0)
+        st = r.status()
+        notes.append(f"J6:OVERSPEED_WARNING {'raised' if got else 'NOT raised'}; back at its hold: {bool(back)}; "
+                     f"err={st.get('err')}")
+        return bool(got) and bool(back) and st.get("err") == 0
+    finally:
+        ctx.sim(cmd="physics", node=5, kind="clear")
+        r.disconnect()
+
+
+def tracking_lag(ctx, notes):
+    """J4's drive follows its position target with a 0.3 s lag during an EXEC move (a weak or saturated drive): the
+    tracking error grows past J4's limit -> J4:TRACKING_WARNING; the same move without the lag raises none."""
+    r = ctx.robot()
+    try:
+        ctx.ready(r, home=True)
+        r.enter_exec_mode(wait=True)
+        q = [float(v) for v in r.get_joints()]
+        mark = ctx.activity_mark()
+        r.move_joints(*[v + (20.0 if k == 3 else 0.0) for k, v in enumerate(q)], speed=50)
+        r.wait_idle(timeout=30)
+        clean = not ctx.has(mark, "TRACKING_WARNING", 4)
+        mark = ctx.activity_mark()
+        ctx.sim(cmd="physics", node=3, kind="lag", tau=0.3, ms=15000)
+        r.move_joints(*q, speed=50)
+        r.wait_idle(timeout=30, raise_on_error=False)
+        got = _wait(lambda: ctx.has(mark, "TRACKING_WARNING", 4), 2.0)
+        st = r.status()
+        notes.append(f"J4 +20 deg at 50 % without a lag: TRACKING_WARNING {'none' if clean else 'RAISED'}; back with a "
+                     f"0.3 s lag: {'raised' if got else 'NOT raised'}; err={st.get('err')}")
+        return clean and bool(got) and st.get("err") == 0
+    finally:
+        ctx.sim(cmd="physics", node=3, kind="clear")
+        r.disconnect()
+
+
+def hold_buzz(ctx, notes):
+    """J3's measured current swings +-300 mA at 60 Hz while EXEC holds it still (the whine of too-high gains):
+    J3:HOLD_OSCILLATION_WARNING after the monitor's 1.5 s sustain — a warning, never a stop; none before 1 s."""
+    r = ctx.robot()
+    try:
+        ctx.ready(r, home=True)
+        r.enter_exec_mode(wait=True)
+        time.sleep(0.5)
+        mark = ctx.activity_mark()
+        t0 = time.monotonic()
+        ctx.sim(cmd="physics", node=2, kind="buzz", ma=300.0, hz=60.0, ms=4000)
+        time.sleep(1.0)
+        early = ctx.has(mark, "HOLD_OSCILLATION_WARNING", 3)
+        got = _wait(lambda: ctx.has(mark, "HOLD_OSCILLATION_WARNING", 3), 4.0)
+        after = time.monotonic() - t0
+        st = r.status()
+        notes.append(f"J3:HOLD_OSCILLATION_WARNING {'raised' if got else 'NOT raised'} ~{after:.1f} s in (none at 1 s: "
+                     f"{not early}); err={st.get('err')}")
+        return bool(got) and not early and st.get("err") == 0
+    finally:
+        ctx.sim(cmd="physics", node=2, kind="clear")
+        r.disconnect()
+
+
 def rti_lost(ctx, notes):
     """RTI killed while J1 approaches its endstop in SPEED mode (homing): every drive's CAN watchdog (100 ms) must trip
     ~100 ms after the last command, and J1 stop there — not run on to the endstop (with 5 s it would have)."""
@@ -313,5 +511,5 @@ def rti_lost(ctx, notes):
     return ok and still < 1.0 and abs(speed) > 1000 and not math.isnan(speed)
 
 
-SCENARIOS = {f.__name__: f for f in (node_lost, drive_fault, reply_loss, drive_reboot, executor_lost, estop,
-                                     rti_lost)}
+SCENARIOS = {f.__name__: f for f in (node_lost, drive_fault, drive_flags, reply_loss, drive_reboot, hand_push,
+                                     push_through, runaway, tracking_lag, hold_buzz, executor_lost, estop, rti_lost)}

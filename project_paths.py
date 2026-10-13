@@ -43,6 +43,14 @@ if SIMULATION:
     os.makedirs(LOGS_DIR, exist_ok=True)
     os.makedirs(TEMP_DATA_DIR, exist_ok=True)
 
+# ─── Offline tests (tools/run_nets.py, 2026-10-13) ───────────────────────────
+# RCB_LOGS_DIR: the folder every log below goes to. The test runner sets it per test, so a test that runs the real
+# error pass or the planner cannot write its FAKE events (CAN_LOST, ESTOP, MOTION_ABORTED, ...) into the robot's own
+# logs/activity_rti.log next to real incidents — 16 tests did. Unset (the robot's processes): nothing changes.
+if os.environ.get("RCB_LOGS_DIR"):
+    LOGS_DIR = Path(os.environ["RCB_LOGS_DIR"])
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
 # ─── Common files ────────────────────────────────────────────────────────────
 SYSTEM_XML     = CONFIG_DIR  / "system.xml"           # Top-level: selects active robot
 CELLS_DIR      = CONFIG_DIR  / "cells"                # Safety-zone cell files, chosen by <active_cell>

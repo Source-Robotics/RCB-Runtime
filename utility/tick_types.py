@@ -6,7 +6,7 @@ that need these types but are also imported by mode_dispatch.py.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -26,7 +26,7 @@ class TickContext:
     active_CAN_gripper: int
 
     # State
-    shared_data: object
+    shared_data: Any             # the data.shared_data module (its segment dicts: rti, joint, ...)
     robot: object
     delta_t: float
 
@@ -54,7 +54,7 @@ class TickContext:
     rti_udp_count: int = 0
 
     # Haptic zone walls (utility/haptic_walls.py) for IDLE gravity-comp freedrive. None = no walls.
-    haptic_walls: object = None
+    haptic_walls: Any = None
 
     # The Hall sensor check (robotics/hall_check.py): the joint that gets the Hall-index command instead of its data
     # pack while the check runs; -1 = none (every tick but those).

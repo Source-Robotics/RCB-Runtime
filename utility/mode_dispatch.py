@@ -71,10 +71,10 @@ _tick_ok             = TickResult()
 # Preallocated per the hot-path allocation rule — FLASHING claims the gripper
 # channel so RTI's gripper send block stays silent too.
 _tick_flashing       = TickResult(gripper_owned=True)
-_output_vel_zero     = None
-_output_torque_zero  = None
+_output_vel_zero: ControlOutput = None     # type: ignore[assignment]  # built by build_dispatch() before any tick
+_output_torque_zero: ControlOutput = None  # type: ignore[assignment]  # (the same)
 _output_idle_gravity = ControlOutput()
-_idle_trq_buf = None       # gravity (+ walls) + friction compensation, preallocated in build
+_idle_trq_buf: np.ndarray = None  # type: ignore[assignment]  # gravity (+ walls) + friction comp., preallocated in build
 
 _MODE_PROFILE_ENABLED = os.environ.get("RTI_MODE_PROFILE", "0") == "1"
 _MODE_PROFILE_INTERVAL = max(1, int(os.environ.get("RTI_MODE_PROFILE_INTERVAL", "500")))
