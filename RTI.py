@@ -49,7 +49,7 @@ from utility.state_machine import RobotMode, request_mode_change, request_enable
 from utility.error_checks import (
     process_errors_tick, clear_errors, send_clear_errors, ExecLinkWatchdog,
     LoopDegradationMonitor,
-    CLEAR_ERROR_SETTLE_TICKS, CLEAR_ERROR_SEND_REPEATS, _WARNING_SUFFIXES,
+    CLEAR_ERROR_SETTLE_TICKS, CLEAR_ERROR_SEND_REPEATS, BOOT_CLEAR_TICK, _WARNING_SUFFIXES,
 )
 from utility.activity_log import get_rti_activity_logger, log_activity
 from utility.incident_dump import IncidentDumper
@@ -601,8 +601,12 @@ def main():
     # Every fatal error or disconnect because motor drivers might lose this data
     # Same goes for gripper configs if we have CAN gripper
     # ==========================================================================
-    motor_watchdog_rate   = cfg['motor_watchdog_rate']
-    gripper_watchdog_rate = int(cfg['gripper_watchdog_rate']) if active_CAN_gripper else 5000
+    # Every drive's CAN watchdog: ONE value, system.xml <drive_watchdog_ms> (2026-10-13; the robot / gripper XML
+    # <watchdog_rate> — 5000 ms, a bring-up value — is no longer read). A drive that hears no command or poll for this
+    # long goes idle, so none keeps running RTI's last speed or torque once RTI is gone.
+    motor_watchdog_rate   = [_sys['drive_watchdog_ms']] * joint_num
+    gripper_watchdog_rate = _sys['drive_watchdog_ms']
+    logging.info(f"[CAN] drive watchdog {_sys['drive_watchdog_ms']} ms on every drive (system.xml <drive_watchdog_ms>)")
 
     # ==========================================================================
     # Helpers that bundle load + write_to_shared for arm and gripper configs.
@@ -673,19 +677,10 @@ def main():
         Motor_Kt_data, shared_data,
     )
 
-    # ==========================================================================
-    # Start-up clear (2026-10-05)
-    # ==========================================================================
-    # The drivers keep the fault the LAST run's end left them (their CAN watchdog trips once RTI stops sending):
-    # the Kt replies above carry err=1 from every node, and before this clear the gripper latched GRIPPER_ERROR at
-    # tick 1 of every start (J1 WATCHDOG in 36 of 67 starts) — an error the operator had to clear and an incident
-    # dump with nothing in it. One clear to every driver, now that they have their config; the loop then ignores
-    # what the drivers REPORT until it has settled (driver_faults in the error pass below). Connection losses, the
-    # E-stop, the monitor and every system error are read from tick 1 as before.
-    send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
-                      Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper, all_motors=True)
-    logging.info(f"[ERRORS] start-up clear sent to every driver; their own faults are read from tick "
-                 f"{CLEAR_ERROR_SETTLE_TICKS + 1}.")
+    # The start-up clear (2026-10-05) is sent in the loop at tick BOOT_CLEAR_TICK since 2026-10-13: the drivers keep the
+    # watchdog trip the LAST run's end left them (the Kt replies above carry err=1 from every node — before the clear,
+    # the gripper latched GRIPPER_ERROR at tick 1 of every start), and with a 100 ms watchdog the set-up below trips
+    # them again before tick 1, so a clear sent here would be undone before the loop starts.
 
     # ==========================================================================
     # Initialize the timer before the loop starts
@@ -2140,8 +2135,9 @@ def main():
             monitor_errors=_monitor_errors,
             monitor_warnings=safety_monitor.warnings,
             on_hard_error=_incident_hook,
-            # The settle after the start-up clear: a driver reports the LAST run's fault until the clear lands.
-            driver_faults=_tick_now > CLEAR_ERROR_SETTLE_TICKS,
+            # The settle after the start-up clear (sent at tick BOOT_CLEAR_TICK): a driver reports the watchdog trip the
+            # last run's end and the set-up left it until the clear lands.
+            driver_faults=_tick_now > BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS,
         )
         _profile_last = _profile_mark(_profile_last, "error_checks")
 
@@ -2264,6 +2260,21 @@ def main():
             stats_interval=LOOP_STATS_INTERVAL,
         )
         _profile_last = _profile_mark(_profile_last, "timing_stats")
+
+        # ==========================================================================
+        # Start-up clear (2026-10-05; here, at tick BOOT_CLEAR_TICK, since 2026-10-13)
+        # ==========================================================================
+        # The drivers start with a watchdog trip: the last run's end left one, and the ~0.5 s of set-up between the
+        # config preload and tick 1 (the joint walls' inertia search) trips them again with a 100 ms watchdog. A
+        # command only restarts a drive's watchdog timer, only a clear removes a trip — so the clear goes out after tick
+        # 1's commands restarted every timer. One clear to every driver; the loop ignores what the drivers REPORT until
+        # the settle after it is over (driver_faults in the error pass). Connection losses, the E-stop, the monitor and
+        # every system error are read from tick 1.
+        if _tick_now == BOOT_CLEAR_TICK:
+            send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
+                              Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper, all_motors=True)
+            logging.info("[ERRORS] start-up clear sent to every driver at tick %d; their own faults are read from "
+                         "tick %d.", BOOT_CLEAR_TICK, BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS + 1)
 
         # ==========================================================================
         # Run selfcheck (only once at startup)

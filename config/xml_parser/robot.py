@@ -368,7 +368,7 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         'rti_acceleration_limit':  get_all_values(joints, 'rti_limits/acceleration'),
         'rti_jerk_limit':          get_all_values(joints, 'rti_limits/jerk'),
         'rti_torque_rate_limit':   get_all_values(joints, 'rti_limits/torque_rate'),
-        'motor_watchdog_rate':    get_all_values(joints, 'watchdog_rate'),
+        # (no 'motor_watchdog_rate' since 2026-10-13: every drive's watchdog is system.xml <drive_watchdog_ms>)
         'motor_KPP':              get_all_values(joints, 'KPP'),
         'motor_KPV':              get_all_values(joints, 'KPV'),
         'motor_KIV':              get_all_values(joints, 'KIV'),
@@ -426,7 +426,6 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         'gripper_Ilim':           _gval('Ilim'),
         'gripper_voltage_limit':  _voltage_limit_or_default(_gval('voltage_limit')),
         'gripper_velocity_limit': _gval('Velocity_limit'),
-        'gripper_watchdog_rate':  _gval('watchdog_rate'),
         'gripper_KPP':            _gval('KPP'),
         'gripper_KPV':            _gval('KPV'),
         'gripper_KIV':            _gval('KIV'),

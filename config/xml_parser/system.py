@@ -13,6 +13,13 @@ from pathlib import Path
 
 from config.xml_parser.xml_access import get_active_gripper, get_joint_count, parse_robot_config
 
+# <drive_watchdog_ms> (2026-10-13): every drive's CAN watchdog. 0 would switch it off in the drive firmware; under
+# ~50 ms the tick-50/150/300 configuration bursts (RTI sends no command for ~25-30 ms while ~200 frames go out) would
+# trip it; above 1 s a drive keeps running RTI's last speed or torque long after RTI is gone.
+DRIVE_WATCHDOG_DEFAULT_MS = 100
+DRIVE_WATCHDOG_MIN_MS = 50
+DRIVE_WATCHDOG_MAX_MS = 1000
+
 
 def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> dict:
     """
@@ -84,6 +91,18 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         if _crf_text not in ("1", "true", "yes", "on"):
             logging.warning(f"[system.xml] <can_read_first>{_crf_text!r} is not 0/1 — ON (read first, send early)")
         can_read_first = 1
+    # <drive_watchdog_ms>: every drive's CAN watchdog in ms (2026-10-13, user: "normal times" — it was 5000 per drive in
+    # the robot / gripper XMLs, a bring-up value, no longer read). One value for every drive: it is about RTI's link,
+    # not the arm. Missing -> the default; not a whole number in [MIN, MAX] -> the default with a warning.
+    _wd_text = (root.findtext("drive_watchdog_ms") or str(DRIVE_WATCHDOG_DEFAULT_MS)).strip()
+    try:
+        drive_watchdog_ms = int(_wd_text)
+    except ValueError:
+        drive_watchdog_ms = None
+    if drive_watchdog_ms is None or not DRIVE_WATCHDOG_MIN_MS <= drive_watchdog_ms <= DRIVE_WATCHDOG_MAX_MS:
+        logging.warning(f"[system.xml] <drive_watchdog_ms>{_wd_text!r} is not a whole number of ms in "
+                        f"{DRIVE_WATCHDOG_MIN_MS}..{DRIVE_WATCHDOG_MAX_MS} — using {DRIVE_WATCHDOG_DEFAULT_MS} ms")
+        drive_watchdog_ms = DRIVE_WATCHDOG_DEFAULT_MS
     # <control_box><pcb_version>: which PCB is fitted (hardware/control_box.py has the capability table; the
     # first consumer is the E-stop channel policy). Missing or not a number -> 1 (the board the fleet has).
     _cb = root.find("control_box")
@@ -113,6 +132,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         "kt_source":      kt_source,
         "realtime_required": realtime_required,
         "can_read_first": can_read_first,
+        "drive_watchdog_ms": drive_watchdog_ms,
         "pcb_version":    pcb_version,
         "jog_defaults":   jog_defaults,
         "rti_defaults":   rti_defaults,

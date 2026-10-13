@@ -74,6 +74,12 @@ _ACTIVITY_MIN_INTERVAL = 1.0  # seconds
 # instead of on elapsed time — see currently_doing.md.
 CLEAR_ERROR_SETTLE_TICKS = 38   # ticks (~152 ms @ 4 ms) to wait after a CAN clear before wiping the latch
 CLEAR_ERROR_SEND_REPEATS = 3    # how many times Send_Clear_Error() is sent per motor
+# The tick RTI sends its start-up clear to every driver on (2026-10-13; before the loop until then). It must follow
+# tick 1's commands: a drive's watchdog (<drive_watchdog_ms>, 100 ms) trips during the ~0.5 s of set-up between the
+# config preload and tick 1 whatever is sent before it, and only a clear removes a trip — a command only restarts the
+# timer. Tick 1's commands restart every drive's timer, this clear then removes the trip; the drivers' own faults are
+# read from tick BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS + 1.
+BOOT_CLEAR_TICK = 2
 
 # RT loop degradation bands — FRACTIONS of delta_t, never absolute times. delta_t is
 # per-robot (PAR6 4 ms / 250 Hz; INDIGO and SKAR 10 ms / 100 Hz), so an absolute band
@@ -581,8 +587,9 @@ def check_errors(
         active_CAN_gripper: 1 if a CAN gripper is configured, 0 if not.
         driver_faults:      False = the faults the motor drivers and the gripper REPORT are not read (connection
                             losses, the E-stop, the monitor and every system error still are). RTI passes False
-                            for the settle after its start-up clear (2026-10-05): the drivers report the fault the
-                            last run's end left them until that clear lands — not a fault of this run.
+                            until the settle after its start-up clear (2026-10-05; at tick BOOT_CLEAR_TICK since
+                            2026-10-13) is over: the drivers report the watchdog trip the last run's end (and the
+                            set-up before tick 1) left them until that clear lands — not a fault of this run.
 
     Returns:
         (error_active: bool, latched_errors: set)
@@ -818,7 +825,7 @@ def process_errors_tick(
         Gripper_data:           Per-node deques of gripper CAN dicts.
         on_hard_error:          Optional callable(new_hard_keys, tick), called on the ONE tick a hard error
                                 first latches (utility/incident_dump.py saves the last two seconds).
-        driver_faults:          False during the settle after RTI's start-up clear (check_errors).
+        driver_faults:          False until the settle after RTI's start-up clear is over (check_errors).
 
     Returns:
         (clear_error_countdown, latched_errors, error_metadata, current_mode)

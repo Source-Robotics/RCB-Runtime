@@ -296,6 +296,8 @@ def _load_rti_gripper_cfg():
     _sys = load_system_config(SYSTEM_XML, ROBOTS_DIR)
     cfg = load_full_robot_config(str(_sys["robot_xml_path"]), grippers_dir=GRIPPERS_DIR,
                                  active_gripper=_sys["active_gripper"])
+    # RTI arms every drive with system.xml <drive_watchdog_ms> since 2026-10-13 (the gripper XML's value is not read)
+    cfg["gripper_watchdog_rate"] = _sys["drive_watchdog_ms"]
     return _sys, cfg
 
 
