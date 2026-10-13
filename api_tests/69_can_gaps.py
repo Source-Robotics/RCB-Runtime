@@ -881,11 +881,14 @@ def selftest():
         "its OWN tick (1.5 + 2.27 = 3.77 ms, not 7.77)", abs(blk_x["loop_ms"]["med"] - 3.77) < 0.01, blk_x["loop_ms"])
     src = open(os.path.abspath(__file__)).read()
     code = [ln.strip() for ln in src.splitlines()]   # whole code lines: this check's own strings never equal one
-    chk("the session runner records each block's order and switches option B for '_rf' blocks only (on, then off in "
-        "its finally) — the analysis pairs reply and command by it",
+    chk("the session runner records each block's order, sets it for EVERY block (option B for '_rf', else the old "
+        "one — B is on at start since 2026-10-12) and puts the starting order back at the end — the analysis pairs reply "
+        "and command by it",
         '"read_first": base != kind}' in code and 'base = kind[:-len("_rf")] if kind.endswith("_rf") else kind' in code
-        and any(ln.startswith("robot.set_can_read_first(True)") for ln in code)
-        and "robot.set_can_read_first(False)" in code)
+        and any(ln.startswith("robot.set_can_read_first(base != kind)") for ln in code)
+        and any(ln.startswith("robot.set_can_read_first(rf_start)") for ln in code)
+        and not any(ln.startswith("robot.set_can_read_first(True)") or ln == "robot.set_can_read_first(False)"
+                    for ln in code))
     r600 = [r for r in blk["runs"] if r["tick"] == 10601][0]
     chk("the late command: 3.4 ms after RTI's clock reading (usual 0.6)", abs(r600["tx_ms"] - 3.4) < 0.01, r600)
     ipj = json.dumps([{"linkinfo": {"info_data": {"state": "ERROR-ACTIVE"}, "info_xstats": {"bus_error": 2}},
@@ -1047,6 +1050,7 @@ def run_session(args, cfg, order, out_dir):
     robot = RobotClient()
     robot.connect(args.host, args.port)
     capture = dump = dump_fh = dump_path = None
+    rf_start = None                                    # the tick order at the start, put back at the end
     run = {"order": order, "args": vars(args), "delta_t": float(cfg.get("delta_t", 0.004)), "blocks": [],
            "clock_offsets": [], "threads": [], "analysed": False}
     prev_recipe, claimed, ok = None, False, True
@@ -1067,6 +1071,10 @@ def run_session(args, cfg, order, out_dir):
             return 2, None
         ff68.claim_control(robot)
         claimed = True
+        # RTI's tick order at the start (status() since 2026-10-13; an older executor: the shipped default, ON) — every
+        # block sets its own order and the run puts this one back at the end (RTI starts in system.xml's order).
+        rf_start = bool(st.get("can_read_first", True))
+        run["read_first_at_start"] = rf_start
         if st.get("motion_aborted"):
             robot.clear_errors(wait=True)
         if st.get("mode") == "EXEC":
@@ -1100,9 +1108,8 @@ def run_session(args, cfg, order, out_dir):
             print(f"  {name:15s} ... ", end="", flush=True)
             load = Load(args.load_cores) if args.load and kind != "idle" else None
             try:
-                if base != kind:
-                    robot.set_can_read_first(True)         # TODO/can_tx_timing_plan.md option B, this block only
-                    time.sleep(0.2)
+                robot.set_can_read_first(base != kind)     # this block's order: option B for '_rf', else the old one
+                time.sleep(0.2)
                 if kind == "idle":
                     time.sleep(IDLE_S)
                 elif base == "exec":
@@ -1120,11 +1127,6 @@ def run_session(args, cfg, order, out_dir):
             finally:
                 if load is not None:
                     load.stop()
-                if base != kind:
-                    try:
-                        robot.set_can_read_first(False)
-                    except Exception as exc:
-                        print(f"!!! could not switch read-first off ({exc}) — it goes off at the next RTI start")
             blk.update({"t_end": time.time(), "tick1": newest_tick(capture), "can_after": read_counters(args.iface),
                         "irq_after": read_irqs()})
             run["blocks"].append(blk)
@@ -1144,6 +1146,11 @@ def run_session(args, cfg, order, out_dir):
             robot.enter_idle_mode()
         except Exception as exc:
             print(f"(cleanup: {exc})")
+        if rf_start is not None:
+            try:
+                robot.set_can_read_first(rf_start)         # the order the robot had before the run
+            except Exception as exc:
+                print(f"!!! could not restore the tick order ({exc}) — RTI starts in system.xml's at its next start")
         if capture is not None:
             capture.stop()
         if dump is not None:

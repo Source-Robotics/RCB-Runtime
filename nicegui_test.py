@@ -1183,8 +1183,13 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                         # changed across NiceGUI versions (3.3 made ui.html's `sanitize` a
                         # required kwarg), and a tooltip is not worth a version dependency.
                         with ui.tooltip().classes("max-w-sm"), ui.column().classes("gap-1 py-1"):
-                            ui.label("How old the measurements RTI is controlling on are.") \
+                            ui.label("How long the CAN frames waited for RTI's read.") \
                                 .classes("font-semibold")
+                            ui.label(
+                                "With the read first (the default since 2026-10-12) the commands leave early, the "
+                                "replies come back early and wait longer for the next read: ~0.3 ms more here than "
+                                "in the old order is MARGIN for the last joints, not older data. How old the data "
+                                "is when it reaches the motors is the Loop delay row (3.8 vs 7.8 ms).")
                             ui.label(
                                 "Each tick RTI drains the CAN socket. Every frame carries a "
                                 "kernel arrival timestamp, so this is how long the oldest frame "

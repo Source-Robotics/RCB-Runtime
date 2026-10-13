@@ -534,11 +534,13 @@ def run_session(args, cfg, gain_sets, set_order):
     capture, prev_recipe, claimed, gains_changed = None, None, False, False
     comp_used = any(split_rf(n)[0] in COMP_SETS or split_rf(n)[0] in PROFILE_SETS for n in set_order)
     rf_used = any(split_rf(n)[1] for n in set_order)
+    rf_start = None                                   # RTI's tick order at the start, put back at the end
     comp0, applied = (False, False), False
     records, ok = [], True
     names = label_sets(set_order)
     try:
         st = robot.status()
+        rf_start = bool(st.get("can_read_first", True))   # status() since 2026-10-13; older executor: the default, ON
         q0 = np.asarray(robot.get_joints(), float)
         moves = plan_moves(q0, joints1, lo, hi, amps, speeds)
         print(f"Joints now (deg): {np.round(q0, 2).tolist()}")
@@ -603,7 +605,7 @@ def run_session(args, cfg, gain_sets, set_order):
             print(f"\n=== set '{label}' ===")
             applied = True
             if rf_used:
-                robot.set_can_read_first(rf)              # option B for this set only (OFF at every RTI start)
+                robot.set_can_read_first(rf)              # this set's order (option B ON at RTI start since 2026-10-12)
             gains_changed = apply_set(robot, set_name, gain_sets) or gains_changed
             time.sleep(1.0)                               # let the hold settle on the new setup
             for i, mv in enumerate(moves, 1):
@@ -628,11 +630,11 @@ def run_session(args, cfg, gain_sets, set_order):
         except Exception:
             pass
     finally:
-        if rf_used:
+        if rf_used and rf_start is not None:
             try:
-                robot.set_can_read_first(False)
+                robot.set_can_read_first(rf_start)        # the order the robot had before the run
             except Exception as exc:
-                print(f"!!! could not switch read-first off ({exc}) — it goes off at the next RTI start")
+                print(f"!!! could not restore the tick order ({exc}) — RTI starts in system.xml's at its next start")
         if gains_changed:
             try:
                 apply_gains(robot, gain_sets["new"])

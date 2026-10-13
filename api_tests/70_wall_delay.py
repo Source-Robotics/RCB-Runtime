@@ -231,6 +231,7 @@ def run(args):
     robot = RobotClient(sync=False)
     robot.connect(args.host, args.port)
     claimed, capture, prev_recipe, restore_spec, fric_was, rf_touched = False, None, None, None, False, False
+    rf_start = True                                   # RTI's tick order at the start (read below), put back at the end
     meta = {"joint": N, "hz": args.hz, "filter_ms": args.filter, "phases": []}
     try:
         w = robot.get_joint_walls()["walls"][j]
@@ -253,6 +254,7 @@ def run(args):
             print("DRY RUN: re-run with --go. Nothing moved, nothing changed.")
             return 0, None
         st = robot.status()
+        rf_start = bool(st.get("can_read_first", True))   # status() since 2026-10-13; older executor: the default, ON
         if st.get("state") != "ENABLED" or st.get("homed") is not True:
             print(f"Robot must be ENABLED and homed (got state={st.get('state')} homed={st.get('homed')}).")
             return 2, None
@@ -310,7 +312,7 @@ def run(args):
                 base.claim_control(robot)
                 claimed = True
             if rf_touched:
-                robot.set_can_read_first(False)
+                robot.set_can_read_first(rf_start)        # the order the robot had before the run
             if restore_spec is not None:
                 robot.set_joint_wall(N, **restore_spec)
                 print(f"J{N}'s wall setting restored.")

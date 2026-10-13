@@ -471,6 +471,7 @@ def run_session(args, cfg, senders, set_order):
     robot = RobotClient()
     robot.connect(args.host)
     capture, records, ok, prev_recipe, comp0, claimed = None, [], True, None, None, False
+    rf_start = None                                   # RTI's tick order at the start, put back at the end
     try:
         why = sc.preflight(robot)
         if why:
@@ -478,6 +479,7 @@ def run_session(args, cfg, senders, set_order):
             return 2, None
         st = robot.status()
         comp0 = (bool(st.get("inertia_comp", True)), bool(st.get("coriolis_comp", True)))
+        rf_start = bool(st.get("can_read_first", True))   # status() since 2026-10-13; older executor: the default, ON
         if st.get("mode") not in ("IDLE", "EXEC"):
             print(f"The robot must be in IDLE or EXEC (it is in {st.get('mode')}). Nothing moved.")
             return 2, None
@@ -567,11 +569,11 @@ def run_session(args, cfg, senders, set_order):
         except Exception:
             pass
     finally:
-        if any(split_rf(n)[1] for n in set_order):
+        if any(split_rf(n)[1] for n in set_order) and rf_start is not None:
             try:
-                robot.set_can_read_first(False)
+                robot.set_can_read_first(rf_start)        # the order the robot had before the run
             except Exception as exc:
-                print(f"!!! could not switch read-first off ({exc}) — it goes off at the next RTI start")
+                print(f"!!! could not restore the tick order ({exc}) — RTI starts in system.xml's at its next start")
         try:
             robot.rti_set_dynamics_ff("off")
             sc.clear_config(robot)

@@ -1539,9 +1539,12 @@ def current_status():
         # The two freedrive switches (IDLE): gravity comp (the arm floats) and friction compensation on top of it.
         "gravity_comp": bool(shared_data.rti["gravity_comp_enabled"][0] > 0.5),
         "friction_comp": bool(shared_data.rti["friction_comp_enabled"][0] > 0.5),
-        # Inertia / Coriolis feedforward on the commanded motion (OFF after every RTI start).
+        # Inertia / Coriolis feedforward on the commanded motion (start state: system.xml <dynamics_feedforward>, ON).
         "inertia_comp": bool(shared_data.rti["inertia_comp_enabled"][0] > 0.5),
         "coriolis_comp": bool(shared_data.rti["coriolis_comp_enabled"][0] > 0.5),
+        # RTI's CAN tick order: True = read first, send early (option B; start state system.xml <can_read_first>, ON),
+        # False = the old order — also while homing, which always uses it (set_can_read_first switches it).
+        "can_read_first": bool(shared_data.rti["can_read_first"][0] > 0.5),
         # The declared payload RTI's gravity model carries (set_payload; 0 after every RTI start).
         # RTI's tick length (s): an RTI client computes the robot's time from the state packets' `tick` with it
         # (RTIClient.control, 2026-10-11) — the robot's clock, not the PC's, as industrial streaming interfaces do.
