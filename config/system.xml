@@ -49,8 +49,8 @@
          that is no longer read). A drive that gets no command or poll from RTI for this long goes idle (the joints
          brake and sink slowly, the gripper coasts), so no drive can keep running RTI's last speed or torque once RTI
          is gone (a crash, a hang, a pulled cable). RTI sends every drive a command every tick (4 ms); its longest
-         normal silence is the tick-50/150/300 configuration bursts (~25-30 ms). 100 ms = 25 ticks, where industrial
-         real-time interfaces and fieldbus defaults land (20-100 ms). 50-1000; anything else -> 100 with a warning
+         normal silence is the tick-50/150/300 configuration bursts (~35-40 ms). 100 ms = 25 ticks, where industrial
+         real-time interfaces and fieldbus defaults land (20-100 ms). 80-1000; anything else -> 100 with a warning
          (0 would switch the watchdog off). An RTI stop or restart leaves the arm unheld ~0.1 s after RTI stops (it
          was 5 s): support or park the arm first. -->
     <drive_watchdog_ms>100</drive_watchdog_ms>

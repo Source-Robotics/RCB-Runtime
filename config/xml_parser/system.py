@@ -13,11 +13,12 @@ from pathlib import Path
 
 from config.xml_parser.xml_access import get_active_gripper, get_joint_count, parse_robot_config
 
-# <drive_watchdog_ms> (2026-10-13): every drive's CAN watchdog. 0 would switch it off in the drive firmware; under
-# ~50 ms the tick-50/150/300 configuration bursts (RTI sends no command for ~25-30 ms while ~200 frames go out) would
-# trip it; above 1 s a drive keeps running RTI's last speed or torque long after RTI is gone.
+# <drive_watchdog_ms> (2026-10-13): every drive's CAN watchdog. 0 would switch it off in the drive firmware; the
+# minimum is 2x the tick-50/150/300 configuration bursts (~200 frames ahead of that tick's commands: a drive went 40 ms
+# without a fresh reply after the tick-50 burst on 2026-10-13); above 1 s a drive keeps running RTI's last speed or
+# torque long after RTI is gone.
 DRIVE_WATCHDOG_DEFAULT_MS = 100
-DRIVE_WATCHDOG_MIN_MS = 50
+DRIVE_WATCHDOG_MIN_MS = 80
 DRIVE_WATCHDOG_MAX_MS = 1000
 
 
