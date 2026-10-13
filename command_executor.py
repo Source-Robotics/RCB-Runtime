@@ -27,6 +27,7 @@ Contact: petar@source-robotics.com
 
 import json
 import logging
+import math
 import socket
 from contextlib import nullcontext
 from pathlib import Path
@@ -611,8 +612,9 @@ def _recipe_names():
     refuse. Status is push-on-change, not per-tick, so a 5-entry glob costs nothing here —
     it would not be acceptable on RTI's hot path.
 
-    RTI validates `set_recipe` against ITS OWN live RecipeManager, so this list is a
-    convenience for discovery, never the authority.
+    RTI validates `set_recipe` against ITS OWN live RecipeManager too. Since 2026-10-13 the
+    executor also refuses a name that is not on disk (UNKNOWN_RECIPE): RTI's refusal is only a
+    log line, and the client was answered "ok" for a typo that changed nothing (api_tests/72).
     """
     try:
         from project_paths import DATA_RECIPE_DIR
@@ -1219,15 +1221,65 @@ def _handle_enter_flashing_mode(args, cid, conn):
                                                    else "(operator confirmed PARKED)"))
 
 
-def _forward_fmt(prefix, cmd_name, argc):
+# Value checks for _forward_fmt (2026-10-13, api_tests/72 against the simulated robot). Each takes the argument and
+# returns the text RTI gets, or raises ValueError with what it should be. Before them only the COUNT was checked: a
+# switch took any value but "1" as OFF (a JSON `true` from a non-Python client switched gravity compensation OFF), and
+# `jog_accel "abc"` was answered "ok" and then raised inside RTI (logged CRITICAL, the setting never applied).
+def _arg_switch(v):
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return str(int(v))
+    if isinstance(v, str) and v.strip() in ("0", "1"):
+        return v.strip()
+    raise ValueError("0 or 1 (or true / false)")
+
+
+def _arg_positive(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError("a positive number") from None
+    if not (math.isfinite(f) and f > 0):
+        raise ValueError("a positive number")
+    return repr(f)
+
+
+def _arg_one_of(*allowed):
+    def check(v):
+        if str(v).strip() not in allowed:
+            raise ValueError("one of " + ", ".join(allowed))
+        return str(v).strip()
+    return check
+
+
+def _arg_recipe(v):
+    if str(v).strip() not in _recipe_names():
+        raise ValueError("a recipe on disk: " + ", ".join(_recipe_names()))
+    return str(v).strip()
+
+
+_JOG_PROFILES = ("trapezoidal", "scurve")       # robotics/jog.py _PROFILE_TO_IDX (pinned by test_exec_command_args)
+_JOG_CONTROL_MODES = ("pid", "pd")              # robotics/jog.py _CONTROL_TO_IDX
+
+
+def _forward_fmt(prefix, cmd_name, argc, checks=None):
     """Build a handler that forwards `prefix:arg0:arg1:...` to RTI (its colon-delimited wire
     format, e.g. jog_set:2:1:0.5). `argc` is the exact arg count; a mismatch is rejected, not
-    forwarded, so a malformed call can never reach RTI as a truncated command."""
+    forwarded, so a malformed call can never reach RTI as a truncated command. `checks`: one value
+    check per argument (_arg_switch, ...) — a value it refuses is BAD_ARGS, never forwarded."""
     def handler(args, cid, conn):
         if len(args) != argc:
             msg = f"{cmd_name} needs {argc} arg(s), got {len(args)}"
             _log_exec_reject(cid, "BAD_ARGS", msg, command=cmd_name)
             return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
+        if checks:
+            try:
+                args = [chk(a) for chk, a in zip(checks, args)]
+            except ValueError as e:
+                msg = f"{cmd_name}: {list(args)} — expected {e}"
+                _log_exec_reject(cid, "BAD_ARGS", msg, command=cmd_name)
+                return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
         rti_msg = ":".join([prefix] + [str(a) for a in args])
         send_to_rti(rti_msg, cid, "TCP")
         reply(conn, {"id": cid, "status": "ok"})
@@ -1251,14 +1303,31 @@ _PID_GAIN_KEYS = ("KPP", "KPV", "KIV", "KPIQ", "KIIQ", "KP", "KD", "Ilim", "vel_
 def _handle_set_pid_gains(args, cid, conn):
     """set_pid_gains carries {joint, <gain>: value, ...} as a dict (RTI reads the fields off the
     command dict, not a colon string), so forward the dict whole via send_payload_to_rti."""
+    msg = None
     if not isinstance(args, dict) or "joint" not in args:
         msg = "set_pid_gains needs a dict with a 'joint' field and one or more gains"
+    else:
+        # Checked here, not left to RTI (2026-10-13): RTI silently ignores a joint it does not have, so a wrong index
+        # was answered "ok" and changed nothing; an unknown gain name (a typo) was dropped the same way.
+        unknown = sorted(k for k in args if k != "joint" and k not in _PID_GAIN_KEYS)
+        try:
+            joint = int(args["joint"])
+            gains = {k: float(args[k]) for k in _PID_GAIN_KEYS if k in args}
+        except (TypeError, ValueError):
+            joint, gains = None, {}
+            msg = f"set_pid_gains: the joint and every gain must be numbers ({args})"
+        if msg is None and not all(math.isfinite(v) for v in gains.values()):
+            msg = f"set_pid_gains: every gain must be a finite number ({gains})"
+        elif msg is None and not 0 <= joint <= JOINT_NUM:
+            msg = f"set_pid_gains: joint {joint} does not exist (0..{JOINT_NUM - 1}, {JOINT_NUM} = the gripper)"
+        elif msg is None and unknown:
+            msg = f"set_pid_gains: unknown gain(s) {unknown} — known: {', '.join(_PID_GAIN_KEYS)}"
+        elif msg is None and not gains:
+            msg = "set_pid_gains: no gain given"
+    if msg is not None:
         _log_exec_reject(cid, "BAD_ARGS", msg, command="set_pid_gains")
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
-    payload = {"msg": "set_pid_gains", "joint": int(args["joint"])}
-    for key in _PID_GAIN_KEYS:
-        if key in args:
-            payload[key] = float(args[key])
+    payload = {"msg": "set_pid_gains", "joint": joint, **gains}
     send_payload_to_rti(payload, cid, "TCP")
     reply(conn, {"id": cid, "status": "ok"})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
@@ -1413,16 +1482,16 @@ IMMEDIATE_HANDLERS = {
     "exit_flashing_mode":  _forward_to_rti("set_mode:IDLE", "exit_flashing_mode"),
     "jog_set":          _forward_fmt("jog_set", "jog_set", 3),
     "jog_stop":         _forward_to_rti("jog_stop", "jog_stop"),
-    "jog_accel":        _forward_fmt("jog_accel", "jog_accel", 1),
-    "jog_profile":      _forward_fmt("jog_profile", "jog_profile", 1),
-    "jog_jerk_factor":  _forward_fmt("jog_jerk_factor", "jog_jerk_factor", 1),
-    "jog_control_mode": _forward_fmt("jog_control_mode", "jog_control_mode", 1),
-    "gravity_comp":     _forward_fmt("gravity_comp", "gravity_comp", 1),
-    "friction_comp":    _forward_fmt("friction_comp", "friction_comp", 1),
-    "inertia_comp":     _forward_fmt("inertia_comp", "inertia_comp", 1),
-    "can_read_first":   _forward_fmt("can_read_first", "can_read_first", 1),   # TODO/can_tx_timing_plan.md option B
-    "hall_check":       _forward_fmt("hall_check", "hall_check", 1),   # robotics/hall_check.py (IDLE only: COMMAND_RULES)
-    "coriolis_comp":    _forward_fmt("coriolis_comp", "coriolis_comp", 1),
+    "jog_accel":        _forward_fmt("jog_accel", "jog_accel", 1, (_arg_positive,)),
+    "jog_profile":      _forward_fmt("jog_profile", "jog_profile", 1, (_arg_one_of(*_JOG_PROFILES),)),
+    "jog_jerk_factor":  _forward_fmt("jog_jerk_factor", "jog_jerk_factor", 1, (_arg_positive,)),
+    "jog_control_mode": _forward_fmt("jog_control_mode", "jog_control_mode", 1, (_arg_one_of(*_JOG_CONTROL_MODES),)),
+    "gravity_comp":     _forward_fmt("gravity_comp", "gravity_comp", 1, (_arg_switch,)),
+    "friction_comp":    _forward_fmt("friction_comp", "friction_comp", 1, (_arg_switch,)),
+    "inertia_comp":     _forward_fmt("inertia_comp", "inertia_comp", 1, (_arg_switch,)),
+    "can_read_first":   _forward_fmt("can_read_first", "can_read_first", 1, (_arg_switch,)),   # TODO/can_tx_timing_plan.md option B
+    "hall_check":       _forward_fmt("hall_check", "hall_check", 1, (_arg_switch,)),   # robotics/hall_check.py (IDLE only: COMMAND_RULES)
+    "coriolis_comp":    _forward_fmt("coriolis_comp", "coriolis_comp", 1, (_arg_switch,)),
     "set_pid_gains":    _handle_set_pid_gains,
     # --- RTI mode handshake (TODO/RTI_mode_plan.md §4d). The UDP setpoint stream
     # bypasses this process entirely and goes straight to RTI's socket; only the
@@ -1451,12 +1520,12 @@ IMMEDIATE_HANDLERS = {
     "release_control":          _handle_release_control,
     "set_force_confirm":        _handle_set_force_confirm,
     "rti_set_min_duration":     _forward_fmt("rti_set_min_duration", "rti_set_min_duration", 1),
-    "set_recipe":               _forward_fmt("set_recipe", "set_recipe", 1),
+    "set_recipe":               _forward_fmt("set_recipe", "set_recipe", 1, (_arg_recipe,)),
     "rti_set_start_pose_check": _forward_fmt("rti_set_start_pose_check",
                                              "rti_set_start_pose_check", 1),
     "rti_set_lowpass":  _forward_fmt("rti_set_lowpass", "rti_set_lowpass", 1),
     "gripper_calibrate": _forward_to_rti("gripper_calibrate", "gripper_calibrate"),
-    "gripper_ctrl_mode": _forward_fmt("gripper_ctrl_mode", "gripper_ctrl_mode", 1),
+    "gripper_ctrl_mode": _forward_fmt("gripper_ctrl_mode", "gripper_ctrl_mode", 1, (_arg_one_of("1", "2"),)),
     "gripper_set":       _forward_fmt("gripper_set", "gripper_set", 4),
 }
 
