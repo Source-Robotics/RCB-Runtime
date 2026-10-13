@@ -21,8 +21,13 @@ RULES IT ENFORCES
   4. ruff (F-rules + syntax) runs over the source; any finding not in temp_data/ruff_baseline.txt fails. The
      baseline is "what the tree had on 2026-10-02" — the rule is NO NEW findings, not zero.
   5. The summary names the source modules no net imports (static scan) — refactoring one of those is riskier.
+  6. (2026-10-13, tools/quality.py) mypy, bandit, vulture and radon run over the runtime, each against its own
+     baseline (temp_data/quality/): NO NEW findings. --coverage measures line + branch coverage of the nets and
+     ratchets it (temp_data/coverage/html). A failed net is rerun once: a pass then is reported FLAKY (and logged in
+     temp_data/quality/flaky_history.tsv). A full run regenerates docs/test_catalog.md. --audit adds the known-
+     vulnerability audit (report only). The policy for new features: docs/testing.md "Testing policy".
 
-Exit code 0 only when every net and the ruff check pass. The summary is also written to temp_data/nets/last_run.txt.
+Exit code 0 only when every net and every check pass. The summary is also written to temp_data/nets/last_run.txt.
 """
 import argparse
 import ast
@@ -36,21 +41,25 @@ import subprocess
 import sys
 import time
 
+import quality                                     # tools/quality.py (same folder)
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NETS_DIR = os.path.join(ROOT, "dummy_test_scripts")
 OUT_DIR = os.path.join(ROOT, "temp_data", "nets")
 RUFF_BASELINE = os.path.join(ROOT, "temp_data", "ruff_baseline.txt")
-SOURCE = ["RTI.py", "command_executor.py", "supervisor.py", "nicegui_test.py", "gui_command_sender.py",
-          "gui_walls_tab.py", "project_paths.py", "communication", "config", "data", "hardware", "motion",
-          "robotics", "robots", "utility", "supervisor", "robotclient"]
-SOURCE_PKGS = ("communication", "config", "data", "hardware", "motion", "robotics", "robots", "utility",
-               "supervisor", "robotclient")
+# The runtime source: ONE list for ruff, the static checks and the import map (tools/quality.py) — ruff covered
+# less until 2026-10-13 (not blockly/, sim/, the self-collision worker, six gui_*.py: 0 findings there).
+SOURCE = quality.RUNTIME_FILES + quality.RUNTIME_PKGS
+SOURCE_PKGS = tuple(quality.RUNTIME_PKGS)
 # A net passed when its exit code is 0 AND no line STARTS with one of these (anchored: a PASS line whose text
 # mentions "FAILED" must not count). Tracebacks in the output are NOT a failure signal: a crash gives a non-zero
 # exit anyway, while several nets print tracebacks on purpose (a handler raising "boom" to test the intake guard)
 # or at exit (CPython's resource_tracker complaining about a segment the net unlinked itself).
 FAIL_MARKERS = re.compile(r"(?m)^\s*(?:(?!0 )\d+ (?:failed|FAILED|FAILURE)|FAILED\b|FAILURES:|\[FAIL\]|FAIL\s{2,}|"
                           r"PLAN ERROR|RESULT: (?!ALL)\S*FAIL)")
+# A CPU-time budget skips itself only under coverage (dummy_test_scripts/_timing.py); in a plain run that line means
+# the budget silently stopped being judged — a failure.
+COVERAGE_SKIP = re.compile(r"(?m)^SKIP .*\(coverage run:")
 
 
 def robot_state(timeout=2.0):
@@ -90,11 +99,14 @@ def unlink_prefixed(prefix):
     return n
 
 
-def run_one(path, index, timeout):
+def run_one(path, index, timeout, coverage=False):
     name = os.path.basename(path)[:-3]
     prefix = f"nets{os.getpid()}_{index}_"
     env = dict(os.environ, RCB_SHM_PREFIX=prefix, PYTHONUNBUFFERED="1", PYTHONPATH=ROOT)
     cmd = [sys.executable, path]
+    if coverage:                                       # measured: lines + branches, its subprocesses too
+        cmd = quality.coverage_command(path)
+        env.update(quality.coverage_env())
     if shutil.which("ionice"):
         cmd = ["ionice", "-c3"] + cmd
     log = os.path.join(OUT_DIR, name + ".log")
@@ -113,6 +125,8 @@ def run_one(path, index, timeout):
     marker = FAIL_MARKERS.search(out)
     if rc == 0 and marker:
         rc, why = 1, f"output says: {marker.group(0).strip()[:60]!r}"
+    elif rc == 0 and not coverage and COVERAGE_SKIP.search(out):
+        rc, why = 1, "a CPU-time budget skipped itself outside a coverage run (dummy_test_scripts/_timing.py)"
     elif rc not in (0, -1):
         why = f"exit {rc}"
         m = re.findall(r"(?m)^(?:\w+Error|\w+Exception|AssertionError)[^\n]*$", out)
@@ -195,7 +209,15 @@ def main():
     ap.add_argument("--no-ruff", action="store_true")
     ap.add_argument("--update-ruff-baseline", action="store_true")
     ap.add_argument("--allow-enabled", action="store_true", help="run even while the robot is ENABLED (not advised)")
+    ap.add_argument("--coverage", action="store_true", help="measure line + branch coverage (slower); a ratchet")
+    ap.add_argument("--no-static", action="store_true", help="skip mypy / bandit / vulture / radon")
+    ap.add_argument("--audit", action="store_true", help="also the known-vulnerability audit (internet; report only)")
+    ap.add_argument("--no-rerun", action="store_true", help="do not rerun a failed net once (flaky detection)")
+    ap.add_argument("--update-baselines", action="store_true",
+                    help="accept today's ruff / static / coverage state as the baselines (after review only)")
     args = ap.parse_args()
+    if args.update_baselines:
+        args.update_ruff_baseline = True
     nets = list_nets(args.only)
     all_nets = list_nets(None)
     if args.list:
@@ -214,20 +236,47 @@ def main():
           f"RCB_SHM_PREFIX set per net, timeout {args.timeout:.0f} s each\n")
     results = []
     t_all = time.perf_counter()
+    if args.coverage:
+        quality.coverage_prepare()
     for i, n in enumerate(nets):
-        r = run_one(n, i, args.timeout)
+        r = run_one(n, i, args.timeout, args.coverage)
+        if not r["ok"] and not args.no_rerun and not r["why"].startswith("TIMEOUT"):
+            first_why = r["why"]                          # flaky detection: one rerun; a pass then is FLAKY, not green
+            r = run_one(n, i, args.timeout, args.coverage)
+            if r["ok"]:
+                r["flaky"], r["why"] = True, f"FLAKY — failed once ({first_why}), passed on the rerun"
         results.append(r)
-        print(f"  {'PASS' if r['ok'] else 'FAIL'}  {r['seconds']:7.1f} s  {r['net']}" + (f"   [{r['why']}]" if r["why"] else "")
+        tag = "FLAKY" if r.get("flaky") else ("PASS" if r["ok"] else "FAIL")
+        print(f"  {tag:5s} {r['seconds']:7.1f} s  {r['net']}" + (f"   [{r['why']}]" if r["why"] else "")
               + (f"   (cleaned {r['shm_segments_cleaned']} shm segments)" if r["shm_segments_cleaned"] else ""), flush=True)
+    t_nets = time.perf_counter() - t_all
     ruff = None if args.no_ruff else ruff_check(args.update_ruff_baseline)
+    static = None if args.no_static else quality.static_checks(args.update_baselines)
+    cov = quality.coverage_finish(args.update_baselines, ratchet=not args.only) if args.coverage else None
+    aud = quality.audit() if args.audit else None
     failed = [r for r in results if not r["ok"]]
-    lines = [f"nets: {len(results) - len(failed)}/{len(results)} passed in {time.perf_counter() - t_all:.0f} s"]
+    flaky = [r["net"] for r in results if r.get("flaky")]
+    quality.record_flaky(flaky)
+    lines = [f"nets: {len(results) - len(failed)}/{len(results)} passed in {t_nets:.0f} s"
+             + (f" ({len(flaky)} FLAKY: {', '.join(flaky)})" if flaky else "")]
     for r in failed:
         lines.append(f"  FAIL {r['net']}: {r['why']}  (see {r['log']})")
     if ruff is not None:
         lines.append(f"ruff: {'OK' if ruff['ok'] else 'FAIL'} — {ruff['why']}")
         for p, c, msg in ruff["new"][:30]:
             lines.append(f"  NEW {p}: {c} {msg}")
+    for name, v in (static or {}).items():
+        lines.append(f"{name}: {'OK' if v['ok'] else 'FAIL'} — {v['why']}")
+        for f in v["new"][:30]:
+            lines.append("  NEW " + " | ".join(f))
+    if cov is not None:
+        lines.append(f"coverage: {'OK' if cov['ok'] else 'FAIL'} — {cov['why']} (temp_data/coverage/html/index.html)")
+        for pth, was, now in cov.get("drops", [])[:20]:
+            lines.append(f"  DROP {pth}: {was} % -> {now} %")
+    if aud is not None:
+        lines.append(f"audit: {'OK' if aud['ok'] else 'WARN'} — {aud['why']} (report only)")
+    if not args.only:
+        lines.append("catalog: " + os.path.relpath(quality.write_catalog(results, static, cov, ruff), ROOT))
     unc = coverage_map(all_nets)
     lines.append(f"source modules no net imports ({len(unc)}): " + ", ".join(unc))
     summary = "\n".join(lines)
@@ -235,8 +284,10 @@ def main():
     with open(os.path.join(OUT_DIR, "last_run.txt"), "w") as fh:
         fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + summary + "\n")
     with open(os.path.join(OUT_DIR, "last_run.json"), "w") as fh:
-        json.dump({"when": time.time(), "results": results, "ruff": ruff}, fh, indent=1)
-    ok = not failed and (ruff is None or ruff["ok"])
+        json.dump({"when": time.time(), "results": results, "ruff": ruff, "static": static,
+                   "coverage": None if cov is None else {k: v for k, v in cov.items() if k != "files"}}, fh, indent=1)
+    ok = not failed and (ruff is None or ruff["ok"]) and all(v["ok"] for v in (static or {}).values()) \
+        and (cov is None or cov["ok"])
     print("\nRESULT:", "ALL GREEN" if ok else "RED")
     return 0 if ok else 1
 

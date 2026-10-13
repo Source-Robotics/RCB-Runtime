@@ -1,0 +1,15 @@
+# RCB Control Runtime — DEVELOPMENT / TEST tools (not needed to run the robot)
+# Created: 2026-10-13 UTC — the testing toolchain of tools/run_nets.py + tools/quality.py (docs/testing.md):
+#   coverage (line + branch coverage of the offline nets), mypy (static types), bandit (security lint), vulture (dead
+#   code), radon (complexity), hypothesis (property-based tests), pip-audit (known vulnerabilities in installed
+#   packages), ruff (lint — already in use since 2026-10-02). Installed into .venv:
+#       .venv/bin/pip install -r requirements-dev.txt
+#   Versions as installed and verified on the robot's Pi (aarch64, Python 3.11) on 2026-10-13.
+coverage==7.16.2
+mypy==2.4.0
+bandit==1.9.4
+vulture==2.16
+radon==6.0.1
+hypothesis==6.169.0
+pip-audit==2.10.1
+ruff==0.16.10

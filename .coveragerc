@@ -1,0 +1,32 @@
+# Coverage of the offline test nets (tools/run_nets.py --coverage, 2026-10-13): which lines and branches of the
+# runtime no test ever runs. Every .venv Python process a net starts is measured too (COVERAGE_PROCESS_START + the
+# startup hook tools/quality.py installs in .venv). Reports: temp_data/coverage/ (text, JSON, HTML).
+# ${RCB_ROOT-.}: the repo, set by tools/quality.py — a net's subprocess started in another folder still measures
+# this tree and writes its data here (plain '.' would be ITS working directory).
+[run]
+branch = True
+parallel = True
+concurrency = thread,multiprocessing
+data_file = ${RCB_ROOT-.}/temp_data/coverage/.coverage
+source = ${RCB_ROOT-.}
+omit =
+    ${RCB_ROOT-.}/.venv/*
+    ${RCB_ROOT-.}/dummy_test_scripts/*
+    ${RCB_ROOT-.}/api_tests/*
+    ${RCB_ROOT-.}/tools/*
+    ${RCB_ROOT-.}/legacy/*
+    ${RCB_ROOT-.}/temp_data/*
+    ${RCB_ROOT-.}/TODO/*
+    ${RCB_ROOT-.}/scripts/*
+    ${RCB_ROOT-.}/blockly/web/*
+    */__pycache__/*
+
+[report]
+skip_empty = True
+precision = 1
+
+[html]
+directory = ${RCB_ROOT-.}/temp_data/coverage/html
+
+[json]
+output = ${RCB_ROOT-.}/temp_data/coverage/coverage.json
