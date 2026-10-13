@@ -257,15 +257,16 @@ def _record_sent(ctx, pos_buf, vel_buf, curr_buf, mode):
 def _send(ctx, pos_buf, vel_buf, curr_buf, mode):
     """Dispatch the CAN send based on ControlOutput.mode."""
     _record_sent(ctx, pos_buf, vel_buf, curr_buf, mode)
+    # hall_check_joint: the joint in the Hall sensor check (robotics/hall_check.py) gets its Hall-index command instead
     if mode == "pd":
         send_motor_commands_pd(
             ctx.Motor, ctx.joint_num,
-            positions=pos_buf, speeds=vel_buf, currents=curr_buf,
+            positions=pos_buf, speeds=vel_buf, currents=curr_buf, hall_joint=ctx.hall_check_joint,
         )
     else:
         send_motor_commands(
             ctx.Motor, ctx.joint_num,
-            positions=pos_buf, speeds=vel_buf, currents=curr_buf,
+            positions=pos_buf, speeds=vel_buf, currents=curr_buf, hall_joint=ctx.hall_check_joint,
         )
 
 

@@ -56,6 +56,10 @@ class TickContext:
     # Haptic zone walls (utility/haptic_walls.py) for IDLE gravity-comp freedrive. None = no walls.
     haptic_walls: object = None
 
+    # The Hall sensor check (robotics/hall_check.py): the joint that gets the Hall-index command instead of its data
+    # pack while the check runs; -1 = none (every tick but those).
+    hall_check_joint: int = -1
+
 
 @dataclass
 class TickResult:

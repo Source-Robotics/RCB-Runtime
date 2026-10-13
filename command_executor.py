@@ -1223,6 +1223,14 @@ def _forward_fmt(prefix, cmd_name, argc):
     return handler
 
 
+def _hall_check_status(rti):
+    """status()["hall_check"] from the shared memory RTI's robotics/hall_check.py writes (NaN / -1 -> None)."""
+    pin = int(rti["hall_check_pin"][0])
+    edges = [None if v != v else round(float(v), 2) for v in rti["hall_check_edge_deg"][:2]]
+    return {"joint": int(rti["hall_check_joint"][0]), "pin": None if pin < 0 else pin,
+            "changes": int(rti["hall_check_changes"][0]), "edge_deg": edges}
+
+
 # Gains RTI's _handle_set_pid_gains reads off the command dict, per joint (or the gripper).
 _PID_GAIN_KEYS = ("KPP", "KPV", "KIV", "KPIQ", "KIIQ", "KP", "KD", "Ilim", "vel_lim", "vlim")
 
@@ -1400,6 +1408,7 @@ IMMEDIATE_HANDLERS = {
     "friction_comp":    _forward_fmt("friction_comp", "friction_comp", 1),
     "inertia_comp":     _forward_fmt("inertia_comp", "inertia_comp", 1),
     "can_read_first":   _forward_fmt("can_read_first", "can_read_first", 1),   # TODO/can_tx_timing_plan.md option B
+    "hall_check":       _forward_fmt("hall_check", "hall_check", 1),   # robotics/hall_check.py (IDLE only: COMMAND_RULES)
     "coriolis_comp":    _forward_fmt("coriolis_comp", "coriolis_comp", 1),
     "set_pid_gains":    _handle_set_pid_gains,
     # --- RTI mode handshake (TODO/RTI_mode_plan.md §4d). The UDP setpoint stream
@@ -1545,6 +1554,9 @@ def current_status():
         # RTI's CAN tick order: True = read first, send early (option B; start state system.xml <can_read_first>, ON),
         # False = the old order — also while homing, which always uses it (set_can_read_first switches it).
         "can_read_first": bool(shared_data.rti["can_read_first"][0] > 0.5),
+        # The Hall sensor check (hall_check; robotics/hall_check.py): joint = the limp joint's number, 0 = off; pin =
+        # its Hall pin, None until read; changes = pin changes seen; edge_deg = its angle at the last change to 0 / 1.
+        "hall_check": _hall_check_status(shared_data.rti),
         # The declared payload RTI's gravity model carries (set_payload; 0 after every RTI start).
         # RTI's tick length (s): an RTI client computes the robot's time from the state packets' `tick` with it
         # (RTIClient.control, 2026-10-11) — the robot's clock, not the PC's, as industrial streaming interfaces do.

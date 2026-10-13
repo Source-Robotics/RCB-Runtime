@@ -145,6 +145,9 @@ COMMAND_RULES = {
     "inertia_comp":     (IMMEDIATE, None, None, False),   # inertia feedforward switch (OWNED, 2026-10-10)
     "coriolis_comp":    (IMMEDIATE, None, None, False),   # Coriolis feedforward switch (OWNED, 2026-10-10)
     "can_read_first":   (IMMEDIATE, None, None, False),   # RTI reads CAN first, sends early (option B; OWNED, 2026-10-12)
+    # The Hall sensor check (robotics/hall_check.py, 2026-10-13): the Hall-sensor joint limp, its pin shown live. IDLE
+    # only, enabled or not, homed or not (OWNED); RTI stops it itself before any mode change.
+    "hall_check":       (IMMEDIATE, ["IDLE"], None, False),
     "set_pid_gains":    (IMMEDIATE, None, None, False),
     # --- RTI mode session control (TODO/RTI_mode_plan.md §3). Only the handshake goes
     # through here; the UDP setpoint stream never touches command_executor.

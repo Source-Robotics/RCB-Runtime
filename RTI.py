@@ -53,6 +53,7 @@ from utility.error_checks import (
 )
 from utility.activity_log import get_rti_activity_logger, log_activity
 from utility.incident_dump import IncidentDumper
+from robotics.hall_check import HallCheck, hall_joint_index
 from robotics.homing import HomingController
 from robotics.homing_arms import HomingArms
 from motion.rti_handler import RTIModeHandler
@@ -869,6 +870,11 @@ def main():
         motor_buffers=motor_buffers,
     )
 
+    # The Hall sensor check (robotics/hall_check.py, 2026-10-13): the robot XML's <has_hall_sensor> joint, its live
+    # limits (stop() restores them; PID apply edits these arrays in place).
+    hall_check = HallCheck(Motor, hall_joint_index(cfg['has_hall_sensor'], joint_num), motor_velocity_limit, motor_Ilim,
+                           ctx, shared_data.rti, shared_data.joint['joint_position'], log=logger.info)
+
     MODE_HANDLERS = build_mode_dispatch(
         joint_num=joint_num,
         homing_ctrl=homing_ctrl,
@@ -1220,6 +1226,27 @@ def main():
 
     def _handle_coriolis_comp(cmd_msg, cmd_dict):
         _dynamics_switch(cmd_msg, 'coriolis_comp_enabled', "Coriolis")
+
+    def _handle_hall_check(cmd_msg, cmd_dict):
+        """hall_check:1|0 — the Hall sensor check (robotics/hall_check.py, 2026-10-13): the Hall-sensor joint (J6) limp,
+        its Hall pin read every tick for the dashboard's I/O tab. Only in IDLE (enabled or not, homed or not); it stops
+        itself before any mode change."""
+        parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
+        if len(parts) != 2:
+            return
+        if parts[1].strip() == "1":
+            why = hall_check.start(idle=st.current_mode == RobotMode.IDLE,
+                                   mode_pending=st.pending_mode_request is not None,
+                                   booting=st.startup_motor_reconfig < 3)
+            if why:
+                logger.warning(f"[Hall check] refused: {why}")
+                log_activity(_rti_activity_logger, "RTI", "warning", "HALL_CHECK_REFUSED", message=why)
+            elif hall_check.active:
+                log_activity(_rti_activity_logger, "RTI", "info", "HALL_CHECK",
+                             message=f"J{hall_check.joint + 1} limp: Hall sensor check ON")
+        elif hall_check.active:
+            hall_check.stop("stopped by the operator")
+            log_activity(_rti_activity_logger, "RTI", "info", "HALL_CHECK", message="Hall sensor check OFF")
 
 
     def _handle_set_mode(cmd_msg, cmd_dict):
@@ -1835,6 +1862,7 @@ def main():
         "friction_comp":     _handle_friction_comp,
         "inertia_comp":      _handle_inertia_comp,
         "can_read_first":    _handle_can_read_first,
+        "hall_check":        _handle_hall_check,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
@@ -2442,6 +2470,11 @@ def main():
         # resolution per tick it always was — the telemetry block reuses it.
         ctx.recipe = recipe = recipe_mgr.get(shared_data.active_recipe.get())
         _profile_last = _profile_mark(_profile_last, "udp_rx_context")
+
+        # The Hall sensor check (robotics/hall_check.py): read the joint's pin; stop it — the joint's limits restored —
+        # BEFORE a mode change takes effect (homing sends its own limits on entry) or once the robot left IDLE.
+        if hall_check.active:
+            hall_check.tick(st.current_mode == RobotMode.IDLE and st.pending_mode_request is None)
 
         # ==========================================================================
         # Perform robot state and mode management

@@ -1390,6 +1390,17 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                     ui.label("LED 1");    io_led1_badge = ui.badge("OFF").props("color=grey outline")
                     ui.label("LED 2");    io_led2_badge = ui.badge("OFF").props("color=grey outline")
 
+            # The Hall sensor check (gui_hall_check.py, robotics/hall_check.py, 2026-10-13)
+            refresh_hall_card = None
+            try:
+                from gui_hall_check import add_hall_check_card
+                from robotics.hall_check import hall_joint_index
+                refresh_hall_card = add_hall_check_card(
+                    shared_data, _exec_sender.submit,
+                    hall_joint_index(_xml_cfg["has_hall_sensor"], int(_sys_cfg["joint_num"])))
+            except Exception:
+                logging.exception("Hall sensor check card unavailable")
+
     # ─── System Info ────────────────────────────────────────
     with ui.tab_panel(tab_sysinfo):
         with ui.row().classes("gap-4 items-start flex-wrap mb-3"):
@@ -4099,6 +4110,9 @@ def update_tables():
         _io_badge(io_btn2_badge, not shared_data.gpio_states[BUTTON2],
                   high_label="PRESSED", low_label="OFF",
                   high_color="positive", low_color="grey")
+
+        if refresh_hall_card is not None:
+            refresh_hall_card()
 
         _io_badge(io_led1_badge, shared_data.gpio_states[LED1],
                   high_label="ON", low_label="OFF",

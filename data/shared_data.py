@@ -702,8 +702,13 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # The control loop's delay per joint (2026-10-12, utility/loop_delay_meter.py): a reply's arrival -> the departure of
     # the command computed from it [s], median / max of the last ~5 s; NaN until measured. can_read_first: 1 while
     # RTI runs option B's tick order (read first, send early), 0 in the normal order.
+    # The Hall sensor check (robotics/hall_check.py, 2026-10-13): hall_check_joint = the limp joint's number (1-based)
+    # while the check runs, 0 = off; hall_check_pin = its Hall pin (0 / 1), -1 = not read yet; hall_check_changes = pin
+    # changes seen; hall_check_edge_deg = the joint's angle (deg) at the last change to 0 / to 1 (NaN = none yet).
     for name, count in [("sc_pair_gaps", 49), ("jog_ref", joint_num), ("jog_dir", joint_num),
-                        ("loop_delay", joint_num), ("loop_delay_max", joint_num), ("can_read_first", 1)]:
+                        ("loop_delay", joint_num), ("loop_delay_max", joint_num), ("can_read_first", 1),
+                        ("hall_check_joint", 1), ("hall_check_pin", 1), ("hall_check_changes", 1),
+                        ("hall_check_edge_deg", 2)]:
         shm, arr = _attach_or_create(name, np.float64, count)
         rti_shms[name] = shm
         rti[name] = arr

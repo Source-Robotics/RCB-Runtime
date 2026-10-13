@@ -17,6 +17,7 @@ import logging
 import time
 import numpy as np
 from config.xml_parser import clamp_voltage_limit
+from robotics.hall_check import HALL_CHECK_TRIGGER
 from utility.data_init import (
     process_motor_data,
     process_gripper_data,
@@ -224,7 +225,7 @@ def _reload_gripper(shared_data, Motor, joint_num, gripper_watchdog_rate, grippe
     logger.info("[RTI] Gripper config reload done.")
 
 
-def send_motor_commands(motors, joint_num, positions=None, speeds=None, currents=None):
+def send_motor_commands(motors, joint_num, positions=None, speeds=None, currents=None, hall_joint=-1):
     """Send data_pack_1 to all arm joints.
 
     All arrays are optional and indexed by joint (0..joint_num-1).
@@ -237,15 +238,20 @@ def send_motor_commands(motors, joint_num, positions=None, speeds=None, currents
         positions: target position array or None
         speeds:    target speed array or None
         currents:  feedforward current/torque array or None (default 0 each)
+        hall_joint: the joint in the Hall sensor check (robotics/hall_check.py) — it gets the Hall-index command at
+                   speed 0 instead (its drive's current limit is 0 meanwhile); -1 = none
     """
     for i in range(joint_num):
+        if i == hall_joint:
+            motors[i].Send_data_pack_HALL(Speed=0, trigger_value=HALL_CHECK_TRIGGER)
+            continue
         motors[i].Send_data_pack_1(
             Position=int(positions[i]) if positions is not None else None,
             Speed=int(speeds[i])    if speeds    is not None else None,
             Current=int(currents[i]) if currents is not None else 0,
         )
 
-def send_motor_commands_pd(motors, joint_num, positions, speeds, currents=None):
+def send_motor_commands_pd(motors, joint_num, positions, speeds, currents=None, hall_joint=-1):
     """Send data_pack_PD to all arm joints (PD impedance control mode).
 
     Unlike data_pack_1, the firmware uses its on-board KP/KD gains to compute
@@ -257,8 +263,12 @@ def send_motor_commands_pd(motors, joint_num, positions, speeds, currents=None):
         positions: target position array (required, ticks)
         speeds:    target speed array (required, ticks/s)
         currents:  feedforward current/torque array or None (default 0 each)
+        hall_joint: as in send_motor_commands
     """
     for i in range(joint_num):
+        if i == hall_joint:
+            motors[i].Send_data_pack_HALL(Speed=0, trigger_value=HALL_CHECK_TRIGGER)
+            continue
         motors[i].Send_data_pack_PD(
             Position=int(positions[i]),
             Speed=int(speeds[i]),
@@ -672,7 +682,8 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
         loop_tick_cnt (int): Current loop tick counter
         received_ids (np.array): Array to mark received IDs
         latest_commands_id (np.array): Array to store latest command IDs
-        data_reply_count_out (list): if given, filled with the number of data replies (DATA_PACK 3 / 5 / 7) read
+        data_reply_count_out (list): if given, filled with the number of data replies (DATA_PACK 3 / 5 / 7, and the
+            Hall-index reply 32 of a joint in the Hall sensor check) read
             from each joint this tick (2026-10-12: utility/can_reply_monitor.py counts the ticks that got none)
         receive (callable): if given, used instead of communication.receive_can_messages — the same
             (message, (node, command, error_bit)) contract; option B passes hardware/can_hardware.FastCanReader's
@@ -746,7 +757,8 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
                 # and so would otherwise only refresh one of two different deques.
                 if node_error_bits is not None:
                     node_error_bits[node_id] = error_bit
-                if data_reply_count_out is not None and command_id in (3, 5, 7) \
+                # 32: a Hall-index reply — the per-tick reply of a joint in the Hall sensor check (robotics/hall_check.py)
+                if data_reply_count_out is not None and command_id in (3, 5, 7, 32) \
                         and node_id < len(data_reply_count_out):
                     data_reply_count_out[node_id] += 1
                 if reply_time_out is not None and command_id in (3, 5, 7) and node_id < len(reply_time_out):

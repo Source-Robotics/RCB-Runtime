@@ -338,6 +338,13 @@ class RobotClient:
         old order. RTI.log reports the waits when it is switched off."""
         return self._immediate("can_read_first", [1 if enabled else 0])
 
+    def hall_check(self, on: bool = True) -> Any:
+        """The Hall sensor check (2026-10-13): True = the joint homed on a Hall sensor (J6) goes limp (its drive's
+        current limit 0) and its Hall pin is read every tick — turn it by hand and watch the dashboard's I/O tab, or
+        status()["hall_check"]. Only in IDLE (enabled or not, homed or not); the robot stops it itself before any mode
+        change (homing, a jog, an error, the E-stop) and puts the joint's limits back. False = stop it."""
+        return self._immediate("hall_check", [1 if on else 0])
+
     def set_coriolis_comp(self, enabled: bool) -> Any:
         """Robot-wide CORIOLIS / centripetal feedforward: the torque C(q, qd)·qd the joints exert on each other when
         several move at once, from the commanded motion — same modes as set_inertia_comp. Starts as system.xml
