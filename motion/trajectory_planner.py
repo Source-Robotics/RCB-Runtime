@@ -3759,8 +3759,12 @@ class TrajectoryPlanner(Thread):
         n = int(np.atleast_2d(np.asarray(positions)).shape[0])
         where = f"at sample {k + 1} of {n} ({100.0 * k / max(n - 1, 1):.0f} % of the way)"
         if why == "within":
+            # THIS pair's planner margin (per-pair overrides differ; the smallest of all pairs — what this said until
+            # 2026-10-13 — made a correct refusal read "4.8 mm apart; the margin is 3 mm")
+            own = [float(m) for pf, m in zip(model.pair_frames, model.margins["planner"]) if set(pf) == {a, b}]
+            margin = own[0] if own else float(model.margins["planner"].min())
             text = (f"the arm would run into itself — {model.describe(a, b)} would be {1e3 * gap:.1f} mm apart {where}; "
-                    f"the margin is {1e3 * float(model.margins['planner'].min()):.0f} mm")
+                    f"their margin is {1e3 * margin:.0f} mm")
         elif why == "closer":
             text = (f"the arm starts with {model.describe(a, b)} within the self-collision margin and this move brings "
                     f"them CLOSER ({1e3 * gap:.1f} mm {where}) — from there only a move that takes them apart is allowed")

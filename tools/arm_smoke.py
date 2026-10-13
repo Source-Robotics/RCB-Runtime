@@ -8,8 +8,8 @@ set of api_tests on the arm and saves the results with the commit they ran on.
         --only a,b     just these (names from --list)
 
 Before: the arm ENABLED, homed, error-free, in IDLE or EXEC (the dashboard); the workspace clear, the E-stop in reach.
-What moves: J1 by +1 deg and back, J1 5 deg stopped mid-move and back, J5 small moves + a refused limit + a jog
-(api_tests 02 / 12 / 45). Everything else moves nothing (00 / 49 / 42 / 60 / 25).
+What moves: every joint to the api_tests' start pose at 10 % (2026-10-13), then J1 by +1 deg and back, J1 5 deg
+stopped mid-move and back, J5 small moves + a refused limit + a jog (api_tests 02 / 12 / 45). Everything else moves nothing (00 / 49 / 42 / 60 / 25).
 
 It also tells you when the robot runs OLDER code than what is on disk: RTI's commit (its `[RTI] code:` line in
 RTI.log, logged at every start since 2026-10-13) against HEAD, and tracked files changed after RTI started.
@@ -32,6 +32,8 @@ sys.path.insert(0, ROOT)
 
 from project_paths import RTI_LOG, TEMP_DATA_DIR                          # noqa: E402
 from utility.code_version import git_commit                               # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "api_tests"))
+from _common import START_POSE_DEG                                        # noqa: E402  (the api_tests' one start pose)
 
 PY = os.path.join(ROOT, ".venv", "bin", "python")
 OUT = os.path.join(str(TEMP_DATA_DIR), "smoke")
@@ -44,6 +46,10 @@ TESTS = [
     ("arbitration",    "42_arbitration.py",    [],                                        None, None),
     ("self_collision", "60_self_collision.py", ["--go"],                                  None, None),
     ("rti_link",       "25_rti_comm.py",       [],                                        None, "IDLE"),   # RTI only from IDLE
+    # 2026-10-13 (user): every run's motion tests start from the same pose — on the arm 45's J5 approach was refused
+    # (SELF_COLLISION, correctly) from where the arm had been left by hand; the simulator starts here after homing
+    ("start_pose",     None,                   [],
+     "every joint to the api_tests' start pose " + str(START_POSE_DEG) + " deg at 10 %", "EXEC"),
     ("joint_nudge",    "02_joint.py",          ["--go", "--assume-ready", "--speed", "10"], "J1 +1 deg and back", "EXEC"),
     ("stop",           "12_stop.py",           ["--go", "--assume-ready", "--speed", "10"],
      "J1 5 deg, stopped mid-move, back", "EXEC"),
@@ -152,7 +158,8 @@ def main():
         tests = [t for t in TESTS if t[0] in want]
     if args.list:
         for name, script, extra, moves, _ in TESTS:
-            print(f"  {name:15s} {'api_tests/' + script:32s} {' '.join(extra):34s} {moves or 'nothing moves'}")
+            print(f"  {name:15s} {('api_tests/' + script) if script else '(this tool)':32s} {' '.join(extra):34s} "
+                  f"{moves or 'nothing moves'}")
         return 0
 
     branch, sha = git_commit(ROOT)
@@ -183,6 +190,12 @@ def main():
     if problems:
         print("REFUSED: the arm is not ready — " + "; ".join(problems) + ". Prepare it in the dashboard first.")
         return 2
+    if s.get("motion_aborted"):
+        # a previous program's abort latch (e.g. a refused move of an earlier smoke run): motion stays refused until
+        # cleared — a fresh run clears it (real errors refused above), and says so
+        print(f"note: a previous program's abort latch is set ({s['motion_aborted'].get('code')}) — clearing it")
+        robot.clear_errors(wait=True)
+        time.sleep(0.3)
 
     print("\nWill run, in this order:")
     for name, script, extra, moves, _ in tests:
@@ -214,6 +227,30 @@ def main():
         except Exception:                                           # noqa: BLE001 — not holding it is fine
             pass
         _wait_control_free(robot)
+        if script is None:                                  # the start pose: this tool moves the arm itself
+            print(f"\n--- {name}: move_joints{tuple(START_POSE_DEG)} at 10 %", flush=True)
+            t0 = time.monotonic()
+            try:
+                robot.move_joints(*START_POSE_DEG, speed=10)
+                f = robot.wait_idle(timeout=TIMEOUT_S, raise_on_error=False)
+                code, text = (0, "reached") if not f else (1, f"FAIL  {f}")
+            except Exception as e:                          # noqa: BLE001 — a refused or failed move fails the step
+                code, text = 1, f"FAIL  {type(e).__name__}: {e}"
+            try:
+                robot.release_control()
+            except Exception:                               # noqa: BLE001
+                pass
+            dt = time.monotonic() - t0
+            with open(os.path.join(run_dir, f"{name}.log"), "w") as fh:
+                fh.write(text + "\n")
+            ok = code == 0
+            results.append({"name": name, "script": None, "args": [], "exit": code, "ok": ok, "seconds": round(dt, 1),
+                            "note": "" if ok else text[:160]})
+            print(f"    {'PASS' if ok else 'FAIL'}  {dt:6.1f} s" + ("" if ok else f"   {text[:150]}"), flush=True)
+            if not ok:
+                aborted = "the start pose was not reached — the motion tests were not run"
+                break
+            continue
         cmd = [PY, os.path.join("api_tests", script), "--host", "127.0.0.1"] + extra
         print(f"\n--- {name}: {' '.join(cmd[1:])}", flush=True)
         t0 = time.monotonic()
