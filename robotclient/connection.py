@@ -330,7 +330,10 @@ class Connection:
     def wait_ack(p, timeout):
         if not p.ack.wait(timeout):
             raise RobotTimeout("no ack within timeout")
-        if p.error is not None:
+        # A rejection is an error INSTEAD of "queued". A command that was queued and then failed before this thread
+        # looked is a motion failure — reported once, by wait_done / wait_idle (MotionFailed) — not ALSO here
+        # (2026-10-13: the simulated suite saw one JOINT_LIMIT counted twice).
+        if p.error is not None and not p.queued:
             raise CommandRejected(*p.error)
 
     @staticmethod

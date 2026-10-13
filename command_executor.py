@@ -28,6 +28,7 @@ Contact: petar@source-robotics.com
 import json
 import logging
 import socket
+from contextlib import nullcontext
 from pathlib import Path
 import threading
 import time
@@ -1098,6 +1099,14 @@ _LEAVES_EXEC = frozenset({"disable", "home", "enter_idle_mode", "enter_jog_mode"
                           "enter_flashing_mode", "rti_connect", "rti_claim"})
 
 
+def _abort_gate():
+    """The planner's abort gate (TrajectoryPlanner.abort_gate): held across an event that empties the queue AND the
+    pending-client failures it causes, and across a queued command's check -> register -> queue -> ack — so a command
+    is either refused at its ack, or queued and acknowledged before the event drops it (2026-10-13). A no-op before
+    main() builds the planner."""
+    return _planner.abort_gate if _planner is not None else nullcontext()
+
+
 def _on_exec_exit(reason):
     """RTI has left (or is about to leave) EXEC.
 
@@ -1111,18 +1120,21 @@ def _on_exec_exit(reason):
     if _planner is None:
         return
     _planner.note_exec_exit()
-    with _pending_lock:
-        busy = bool(pending_client)
+    with _abort_gate():
+        with _pending_lock:
+            busy = bool(pending_client)
+        if busy:
+            msg = f"the program was interrupted: {reason}"
+            _planner.interrupt("ABORTED", msg)
+            _fail_pending("ABORTED", msg + " — clear errors to run motion again")
     if busy:
-        msg = f"the program was interrupted: {reason}"
-        _planner.interrupt("ABORTED", msg)
-        _fail_pending("ABORTED", msg + " — clear errors to run motion again")
         log_activity(_exec_activity_logger, "EXEC", "error", "MOTION_ABORTED", message=msg)
 
 
 def _handle_stop(args, cid, conn):
-    _planner.flush()                       # drop queued motion + reset endpoint
-    _fail_pending("STOPPED", "motion stopped")
+    with _abort_gate():                    # a command being queued right now lands before this, never after
+        _planner.flush()                   # drop queued motion + reset endpoint
+        _fail_pending("STOPPED", "motion stopped")
     send_to_rti("set_mode:IDLE", cid, "TCP")
     reply(conn, {"id": cid, "status": "ok"})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="stop")
@@ -1668,38 +1680,44 @@ def dispatch(msg, conn):
             _on_exec_exit(f"'{cmd}' was sent before the program finished")
         handle_immediate(cmd, msg, cid, conn)
     else:  # QUEUED
-        aborted = _planner.abort_info() if _planner is not None else None
-        if aborted is not None:
-            why = (f"motion is aborted: command {aborted['cid']} failed ({aborted['code']})"
-                   if aborted.get("cid") else f"motion is aborted: {aborted['message']}")
-            why += " — clear errors (clear_errors / the Clear Errors button) to run motion again"
-            _log_exec_reject(cid, "MOTION_ABORTED", why, command=_fmt_command(cmd, args))
-            return reply(conn, {"id": cid, "status": "error", "code": "MOTION_ABORTED",
-                                "message": why})
-        try:
-            queued = _build_queued_command(cid, cmd, args, msg.get("options", {}) or {})
-        except (TypeError, ValueError) as e:
-            _log_exec_reject(cid, "BAD_OPTIONS", str(e), command=_fmt_command(cmd, args))
-            return reply(conn, {"id": cid, "status": "error", "code": "BAD_OPTIONS",
-                                "message": str(e)})
-        # Register BEFORE queueing. The planner can fail a command within a millisecond of
-        # picking it up (a JOINT_LIMIT target is refused before any planning), and an error for
-        # an id not yet registered is dropped as "unknown" — the client then hangs until its
-        # timeout. A rejected (full-queue) command is unregistered again below.
+        with _abort_gate():                # check -> register -> queue -> ack: no failure / Stop / interrupt between
+            _submit_queued(cmd, args, msg, cid, conn)
+
+
+def _submit_queued(cmd, args, msg, cid, conn):
+    """A queued command's check -> register -> queue -> ack. dispatch() holds _abort_gate() around it."""
+    aborted = _planner.abort_info() if _planner is not None else None
+    if aborted is not None:
+        why = (f"motion is aborted: command {aborted['cid']} failed ({aborted['code']})"
+               if aborted.get("cid") else f"motion is aborted: {aborted['message']}")
+        why += " — clear errors (clear_errors / the Clear Errors button) to run motion again"
+        _log_exec_reject(cid, "MOTION_ABORTED", why, command=_fmt_command(cmd, args))
+        return reply(conn, {"id": cid, "status": "error", "code": "MOTION_ABORTED",
+                            "message": why})
+    try:
+        queued = _build_queued_command(cid, cmd, args, msg.get("options", {}) or {})
+    except (TypeError, ValueError) as e:
+        _log_exec_reject(cid, "BAD_OPTIONS", str(e), command=_fmt_command(cmd, args))
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_OPTIONS",
+                            "message": str(e)})
+    # Register BEFORE queueing. The planner can fail a command within a millisecond of
+    # picking it up (a JOINT_LIMIT target is refused before any planning), and an error for
+    # an id not yet registered is dropped as "unknown" — the client then hangs until its
+    # timeout. A rejected (full-queue) command is unregistered again below.
+    with _pending_lock:
+        pending_client[cid] = conn
+    try:
+        motion_queue.put_nowait(queued)
+    except Full:
         with _pending_lock:
-            pending_client[cid] = conn
-        try:
-            motion_queue.put_nowait(queued)
-        except Full:
-            with _pending_lock:
-                pending_client.pop(cid, None)
-            _log_exec_reject(cid, "QUEUE_FULL", f"motion queue full (max {MOTION_QUEUE_MAXSIZE})",
-                              command=_fmt_command(cmd, args))
-            return reply(conn, {"id": cid, "status": "error", "code": "QUEUE_FULL",
-                                "message": f"motion queue full (max {MOTION_QUEUE_MAXSIZE})"})
-        reply(conn, {"id": cid, "status": "queued", "seq": queued.seq})
-        log_activity(_exec_activity_logger, "EXEC", "info", "CMD_QUEUED", id=cid,
-                     command=_fmt_command(cmd, args))
+            pending_client.pop(cid, None)
+        _log_exec_reject(cid, "QUEUE_FULL", f"motion queue full (max {MOTION_QUEUE_MAXSIZE})",
+                          command=_fmt_command(cmd, args))
+        return reply(conn, {"id": cid, "status": "error", "code": "QUEUE_FULL",
+                            "message": f"motion queue full (max {MOTION_QUEUE_MAXSIZE})"})
+    reply(conn, {"id": cid, "status": "queued", "seq": queued.seq})
+    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_QUEUED", id=cid,
+                 command=_fmt_command(cmd, args))
 
 
 def handle_client(conn, addr):

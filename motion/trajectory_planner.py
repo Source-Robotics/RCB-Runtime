@@ -73,7 +73,7 @@ from dataclasses import replace
 import logging
 import time
 from queue import Empty
-from threading import Thread
+from threading import RLock, Thread
 
 import numpy as np
 import zmq
@@ -410,6 +410,13 @@ class TrajectoryPlanner(Thread):
         # every command that reaches the planner is answered ABORTED without being planned.
         # Cleared only by clear_abort() — command_executor calls it on clear_errors.
         self._abort = None
+        # ABORT GATE (2026-10-13). What empties the queue — a failure (latch + drain), a Stop (flush), the robot
+        # leaving EXEC (interrupt) — and command_executor's check -> register -> queue -> ack of a new command hold
+        # this lock, so neither runs in the middle of the other. Without it a command checked just BEFORE such an
+        # event was queued just AFTER it: behind a failure (its client heard ABORTED before "queued"), or after a Stop,
+        # where nothing kept it from RUNNING (found by the simulated suite; dummy_test_scripts/test_exec_queue_race.py).
+        # Re-entrant: interrupt() flushes under it.
+        self.abort_gate = RLock()
         # Set when the arm may have moved by something other than EXEC (another mode, an
         # error, a hand). The next plan then starts from the MEASURED position instead of
         # the last planned endpoint. Consumed by _start_point().
@@ -480,15 +487,16 @@ class TrajectoryPlanner(Thread):
         braking ramp it will never execute would only leave a stale batch in the
         socket for whatever runs next.
         """
-        try:
-            while True:
-                self._queue.get_nowait()
-        except Empty:
-            pass
-        self._blend_buffer = []
-        self._held = None
-        self._last_endpoint = None
-        self._last_exit_speed = None
+        with self.abort_gate:
+            try:
+                while True:
+                    self._queue.get_nowait()
+            except Empty:
+                pass
+            self._blend_buffer = []
+            self._held = None
+            self._last_endpoint = None
+            self._last_exit_speed = None
 
     def abort_info(self):
         """The failure that aborted the program ({cid, code, message}), or None."""
@@ -497,19 +505,21 @@ class TrajectoryPlanner(Thread):
 
     def clear_abort(self):
         """Accept motion again after an abort. command_executor calls this on clear_errors."""
-        if self._abort is not None:
-            logger.info(f"[Planner] abort cleared (was: {self._abort['code']})")
-        self._abort = None
+        with self.abort_gate:
+            if self._abort is not None:
+                logger.info(f"[Planner] abort cleared (was: {self._abort['code']})")
+            self._abort = None
 
     def interrupt(self, code, message):
         """The robot stopped mid-program — an error, E-stop or a mode change took it out of
         EXEC while commands were still pending. RTI already discarded what it had, so there is
         nothing to finish cleanly: latch the abort and drop everything queued, like flush().
-        Called from command_executor's thread; the caller fails the pending clients."""
-        if self._abort is None:
-            self._abort = {"cid": None, "code": code, "message": message}
-            logger.error(f"[Planner] motion ABORTED: {message}")
-        self.flush()
+        Called from command_executor's thread; the caller fails the pending clients (under abort_gate too)."""
+        with self.abort_gate:
+            if self._abort is None:
+                self._abort = {"cid": None, "code": code, "message": message}
+                logger.error(f"[Planner] motion ABORTED: {message}")
+            self.flush()
         self._resync = True
 
     def note_exec_exit(self):
@@ -3667,8 +3677,9 @@ class TrajectoryPlanner(Thread):
         # latch re-aborts it, a late drain swallows its first moves. Measured in the test, both.
         # Only the ABORTED *reports* for the dropped commands go out after this error, so a
         # client reads the cause first (on the arm they arrived cause-last, which reads backwards).
-        aborting = self._latch_abort(cid, code, message)
-        dropped = self._finish_abort(aborting) if aborting else ()
+        with self.abort_gate:                    # a submission never lands between the latch and the drain
+            aborting = self._latch_abort(cid, code, message)
+            dropped = self._finish_abort(aborting) if aborting else ()
         try:
             self._status_sock.send_json(
                 {"checkpoint_id": cid or "", "status": "error",
@@ -3688,10 +3699,11 @@ class TrajectoryPlanner(Thread):
 
     def _command_failed(self, cid, code, message):
         """For a subclass that reports failures its own way (the dry run): abort unless exempt."""
-        aborting = self._latch_abort(cid, code, message)
-        if aborting:
-            for cmd in self._finish_abort(aborting):
-                self._report_aborted(cmd, aborting)
+        with self.abort_gate:
+            aborting = self._latch_abort(cid, code, message)
+            dropped = self._finish_abort(aborting) if aborting else ()
+        for cmd in dropped:
+            self._report_aborted(cmd, aborting)
 
     def _latch_abort(self, cid, code, message):
         """Set the abort latch for a failure that aborts. Returns the latch dict, or None when
