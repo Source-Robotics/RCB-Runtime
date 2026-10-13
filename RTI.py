@@ -33,7 +33,8 @@ import json
 from utility.data_init import initialize_robot_data, logger, process_gripper_joint_data, process_joint_data
 from utility.signal_processing import reset_rolling_stats, update_rolling_percentiles, update_rt_loop_stats, pace_deadline
 from utility.RTI_utils import print_heartbeat
-from project_paths import RTI_LOG, SYSTEM_XML, ROBOTS_DIR, TEMP_DATA_DIR, DATA_RECIPE_DIR, GRIPPERS_DIR, CRITICAL_LOG, FILTER_CONFIG_PATH, FLASH_PERFORMED_MARKER, CELLS_DIR
+from project_paths import RTI_LOG, SYSTEM_XML, ROBOTS_DIR, TEMP_DATA_DIR, DATA_RECIPE_DIR, GRIPPERS_DIR, CRITICAL_LOG, FILTER_CONFIG_PATH, FLASH_PERFORMED_MARKER, CELLS_DIR, PROJECT_ROOT
+from utility.code_version import describe as describe_code
 import logging
 import sys
 import numpy as np
@@ -322,6 +323,8 @@ def main():
     # own stderr handler, and setup_logging then saw "already configured" and set up NOTHING — no RTI.log, INFO
     # dropped, writes unqueued in the RT thread — from 2026-10-04 17:52 until this fix (2026-10-05).
     logging.info(f"[control box] {describe_pcb(_sys.get('pcb_version', 1))}")
+    # Which commit this RTI runs (2026-10-13; tools/arm_smoke.py records it) — read from the .git files, no subprocess.
+    logging.info(f"[RTI] code: {describe_code(PROJECT_ROOT)}")
     # The last two seconds before a hard error -> temp_data/incidents/*.npz (utility/incident_dump.py,
     # 2026-10-03). Its worker thread starts here for the same reason the log listener does; it yields between
     # channels, so it never holds the interpreter for more than ~one channel of the 500-tick history.

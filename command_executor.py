@@ -36,7 +36,8 @@ from queue import Queue, Full
 import numpy as np
 import zmq
 
-from project_paths import HIGH_LEVEL_LOG, SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, CELLS_DIR, DATA_RECIPE_DIR, FILTER_CONFIG_PATH
+from project_paths import HIGH_LEVEL_LOG, SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, CELLS_DIR, DATA_RECIPE_DIR, FILTER_CONFIG_PATH, PROJECT_ROOT
+from utility.code_version import describe as describe_code
 from data.shared_memory_index import (
     ISOLATED_INPUT_1, ISOLATED_INPUT_2, ISOLATED_INPUT_3,
     ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_2, ISOLATED_OUTPUT_3,
@@ -1764,6 +1765,8 @@ def tcp_server(host="0.0.0.0", port=TCP_PORT):
 # ========================================================================== #
 def main():
     global _planner, ROBOT_MODEL
+    # Which commit this executor runs (2026-10-13; tools/arm_smoke.py records it).
+    logging.info(f"[EXEC] code: {describe_code(PROJECT_ROOT)}")
     if ROBOT_MODEL is None:
         ROBOT_MODEL = _build_robot_model()
     _planner = TrajectoryPlanner(
