@@ -15,7 +15,7 @@
                          arguments: --tests "00_status,01_mode --go,02_joint --go --assume-ready"
                          'smoke' = tools/arm_smoke.py against the simulated robot (home it first):
                          --tests "01_mode --go,smoke"
-                         'suite' = the SIMULATED suite: the smoke routine + 28 more api_tests that move the arm far
+                         'suite' = the SIMULATED suite: the smoke routine + 29 more api_tests that move the arm far
                          (tools/arm_smoke.py --suite sim): --tests "01_mode --go,suite"
         --coverage       measure the runtime (RTI, the executor, the worker, the drives, the GUI) with coverage: run
                          under the venv's Python, data + report in temp_data/sim/coverage/ and, with the nets' last

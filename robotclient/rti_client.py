@@ -361,6 +361,7 @@ class RTIClient:
         _to = [first_packet_timeout]
         started = time.monotonic()
         tick0 = None
+        received = False             # a packet seen: a stop after this is a LOST stream, not one that never started
         try:
             while self._running:
                 try:
@@ -379,10 +380,20 @@ class RTIClient:
                             "RTI mode. A latched error forces ACTIVE_ERROR, which ends the "
                             "stream; check robot.status() and the error list for the cause."
                             + self._link_summary())
+                    if received:
+                        # 2026-10-13: a recipe without rti_state (e.g. `tracking`) cannot tell us whether we held
+                        # control — but packets came and then stopped, so the robot left RTI mode. Reporting "never
+                        # started streaming" here sent the operator looking at the pairing instead.
+                        raise ControlLost(
+                            "state stream stopped after it had started — the robot has left RTI mode (a latched "
+                            "error forces ACTIVE_ERROR, which ends the stream; the active recipe carries no "
+                            "rti_state, so check robot.status() and the error list for the cause)."
+                            + self._link_summary())
                     raise RuntimeError("RTI timeout: no state packet from robot "
                                        "(never started streaming — is it paired?)")
 
                 state = self._decode(data)
+                received = True
                 tick = state.get("tick")
                 if self.tick_s is not None and isinstance(tick, (int, float)):
                     if tick0 is None:
