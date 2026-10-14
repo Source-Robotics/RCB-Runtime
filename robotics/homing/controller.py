@@ -157,10 +157,9 @@ class HomingController:
         # its gravity current as feedforward — the zero-speed hold let J2 / J3 sink back toward their endstops while the
         # later steps ran (16 homings ended with a joint past its soft limit) {j: motor ticks}
         self._hold_pos: dict = {}
-        # 2026-10-14 (user): an <approach> pre-move drives a joint to its endstop and holds it there (raw motor ticks,
-        # no gravity feedforward — the pose is not known yet) until its own homing step {j: motor ticks}; its travel
-        # is added to the joint's pass-1 travel in the history {j: ticks}
-        self._approach_hold: dict = {}
+        # 2026-10-14 (user): an <approach> pre-move drives a joint to its endstop at a controlled speed, then backs it
+        # off and hands it back as an <idle> joint (moves.py); its travel is added to the joint's pass-1 travel in the
+        # history {j: ticks}
         self._approach_travel: dict = {}
         self._approach: dict = {}                         # the running approaches' state {j: dict}
         self._homing_stats: dict = {}                     # {j: (two-pass diff, release relaxation, travel)} history
@@ -289,6 +288,8 @@ class HomingController:
     _send_idle = _moves._send_idle
     _approach_setup = _moves._approach_setup
     _approach_tick = _moves._approach_tick
+    _approach_back = _moves._approach_back
+    _approach_limits = _moves._approach_limits
 
     # ------------------------------------------------------------------
     def _jlabel(self, j, Motor) -> str:
@@ -370,7 +371,6 @@ class HomingController:
         self._seq_ticks = 0
         self._homing_stats = {}
         self._hold_pos = {}
-        self._approach_hold = {}
         self._approach_travel = {}
         if self.arm_check is not None:
             self.arm_check.on_homing_start()
@@ -449,7 +449,6 @@ class HomingController:
                     duration_ticks = max(1, round(pm['duration_s'] / self.dt))
                     self._pre_move_targets[j] = ('idle', duration_ticks)
                 elif pm.get('type') == 'approach':
-                    self._approach_hold.pop(j, None)
                     self._approach[j] = self._approach_setup(j, pm)
                     self._pre_move_targets[j] = ('approach', self._approach[j]['timeout_ticks'])
                 elif pm.get('type') == 'gripper_move':
@@ -486,8 +485,6 @@ class HomingController:
         home_joints = step['home_joints']
         gripper_mode = step.get('gripper_mode')
         self._active_states = {}
-        for j in home_joints:
-            self._approach_hold.pop(j, None)            # its own homing takes over from the <approach> hold
         for j in home_joints:
             # Use GripperHomingState for gripper firmware mode
             if gripper_mode == 'firmware' and j >= self._arm_count:

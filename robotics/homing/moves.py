@@ -49,9 +49,6 @@ def _send_idle(self, Motor, i, shared_data=None):
             if pos is not None:
                 Motor[i].Send_data_pack_1(Position=pos, Speed=0, Current=self._gravity_ff(shared_data, i))
                 return
-        if i in self._approach_hold:                # brought to its endstop by an <approach>: held there (raw ticks)
-            Motor[i].Send_data_pack_1(Position=self._approach_hold[i], Speed=0, Current=0)
-            return
         Motor[i].Send_data_pack_1(Position=None, Speed=0, Current=0)
 
 
@@ -61,11 +58,18 @@ def _send_idle(self, Motor, i, shared_data=None):
 # the drive's position loop sets the speed whatever gravity does, and works before homing (the encoder counts are
 # there, only the joint angles are not) — with the joint's current limit raised to `current_ma` (enough to carry the
 # arm: J3 800 mA = the gravity model's worst case + friction + ~30 %). It has arrived when the joint stops following the
-# ramp (the endstop); then it is held THERE in position until its own homing step. No arrival within its timeout
-# (default: the joint's homing timeout) fails homing with that reason.
+# ramp (the endstop). Then it BACKS OFF `backoff` ticks (default 3000, ~3.6 deg on J3) the same way and is handed back
+# exactly as an <idle> joint was (user, after the first version held it pressed there: J3 then homed ~0.3 deg off its
+# usual spot, two passes ~600-870 ticks apart instead of 10-22 — the press at up to 800 mA stayed in the drivetrain):
+# its homing current limit again, the drive's Idle for the rest of the pre-moves, the zero-velocity hold after — its
+# homing makes its own gentle contact. No arrival within its timeout (default: the joint's homing timeout) fails
+# homing with that reason.
 _APPROACH_LAG_S = 0.1          # arrived: the joint trails the ramp by more than 0.1 s of travel ...
 _APPROACH_LAG_MIN = 400        # ... (at least this many ticks) ...
 _APPROACH_LAG_READS = 10       # ... on this many valid reads in a row
+_APPROACH_BACKOFF = 3000       # ticks backed off after arriving (unless the XML says)
+_APPROACH_BACK_TOL = 300       # backed off: within this many ticks of the back-off point ...
+_APPROACH_BACK_WAIT_S = 0.5    # ... or this long after the ramp got there
 
 
 def _approach_setup(self, j, pm):
@@ -73,29 +77,41 @@ def _approach_setup(self, j, pm):
     speed = abs(float(pm['speed'])) if pm.get('speed') is not None else abs(float(self.homing_speeds[j]))
     speed = -speed if int(self.homing_directions[j]) == 1 else speed
     timeout_s = float(pm['timeout_s']) if pm.get('timeout_s') is not None else float(self._timeout_s[j])
+    backoff = abs(float(pm['backoff'])) if pm.get('backoff') is not None else float(_APPROACH_BACKOFF)
     return {'speed': speed, 'current_ma': float(pm['current_ma']), 'timeout_ticks': max(1, round(timeout_s / self.dt)),
-            'lag_max': max(_APPROACH_LAG_MIN, abs(speed) * _APPROACH_LAG_S), 'target': None, 'start': None, 'over': 0,
-            'ticks': 0, 'last_valid': None}
+            'lag_max': max(_APPROACH_LAG_MIN, abs(speed) * _APPROACH_LAG_S), 'backoff': backoff, 'phase': 'approach',
+            'target': None, 'start': None, 'end': None, 'over': 0, 'ticks': 0, 'back_ticks': 0, 'idle_ticks': 0,
+            'last_valid': None}
+
+
+def _approach_limits(self, Motor, j, current_ma):
+    mc = getattr(self, '_motor_config', None)
+    vlim = mc['velocity_limit'][j] if mc is not None else abs(self._approach[j]['speed']) * 4
+    for _ in range(self._LIMIT_REPEATS):
+        Motor[j].Send_Limits(Velocity_limit=int(vlim), Current_limit=int(current_ma))
 
 
 def _approach_tick(self, Motor, j, shared_data) -> str:
-    """One tick of joint j's <approach>: 'running', 'arrived' (held at its endstop from now on) or 'failed'."""
+    """One tick of joint j's <approach>: 'running', 'arrived' (backed off and idle, as an <idle> joint) or 'failed'."""
     a = self._approach[j]
-    label = self._jlabel(j, Motor)
-    if j in self._approach_hold:
-        Motor[j].Send_data_pack_1(Position=self._approach_hold[j], Speed=0, Current=0)
+    if a['phase'] == 'idle':                         # handed back: the drive's Idle (twice), then polls — as <idle>
+        a['idle_ticks'] += 1
+        if a['idle_ticks'] <= 2:
+            Motor[j].Send_Idle()
+        else:
+            Motor[j].Send_Respond_Encoder_data()
         return 'arrived'
-    a['ticks'] += 1
-    if a['ticks'] == 1:
-        mc = getattr(self, '_motor_config', None)
-        vlim = mc['velocity_limit'][j] if mc is not None else abs(a['speed']) * 4
-        for _ in range(self._LIMIT_REPEATS):
-            Motor[j].Send_Limits(Velocity_limit=int(vlim), Current_limit=int(a['current_ma']))
-        logging.info(f"[Homing] {label} approaching its endstop: {a['speed']:+.0f} ticks/s (a position ramp), current "
-                     f"limit {a['current_ma']:.0f} mA")
+    label = self._jlabel(j, Motor)
     pos = Motor[j].position
     if pos is not None:
         a['last_valid'] = int(pos)
+    if a['phase'] == 'backoff':
+        return self._approach_back(Motor, j, pos, label)
+    a['ticks'] += 1
+    if a['ticks'] == 1:
+        self._approach_limits(Motor, j, a['current_ma'])
+        logging.info(f"[Homing] {label} approaching its endstop: {a['speed']:+.0f} ticks/s (a position ramp), current "
+                     f"limit {a['current_ma']:.0f} mA")
     if a['target'] is None:
         if a['last_valid'] is None:                 # no position yet: hold still until one is read
             Motor[j].Send_data_pack_1(Position=None, Speed=0, Current=0)
@@ -109,12 +125,13 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
             lag = (a['target'] - pos) * (1.0 if a['speed'] > 0 else -1.0)
             a['over'] = a['over'] + 1 if lag > a['lag_max'] else 0
             if a['over'] >= _APPROACH_LAG_READS:
-                held = self._approach_hold[j] = int(pos)
-                travel = self._approach_travel[j] = held - int(a['start'])
+                travel = self._approach_travel[j] = int(pos) - int(a['start'])
+                a['phase'], a['target'] = 'backoff', float(pos)
+                a['end'] = float(pos) - (a['backoff'] if a['speed'] > 0 else -a['backoff'])
                 logging.info(f"[Homing] {label} reached its endstop (approach): {travel:+d} ticks in "
-                             f"{a['ticks'] * self.dt:.3f} s (from {int(a['start'])} to {held}) — held there until its "
-                             f"homing")
-                return 'arrived'
+                             f"{a['ticks'] * self.dt:.3f} s (from {int(a['start'])} to {int(pos)}) — backing off "
+                             f"{a['backoff']:.0f} ticks")
+                return 'running'
     if a['ticks'] >= a['timeout_ticks']:
         reason = (f"it did not reach its endstop within {a['timeout_ticks'] * self.dt:.1f} s of its controlled approach "
                   f"({a['speed']:+.0f} ticks/s, {a['current_ma']:.0f} mA) — something in the way, or the joint far "
@@ -125,6 +142,25 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
         self._report_failure(j, reason)
         self._seq_phase = self._FAILED
         return 'failed'
+    return 'running'
+
+
+def _approach_back(self, Motor, j, pos, label) -> str:
+    """The back-off after arriving: the ramp back at the approach speed to `end`; there (or 0.5 s after the ramp got
+    there), handed back: its homing current limit, then the drive's Idle — 'arrived'."""
+    a = self._approach[j]
+    step = abs(a['speed']) * self.dt
+    to_go = a['end'] - a['target']
+    a['target'] = a['end'] if abs(to_go) <= step else a['target'] + (step if to_go > 0 else -step)
+    there = a['target'] == a['end']
+    a['back_ticks'] += 1 if there else 0
+    Motor[j].Send_data_pack_1(Position=int(round(a['target'])), Speed=0 if there else int(-a['speed']), Current=0)
+    if there and ((pos is not None and abs(int(pos) - a['end']) <= _APPROACH_BACK_TOL)
+                  or a['back_ticks'] * self.dt >= _APPROACH_BACK_WAIT_S):
+        self._approach_limits(Motor, j, self.homing_current_ma[j])
+        a['phase'] = 'idle'
+        logging.info(f"[Homing] {label} backed off to {a['last_valid']} — idle until its homing (current limit "
+                     f"{self.homing_current_ma[j]:.0f} mA again)")
     return 'running'
 
 

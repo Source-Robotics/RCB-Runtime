@@ -142,6 +142,11 @@ class JointHomingState:
         self._two_pass_max_diff = (int(two_pass_max_diff)
                                    if not math.isnan(two_pass_max_diff)
                                    else self._TWO_PASS_MAX_DIFF_TICKS)
+        # 2026-10-14 (user: a failing joint "flops first"): a joint that slides more than twice its two-pass tolerance
+        # during its release is not resting on an endstop (a false stall) — it fails at once instead of finishing the
+        # release (normal: J1 -12..-116, J2 +1064..+2144, J3 -744..-1125, J5 ~+10 ticks; seen failing: J2 up to
+        # +21684, J3 up to -19506)
+        self._release_slide_max = 2 * self._two_pass_max_diff
 
         # Derived tick thresholds from time constants
         self._stall_window     = max(5, round(self._STALL_TIME / self.dt))
@@ -181,6 +186,7 @@ class JointHomingState:
         # compares pass 1 with THIS: comparing with the released position counted the gearbox's play as "not
         # repeatable" — the black arm's J2 relaxed 2062 ticks (limit 2000) with its two stalls 45 ticks apart.
         self._pass2_stall_pos  = None
+        self._two_pass_done    = False
         self._post_move_target = None
         self._post_move_ok     = 0
         self._limits_sent      = False
@@ -243,6 +249,7 @@ class JointHomingState:
         self._triggered_pos    = None
         self._pass1_pos        = None
         self._pass2_stall_pos  = None
+        self._two_pass_done    = False
         self._post_move_target = None
         self._post_move_ok     = 0
         self._limits_sent      = False
@@ -308,7 +315,7 @@ class JointHomingState:
         elif self._phase == self._PAUSE:
             return self._do_pause(motor)
         elif self._phase == self._RELEASE:
-            return self._do_release(motor)
+            return self._do_release(motor, shared_data)
         elif self._phase == self._POST_MOVE:
             return self._do_post_move(motor, joint_or_none, shared_data)
         else:
@@ -421,6 +428,11 @@ class JointHomingState:
                 # Release phase: command a controlled current to relieve gearbox
                 # preload, then latch the true resting endstop position.
                 self._pass2_stall_pos = stall_pos if not self.has_hall_sensor else motor.position
+                # 2026-10-14: the two passes compared HERE, before the release — two passes apart are a joint that
+                # cannot hold itself at its homing current; the release (less current) let it fall further first
+                if (self._pass1_pos is not None and self._pass2_stall_pos is not None
+                        and not self._two_pass_check(motor, shared_data, self._pass2_stall_pos)):
+                    return 'failed'
                 self._phase         = self._RELEASE
                 self._release_count = 0
                 self._release_reads = []
@@ -601,7 +613,35 @@ class JointHomingState:
         return 'running'
 
     # ------------------------------------------------------------------
-    def _do_release(self, motor) -> str:
+    def _two_pass_check(self, motor, shared_data, pass2_pos) -> bool:
+        """Pass 2's stall against pass 1's (logged; once per homing). Too far apart: FAILED, the joint's normal limits
+        restored — False. With a release this runs at pass 2's stall (2026-10-14), without one after the settle."""
+        self._two_pass_done = True
+        diff = abs(int(pass2_pos) - int(self._pass1_pos))
+        self.two_pass_diff = diff
+        logging.info(
+            f"[Homing] {self._label} two-pass difference: "
+            f"{diff} ticks (pass1={self._pass1_pos}, "
+            f"pass2={pass2_pos}, "
+            f"max={self._two_pass_max_diff})"
+        )
+        if diff > self._two_pass_max_diff:
+            self.fail_reason = (f"the two passes stopped {diff} ticks apart (max {self._two_pass_max_diff}) — "
+                                f"the endstop trigger is not repeatable (a false stall: the joint could not move, "
+                                f"or something blocked it?)")
+            logging.error(
+                f"[Homing] {self._label} FAILED: two-pass difference "
+                f"{diff} ticks exceeds max {self._two_pass_max_diff} — "
+                f"endstop trigger is not repeatable"
+            )
+            shared_data.rti["homing_status"][self.j] = STATUS_FAILED
+            self._restore_limits(motor)
+            self._phase = self._FAILED
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    def _do_release(self, motor, shared_data=None) -> str:
         """Command a controlled current to release gearbox preload at endstop.
 
         The motor is driven in current-command mode (Position=None, Speed=None,
@@ -610,6 +650,16 @@ class JointHomingState:
         window — after the gearbox has relaxed but before the joint drifts away.
         """
         self._release_count += 1
+        pos = motor.position
+        if (shared_data is not None and pos is not None and self._pass2_stall_pos is not None
+                and abs(int(pos) - int(self._pass2_stall_pos)) > self._release_slide_max):
+            # Sliding, not resting on an endstop: hold it (zero velocity) and give it its normal limits NOW (2026-10-14)
+            motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
+            self._restore_limits(motor)
+            self._fail(shared_data, f"it slid {int(pos) - int(self._pass2_stall_pos):+d} ticks during its release "
+                                    f"(more than {self._release_slide_max}, twice its two-pass tolerance) — it was not "
+                                    f"resting on an endstop: a false stall (could it carry the arm from where it was?)")
+            return 'failed'
         current_cmd = int(self.release_current_ma)
         motor.Send_data_pack_1(Position=None, Speed=None, Current=current_cmd)
 
@@ -686,29 +736,9 @@ class JointHomingState:
                 f"{int(self._triggered_pos) - int(self._pass2_stall_pos):+d} ticks "
                 f"(stall {self._pass2_stall_pos} -> latched {self._triggered_pos})"
             )
-        if (self._pass1_pos is not None
-                and pass2_pos is not None):
-            diff = abs(int(pass2_pos) - int(self._pass1_pos))
-            self.two_pass_diff = diff
-            logging.info(
-                f"[Homing] {self._label} two-pass difference: "
-                f"{diff} ticks (pass1={self._pass1_pos}, "
-                f"pass2={pass2_pos}, "
-                f"max={self._two_pass_max_diff})"
-            )
-            if diff > self._two_pass_max_diff:
-                self.fail_reason = (f"the two passes stopped {diff} ticks apart (max {self._two_pass_max_diff}) — "
-                                    f"the endstop trigger is not repeatable (a false stall: the joint could not move, "
-                                    f"or something blocked it?)")
-                logging.error(
-                    f"[Homing] {self._label} FAILED: two-pass difference "
-                    f"{diff} ticks exceeds max {self._two_pass_max_diff} — "
-                    f"endstop trigger is not repeatable"
-                )
-                shared_data.rti["homing_status"][j] = STATUS_FAILED
-                self._restore_limits(motor)
-                self._phase = self._FAILED
-                return 'failed'
+        if (self._pass1_pos is not None and pass2_pos is not None and not self._two_pass_done
+                and not self._two_pass_check(motor, shared_data, pass2_pos)):
+            return 'failed'
 
         # Update joint position reference at endstop
         if self._triggered_pos is not None:

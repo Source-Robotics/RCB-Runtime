@@ -565,7 +565,8 @@ def rti_lost(ctx, notes):
     r = ctx.robot()
     ctx.ready(r)
     r.home(wait=False)
-    _wait(lambda: abs(ctx.nodes()[0]["speed"]) > 1000, 8.0)
+    # J1 homes after the first step's pre-moves — J3's <approach> can take up to its 10 s timeout (2026-10-14)
+    _wait(lambda: abs(ctx.nodes()[0]["speed"]) > 1000, 20.0)
     speed = ctx.nodes()[0]["speed"]
     ctx.kill("RTI", signal.SIGKILL)
     time.sleep(0.6)

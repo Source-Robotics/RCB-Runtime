@@ -8,7 +8,8 @@
       <idle joint="1" duration_s="4.0" />
       <!-- 2026-10-14 (user): J3 is brought to its endstop by a controlled approach instead of idle (the drive's brake
            let it free-fall when the arm was stretched out): its homing speed, current limit 800 mA (the gravity
-           model's worst case 524 mA + friction + ~30 %), held there until its own homing. Was:
+           model's worst case 524 mA + friction + ~30 %); then it backs off 3000 ticks (~3.6 deg) and idles as before,
+           so its homing makes its own gentle contact (held pressed there, J3 homed ~0.3 deg off). Was:
            <idle joint="2" duration_s="4.0" /> -->
       <approach joint="2" current_ma="800" />
       <nudge joint="4" speed="-7000" duration_s="2.8" />
