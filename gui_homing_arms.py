@@ -15,7 +15,9 @@ import utility.display_time as dt
 
 HELP = ("Homing recognises which arm is connected from where each joint's endstop is, and FAILS when a joint homes more "
         f"than {ha.TOL_DEG:g}° away from where this arm's joint always homes — a false stall, a skipped belt, a slipping "
-        f"coupling. A new arm is learned over its first {ha.KNOWN_AFTER} homings.")
+        f"coupling. The first arm is learned over its first {ha.KNOWN_AFTER} homings; once an arm is known, an arm no "
+        f"known one matches FAILS homing (most likely a joint that could not move) — a different arm is learned only "
+        f"after 'Learn a new arm on the next homing'.")
 
 
 def last_homing(table: dict, gears, gripper_dependent, counts) -> tuple[str, str]:
@@ -107,6 +109,10 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
             name_in = ui.input("New name").classes("w-48")
             rename_btn = ui.button("Rename", icon="edit")
             forget_btn = ui.button("Forget…", icon="delete").props("color=negative outline")
+            # 2026-10-14 (user): once an arm is known, an arm no known one matches FAILS homing — a different arm is
+            # learned only after this (one homing)
+            learn_btn = ui.button("Learn a new arm on the next homing…", icon="add_circle").props("outline")
+        learn_lbl = ui.label("").classes("text-xs text-blue-700")
         ui.label("Joints of the selected arm").classes("text-xs font-semibold text-gray-600 uppercase mt-3")
         ui.label("Repeats within / SD: the spread of its last homings' endstop spots; worst seen: the furthest any homing "
                  "in the history was from the usual spot; two-pass: the gap between homing's two approaches; relaxation: "
@@ -181,6 +187,19 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
                 f"scratch over {ha.KNOWN_AFTER} homings, and until then a false stall or a skipped belt is NOT caught.",
                 lambda: forget_now(a))
 
+    def learn_now():
+        edit(lambda t: ha.set_learn_next(t, not t.get("learn_next")))
+
+    def do_learn():
+        if state["table"].get("learn_next"):
+            learn_now()                                     # a second click switches it off again
+            return
+        confirm("Learn a new arm on the next homing?",
+                "Only when a DIFFERENT arm is connected. The next homing then learns it instead of failing (it is known "
+                f"after {ha.KNOWN_AFTER} homings). If this is an arm you already have, do not: a homing that matches no "
+                "known arm is a false stall (a joint that could not move) — move the arm to its park pose and home again.",
+                learn_now)
+
     def do_accept():
         confirm("Accept the failed homing as the new reference?",
                 "Only after a DELIBERATE mechanical change to that joint (a belt tensioned, a motor re-mounted) — and home "
@@ -190,13 +209,14 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
 
     rename_btn.on_click(do_rename)
     forget_btn.on_click(do_forget)
+    learn_btn.on_click(do_learn)
     accept_btn.on_click(do_accept)
 
     def refresh():
         homing = (shared_data.robot_mode.get() or "") == "HOMING"
         if homing != state["homing"]:
             state["homing"] = homing
-            for b in (rename_btn, forget_btn, accept_btn):
+            for b in (rename_btn, forget_btn, accept_btn, learn_btn):
                 b.set_enabled(not homing)
             lock_lbl.set_text("Homing in progress — editing is locked until it ends." if homing else "")
         try:
@@ -221,6 +241,9 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
             arm_sel.value = next(iter(arm_sel.options), None)
         arm_sel.update()
         show_joints()
+        learn_lbl.set_text("The next homing will learn a NEW arm (click the button again to cancel)."
+                           if t.get("learn_next") else "")
+        learn_btn.set_text("Cancel: learn a new arm" if t.get("learn_next") else "Learn a new arm on the next homing…")
         lf = t.get("last_failed")
         failed_row.set_visibility(bool(lf))
         failed_lbl.set_text(f"Stored failed homing: {lf['arm']} at {dt.fmt_utc_text(lf['utc'], '%Y-%m-%d %H:%M:%S %Z')}" if lf else "")
@@ -236,4 +259,5 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
     ui.timer(1.0, refresh)
     return {"refresh": refresh, "table": table_el, "last": last_lbl, "select": arm_sel, "name": name_in,
             "rename": do_rename, "forget_now": forget_now, "accept_now": accept_now, "failed_row": failed_row,
-            "buttons": (rename_btn, forget_btn, accept_btn), "joints": joints_el, "history": history_el, "state": state}
+            "buttons": (rename_btn, forget_btn, accept_btn), "joints": joints_el, "history": history_el, "state": state,
+            "learn": do_learn, "learn_now": learn_now, "learn_btn": learn_btn, "learn_lbl": learn_lbl}

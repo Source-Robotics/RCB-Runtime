@@ -161,6 +161,7 @@ class HomingController:
         # off and hands it back as an <idle> joint (moves.py); its travel is added to the joint's pass-1 travel in the
         # history {j: ticks}
         self._approach_travel: dict = {}
+        self._approach_arrival: dict = {}                 # where each approach stopped, motor ticks (the arm history)
         self._approach: dict = {}                         # the running approaches' state {j: dict}
         self._homing_stats: dict = {}                     # {j: (two-pass diff, release relaxation, travel)} history
         # 2026-10-14 (user: a failed homing is a latched ERROR naming its reason): every failure as (error key, reason),
@@ -289,6 +290,7 @@ class HomingController:
     _approach_setup = _moves._approach_setup
     _approach_tick = _moves._approach_tick
     _approach_back = _moves._approach_back
+    _approach_where = _moves._approach_where
     _approach_limits = _moves._approach_limits
 
     # ------------------------------------------------------------------
@@ -372,6 +374,7 @@ class HomingController:
         self._homing_stats = {}
         self._hold_pos = {}
         self._approach_travel = {}
+        self._approach_arrival = {}
         if self.arm_check is not None:
             self.arm_check.on_homing_start()
 
@@ -719,12 +722,14 @@ class HomingController:
         verdict = self.arm_check.judge_and_learn(latches, {
             "duration_s": round(self._seq_ticks * self.dt, 2),
             "two_pass": {j: v[0] for j, v in arm_stats.items()}, "relaxed": {j: v[1] for j, v in arm_stats.items()},
-            "travel": {j: v[2] for j, v in arm_stats.items()}})
+            "travel": {j: v[2] for j, v in arm_stats.items()},
+            "approach": {j: a - latches[j] for j, a in self._approach_arrival.items() if j in latches}})
         if verdict["kind"] == "fault":
             logging.error(verdict["text"])
             for j, d in verdict["off"]:
                 shared_data.rti["homing_status"][j] = STATUS_FAILED
-                self._report_failure(j, f"it homed {d:+.2f} deg from where this arm always homes — "
+                self._report_failure(j, (verdict.get("reasons") or {}).get(j)
+                                     or f"it homed {d:+.2f} deg from where this arm always homes — "
                                         f"{verdict['text'].split(' — ', 1)[-1]}")
             self._seq_phase = self._FAILED
             return False

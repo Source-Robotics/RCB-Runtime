@@ -2,8 +2,9 @@
 """The arms homing has learned — robotics/homing_arms.py, temp_data/homing_arms.json (2026-10-09, homing plan H1).
 
 After every homing RTI compares each joint's endstop latch (within one motor revolution) with where THIS arm's joint
-always homes: it recognises the arm, learns a new one (known after 3 homings that agree), and FAILS homing when a joint of
-a recognised arm is more than 1 deg off — a false stall, a skipped belt, a slipping coupling.
+always homes: it recognises the arm, learns the first one (known after 3 homings that agree), and FAILS homing when a
+joint of a recognised arm is more than 1 deg off — a false stall, a skipped belt, a slipping coupling — or (2026-10-14)
+when the first joints match no known arm, unless --learn-next was set.
 
     .venv/bin/python tools/homing_arms.py                       # list the arms, their joints' spots and spread
     .venv/bin/python tools/homing_arms.py --name arm-1 grey      # give an arm a name (shown in the homing log)
@@ -11,6 +12,9 @@ a recognised arm is more than 1 deg off — a false stall, a skipped belt, a sli
     .venv/bin/python tools/homing_arms.py --accept-last          # after a DELIBERATE mechanical change (belt tensioned,
                                                                  # motor re-mounted): the last homing that failed becomes
                                                                  # the reference for the joints that were off
+    .venv/bin/python tools/homing_arms.py --learn-next           # a DIFFERENT arm is connected: the next homing learns it
+                                                                 # (once an arm is known, an arm no known one matches
+                                                                 # FAILS homing — 2026-10-14); --no-learn-next cancels
 
 Edit while the arm is not homing: RTI re-reads the file when a homing starts and writes it when one ends.
 """
@@ -70,6 +74,10 @@ def main(argv=None):
             msg = ha.forget(table, argv[1])
         elif argv[0] == "--accept-last" and len(argv) == 1:
             msg = ha.accept_last(table, gears, dep, counts)
+        elif argv[0] == "--learn-next" and len(argv) == 1:
+            msg = ha.set_learn_next(table, True)
+        elif argv[0] == "--no-learn-next" and len(argv) == 1:
+            msg = ha.set_learn_next(table, False)
         else:
             print(__doc__)
             return 2

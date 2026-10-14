@@ -10,7 +10,11 @@ else on an arm that is otherwise recognised is a FAULT: a false stall both passe
 references would be wrong by degrees and nothing else notices.
 
 User decisions (2026-10-09): such a joint FAILS homing; arms are LEARNED automatically (known after 3 homings that
-agree); the tolerance is 1 deg at the joint.
+agree); the tolerance is 1 deg at the joint. 2026-10-14 (user, after a pose where J1 itself false-stalled — "another arm?"
+let J2 / J3 home wrong and the sequence go on to the gripper): once an arm is KNOWN, first joints that match none of the
+known arms FAIL homing at once, and a new arm is learned only after "learn a new arm on the next homing" (the dashboard's
+Arms card / `tools/homing_arms.py --learn-next`: `learn_next` in the table, for one homing). And an <approach> pre-move
+is checked where it stops against where it stops on the known arms (`check_approach`).
 
 The table (temp_data/homing_arms.json, machine-specific):
     {"version": 1, "arms": [{"id": "arm-1", "uid": "PAR6-7F3A9C", "name": "grey", "known": true, "homings": 7,
@@ -42,6 +46,8 @@ import time
 
 TOL_DEG = 1.0          # a joint further than this (at the joint) from its usual spot is off (user, 2026-10-09)
 KNOWN_AFTER = 3        # homings that agree before an arm counts as known (user, 2026-10-09)
+APPROACH_TOL_DEG = 2.0  # an <approach> stopping further than this from where it stops on a known arm fails (2026-10-14)
+APPROACH_MIN = 3       # homings with an approach before that spot is learned (until then: only "not short of the latch")
 SAME_ARM_MIN = 4       # joints that must agree with a known arm for "this IS that arm" (6 joints; by chance ~1e-4)
 WINDOW = 10            # latches kept per joint
 HISTORY = 100          # homings kept per arm (the dashboard's history, 2026-10-09)
@@ -142,7 +148,9 @@ def history_entry(verdict: dict, utc: str, stats: dict | None) -> dict:
             "two_pass": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("two_pass") or {}).items()) if v is not None},
             "relaxed": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("relaxed") or {}).items()) if v is not None},
             # pass 1's travel from where the joint started to its endstop, motor ticks (2026-10-14: measured first)
-            "travel": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("travel") or {}).items()) if v is not None}}
+            "travel": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("travel") or {}).items()) if v is not None},
+            # where an <approach> stopped, minus the joint's latch, motor ticks (2026-10-14: check_approach learns it)
+            "approach": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("approach") or {}).items()) if v is not None}}
 
 
 def apply(table: dict, verdict: dict, latches: dict, gripper: str, utc: str, stats: dict | None = None,
@@ -250,6 +258,25 @@ def joint_stats(arm: dict, gears, counts) -> list[dict]:
     return rows
 
 
+def set_learn_next(table: dict, on: bool = True) -> str:
+    """'Learn a new arm on the next homing' (2026-10-14): once an arm is known, first joints that match no known arm
+    fail homing — unless this is set; the next homing that gets to the end clears it."""
+    table["learn_next"] = bool(on)
+    return ("the next homing may learn a NEW arm (once) — home the new arm from its park pose" if on
+            else "learning a new arm: off")
+
+
+def approach_spot(arm: dict, key: str):
+    """Where joint `key`'s <approach> stops on this arm, relative to its latch (the median of the newest 20 homings that
+    recorded it and homed consistently — new / learning / known, not a fault or a relearn — motor ticks) — None until
+    APPROACH_MIN homings recorded it."""
+    name = key.split("@")[0]
+    vals = [e["approach"][name] for e in arm.get("history", [])
+            if e.get("kind") in ("new", "learning", "known") and name in (e.get("approach") or {})][-20:]
+    vals.sort()
+    return vals[len(vals) // 2] if len(vals) >= APPROACH_MIN else None
+
+
 def rename(table: dict, arm_id: str, name: str) -> str:
     arm = next((a for a in table["arms"] if a["id"] == arm_id), None)
     if arm is None:
@@ -347,17 +374,31 @@ class HomingArms:
         keys = {i: joint_key(i, self.gripper_dependent, self.gripper) for i in latches}
         if self._so_far_arm is None:
             known = [a for a in self.table["arms"] if a.get("known")]
+            closest = None
             for arm in known:
-                _, compared, off, _ = compare(arm, latches, keys, self.counts, self.gears)
+                _, compared, off, devs = compare(arm, latches, keys, self.counts, self.gears)
                 if compared and not off:
                     self._so_far_arm = arm["id"]
                     return {"kind": "ok", "text": f"[Homing] arm recognised from the joints homed so far: "
                                                   f"{arm_label(arm)} — each joint homed from now on is checked at once"}
+                if compared and (closest is None or max(abs(d) for _, d in off) < closest[0]):
+                    closest = (max(abs(d) for _, d in off), arm, off)
             self._so_far_off = True
-            if not known:                       # still learning the first arm: the end check says so
+            if closest is None:                 # still learning the first arm (or nothing comparable): the end check
                 return {"kind": "skip"}
-            return {"kind": "skip", "text": "[Homing] the first joint(s) homed match none of the known arms (another "
-                                            "arm?) — checked once the whole sequence is through"}
+            if self.table.get("learn_next"):
+                return {"kind": "skip", "text": "[Homing] the first joint(s) homed match none of the known arms — "
+                                                "learning a new arm (requested: 'learn a new arm on the next homing')"}
+            # 2026-10-14 (user): no longer "another arm?" — a joint that false-stalled first (J1 could not turn in a
+            # folded pose) made every later joint unchecked and the sequence went on to the gripper on wrong references
+            _, arm, off = closest
+            why = (f"homed where no known arm's {', '.join(f'J{i + 1}' for i, _ in off)} homes (closest: "
+                   f"{arm_label(arm)}, {', '.join(f'J{i + 1} {d:+.2f} deg' for i, d in off)}) — a false stall (could it "
+                   f"move from where it was? the arm touching itself or something?), or a different arm. Move the arm "
+                   f"to its park pose and home again; a different arm: System Info > 'Arms (homing)' > 'Learn a new arm "
+                   f"on the next homing'")
+            return {"kind": "fault", "unknown": True, "off": off, "reason": f"it {why}",
+                    "text": f"[Homing] FAILED: {', '.join(f'J{i + 1}' for i, _ in off)} — it {why}"}
         arm = next((a for a in self.table["arms"] if a["id"] == self._so_far_arm), None)
         if arm is None:
             return {"kind": "skip"}
@@ -387,11 +428,73 @@ class HomingArms:
         ensure_uids(self.table, self.prefix)
         utc = utc or time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         verdict = judge(self.table, latches, self.gripper, self.gears, self.gripper_dependent, self.counts)
+        learn = bool(self.table.pop("learn_next", False))
+        unknown = self._unknown_at_end(latches) if verdict["kind"] == "new" and not learn else None
+        if unknown is not None:
+            # 2026-10-14 (user): a new arm only on request — here no known arm matches and none was requested
+            if self._thread is not None:
+                self._q.put(("save", copy.deepcopy(self.table)))
+            return unknown
         apply(self.table, verdict, latches, self.gripper, utc, stats, self.prefix)
         verdict["text"] = describe(self.table, verdict)
         if self._thread is not None:
             self._q.put(("save", copy.deepcopy(self.table)))
         return verdict
+
+    def _unknown_at_end(self, latches: dict) -> dict | None:
+        """The end check's verdict when no known arm matches and no new arm was requested: FAILED, each joint off the
+        closest known arm named (the table is not changed). None when there is no known arm, or the closest one has no
+        joint off (too few joints compared to call it that arm): learned as before."""
+        keys = {i: joint_key(i, self.gripper_dependent, self.gripper) for i in latches}
+        best: tuple | None = None
+        for arm in (a for a in self.table["arms"] if a.get("known")):
+            agree, _, off, _ = compare(arm, latches, keys, self.counts, self.gears)
+            if best is None or agree > best[0]:
+                best = (agree, arm, off)
+        if best is None or not best[2]:
+            return None
+        _, arm, off = best
+        why = (f"no known arm matches (closest: {arm_label(arm)}, "
+               f"{', '.join(f'J{i + 1} {d:+.2f} deg' for i, d in off)}) — false stalls, or a different arm: System "
+               f"Info > 'Arms (homing)' > 'Learn a new arm on the next homing'")
+        return {"kind": "fault", "unknown": True, "arm": arm["id"], "off": off,
+                "reasons": {i: f"it homed {d:+.2f} deg from where the closest known arm's J{i + 1} homes — {why}"
+                            for i, d in off}, "text": f"[Homing] FAILED: {why}"}
+
+    def check_approach(self, j: int, arrival: int, toward: int) -> dict:
+        """<approach> (2026-10-14, user: J3's approach stopped 7 deg short, against the arm's own base, and homing went
+        on): where joint j's approach stopped (motor ticks; `toward` = +1 / -1, the side its endstop is on) against the
+        known arms' latch for it — it must not stop SHORT (something in the way): with APPROACH_MIN homings that
+        recorded it, not more than APPROACH_TOL_DEG short of the spot it stops at on that arm (the history's median
+        offset); before that, not more than APPROACH_TOL_DEG short of the latch (a pressed approach stops ~3 deg BEYOND
+        it). Stopping beyond is left to the joint's own arm check (a skipped belt, a deliberate change: recorded there for
+        'Accept as new reference'). {"kind": "ok" | "skip" | "fault", "reason", "text"}."""
+        fresh, self._fresh = self._fresh, None
+        if fresh is not None:
+            self.table = fresh
+        key = joint_key(j, self.gripper_dependent, self.gripper)
+        known = [a for a in self.table["arms"] if a.get("known") and a["joints"].get(key)]
+        if not known or self.table.get("learn_next"):      # nothing to compare / a new arm is being learned
+            return {"kind": "skip"}
+        best: tuple | None = None
+        for arm in known:
+            centre = circular_centre(arm["joints"][key], self.counts[j])
+            spot = approach_spot(arm, key)
+            d = off_deg(arrival - (spot or 0), centre, self.counts[j], self.gears[j]) * (1 if toward >= 0 else -1)
+            ok, miss = d >= -APPROACH_TOL_DEG, -d
+            if ok:
+                return {"kind": "ok"}
+            if best is None or miss < best[0]:
+                best = (miss, d, arm, spot)
+        if best is None:
+            return {"kind": "skip"}
+        _, d, arm, spot = best
+        where = ("short of where it always stops" if spot is not None else "short of where its endstop always is")
+        why = (f"its controlled approach stopped {abs(d):.1f} deg {where} on arm {arm_label(arm)} — something in the "
+               f"way (the arm against itself or its base?), or the joint could not carry the arm there. Move the arm to "
+               f"its park pose and home again; a different arm: System Info > 'Arms (homing)' > 'Learn a new arm on the "
+               f"next homing'")
+        return {"kind": "fault", "reason": f"{why}", "text": f"[Homing] FAILED: J{j + 1} — {why}"}
 
     def _run(self) -> None:
         from utility.incident_dump import _leave_the_rt_core

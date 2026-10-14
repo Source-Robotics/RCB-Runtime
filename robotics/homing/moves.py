@@ -125,6 +125,9 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
             lag = (a['target'] - pos) * (1.0 if a['speed'] > 0 else -1.0)
             a['over'] = a['over'] + 1 if lag > a['lag_max'] else 0
             if a['over'] >= _APPROACH_LAG_READS:
+                self._approach_arrival[j] = int(pos)
+                if not self._approach_where(Motor, j, int(pos), a, shared_data):
+                    return 'failed'
                 travel = self._approach_travel[j] = int(pos) - int(a['start'])
                 a['phase'], a['target'] = 'backoff', float(pos)
                 a['end'] = float(pos) - (a['backoff'] if a['speed'] > 0 else -a['backoff'])
@@ -143,6 +146,23 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
         self._seq_phase = self._FAILED
         return 'failed'
     return 'running'
+
+
+def _approach_where(self, Motor, j, pos, a, shared_data) -> bool:
+    """Where the approach stopped against where it stops on the known arms (homing_arms.check_approach, 2026-10-14:
+    J3 stopped 7 deg short — against the arm's own base — and homing went on). False: FAILED, the joint stopped."""
+    if self.arm_check is None:
+        return True
+    verdict = self.arm_check.check_approach(j, pos, 1 if a['speed'] > 0 else -1)
+    if verdict["kind"] != "fault":
+        return True
+    Motor[j].Send_data_pack_1(Position=None, Speed=0, Current=0)      # stop pushing
+    logging.error(verdict["text"])
+    if j < len(shared_data.rti["homing_status"]):
+        shared_data.rti["homing_status"][j] = STATUS_FAILED
+    self._report_failure(j, verdict["reason"])
+    self._seq_phase = self._FAILED
+    return False
 
 
 def _approach_back(self, Motor, j, pos, label) -> str:
