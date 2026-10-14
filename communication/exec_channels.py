@@ -22,6 +22,10 @@ Wire format (little-endian, one contiguous bytes object)::
     ...     float32[N*J] torque_ff         (Nm feedforward)
 
 The header is self-describing: ``unpack_batch`` needs no external knowledge of N or J.
+
+A FENCE (2026-10-14) is a second, 12-byte message on the same socket: b'RCBF' + uint64 stop epoch (``pack_fence`` /
+``fence_epoch``). The planner sends one at every flush (a Stop); RTI drops every batch in front of it and keeps what
+follows. Its own magic, so a reader that predates it drops it as malformed instead of playing it.
 """
 
 import struct

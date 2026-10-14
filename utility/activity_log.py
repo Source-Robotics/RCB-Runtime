@@ -73,6 +73,14 @@ CATALOG = {
     "TOPPRA_UNAVAILABLE":     {"cause": "TOPPRA profile was requested but the toppra package is not importable.", "fix": "install toppra, or select a different profile (trapezoid/quintic/s_curve)."},
     "TOPPRA_INFEASIBLE":      {"cause": "TOPPRA could not compute a valid time-parameterization for this path.", "fix": "check the requested speed/accel limits, or select a different profile."},
 
+    # EXEC — a stop RTI did not confirm (2026-10-14): command_executor fell back to the old stop, IDLE
+    "STOP_FALLBACK":          {"cause": "RTI did not confirm the controlled stop within 1.5 s — RTI runs code from before "
+                                        "2026-10-14 (restart only the GUI / executor?), or the planner's stop fence was lost "
+                                        "(RTI not draining the trajectory socket).",
+                               "fix": "the robot went to IDLE instead (the arm braked first if RTI started the stop). "
+                                      "Restart the service so RTI and the executor run the same code; if it recurs, "
+                                      "check logs/RTI.log for the [EXEC] stop line and logs/high_level.log."},
+
     # EXEC — warning (not a failure, planning still succeeds)
     "IK_SINGULARITY_WARNING": {"cause": "planned path passes near a kinematic singularity.", "fix": "check the singularity metrics; consider an alternate path if this recurs."},
 
