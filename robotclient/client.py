@@ -680,6 +680,9 @@ class RobotClient:
         self._immediate("set_recipe", [str(name)])
 
     def stop(self, wait: bool | None = None) -> None:
+        """Stop: the queued program is dropped and, if the arm is moving in EXEC, it brakes along its planned path
+        at the joints' hardware limits (at most ~0.15 s from full speed) and the robot goes to IDLE once the arm is
+        at rest. With wait (the default), returns in IDLE."""
         self._state_change("stop", wait, lambda s: s.get("mode") == "IDLE",
                            what="wait_mode(IDLE)")
         # stop() cancels queued motion server-side, which replies "error"/STOPPED for
@@ -702,11 +705,11 @@ class RobotClient:
                       WAIT_HOMED_TIMEOUT, "home")
 
     def pause(self, wait: bool | None = None) -> None:
-        """Freeze motion in place (only valid mid-EXEC). Resume with resume()."""
+        """Brake along the planned path to rest and hold there (EXEC). With wait, returns at rest. resume()."""
         self._state_change("pause", wait, lambda s: bool(s.get("exec_paused")))
 
     def resume(self, wait: bool | None = None) -> None:
-        """Continue motion frozen by pause(), exactly where it left off."""
+        """Speed back up along the same path and continue from exactly where pause() stopped."""
         self._state_change("resume", wait, lambda s: not s.get("exec_paused"))
 
     def set_joint_speed(self, percent: float) -> Any:

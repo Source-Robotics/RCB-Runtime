@@ -12,18 +12,35 @@ Data flow:
 
 Per tick:
   1. Flush any pending checkpoint statuses (non-blocking).
-  2. If paused: hold in place (batch/index untouched) — see pause()/resume() below.
+  2. Paused (or stopped) at rest: hold in place — see "Controlled pause / stop" below.
   3. Pre-fetch the next batch before the current one runs out (double-buffer, no gap).
   4. Swap to the pre-fetched batch when the current is exhausted; publish checkpoint.
   5. Read this tick's waypoint → ControlOutput(pos, vel, torque_ff + gravity).
   6. If no batch available: hold last position (Speed=0) with gravity feedforward.
 
-pause()/resume() (called from RTI.py's command dispatch on "exec_pause"/"exec_resume",
-same single-threaded pattern as JogHandler.set_jog/stop_jog — no locking needed): pause()
-freezes consumption without touching _current/_index/_next, so the in-flight batch and
-position within it are preserved; resume() continues advancing from exactly there. This
-differs from having no batch available (which has nothing to resume into) — pause holds a
-*specific* waypoint, ready to continue, not just "idle until data arrives."
+Controlled pause / stop (2026-10-13, user's choice: as industrial arms commonly do it). pause() / resume() /
+begin_stop() are called from RTI.py's command dispatch ("exec_pause" / "exec_resume"; a set_mode:IDLE while EXEC plays —
+the client's stop() and enter_idle_mode() — calls begin_stop()), the same single-threaded pattern as
+JogHandler.set_jog — no locking.
+  - pause() brakes the arm ALONG THE PLANNED PATH at the joints' hardware ceilings — robot XML
+    <joint_acceleration_limit>, the limits hard RTI's controlled stops use — and holds it there; exec_paused once it
+    is at rest. Never above <joint_jerk_limit> * dt / 2 either: then stepping in one tick from EXEC's acceleration
+    (when it is no higher) to full braking, and back, keeps within the jerk ceiling. PAR6: J * dt / 2 = A at 250 Hz,
+    so it brakes at the full ceiling; a robot XML on the parser's 50 x fallback would brake at a tenth of it.
+  - resume() speeds it back up along the same path at EXEC's own acceleration (<exec_limits>) and continues from
+    exactly where it stopped.
+  - begin_stop() brakes the same way, waits for the measured arm to come to rest (IDLE is freedrive — a moving arm
+    would coast), then asks for IDLE; the executor has already dropped the rest of the program.
+  - Errors and the E-stop stay instant (ACTIVE_ERROR); an error during a pause drops the rest by leaving EXEC.
+Until 2026-10-13 a pause FROZE the setpoint (the drives stopped the arm as hard as they could) and a stop switched
+to IDLE at speed (freedrive: the arm coasted).
+
+How: playback has a RATE r (1 = as planned, 0 = stopped) and a fractional PLAYHEAD between two samples. Each tick
+the playhead advances by the new rate r'; the setpoint is the planned path interpolated there, its velocity the
+planned velocity w (taken where the old rate would have put the playhead) times r'. r changes as fast as the limits
+allow: on every joint the commanded velocity may change by at most A * dt per tick, |w * r' - v_last| <= A * dt —
+linear in r', so one bound per joint, solved exactly. At r = 1 on a whole sample the tick is the plain sample read,
+exactly as before.
 
 RT rules (see CLAUDE.md): all numpy buffers and the ControlOutput are pre-allocated in
 __init__; step() only writes into them. ZMQ receives/sends are non-blocking — the RT
@@ -31,12 +48,14 @@ tick never blocks on IPC.
 """
 
 import logging
+import math
 
 from collections import deque
 
 import numpy as np
 import zmq
 
+from utility.state_machine import RobotMode
 from utility.tick_types import TickResult, ControlOutput
 from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, unpack_batch
 from config.networking import ZMQ_EXEC_TRAJECTORY_SOCKET, ZMQ_EXEC_STATUS_SOCKET, background_zmq_context
@@ -86,6 +105,12 @@ class ExecHandler:
     # Completion policy defaults. At a 1 kHz RTI tick, 500 ticks is 0.5 s.
     DEFAULT_SETTLE_TOLERANCE_RAD = 0.01
     DEFAULT_SETTLE_MAX_TICKS = 500
+    # Controlled pause / stop (module docstring). A stop asks for IDLE once the MEASURED arm is at rest — every
+    # joint's filtered speed below this — or after
+    # STOP_REST_MAX_S at the latest: IDLE is freedrive, where a still-moving arm would coast.
+    STOP_REST_SPEED_RAD_S = 0.02
+    STOP_REST_MAX_S = 0.5
+    _VEL_EPS = 1e-9            # rad/s: a joint the path does not move at the new playhead sets no bound on the rate
 
     def __init__(
             self,
@@ -93,9 +118,24 @@ class ExecHandler:
             shared_data=None,
             completion_policy="settled",
             settle_tolerance_rad=DEFAULT_SETTLE_TOLERANCE_RAD,
-            settle_max_ticks=DEFAULT_SETTLE_MAX_TICKS):
+            settle_max_ticks=DEFAULT_SETTLE_MAX_TICKS,
+            *,
+            stop_accel,
+            stop_jerk,
+            resume_accel):
+        """stop_accel / stop_jerk: the robot XML's hardware ceilings (rad/s^2, rad/s^3 per joint) a pause or a stop
+        brakes at; resume_accel: EXEC's own acceleration (<exec_limits>), at which a resume speeds back up."""
         self.joint_num = joint_num
         self._shared_data = shared_data
+
+        # Controlled pause / stop limits — copies, so nothing outside can change them under the RT loop.
+        self._stop_accel = np.array(stop_accel, dtype=np.float64)
+        self._stop_jerk = np.array(stop_jerk, dtype=np.float64)
+        self._resume_accel = np.array(resume_accel, dtype=np.float64)
+        for name, lim in (("stop_accel", self._stop_accel), ("stop_jerk", self._stop_jerk),
+                          ("resume_accel", self._resume_accel)):
+            if lim.shape != (joint_num,) or not np.all(np.isfinite(lim)) or np.any(lim <= 0.0):
+                raise ValueError(f"ExecHandler {name} must be {joint_num} finite values > 0, got {lim!r}")
 
         # Pre-allocated buffers — never reallocated inside step().
         self._target_pos     = np.zeros(joint_num, dtype=np.float64)  # rad
@@ -123,8 +163,35 @@ class ExecHandler:
         # Checkpoint statuses awaiting a successful non-blocking send.
         self._pending_status = []
 
-        # Pause state — set via pause()/resume(), called from RTI's command dispatch.
-        self._paused = False
+        # Playback rate and playhead (module docstring). The last OUTPUT sat at playhead (_index - 1) + _frac of
+        # the current batch (-1 = the tail below); at r = 1 the fraction stays 0 and this is the plain sample read.
+        self._rate = 1.0
+        self._rate_target = 1.0            # 0 = pause / stop asked for, 1 = play (resume)
+        self._frac = 0.0
+        self._stopping = False             # begin_stop(): brake, then IDLE once the arm is at rest
+        self._stop_ticks = 0               # ticks since begin_stop() (the log line)
+        self._rest_wait = 0                # ticks at r = 0 waiting for the measured arm to come to rest
+        self._rest_wait_max = 0            # STOP_REST_MAX_S in ticks (set with the bands, from dt)
+        self._idle_asked = False
+        self._band_dt = 0.0                # the dt the per-tick velocity bands below were computed for
+        self._stop_band = np.zeros(joint_num, dtype=np.float64)     # rad/s per tick, braking
+        self._resume_band = np.zeros(joint_num, dtype=np.float64)   # rad/s per tick, speeding up
+        # The sample before the current batch's first: the previous batch's last (or the hold point) — a playhead
+        # between the two interpolates across the seam. Shaped like a batch so _locate() treats it as one.
+        self._tail = {'num_points': 1, 'is_last_chunk': False, 'checkpoint_id': '', 'flags': 0,
+                      'joint_positions': np.zeros((1, joint_num), dtype=np.float64),
+                      'joint_velocities': np.zeros((1, joint_num), dtype=np.float64),
+                      'torque_ff': np.zeros((1, joint_num), dtype=np.float64)}
+        # Rate solver buffers.
+        self._ramp_w = np.zeros(joint_num, dtype=np.float64)        # path velocity at the candidate playhead
+        self._ramp_lo = np.zeros(joint_num, dtype=np.float64)
+        self._ramp_hi = np.zeros(joint_num, dtype=np.float64)
+        self._ramp_t1 = np.zeros(joint_num, dtype=np.float64)
+        self._ramp_t2 = np.zeros(joint_num, dtype=np.float64)
+        self._ramp_abs = np.zeros(joint_num, dtype=np.float64)
+        self._ramp_moving = np.zeros(joint_num, dtype=bool)
+        self._tick_ok = TickResult()
+        self._tick_to_idle = TickResult(pending_mode=RobotMode.IDLE)
 
         # Completion state. "commanded" completes after the last commanded sample.
         # "settled" and "strict" hold the final target until measured joints are
@@ -164,7 +231,7 @@ class ExecHandler:
         self._pending_samples = 0
         self._index = 0
         self._pending_status.clear()
-        self._paused = False
+        self._reset_playback()
         self._clear_settling()
         self._mirror_exec_state(ctx)
         self._last_target_pos[:] = ctx.shared_data.joint['joint_position'][:self.joint_num]
@@ -174,12 +241,23 @@ class ExecHandler:
         self._last_target_vel[:] = ctx.shared_data.joint['joint_speed_filtered'][:self.joint_num]
 
     def pause(self):
-        """Freeze consumption in place. Batch/index untouched — resume() continues from here."""
-        self._paused = True
+        """Brake along the planned path to rest and hold there (exec_paused once at rest); resume() continues."""
+        if not self._stopping:
+            self._rate_target = 0.0
 
     def resume(self):
-        """Continue consuming from exactly where pause() froze."""
-        self._paused = False
+        """Speed back up along the same path, from exactly where pause() stopped it. Ignored while stopping."""
+        if not self._stopping:
+            self._rate_target = 1.0
+
+    def begin_stop(self):
+        """Brake along the planned path; once the measured arm is at rest, ask for IDLE (step() returns it)."""
+        if not self._stopping:
+            self._stopping = True
+            self._rate_target = 0.0
+            self._stop_ticks = 0
+            self._rest_wait = 0
+            self._idle_asked = False
 
     def set_completion_policy(self, policy):
         """Set final-checkpoint completion behavior: commanded, settled, or strict."""
@@ -207,12 +285,17 @@ class ExecHandler:
         # with a status read). Cheaper than diffing — it's one float64 write.
         self._mirror_exec_state(ctx)
 
-        # 1. PAUSED: hold exactly in place. Batch/index untouched so resume() continues
-        #    seamlessly. Distinct from "no batch" — this freezes a specific waypoint.
-        if self._paused:
-            return TickResult(), self._hold(ctx)
+        # 1. A controlled pause / stop / resume runs (rate or target below 1), or the playhead sits between two
+        #    samples (a resume ended there): the ramped read below. Paused or stopped AT REST: hold right there —
+        #    batch and playhead untouched, so resume() continues seamlessly.
+        if self._stopping:
+            self._stop_ticks += 1
+        ramp = self._rate != 1.0 or self._rate_target != 1.0 or self._frac != 0.0
+        if ramp and self._rate == 0.0 and self._rate_target == 0.0:
+            return self._tick_at_rest(ctx)
 
         if self._settling:
+            self._rate = self._rate_target     # nothing moves while settling: no ramp to run
             return TickResult(), self._tick_settling(ctx)
 
         # 2. PRE-FETCH until we hold TARGET_BUFFER_SAMPLES of motion — a TIME-based runway,
@@ -231,11 +314,14 @@ class ExecHandler:
             self._pending_samples += batch['num_points']
             pulls += 1
 
-        # 3. SWAP if the current batch is exhausted (or absent).
-        if self._current is None or self._index >= self._current['num_points']:
+        # 3. SWAP if the current batch is exhausted (or absent). Not while the playhead sits between its last sample
+        #    and the next batch's first (a fraction left): the ramped read crosses that seam itself.
+        if self._frac == 0.0 and (self._current is None or self._index >= self._current['num_points']):
+            self._keep_tail()
             if self._current is not None and self._current['is_last_chunk']:
                 if self._begin_completion(self._current['checkpoint_id'], self._current.get('flags', 0)):
                     self._current = None
+                    self._rate = self._rate_target     # holding: no ramp to run
                     return TickResult(), self._hold(ctx)
             # Mark the finished batch consumed so its checkpoint can't re-fire on
             # subsequent hold ticks (when no next batch is available).
@@ -253,7 +339,12 @@ class ExecHandler:
                     self._current = batch
                     self._index = 0
                 else:
+                    self._rate = self._rate_target     # holding: no ramp to run
                     return TickResult(), self._hold(ctx)
+
+        if ramp:
+            self._read_ramped(ctx)
+            return TickResult(), self._output(ctx)
 
         # 4. READ this tick's waypoint into pre-allocated buffers.
         i = self._index
@@ -265,8 +356,11 @@ class ExecHandler:
         self._index += 1
         self._last_target_pos[:] = self._target_pos
         self._last_target_vel[:] = self._target_vel
+        return TickResult(), self._output(ctx)
 
-        # 4. Commanded torque = planner feedforward + gravity comp (when enabled).
+    def _output(self, ctx):
+        """The tick's ControlOutput from the _target_* buffers just read."""
+        # Commanded torque = planner feedforward + gravity comp (when enabled).
         if bool(ctx.shared_data.rti['gravity_comp_enabled'][0]):
             np.add(self._target_trq_ff,
                    ctx.shared_data.joint['joint_gravity_torque'][:self.joint_num],
@@ -284,7 +378,7 @@ class ExecHandler:
         out.target_vel_rad = self._target_vel
         out.target_acc_rad = self._target_acc
         out.target_trq_nm  = self._target_trq_ff
-        return TickResult(), out
+        return out
 
     def exit(self, ctx):
         """Flush remaining batches so a re-entry starts clean. Sockets stay open."""
@@ -293,7 +387,7 @@ class ExecHandler:
         self._pending.clear()
         self._pending_samples = 0
         self._index = 0
-        self._paused = False
+        self._reset_playback()
         self._clear_settling()
         self._mirror_exec_state(ctx)
 
@@ -318,9 +412,173 @@ class ExecHandler:
         out.target_trq_nm  = None
         return out
 
+    # ---- controlled pause / stop (module docstring) ------------------------------------------------------------
+
+    def _reset_playback(self):
+        self._rate = 1.0
+        self._rate_target = 1.0
+        self._frac = 0.0
+        self._stopping = False
+        self._stop_ticks = 0
+        self._rest_wait = 0
+        self._idle_asked = False
+
+    def _tick_at_rest(self, ctx):
+        """Paused or stopped at rest: hold. A stop then asks for IDLE once the measured arm is at rest too."""
+        if self._stopping:
+            if self._band_dt != ctx.delta_t:
+                self._set_bands(ctx.delta_t)
+            self._rest_wait += 1
+            if self._arm_at_rest(ctx) or self._rest_wait >= self._rest_wait_max:
+                if not self._idle_asked:
+                    self._idle_asked = True
+                    logger.info("[EXEC] stop: braked along the path, at rest %.0f ms after the stop (%s) -> IDLE",
+                                self._stop_ticks * ctx.delta_t * 1000.0,
+                                "measured still" if self._rest_wait < self._rest_wait_max else
+                                "still moving after %.1f s — IDLE anyway" % self.STOP_REST_MAX_S)
+                return self._tick_to_idle, self._hold(ctx)
+        return self._tick_ok, self._hold(ctx)
+
+    def _arm_at_rest(self, ctx):
+        np.abs(ctx.shared_data.joint['joint_speed_filtered'][:self.joint_num], out=self._ramp_abs)
+        return float(self._ramp_abs.max()) < self.STOP_REST_SPEED_RAD_S
+
+    def _set_bands(self, dt):
+        """The per-tick velocity change allowed: braking at the ceiling, but never above jerk * dt / 2 (module
+        docstring: the one-tick step to full braking then keeps within the jerk ceiling); speeding up at EXEC's."""
+        np.multiply(self._stop_jerk, 0.5 * dt, out=self._stop_band)
+        np.minimum(self._stop_band, self._stop_accel, out=self._stop_band)
+        self._stop_band *= dt
+        np.multiply(self._resume_accel, dt, out=self._resume_band)
+        self._rest_wait_max = max(1, int(round(self.STOP_REST_MAX_S / dt))) if dt > 0 else 1
+        self._band_dt = dt
+
+    def _keep_tail(self):
+        """The sample before the next batch's first: this batch's last, or (no batch) the hold point at rest."""
+        tail = self._tail
+        cur = self._current
+        if cur is not None:
+            n = cur['num_points'] - 1
+            tail['joint_positions'][0] = cur['joint_positions'][n]
+            tail['joint_velocities'][0] = cur['joint_velocities'][n]
+            tail['torque_ff'][0] = cur['torque_ff'][n]
+        else:
+            tail['joint_positions'][0] = self._last_target_pos
+            tail['joint_velocities'][0] = 0.0
+            tail['torque_ff'][0] = 0.0
+
+    def _continues(self, batch):
+        """Playback runs straight on from `batch` into the next one — exactly when _begin_completion would not hold."""
+        if not batch['is_last_chunk'] or not batch['checkpoint_id']:
+            return True
+        if batch.get('flags', 0) & BATCH_FLAG_BLEND_CONTINUES:
+            return True
+        return self._completion_policy == COMPLETION_COMMANDED
+
+    def _locate(self, k):
+        """The batch and row of playhead sample k: -1 is the tail, past the current batch the pending ones in order
+        as far as playback runs on into them. (None, 0) beyond the end of the playable path."""
+        if k < 0:
+            return self._tail, 0
+        b = self._current
+        j = 0
+        while k >= b['num_points']:
+            if j >= len(self._pending) or not self._continues(b):
+                return None, 0
+            k -= b['num_points']
+            b = self._pending[j]
+            j += 1
+        return b, k
+
+    def _path_point(self, p, key, out):
+        """out = the planned `key` interpolated at playhead p. Returns the playhead used: p, or the last sample of
+        the playable path when p lies beyond it (p is never more than one sample past the last output)."""
+        k = math.floor(p)
+        b, i = self._locate(k)
+        if b is None:                      # past the end of the playable path: stay on its last sample
+            k -= 1
+            b, i = self._locate(k)
+            out[:] = b[key][i]
+            return float(k)
+        g = p - k
+        if g == 0.0:
+            out[:] = b[key][i]
+            return p
+        b2, i2 = self._locate(k + 1)
+        if b2 is None:
+            out[:] = b[key][i]
+            return float(k)
+        np.subtract(b2[key][i2], b[key][i], out=out)
+        out *= g
+        out += b[key][i]
+        return p
+
+    def _rate_bound(self, band, slowing, rate):
+        """The new rate from the path velocity at the candidate playhead (_ramp_w): on every joint
+        |w * r' - v_last| <= band, i.e. r' in [(v_last - band) / w, (v_last + band) / w] — the lowest (slowing) or
+        highest (speeding up) rate every joint allows, never past the target nor back past the current rate. A joint
+        the path does not move there sets no bound. Should the joints' ranges not overlap, the rate stays."""
+        w = self._ramp_w
+        np.subtract(self._last_target_vel, band, out=self._ramp_lo)
+        np.add(self._last_target_vel, band, out=self._ramp_hi)
+        np.abs(w, out=self._ramp_abs)
+        np.greater(self._ramp_abs, self._VEL_EPS, out=self._ramp_moving)
+        self._ramp_t1.fill(-np.inf)
+        self._ramp_t2.fill(np.inf)
+        np.divide(self._ramp_lo, w, out=self._ramp_t1, where=self._ramp_moving)
+        np.divide(self._ramp_hi, w, out=self._ramp_t2, where=self._ramp_moving)
+        np.minimum(self._ramp_t1, self._ramp_t2, out=self._ramp_lo)
+        np.maximum(self._ramp_t1, self._ramp_t2, out=self._ramp_hi)
+        lo = float(self._ramp_lo.max())
+        hi = float(self._ramp_hi.min())
+        if slowing:
+            new = lo if lo > self._rate_target else self._rate_target
+            return rate if new > hi or new > rate else new
+        new = hi if hi < self._rate_target else self._rate_target
+        return rate if new < lo or new < rate else new
+
+    def _read_ramped(self, ctx):
+        """This tick's setpoint at the new rate: the playhead advanced by it, the path interpolated there."""
+        dt = ctx.delta_t
+        if self._band_dt != dt:
+            self._set_bands(dt)
+        last = (self._index - 1) + self._frac
+        rate = self._rate
+        # The path velocity where the CURRENT rate would put the playhead; the new rate scales it. That makes the
+        # bound exact (the velocity sent is w * r', the very expression bounded) — the path velocity at the new
+        # playhead differs from w only by the plan's acceleration over (rate - r') of a sample (< 0.002 rad/s).
+        self._path_point(last + rate, 'joint_velocities', self._ramp_w)
+        new = rate
+        if self._rate_target != rate:
+            slowing = self._rate_target < rate
+            new = self._rate_bound(self._stop_band if slowing else self._resume_band, slowing, rate)
+        p = self._path_point(last + new, 'joint_positions', self._target_pos)
+        self._path_point(p, 'torque_ff', self._target_trq_ff)
+        np.multiply(self._ramp_w, new, out=self._target_vel)
+        np.subtract(self._target_vel, self._last_target_vel, out=self._target_acc)
+        self._target_acc *= (1.0 / dt) if dt > 0 else 0.0
+        self._last_target_pos[:] = self._target_pos
+        self._last_target_vel[:] = self._target_vel
+        self._rate = new
+        # The playhead into the next batch when it crossed over (_locate only lets it into one that continues).
+        n = self._current['num_points']
+        while p >= n:
+            self._keep_tail()
+            cur = self._current
+            if cur['is_last_chunk']:
+                self._begin_completion(cur['checkpoint_id'], cur.get('flags', 0))   # continues: reported, no hold
+            self._current = self._pending.popleft()
+            self._pending_samples -= self._current['num_points']
+            p -= n
+            n = self._current['num_points']
+        k = math.floor(p)
+        self._index = k + 1
+        self._frac = p - k
+
     def _mirror_exec_state(self, ctx):
         if ctx.shared_data is not None:
-            ctx.shared_data.rti['exec_paused'][0] = 1.0 if self._paused else 0.0
+            paused = self._rate == 0.0 and self._rate_target == 0.0 and not self._stopping
+            ctx.shared_data.rti['exec_paused'][0] = 1.0 if paused else 0.0
             ctx.shared_data.rti['exec_settling'][0] = 1.0 if self._settling else 0.0
             ctx.shared_data.rti['exec_completion_policy_idx'][0] = float(self._completion_policy)
             # Buffered runway (samples not yet consumed in current + prefetched next).

@@ -601,7 +601,7 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
 
 def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn: Callable,
                         motor_config: dict, jog_config: dict, motor_dynamics: Any,
-                        shared_data: Any = None) -> dict:
+                        shared_data: Any = None, exec_limits: dict | None = None) -> dict:
     """Initialise pre-allocated buffers and return the MODE_HANDLERS dict.
 
     Must be called before the RT loop starts.
@@ -626,6 +626,10 @@ def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn:
                                compat; if omitted, JOG works but new tabs will
                                see zeroed jog state until the user touches a
                                slider.
+        exec_limits:           Required. The limits of EXEC's controlled pause / stop
+                               (motion/exec_handler.py): stop_accel / stop_jerk = the
+                               robot XML's hardware ceilings (rad/s^2, rad/s^3),
+                               resume_accel = <exec_limits> acceleration.
 
     Returns:
         dict mapping RobotMode → handler (plain function or class instance).
@@ -670,7 +674,10 @@ def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn:
         shared_data  = shared_data,
         self_collision = bool(jog_config.get('self_collision', False)),
     )
-    _exec_handler    = ExecHandler(joint_num, shared_data=shared_data)
+    if exec_limits is None:
+        raise ValueError("build_mode_dispatch: exec_limits (stop_accel, stop_jerk, resume_accel) is required — "
+                         "EXEC's controlled pause / stop brakes at the robot XML's ceilings")
+    _exec_handler    = ExecHandler(joint_num, shared_data=shared_data, **exec_limits)
 
     return {
         RobotMode.BOOTING:       handle_booting,

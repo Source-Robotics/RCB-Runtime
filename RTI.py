@@ -937,6 +937,13 @@ def main():
             'motor_signs':     motor_signs,
         },
         shared_data=shared_data,
+        # EXEC's controlled pause / stop (motion/exec_handler.py, 2026-10-13): brake along the planned path at the
+        # hardware ceilings (the limits hard RTI's controlled stops use), speed back up at EXEC's own acceleration.
+        exec_limits={
+            'stop_accel':   cfg['joint_acceleration_limit'],
+            'stop_jerk':    cfg['joint_jerk_limit'],
+            'resume_accel': cfg['exec_acceleration_limit'],
+        },
     )
 
     # RTI mode handler. Replaces the handle_idle placeholder build_mode_dispatch()
@@ -1280,6 +1287,15 @@ def main():
         parts = cmd_msg.split(":")  # see _handle_gravity_comp for why this is guarded
         if len(parts) < 2:
             return
+        if parts[1].strip().upper() == "IDLE" and st.current_mode == RobotMode.EXEC:
+            # A stop (the client's stop() / enter_idle_mode()) while EXEC plays: brake along the planned path at
+            # the joints' ceilings first; the EXEC handler asks for IDLE itself once the arm is at rest (2026-10-13,
+            # user's choice: braked along the path, as industrial arms commonly do — IDLE at speed was freedrive: the
+            # arm coasted).
+            _exec = MODE_HANDLERS.get(RobotMode.EXEC)
+            if _exec is not None:
+                _exec.begin_stop()
+                return
         st.pending_mode_request = parts[1].strip().upper()
         # Maintenance modes need an EXPLICIT operator assertion — there is no
         # automatic way to know the arm can survive going limp:

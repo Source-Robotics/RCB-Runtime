@@ -6,7 +6,7 @@ set of api_tests on the arm and saves the results with the commit they ran on.
         --yes          no question (you are at the arm anyway)
         --list         what it runs, then exit
         --only a,b     just these (names from --list; a+b too — inside sim_run.py --tests, whose list splits on ',')
-        --suite sim    the SIMULATED suite (refused on the real arm): these tests + 29 more api_tests that move the
+        --suite sim    the SIMULATED suite (refused on the real arm): these tests + 30 more api_tests that move the
                        arm far (blends, Cartesian lines and curves, G-code, pause / stop mid-chain, SOFT_RTI, block
                        programs ...) — run by tools/sim_run.py --tests suite (2026-10-13)
 
@@ -103,6 +103,8 @@ SIM_EXTRA = [
      "the default profile, then ruckig vs trapezoid", "EXEC"),
     ("command_sweep",   "72_command_sweep.py",    [], None, "IDLE"),
     ("rti_brake",       "71_rti_brake.py",        ["--go"], "J1 at 60 deg/s, braked three ways (hard RTI)", "IDLE"),
+    ("exec_brake",      "73_exec_brake.py",       ["--go"], "J1 + J5 at speed, paused and stopped along the path (EXEC)",
+     "EXEC"),
 ]
 SIM_POSE_SPEED = 30          # the simulated suite's moves to the start pose (%)
 NO_HOST = {"23_dry_run_preview.py", "43_glitch_hunt.py"}     # offline / shared-memory-only tests: no --host
@@ -225,7 +227,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="print the tests and exit")
     ap.add_argument("--only", default="", help="comma-separated names (see --list)")
     ap.add_argument("--suite", default="arm", choices=("arm", "sim"),
-                    help="arm = the smoke routine; sim = + 29 api_tests, the SIMULATED robot only")
+                    help="arm = the smoke routine; sim = + 30 api_tests, the SIMULATED robot only")
     args = ap.parse_args()
 
     simulated_suite = args.suite == "sim"
