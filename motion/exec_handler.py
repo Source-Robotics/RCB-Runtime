@@ -29,8 +29,12 @@ JogHandler.set_jog — no locking.
     so it brakes at the full ceiling; a robot XML on the parser's 50 x fallback would brake at a tenth of it.
   - resume() speeds it back up along the same path at EXEC's own acceleration (<exec_limits>) and continues from
     exactly where it stopped.
-  - begin_stop() brakes the same way, waits for the measured arm to come to rest (IDLE is freedrive — a moving arm
-    would coast), then asks for IDLE; the executor has already dropped the rest of the program.
+  - A STOP (exec_stop:<epoch> — the client's stop(), 2026-10-14, user: "stays in EXEC, holding") brakes the same way,
+    then drops the program — what it holds and everything on the socket up to the planner's FENCE of that epoch
+    (communication/exec_channels.pack_fence; batches carry the epoch they arrived in) — and holds there, still in
+    EXEC, exec_stop_seq = the epoch. Braking never runs into a batch from after the fence (a new program).
+  - set_mode:IDLE while EXEC moves (enter_idle_mode()) brakes the same way, waits for the measured arm to come to rest
+    (IDLE is freedrive — a moving arm would coast), then asks for IDLE.
   - Errors and the E-stop stay instant (ACTIVE_ERROR); an error during a pause drops the rest by leaving EXEC.
 Until 2026-10-13 a pause FROZE the setpoint (the drives stopped the arm as hard as they could) and a stop switched
 to IDLE at speed (freedrive: the arm coasted).
@@ -57,7 +61,7 @@ import zmq
 
 from utility.state_machine import RobotMode
 from utility.tick_types import TickResult, ControlOutput
-from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, unpack_batch
+from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, fence_epoch, unpack_batch
 from config.networking import ZMQ_EXEC_TRAJECTORY_SOCKET, ZMQ_EXEC_STATUS_SOCKET, background_zmq_context
 
 logger = logging.getLogger(__name__)
@@ -168,7 +172,10 @@ class ExecHandler:
         self._rate = 1.0
         self._rate_target = 1.0            # 0 = pause / stop asked for, 1 = play (resume)
         self._frac = 0.0
-        self._stopping = False             # begin_stop(): brake, then IDLE once the arm is at rest
+        self._stopping = False             # begin_stop(): brake, then hold (a stop) or IDLE once the arm is at rest
+        self._stop_epoch = None            # a STOP's epoch (hold in EXEC); None = the stop ends in IDLE
+        self._stop_done = 0                # the epoch of the last completed stop (mirrored: exec_stop_seq)
+        self._rx_epoch = 0                 # the last fence received: every batch is tagged with it on arrival
         self._stop_ticks = 0               # ticks since begin_stop() (the log line)
         self._rest_wait = 0                # ticks at r = 0 waiting for the measured arm to come to rest
         self._rest_wait_max = 0            # STOP_REST_MAX_S in ticks (set with the bands, from dt)
@@ -250,14 +257,28 @@ class ExecHandler:
         if not self._stopping:
             self._rate_target = 1.0
 
-    def begin_stop(self):
-        """Brake along the planned path; once the measured arm is at rest, ask for IDLE (step() returns it)."""
-        if not self._stopping:
-            self._stopping = True
-            self._rate_target = 0.0
-            self._stop_ticks = 0
-            self._rest_wait = 0
-            self._idle_asked = False
+    def begin_stop(self, epoch=None):
+        """Brake along the planned path. epoch (a Stop): then drop the program up to that epoch's fence and hold, in
+        EXEC. None (set_mode:IDLE): ask for IDLE once the measured arm is at rest (step() returns it) — also when a
+        stop is already braking or waiting for its fence (the executor's fallback)."""
+        if self._stopping:
+            if epoch is None:
+                self._stop_epoch = None
+            elif self._stop_epoch is not None and epoch > self._stop_epoch:
+                # A second Stop while one runs (two clients, 2026-10-14: the Blocks server and its runner, 0.5 ms
+                # apart): it takes over — its fence comes after the first's, so it covers everything, and the
+                # executor waits for ITS epoch (ignored, it fell back to IDLE after 1.5 s).
+                self._stop_epoch = int(epoch)
+            return
+        if epoch is not None and self._current is not None and self._current.get('epoch', 0) >= epoch:
+            self._stop_done = max(self._stop_done, int(epoch))    # its program ended already: this one came after it
+            return
+        self._stopping = True
+        self._stop_epoch = None if epoch is None else int(epoch)
+        self._rate_target = 0.0
+        self._stop_ticks = 0
+        self._rest_wait = 0
+        self._idle_asked = False
 
     def set_completion_policy(self, policy):
         """Set final-checkpoint completion behavior: commanded, settled, or strict."""
@@ -307,9 +328,13 @@ class ExecHandler:
             raw = self._recv_nonblocking()
             if raw is None:
                 break
+            if self._note_fence(raw):
+                pulls += 1
+                continue
             batch = self._safe_unpack(raw)
             if batch is None:
                 break
+            batch['epoch'] = self._rx_epoch
             self._pending.append(batch)
             self._pending_samples += batch['num_points']
             pulls += 1
@@ -327,18 +352,20 @@ class ExecHandler:
             # subsequent hold ticks (when no next batch is available).
             self._current = None
 
-            if self._pending:
+            if self._pending and not self._after_stop(self._pending[0]):
                 self._current = self._pending.popleft()
                 self._pending_samples -= self._current['num_points']
                 self._index = 0
             else:
-                # Nothing pre-fetched — one more non-blocking try, else hold.
-                raw = self._recv_nonblocking()
-                batch = self._safe_unpack(raw) if raw is not None else None
-                if batch is not None:
+                # Nothing pre-fetched (or only a program from after a stop's fence) — one more try, else hold.
+                batch = None if self._pending else self._recv_one()
+                if batch is not None and not self._after_stop(batch):
                     self._current = batch
                     self._index = 0
                 else:
+                    if batch is not None:                # from after the stop's fence: it plays once the stop is done
+                        self._pending.append(batch)
+                        self._pending_samples += batch['num_points']
                     self._rate = self._rate_target     # holding: no ramp to run
                     return TickResult(), self._hold(ctx)
 
@@ -419,12 +446,16 @@ class ExecHandler:
         self._rate_target = 1.0
         self._frac = 0.0
         self._stopping = False
+        self._stop_epoch = None
         self._stop_ticks = 0
         self._rest_wait = 0
         self._idle_asked = False
 
     def _tick_at_rest(self, ctx):
-        """Paused or stopped at rest: hold. A stop then asks for IDLE once the measured arm is at rest too."""
+        """Paused or stopped at rest: hold. A stop then drops its program and holds (a Stop), or asks for IDLE once
+        the measured arm is at rest too (set_mode:IDLE)."""
+        if self._stopping and self._stop_epoch is not None:
+            return self._finish_stop(ctx)
         if self._stopping:
             if self._band_dt != ctx.delta_t:
                 self._set_bands(ctx.delta_t)
@@ -442,6 +473,56 @@ class ExecHandler:
     def _arm_at_rest(self, ctx):
         np.abs(ctx.shared_data.joint['joint_speed_filtered'][:self.joint_num], out=self._ramp_abs)
         return float(self._ramp_abs.max()) < self.STOP_REST_SPEED_RAD_S
+
+    def _note_fence(self, raw):
+        """True when `raw` was a stop's fence (its epoch noted: every batch after it is tagged with it)."""
+        e = fence_epoch(raw)
+        if e is None:
+            return False
+        if e > self._rx_epoch:
+            self._rx_epoch = e
+        return True
+
+    def _recv_one(self):
+        """One more non-blocking try for a batch — a fence noted on the way —, tagged with its epoch; else None."""
+        raw = self._recv_nonblocking()
+        if raw is None or self._note_fence(raw):
+            return None
+        batch = self._safe_unpack(raw)
+        if batch is not None:
+            batch['epoch'] = self._rx_epoch
+        return batch
+
+    def _after_stop(self, batch):
+        """A batch from after the fence of the stop in progress — a new program, never played while stopping."""
+        return self._stop_epoch is not None and batch['epoch'] >= self._stop_epoch
+
+    def _finish_stop(self, ctx):
+        """A Stop at rest: drop the stopped program (the batch played, everything queued before the fence), wait for
+        the fence if it is not in yet (what arrives before it is the stopped program too), then hold here in EXEC —
+        what came after the fence plays next."""
+        n = self._stop_epoch
+        self._current = None
+        self._index = 0
+        self._frac = 0.0
+        self._clear_settling()
+        while self._pending and self._pending[0]['epoch'] < n:
+            self._pending_samples -= self._pending.popleft()['num_points']
+        pulls = 0
+        while self._rx_epoch < n and pulls < self.MAX_PULLS_PER_TICK:
+            raw = self._recv_nonblocking()
+            if raw is None:
+                break
+            pulls += 1
+            self._note_fence(raw)              # anything else before the fence: the stopped program, dropped
+        if self._rx_epoch < n:
+            return self._tick_ok, self._hold(ctx)
+        self._stop_done = n
+        logger.info("[EXEC] stop: braked along the path, at rest %.0f ms after the stop; the program dropped "
+                    "(epoch %d), holding here in EXEC", self._stop_ticks * ctx.delta_t * 1000.0, n)
+        self._reset_playback()
+        self._mirror_exec_state(ctx)
+        return self._tick_ok, self._hold(ctx)
 
     def _set_bands(self, dt):
         """The per-tick velocity change allowed: braking at the ceiling, but never above jerk * dt / 2 (module
@@ -483,7 +564,7 @@ class ExecHandler:
         b = self._current
         j = 0
         while k >= b['num_points']:
-            if j >= len(self._pending) or not self._continues(b):
+            if j >= len(self._pending) or not self._continues(b) or self._after_stop(self._pending[j]):
                 return None, 0
             k -= b['num_points']
             b = self._pending[j]
@@ -579,6 +660,8 @@ class ExecHandler:
         if ctx.shared_data is not None:
             paused = self._rate == 0.0 and self._rate_target == 0.0 and not self._stopping
             ctx.shared_data.rti['exec_paused'][0] = 1.0 if paused else 0.0
+            ctx.shared_data.rti['exec_stopping'][0] = 1.0 if self._stopping else 0.0
+            ctx.shared_data.rti['exec_stop_seq'][0] = float(self._stop_done)
             ctx.shared_data.rti['exec_settling'][0] = 1.0 if self._settling else 0.0
             ctx.shared_data.rti['exec_completion_policy_idx'][0] = float(self._completion_policy)
             # Buffered runway (samples not yet consumed in current + prefetched next).
@@ -604,8 +687,11 @@ class ExecHandler:
             return None
 
     def _drain_traj_socket(self):
-        while self._recv_nonblocking() is not None:
-            pass
+        while True:
+            raw = self._recv_nonblocking()
+            if raw is None:
+                return
+            self._note_fence(raw)              # a stop's fence still counts (its stop may be waiting for it)
 
     def _safe_unpack(self, raw):
         try:

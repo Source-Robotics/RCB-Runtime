@@ -42,6 +42,25 @@ _TRQ_DTYPE = np.float32
 # Batch flags. The wire field is uint32; unknown flags are ignored by older readers.
 BATCH_FLAG_BLEND_CONTINUES = 1 << 0
 
+# A FENCE (2026-10-14): a separate 12-byte message on the trajectory socket, b'RCBF' + uint64 epoch. The planner sends
+# one at every flush (a Stop); everything before it on the socket belongs to the stopped program, so RTI drops up to
+# it and keeps what follows. Its own magic, not a batch flag: an older reader would play a flagged 1-point batch, while
+# it drops a message with another magic as malformed (nothing moves).
+_FENCE_STRUCT = struct.Struct("<4sQ")
+_FENCE_MAGIC = b"RCBF"
+
+
+def pack_fence(epoch):
+    """The fence message for stop epoch `epoch` (an int >= 1)."""
+    return _FENCE_STRUCT.pack(_FENCE_MAGIC, int(epoch))
+
+
+def fence_epoch(raw):
+    """The epoch of a fence message, or None when `raw` is not one (a batch)."""
+    if len(raw) == _FENCE_STRUCT.size and raw[:4] == _FENCE_MAGIC:
+        return _FENCE_STRUCT.unpack(raw)[1]
+    return None
+
 
 def pack_batch(joint_positions, joint_velocities, torque_ff,
                checkpoint_id="", is_last_chunk=True, flags=0):

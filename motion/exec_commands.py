@@ -351,6 +351,7 @@ class QueuedCommand:
     cmd: str
     args: Tuple[Any, ...]
     options: MotionOptions
+    epoch: int = 0          # the planner's stop epoch when it was queued (TrajectoryPlanner.flush; command_executor)
 
     @classmethod
     def from_legacy(cls, data: Mapping[str, Any], default_options: Optional[MotionOptions] = None):

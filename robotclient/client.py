@@ -680,11 +680,11 @@ class RobotClient:
         self._immediate("set_recipe", [str(name)])
 
     def stop(self, wait: bool | None = None) -> None:
-        """Stop: the queued program is dropped and, if the arm is moving in EXEC, it brakes along its planned path
-        at the joints' hardware limits (at most ~0.15 s from full speed) and the robot goes to IDLE once the arm is
-        at rest. With wait (the default), returns in IDLE."""
-        self._state_change("stop", wait, lambda s: s.get("mode") == "IDLE",
-                           what="wait_mode(IDLE)")
+        """Stop: the queued program is dropped. In EXEC the arm brakes along its planned path at the joints' hardware
+        limits (at most ~0.15 s from full speed) and HOLDS there, still in EXEC — the next move starts from that point;
+        elsewhere (JOG, RTI, ...) the robot goes to IDLE. Returns once stopped (the executor answers then)."""
+        self._state_change("stop", wait, lambda s: s.get("mode") == "IDLE"
+                           or (s.get("mode") == "EXEC" and not s.get("exec_stopping")), what="stop")
         # stop() cancels queued motion server-side, which replies "error"/STOPPED for
         # each one. Those are the expected consequence of stopping, not a motion
         # failure — drop them so they can't surface at a later wait_idle(). Safe to do

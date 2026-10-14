@@ -8,7 +8,7 @@ the runner (`python3 -m blockly.runner`), which drives command_executor — and 
      it began (0.2 deg), exit 0;
   2. PAUSE once J5 has gone --into of the step (a quarter): the COMMANDED position freezes and the arm settles on it (it creeps a little
      while it catches up — seen on the arm 2026-10-05: 0.08 deg); RESUME finishes the program;
-  3. STOP the same way: the program ends "stopped" (exit 2), J5 stops on its way, the robot leaves EXEC;
+  3. STOP the same way: the program ends "stopped" (exit 2), J5 stops on its way and holds there in EXEC (2026-10-14);
   4. a move past J5's software limit: refused JOINT_LIMIT on ITS block, J5 does not go on toward it, the arm HOLDS in
      EXEC (as an EXEC program leaves it — user, 2026-10-05); errors cleared;
   5. RT timing across the runner start-ups: RTI's overrun counter before / after (an interpreter start-up costs the
@@ -253,7 +253,8 @@ def main():
         check("ended 'stopped', exit 2", r["exit"] == 2 and r["state"] == "stopped", f"exit {r['exit']} {r['state']}")
         check("J5 stopped on its way (moved, short of the target)", abs(j - j0) > 0.1 and abs(j - target[J]) > 0.2,
               f"J5 {j:.2f}: from {j0:.2f} toward {target[J]:.2f}")
-        check("the robot left EXEC", mode == "IDLE", mode)
+        check("the arm HOLDS in EXEC after the stop (braked along its path; 2026-10-14 — it used to drop to IDLE)",
+              mode == "EXEC", mode)
         run("api57 back", program(move_to_point("m1", "start", args.speed)), point)
 
         if args.skip_limit:

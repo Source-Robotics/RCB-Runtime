@@ -36,8 +36,10 @@ def run():
         robot.stop(wait=True)
         stopped_status = robot.get_status()
         show("after stop", stopped_status)
-        if stopped_status.get("mode") != "IDLE":
-            raise RuntimeError(f"expected mode IDLE after stop, got {stopped_status.get('mode')!r}")
+        # Since 2026-10-14 a stop in EXEC brakes along the path and HOLDS, still in EXEC (it used to switch to IDLE).
+        if stopped_status.get("mode") != "EXEC" or stopped_status.get("exec_stopping"):
+            raise RuntimeError(f"expected EXEC, holding, after stop; got mode {stopped_status.get('mode')!r}, "
+                               f"exec_stopping {stopped_status.get('exec_stopping')!r}")
 
         stopped_error = None
         try:
@@ -53,9 +55,7 @@ def run():
             if stopped_status.get("state") != "ENABLED" or stopped_status.get("homed") is not True:
                 print("Not returning: robot is not ENABLED+homed after stop.")
             else:
-                print("Re-entering EXEC mode")
-                robot.enter_exec_mode(wait=True)
-                print("Returning to starting joint position")
+                print("Returning to starting joint position (still in EXEC)")
                 robot.move_joints(start, profile=args.profile, speed=args.speed, timeout=args.timeout)
                 robot.wait_idle(timeout=args.timeout)
 

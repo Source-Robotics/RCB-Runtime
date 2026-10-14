@@ -1288,10 +1288,10 @@ def main():
         if len(parts) < 2:
             return
         if parts[1].strip().upper() == "IDLE" and st.current_mode == RobotMode.EXEC:
-            # A stop (the client's stop() / enter_idle_mode()) while EXEC plays: brake along the planned path at
-            # the joints' ceilings first; the EXEC handler asks for IDLE itself once the arm is at rest (2026-10-13,
-            # user's choice: braked along the path, as industrial arms commonly do — IDLE at speed was freedrive: the
-            # arm coasted).
+            # IDLE while EXEC plays (the client's enter_idle_mode(); the stop's fallback): brake along the planned
+            # path at the joints' ceilings first; the EXEC handler asks for IDLE itself once the arm is at rest
+            # (2026-10-13, user's choice: braked along the path, as industrial arms commonly do — IDLE at speed was
+            # freedrive: the arm coasted). A stop itself is exec_stop and stays in EXEC (2026-10-14).
             _exec = MODE_HANDLERS.get(RobotMode.EXEC)
             if _exec is not None:
                 _exec.begin_stop()
@@ -1386,6 +1386,23 @@ def main():
         _exec = MODE_HANDLERS.get(RobotMode.EXEC)
         if _exec is not None:
             _exec.resume()
+
+
+    def _handle_exec_stop(cmd_msg, cmd_dict):
+        """exec_stop:<epoch> — the client's stop() (2026-10-14, user: the arm stays in EXEC, holding): brake along the
+        planned path, drop the program up to the planner's fence of <epoch>, hold. Not in EXEC (the mode changed
+        since the executor looked): IDLE, as a stop always did there."""
+        parts = cmd_msg.split(":")
+        try:
+            epoch = int(parts[1])
+        except (IndexError, ValueError):
+            logger.warning("[RTI] exec_stop without a valid epoch: %r", cmd_msg)
+            return
+        _exec = MODE_HANDLERS.get(RobotMode.EXEC)
+        if st.current_mode == RobotMode.EXEC and _exec is not None:
+            _exec.begin_stop(epoch)
+        else:
+            _handle_set_mode("set_mode:IDLE", cmd_dict)
 
 
     def _handle_exec_completion_policy(cmd_msg, cmd_dict):
@@ -1916,6 +1933,7 @@ def main():
         "jog_control_mode":  _handle_jog_control_mode,
         "exec_pause":        _handle_exec_pause,
         "exec_resume":       _handle_exec_resume,
+        "exec_stop":         _handle_exec_stop,
         "exec_completion_policy": _handle_exec_completion_policy,
         "gripper_set":       _handle_gripper_set,
         "gripper_calibrate": _handle_gripper_calibrate,

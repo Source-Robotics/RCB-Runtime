@@ -30,6 +30,7 @@ import logging
 import math
 import socket
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 import threading
 import time
@@ -696,6 +697,7 @@ def _handle_get_status(args, cid, conn):
         "software_estop": int(shared_data.rti['software_estop'][0]),
         "exec_paused": int(shared_data.rti['exec_paused'][0]),
         "exec_settling": int(shared_data.rti['exec_settling'][0]),
+        "exec_stopping": int(shared_data.rti['exec_stopping'][0]),
         "exec_completion_policy": _COMPLETION_POLICY_NAMES[
             min(max(int(shared_data.rti['exec_completion_policy_idx'][0]), 0),
                 len(_COMPLETION_POLICY_NAMES) - 1)],
@@ -1133,13 +1135,45 @@ def _on_exec_exit(reason):
         log_activity(_exec_activity_logger, "EXEC", "error", "MOTION_ABORTED", message=msg)
 
 
+# A Stop in EXEC (2026-10-14, user: the arm stays in EXEC, holding): RTI brakes along the path, drops the program up
+# to the planner's fence and confirms through rti['exec_stop_seq'] — within ~0.2 s. Not confirmed in this time (an RTI
+# from before 2026-10-14, a lost fence): the old stop, IDLE at once.
+STOP_CONFIRM_S = 1.5
+
+
 def _handle_stop(args, cid, conn):
+    in_exec = shared_data.robot_mode.get() == "EXEC"
     with _abort_gate():                    # a command being queued right now lands before this, never after
-        _planner.flush()                   # drop queued motion + reset endpoint
+        _planner.flush()                   # drop queued motion + reset endpoint; a new stop epoch + its fence to RTI
         _fail_pending("STOPPED", "motion stopped")
-    send_to_rti("set_mode:IDLE", cid, "TCP")
+        epoch = _planner.epoch
+        # In EXEC: brake along the path, drop the program up to the fence, hold there (still in EXEC). Elsewhere
+        # (JOG, RTI, ...): IDLE as before.
+        send_to_rti(f"exec_stop:{epoch}" if in_exec else "set_mode:IDLE", cid, "TCP")
+    if in_exec:
+        _confirm_exec_stop(epoch, cid)
     reply(conn, {"id": cid, "status": "ok"})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="stop")
+
+
+def _confirm_exec_stop(epoch, cid):
+    """Wait (outside abort_gate: a disable / another Stop must not wait on it) until RTI reports the stop of `epoch`
+    complete, then start the next move from the commanded point the arm holds. True when it completed or the robot
+    left EXEC meanwhile (an error took the program with it); False after the fallback to IDLE."""
+    deadline = time.monotonic() + STOP_CONFIRM_S
+    while time.monotonic() < deadline:
+        if shared_data.rti['exec_stop_seq'][0] >= epoch:
+            _planner.set_hold_start(shared_data.joint['joint_position_commanded'][:JOINT_NUM])
+            return True
+        if shared_data.robot_mode.get() != "EXEC":
+            return True
+        time.sleep(0.004)
+    msg = (f"RTI did not confirm the stop within {STOP_CONFIRM_S:.1f} s (an RTI started before 2026-10-14, or its "
+           f"fence was lost) — switched to IDLE instead")
+    logging.error(f"[STOP] {msg}")
+    log_activity(_exec_activity_logger, "EXEC", "error", "STOP_FALLBACK", id=cid, message=msg)
+    send_to_rti("set_mode:IDLE", cid, "TCP")
+    return False
 
 
 def _handle_set_digital_output(args, cid, conn):
@@ -1620,6 +1654,7 @@ def current_status():
         "estop": int(shared_data.rti["software_estop"][0]),
         "exec_paused": int(shared_data.rti["exec_paused"][0]),
         "exec_settling": int(shared_data.rti["exec_settling"][0]),
+        "exec_stopping": int(shared_data.rti["exec_stopping"][0]),
         "exec_completion_policy": _COMPLETION_POLICY_NAMES[policy_idx],
         # Which telemetry recipe the state stream is carrying, and what else is available.
         # `set_recipe` refuses an unknown name, so a PC needs a way to discover the valid
@@ -1765,6 +1800,8 @@ def _submit_queued(cmd, args, msg, cid, conn):
                             "message": why})
     try:
         queued = _build_queued_command(cid, cmd, args, msg.get("options", {}) or {})
+        if _planner is not None:          # the stop epoch it is queued in (under abort_gate: a Stop cannot fall between)
+            queued = replace(queued, epoch=_planner.epoch)
     except (TypeError, ValueError) as e:
         _log_exec_reject(cid, "BAD_OPTIONS", str(e), command=_fmt_command(cmd, args))
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_OPTIONS",

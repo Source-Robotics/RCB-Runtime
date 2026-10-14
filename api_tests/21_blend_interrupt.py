@@ -175,8 +175,8 @@ def run():
 
         robot.stop(wait=True)
         status = robot.get_status()
-        check("mode is IDLE after stop", status.get("mode") == "IDLE",
-              f"mode={status.get('mode')!r}")
+        check("mode is EXEC after stop — braked along the path, holding (2026-10-14; it used to be IDLE)",
+              status.get("mode") == "EXEC" and not status.get("exec_stopping"), f"mode={status.get('mode')!r}")
 
         # THE CHECK THIS TEST EXISTS FOR. A chain is sent WHOLE, so a stop that does not flush
         # RTI leaves a long stale trajectory sitting in its buffer, and the next move replays it.

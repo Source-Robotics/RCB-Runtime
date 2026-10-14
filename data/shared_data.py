@@ -643,8 +643,10 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "jog_jerk_factor",          # jerk = accel * factor (S-curve only)
         # EXEC live state — mirrors ExecHandler state (RTI-process-local) so
         # command_executor (separate process) can report it in status events.
-        "exec_paused",              # 1.0 = ExecHandler frozen mid-batch, 0.0 = running
+        "exec_paused",              # 1.0 = paused AT REST (braked along the path; resumable), 0.0 = running
         "exec_settling",            # 1.0 = final target settle check active
+        "exec_stopping",            # 1.0 = a stop is braking / dropping the program (2026-10-14)
+        "exec_stop_seq",            # the stop epoch of the last COMPLETED stop (command_executor waits for it)
         "exec_completion_policy_idx", # 0=commanded, 1=settled, 2=strict
         "exec_samples_remaining",   # samples RTI still has buffered (current+next), for the
                                     # planner's rolling-buffer deadline cross-check

@@ -79,7 +79,7 @@ import numpy as np
 import zmq
 from spatialmath import SE3
 
-from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, pack_batch
+from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, pack_batch, pack_fence
 from config.networking import ZMQ_EXEC_TRAJECTORY_SOCKET, ZMQ_EXEC_STATUS_SOCKET, ZMQ_CMD_SOCKET
 from motion.exec_commands import (
     DEFAULT_PROFILE, MotionOptions, QueuedCommand, normalize_profile_name, normalize_ik_solver_name,
@@ -417,6 +417,13 @@ class TrajectoryPlanner(Thread):
         # where nothing kept it from RUNNING (found by the simulated suite; dummy_test_scripts/test_exec_queue_race.py).
         # Re-entrant: interrupt() flushes under it.
         self.abort_gate = RLock()
+        # The STOP EPOCH (2026-10-14): flush() (a Stop) counts it up and sends RTI a fence carrying it; every queued
+        # command carries the epoch it was queued in (command_executor sets it under abort_gate), and a send of a
+        # command from an older epoch is dropped (_send_range, under the gate). So nothing of a stopped program reaches
+        # RTI after the fence — a command still being planned when the Stop came used to send its batches afterwards
+        # (harmless while a Stop left EXEC; the robot now stays in EXEC, holding).
+        self._epoch = 0
+        self._cmd_epoch = 0          # the epoch of the command the planner thread is working on
         # Set when the arm may have moved by something other than EXEC (another mode, an
         # error, a hand). The next plan then starts from the MEASURED position instead of
         # the last planned endpoint. Consumed by _start_point().
@@ -480,12 +487,12 @@ class TrajectoryPlanner(Thread):
         self._blend_pct = float(np.clip(pct, 0.0, 100.0))
 
     def flush(self):
-        """Drop queued motion and forget the planned endpoint (re-sync to live).
+        """Drop queued motion and forget the planned endpoint (re-sync to live); start a new stop epoch and send RTI
+        its fence (nothing of the program before it is sent after it — see abort_gate's notes in __init__).
 
-        Called on stop(), which also puts RTI into IDLE. A held tail is therefore
-        DISCARDED, not committed: the arm is stopping, so sending it the rest of a
-        braking ramp it will never execute would only leave a stale batch in the
-        socket for whatever runs next.
+        Called on stop() (RTI brakes the arm along its path and drops what it holds up to the fence) and by
+        interrupt(). A held tail is DISCARDED, not committed: the arm is stopping, so sending it the rest of a braking
+        ramp it will never execute would only leave a stale batch in the socket for whatever runs next.
         """
         with self.abort_gate:
             try:
@@ -496,6 +503,24 @@ class TrajectoryPlanner(Thread):
             self._blend_buffer = []
             self._held = None
             self._last_endpoint = None
+            self._last_exit_speed = None
+            self._epoch += 1
+            if self._traj_sock is not None:
+                try:
+                    self._traj_sock.send(pack_fence(self._epoch), flags=zmq.NOBLOCK)
+                except zmq.ZMQError as e:            # RTI not draining: its stop waits for the fence, then gives up
+                    logger.error(f"[Planner] stop fence {self._epoch} not sent: {e}")
+
+    @property
+    def epoch(self):
+        """The current stop epoch (flush() counts it up)."""
+        return self._epoch
+
+    def set_hold_start(self, q):
+        """The next move starts from `q` — the commanded point a Stop left the arm holding at (command_executor, once
+        RTI confirmed the stop), not the measured position a flush would otherwise re-read."""
+        with self.abort_gate:
+            self._last_endpoint = np.array(q, dtype=np.float64)[:self.joint_num]
             self._last_exit_speed = None
 
     def abort_info(self):
@@ -573,6 +598,8 @@ class TrajectoryPlanner(Thread):
             timeout = self.HOLD_POLL_S if self._held is not None else 0.2
             try:
                 cmd = self._queue.get(timeout=timeout)
+                ep = cmd.epoch if isinstance(cmd, QueuedCommand) else cmd.get("epoch")
+                self._cmd_epoch = self._epoch if ep is None else ep
             except Empty:
                 if self._held is not None:
                     # Nothing arrived. Commit the tail if RTI is about to run dry.
@@ -3501,14 +3528,28 @@ class TrajectoryPlanner(Thread):
                                torque_ff[start_idx:end_idx],
                                checkpoint_id=cid if is_last else "", is_last_chunk=is_last,
                                flags=chunk_flags)
-            try:
-                self._traj_sock.send(batch)
-            except zmq.Again:
-                logger.error(f"[Planner] send timed out (RTI not draining) — "
-                            f"{end_idx}/{range_end} waypoints sent for id={cid}")
-                self._report_error(cid, "SEND_TIMEOUT",
-                                   "RTI not consuming trajectory batches")
-                return False
+            # Each try under abort_gate, so a Stop's flush (which counts the epoch up and sends the fence under the
+            # same lock) can never fall between the epoch check and the send; non-blocking, so the lock is never held
+            # while RTI is not draining (a Stop / disable must not wait on it) — retried outside it until the timeout.
+            deadline = time.monotonic() + self.SEND_TIMEOUT_MS / 1000.0
+            while True:
+                with self.abort_gate:
+                    if self._cmd_epoch != self._epoch:
+                        logger.info(f"[Planner] id={cid}: not sent — the program was stopped (epoch "
+                                    f"{self._cmd_epoch} -> {self._epoch})")
+                        return True
+                    try:
+                        self._traj_sock.send(batch, flags=zmq.NOBLOCK)
+                        break
+                    except zmq.Again:
+                        pass
+                if time.monotonic() >= deadline:
+                    logger.error(f"[Planner] send timed out (RTI not draining) — "
+                                f"{end_idx}/{range_end} waypoints sent for id={cid}")
+                    self._report_error(cid, "SEND_TIMEOUT",
+                                       "RTI not consuming trajectory batches")
+                    return False
+                time.sleep(0.002)
         return True
 
     def _send_gripper(self, ctype, args, cid):
