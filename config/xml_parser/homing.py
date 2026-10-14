@@ -57,6 +57,19 @@ def parse_homing_sequence(xml_path: str | Path) -> list[dict]:
                     'joint': int(idle_elem.get('joint')),
                     'duration_s': float(idle_elem.get('duration_s')),
                 })
+            for ap_elem in pre_moves_elem.findall('approach'):
+                # 2026-10-14 (user): drive the joint to the endstop it homes against at a controlled speed — a
+                # position ramp in raw motor ticks (no homing needed), its current limit raised to current_ma — and
+                # hold it there until its own homing step. Instead of <idle>, where the drive's brake let a heavy joint
+                # (J3) fall onto its endstop. speed (ticks/s) defaults to the joint's homing speed, timeout_s to its
+                # homing timeout.
+                step['pre_moves'].append({
+                    'type':       'approach',
+                    'joint':      int(ap_elem.get('joint')),
+                    'current_ma': float(ap_elem.get('current_ma')),
+                    'speed':      float(ap_elem.get('speed')) if ap_elem.get('speed') is not None else None,
+                    'timeout_s':  float(ap_elem.get('timeout_s')) if ap_elem.get('timeout_s') is not None else None,
+                })
             for gm_elem in pre_moves_elem.findall('gripper_move'):
                 # position and speed are 0-255; current is mA (2 bytes).
                 # activate, action, ESTOP, release_dir are bitfield flags (0/1).

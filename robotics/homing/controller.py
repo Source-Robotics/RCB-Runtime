@@ -157,6 +157,12 @@ class HomingController:
         # its gravity current as feedforward — the zero-speed hold let J2 / J3 sink back toward their endstops while the
         # later steps ran (16 homings ended with a joint past its soft limit) {j: motor ticks}
         self._hold_pos: dict = {}
+        # 2026-10-14 (user): an <approach> pre-move drives a joint to its endstop and holds it there (raw motor ticks,
+        # no gravity feedforward — the pose is not known yet) until its own homing step {j: motor ticks}; its travel
+        # is added to the joint's pass-1 travel in the history {j: ticks}
+        self._approach_hold: dict = {}
+        self._approach_travel: dict = {}
+        self._approach: dict = {}                         # the running approaches' state {j: dict}
         self._homing_stats: dict = {}                     # {j: (two-pass diff, release relaxation, travel)} history
         # 2026-10-14 (user: a failed homing is a latched ERROR naming its reason): every failure as (error key, reason),
         # taken by RTI (take_failures) and latched by the error pass until Clear Errors. Before, the only trace was
@@ -281,6 +287,8 @@ class HomingController:
     _gravity_ff = _moves._gravity_ff
 
     _send_idle = _moves._send_idle
+    _approach_setup = _moves._approach_setup
+    _approach_tick = _moves._approach_tick
 
     # ------------------------------------------------------------------
     def _jlabel(self, j, Motor) -> str:
@@ -362,6 +370,8 @@ class HomingController:
         self._seq_ticks = 0
         self._homing_stats = {}
         self._hold_pos = {}
+        self._approach_hold = {}
+        self._approach_travel = {}
         if self.arm_check is not None:
             self.arm_check.on_homing_start()
 
@@ -438,6 +448,10 @@ class HomingController:
                 elif pm.get('type') == 'idle':
                     duration_ticks = max(1, round(pm['duration_s'] / self.dt))
                     self._pre_move_targets[j] = ('idle', duration_ticks)
+                elif pm.get('type') == 'approach':
+                    self._approach_hold.pop(j, None)
+                    self._approach[j] = self._approach_setup(j, pm)
+                    self._pre_move_targets[j] = ('approach', self._approach[j]['timeout_ticks'])
                 elif pm.get('type') == 'gripper_move':
                     duration_ticks = max(1, round(pm['duration_s'] / self.dt))
                     self._pre_move_targets[j] = (
@@ -455,7 +469,7 @@ class HomingController:
             # are never cut short by the safety timeout.
             max_timed_ticks = 0
             for info in self._pre_move_targets.values():
-                if info[0] == 'idle':
+                if info[0] in ('idle', 'approach'):
                     max_timed_ticks = max(max_timed_ticks, info[1])
                 elif info[0] == 'nudge':
                     max_timed_ticks = max(max_timed_ticks, info[2])
@@ -472,6 +486,8 @@ class HomingController:
         home_joints = step['home_joints']
         gripper_mode = step.get('gripper_mode')
         self._active_states = {}
+        for j in home_joints:
+            self._approach_hold.pop(j, None)            # its own homing takes over from the <approach> hold
         for j in home_joints:
             # Use GripperHomingState for gripper firmware mode
             if gripper_mode == 'firmware' and j >= self._arm_count:
@@ -604,7 +620,10 @@ class HomingController:
                 pass
             elif state._triggered_pos is not None:
                 self._homed_results[j] = state._triggered_pos
-                self._homing_stats[j] = (state.two_pass_diff, state.release_relaxed, state.travel_ticks)
+                travel = state.travel_ticks
+                if j in self._approach_travel:          # the <approach> brought it most of the way (2026-10-14)
+                    travel = self._approach_travel[j] + (travel or 0)
+                self._homing_stats[j] = (state.two_pass_diff, state.release_relaxed, travel)
                 # For gripper: compute and store ticks_per_meter conversion factor
                 if j >= self._arm_count and hasattr(self, '_gripper_stroke_mm'):
                     stroke_m = self._gripper_stroke_mm / 1000.0

@@ -1,10 +1,12 @@
-"""The moves around homing, as HomingController methods: pre-moves (position / nudge / idle / gripper), move_to
-(smooth interpolated joint moves), sequence-level post-moves, and how a joint that is not being moved is held
+"""The moves around homing, as HomingController methods: pre-moves (position / nudge / idle / approach / gripper),
+move_to (smooth interpolated joint moves), sequence-level post-moves, and how a joint that is not being moved is held
 (homed joints: in position with gravity feedforward)."""
 # Split out of robotics/homing.py (2026-10-09, TODO/homing_plan.md H3) — moved verbatim; the recording
 # (dummy_test_scripts/test_homing_golden.py) proves the behaviour unchanged.
 
 import logging
+
+from robotics.homing.status import STATUS_FAILED
 
 
 # ------------------------------------------------------------------
@@ -47,7 +49,83 @@ def _send_idle(self, Motor, i, shared_data=None):
             if pos is not None:
                 Motor[i].Send_data_pack_1(Position=pos, Speed=0, Current=self._gravity_ff(shared_data, i))
                 return
+        if i in self._approach_hold:                # brought to its endstop by an <approach>: held there (raw ticks)
+            Motor[i].Send_data_pack_1(Position=self._approach_hold[i], Speed=0, Current=0)
+            return
         Motor[i].Send_data_pack_1(Position=None, Speed=0, Current=0)
+
+
+# ------------------------------------------------------------------
+# <approach> (2026-10-14, user: "J3 sometimes freefalls to its endstop in the idle step — move toward the endstop
+# more controlled"): a position RAMP in raw motor ticks toward the endstop the joint homes against, at its homing speed —
+# the drive's position loop sets the speed whatever gravity does, and works before homing (the encoder counts are
+# there, only the joint angles are not) — with the joint's current limit raised to `current_ma` (enough to carry the
+# arm: J3 800 mA = the gravity model's worst case + friction + ~30 %). It has arrived when the joint stops following the
+# ramp (the endstop); then it is held THERE in position until its own homing step. No arrival within its timeout
+# (default: the joint's homing timeout) fails homing with that reason.
+_APPROACH_LAG_S = 0.1          # arrived: the joint trails the ramp by more than 0.1 s of travel ...
+_APPROACH_LAG_MIN = 400        # ... (at least this many ticks) ...
+_APPROACH_LAG_READS = 10       # ... on this many valid reads in a row
+
+
+def _approach_setup(self, j, pm):
+    """The state of one <approach> pre-move (built when its step starts)."""
+    speed = abs(float(pm['speed'])) if pm.get('speed') is not None else abs(float(self.homing_speeds[j]))
+    speed = -speed if int(self.homing_directions[j]) == 1 else speed
+    timeout_s = float(pm['timeout_s']) if pm.get('timeout_s') is not None else float(self._timeout_s[j])
+    return {'speed': speed, 'current_ma': float(pm['current_ma']), 'timeout_ticks': max(1, round(timeout_s / self.dt)),
+            'lag_max': max(_APPROACH_LAG_MIN, abs(speed) * _APPROACH_LAG_S), 'target': None, 'start': None, 'over': 0,
+            'ticks': 0, 'last_valid': None}
+
+
+def _approach_tick(self, Motor, j, shared_data) -> str:
+    """One tick of joint j's <approach>: 'running', 'arrived' (held at its endstop from now on) or 'failed'."""
+    a = self._approach[j]
+    label = self._jlabel(j, Motor)
+    if j in self._approach_hold:
+        Motor[j].Send_data_pack_1(Position=self._approach_hold[j], Speed=0, Current=0)
+        return 'arrived'
+    a['ticks'] += 1
+    if a['ticks'] == 1:
+        mc = getattr(self, '_motor_config', None)
+        vlim = mc['velocity_limit'][j] if mc is not None else abs(a['speed']) * 4
+        for _ in range(self._LIMIT_REPEATS):
+            Motor[j].Send_Limits(Velocity_limit=int(vlim), Current_limit=int(a['current_ma']))
+        logging.info(f"[Homing] {label} approaching its endstop: {a['speed']:+.0f} ticks/s (a position ramp), current "
+                     f"limit {a['current_ma']:.0f} mA")
+    pos = Motor[j].position
+    if pos is not None:
+        a['last_valid'] = int(pos)
+    if a['target'] is None:
+        if a['last_valid'] is None:                 # no position yet: hold still until one is read
+            Motor[j].Send_data_pack_1(Position=None, Speed=0, Current=0)
+        else:
+            a['target'] = a['start'] = float(a['last_valid'])
+    else:
+        a['target'] += a['speed'] * self.dt
+    if a['target'] is not None:
+        Motor[j].Send_data_pack_1(Position=int(round(a['target'])), Speed=int(a['speed']), Current=0)
+        if pos is not None:
+            lag = (a['target'] - pos) * (1.0 if a['speed'] > 0 else -1.0)
+            a['over'] = a['over'] + 1 if lag > a['lag_max'] else 0
+            if a['over'] >= _APPROACH_LAG_READS:
+                held = self._approach_hold[j] = int(pos)
+                travel = self._approach_travel[j] = held - int(a['start'])
+                logging.info(f"[Homing] {label} reached its endstop (approach): {travel:+d} ticks in "
+                             f"{a['ticks'] * self.dt:.3f} s (from {int(a['start'])} to {held}) — held there until its "
+                             f"homing")
+                return 'arrived'
+    if a['ticks'] >= a['timeout_ticks']:
+        reason = (f"it did not reach its endstop within {a['timeout_ticks'] * self.dt:.1f} s of its controlled approach "
+                  f"({a['speed']:+.0f} ticks/s, {a['current_ma']:.0f} mA) — something in the way, or the joint far "
+                  f"from its endstop")
+        logging.error(f"[Homing] FAILED: {label} — {reason}")
+        if j < len(shared_data.rti["homing_status"]):
+            shared_data.rti["homing_status"][j] = STATUS_FAILED
+        self._report_failure(j, reason)
+        self._seq_phase = self._FAILED
+        return 'failed'
+    return 'running'
 
 
 # ------------------------------------------------------------------
@@ -77,6 +155,14 @@ def _do_step_pre_move(self, Motor, Joint, shared_data) -> str:
             else:
                 Motor[j].Send_Respond_Encoder_data()
             if self._move_tick_count < duration_ticks:
+                all_arrived = False
+            continue
+
+        if move_info[0] == 'approach':
+            r = self._approach_tick(Motor, j, shared_data)
+            if r == 'failed':
+                return 'failed'
+            if r != 'arrived':
                 all_arrived = False
             continue
 
