@@ -166,7 +166,7 @@ class LoopState:
         # mode and pending mode request (handlers write, the loop consumes)
         "current_mode", "pending_mode_request", "pending_mode_force", "pending_mode_assertion", "pending_mode_rate_hz",
         # errors
-        "latched_errors", "error_metadata", "clear_error_countdown",
+        "latched_errors", "error_metadata", "clear_error_countdown", "homing_failures",
         # loop statistics ring
         "_loop_stats_buf_pos", "_loop_stats_buf_count",
         # RTI link (pairing / transport)
@@ -798,6 +798,9 @@ def main():
     # or sends the "clear_errors" ZMQ command.
     st.latched_errors: set = set()
     st.error_metadata: dict = {}       # key → {"timestamp": float, "tick": int, "description": str, "level": str}
+    # Homing failures the controller reported this tick, {key: reason} (2026-10-14): handed to the error pass, which
+    # latches them as hard errors with the reason as their description; emptied right after.
+    st.homing_failures: dict = {}
     st.clear_error_countdown: int = 0  # counts down to 0 each time a clear is requested
 
     # EXEC control-link watchdog (gui_executor_migration_plan.md Phase 5): trip if
@@ -2203,6 +2206,8 @@ def main():
 
         # Safety monitor BEFORE the error pass, so a trip latches — and disables the robot — this tick.
         _monitor_errors = safety_monitor.step(st.current_mode)
+        if homing_ctrl.has_failures:                 # a failed homing: a latched error naming its reason (2026-10-14)
+            st.homing_failures.update(homing_ctrl.take_failures())
         _profile_last = _profile_mark(_profile_last, "safety_monitor")
 
         st.clear_error_countdown, st.latched_errors, st.error_metadata, st.current_mode = process_errors_tick(
@@ -2229,7 +2234,10 @@ def main():
             # The settle after the start-up clear (sent at tick BOOT_CLEAR_TICK): a driver reports the watchdog trip the
             # last run's end and the set-up left it until the clear lands.
             driver_faults=_tick_now > BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS,
+            homing_errors=st.homing_failures,
         )
+        if st.homing_failures:
+            st.homing_failures.clear()             # latched by the call above (the latch keeps them until Clear Errors)
         _profile_last = _profile_mark(_profile_last, "error_checks")
 
     # ==========================================================================

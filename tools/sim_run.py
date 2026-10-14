@@ -9,8 +9,8 @@
         --gui            also the dashboard (port 8081; it shows the SIMULATED robot)
         --faults all|a,b fault injection after the boot (sim/faults.py): node_lost, drive_fault, drive_flags,
                          reply_loss, drive_reboot, hand_push, push_through, runaway, tracking_lag, hold_buzz (the
-                         S6 disturbances), executor_lost (homes first), estop (the simulated E-stop button),
-                         rti_lost (ends the run)
+                         S6 disturbances), homing_false_stall (J2 blocked while homing), executor_lost (homes
+                         first), estop (the simulated E-stop button), rti_lost (ends the run)
         --tests a,b,..   after the boot, run these api_tests in order — the file name without .py, plus its
                          arguments: --tests "00_status,01_mode --go,02_joint --go --assume-ready"
                          'smoke' = tools/arm_smoke.py against the simulated robot (home it first):

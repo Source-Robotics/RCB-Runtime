@@ -15,7 +15,10 @@ does not restart the timer, and a tripped (or E-stopped) drive goes idle.
 S6 (2026-10-13) — DISTURBANCES, each set by the control channel's "physics" command until a time: what a real arm does
 that the ideal joint does not, so the safety monitor's checks can trip in simulation: a hand turning a limp joint
 (push), the joint moving on its own whatever it is told (runaway), a drive following its position target with a lag
-(lag), and the measured current swinging while the joint holds (buzz).
+(lag), and the measured current swinging while the joint holds (buzz). 2026-10-14: an obstacle (block) — a powered
+joint cannot pass the position it was at when the block began, on one side (the endstop's unless told), and pushed
+into it reports its current limit, exactly as at an endstop: a load the homing current cannot lift, or something in
+the way — homing sees a stall where there is no endstop, and both passes repeat it.
 """
 from __future__ import annotations
 
@@ -128,6 +131,8 @@ class SimDrive:
         self.runaway_speed, self.runaway_until_ms = 0.0, -1    # ticks/s: the joint moving on its own (a powered drive)
         self.lag_tau, self.lag_until_ms = 0.0, -1              # s: position / PD mode follows its target with this lag
         self.buzz_ma, self.buzz_hz, self.buzz_until_ms = 0.0, 0.0, -1   # the measured current swinging
+        self.block_at, self.block_dir, self.block_until_ms = 0.0, self.stop_dir, -1   # an obstacle: block_at, one side
+        self.push_dir = self.stop_dir                          # the side a saturated current points to
 
     @property
     def error(self):
@@ -320,8 +325,8 @@ class SimDrive:
         """The current the drive reports (mA): its mode's, saturated on an endstop, plus a buzz (S6)."""
         if self.error or self.mode == IDLE:
             cur = 0.0
-        elif self.pushing:                               # leaning on the endstop: the loop saturates at its limit
-            cur = self.stop_dir * self.current_limit
+        elif self.pushing:                               # leaning on the endstop / the obstacle: at its limit
+            cur = self.push_dir * self.current_limit
         elif self.mode == CURRENT:
             cur = max(-self.current_limit, min(self.current_limit, self.iq_setpoint))
         elif run == SPEED and self.target_speed != 0:
@@ -343,8 +348,11 @@ class SimDrive:
         if self.mode == HALL:
             run = self._hall_mode()
         self.pushing = False
+        self.push_dir = self.stop_dir
         if not limp and dt > 0:
             self.position, self.pushing = self._clamp_stop(self._powered_position(run, vmax, dt, ms))
+            if ms < self.block_until_ms and (self.position - self.block_at) * self.block_dir > 0:   # S6: the obstacle
+                self.position, self.pushing, self.push_dir = self.block_at, True, self.block_dir
         if dt > 0 and limp and not self.error and ms < self.push_until_ms:     # S6: a hand on a limp joint
             self.position, _ = self._clamp_stop(self.position + self.push_speed * dt)
         if dt > 0:                                       # the firmware reports a filtered speed (Velocity_Filter)

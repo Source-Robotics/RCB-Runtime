@@ -61,3 +61,19 @@ class GripFailed(RobotError):
         self.result = result
         got = result.name if result is not None else "no result"
         super().__init__(f"expected the gripper to be {expected}, but it reported: {got}")
+
+
+class HomingFailed(RobotError):
+    """home(wait=True) / wait_homed(): the homing ended in an error instead of homed (2026-10-14). The robot is
+    disabled with the error latched — J{n}:HOMING_FAILED names the joint, its reason is in the dashboard's error list
+    and the activity log; Clear Errors, Enable and home again. Until then the wait ran into its 180 s timeout and
+    reported only "timed out".
+
+    `errors` is the list of error keys the robot reported when the homing ended.
+    """
+
+    def __init__(self, errors):
+        self.errors = list(errors)
+        listed = ", ".join(self.errors) or "none reported"
+        super().__init__(f"homing failed — errors: {listed} (the reason: the dashboard's error list or "
+                         f"logs/activity_rti.log)")

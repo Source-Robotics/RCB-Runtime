@@ -17,6 +17,7 @@ from .exceptions import (
     RobotError, RobotConnectionError, RobotTimeout, CommandRejected, MotionFailed,
     GripFailed,
 )
+from .exceptions import HomingFailed as HomingFailed  # "as": an explicit re-export (2026-10-14)
 
 # dry_run is the ONE module here that is not PC-portable: it imports the planner, the
 # kinematics and pinocchio, i.e. the whole robot-side stack. Importing it eagerly made

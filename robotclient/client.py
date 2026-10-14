@@ -30,7 +30,7 @@ from .constants import (
     DEFAULT_PORT, IMMEDIATE_TIMEOUT, FORCE_TAKE_TIMEOUT, ACK_TIMEOUT, DEFAULT_MOVE_TIMEOUT,
     WAIT_STATE_TIMEOUT, WAIT_HOMED_TIMEOUT,
 )
-from .exceptions import RobotTimeout, MotionFailed, GripFailed
+from .exceptions import RobotTimeout, MotionFailed, GripFailed, HomingFailed
 
 
 class GripperResult:
@@ -701,8 +701,16 @@ class RobotClient:
                 self.wait_mode("HOMING", timeout=3.0)
             except RobotTimeout:
                 pass   # never entered HOMING (already homed / instant) — check below
-            self.wait(lambda s: s.get("homed") is True and s.get("mode") != "HOMING",
-                      WAIT_HOMED_TIMEOUT, "home")
+            self._wait_homed(WAIT_HOMED_TIMEOUT, "home")
+
+    def _wait_homed(self, timeout, what):
+        """Until homed and out of HOMING — or out of HOMING with an error (a failed homing latches one, 2026-10-14):
+        then HomingFailed at once, naming the robot's error keys."""
+        self.wait(lambda s: s.get("mode") != "HOMING" and (s.get("homed") is True or s.get("err") == 1),
+                  timeout, what)
+        st = self.status()
+        if st.get("homed") is not True and st.get("err") == 1:
+            raise HomingFailed(st.get("errors") or [])
 
     def pause(self, wait: bool | None = None) -> None:
         """Brake along the planned path to rest and hold there (EXEC). With wait, returns at rest. resume()."""
@@ -1187,9 +1195,9 @@ class RobotClient:
         self.wait(lambda s: s.get("mode") == mode, timeout, f"wait_mode({mode})")
 
     def wait_homed(self, timeout: float | None = WAIT_HOMED_TIMEOUT) -> None:
-        """Wait until homed and not currently homing (guards a stale HOMED flag)."""
-        self.wait(lambda s: s.get("homed") is True and s.get("mode") != "HOMING",
-                  timeout, "wait_homed")
+        """Wait until homed and not currently homing (guards a stale HOMED flag). HomingFailed when the homing ends in
+        an error instead."""
+        self._wait_homed(timeout, "wait_homed")
 
     # ------------------------------------------------------------------ #
     # Data queries (immediate, never block)

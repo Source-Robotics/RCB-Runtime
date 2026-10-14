@@ -103,7 +103,7 @@ LOOP_ERROR_TICK_FACTOR   = 3.0    # ...or ONE tick longer than 3 periods (12 ms 
                                   # measured <= 5.5 ms; reconnect reloads go one node per tick for this.
 
 # Keys (or key suffixes) that are warnings only — they do not set error_active.
-_WARNING_SUFFIXES = ("CAN_STALE", "HOMING_FAILED", "NOT_HOMED", "LOOP_DEGRADED", "ZONE_WARNING",
+_WARNING_SUFFIXES = ("CAN_STALE", "NOT_HOMED", "LOOP_DEGRADED", "ZONE_WARNING",
                      "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING", "OVERSPEED_WARNING", "TRACKING_WARNING",
                      "TCP_OVERSPEED_WARNING", "HOLD_OSCILLATION_WARNING", "SELF_COLLISION_WARNING", "SELF_COLLISION_STALE",
                      "CAN_REPLY_MISSED_WARNING")
@@ -480,21 +480,17 @@ def _collect_can_errors(shared_data, joint_num, current_errors):
             current_errors.add(_joint_key(i, "CAN_STALE"))
 
 
-def _collect_homing_errors(shared_data, joint_num, current_errors):
-    """NOT_HOMED (a general warning) and HOMING_FAILED per joint."""
+def _collect_homing_errors(shared_data, current_errors, homing_errors=None):
+    """NOT_HOMED (a general warning), and the homing failures the controller reported (J{n}:HOMING_FAILED /
+    GRIPPER_HOMING_FAILED — hard errors since 2026-10-14, user). They used to be read from homing_status == 3 as a
+    warning, which the homing dispatch reset to 0 in the same tick: the error list never showed a failed homing."""
     # ------------------------------------------------------------------
     # Homing state — general warning when robot is not homed
     # ------------------------------------------------------------------
     if shared_data.homed_state.get() != "HOMED":
         current_errors.add("NOT_HOMED")
-
-    # ------------------------------------------------------------------
-    # Homing status (per joint)
-    # homing_status values: 0=idle, 1=running, 2=done, 3=failed
-    # ------------------------------------------------------------------
-    for i in range(joint_num):
-        if shared_data.rti["homing_status"][i] == 3:
-            current_errors.add(_joint_key(i, "HOMING_FAILED"))
+    if homing_errors:
+        current_errors.update(homing_errors)
 
 
 def _collect_gripper_errors(shared_data, joint_num, current_errors, faults=True):
@@ -544,7 +540,7 @@ def _log_new_error(key):
     description = _cause_text(short_key, key)
     if key.startswith("J") and ":" in key:
         joint_idx = key.split(":")[0][1:]      # e.g. "J3:TEMPERATURE" → "3" (the joint's 1-based number)
-        if short_key in ("CAN_STALE", "HOMING_FAILED", "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING",
+        if short_key in ("CAN_STALE", "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING",
                          "OVERSPEED_WARNING", "TRACKING_WARNING", "HOLD_OSCILLATION_WARNING",
                          "CAN_REPLY_MISSED_WARNING"):
             logging.warning(f"[WARNING] Joint {joint_idx}: {description}")
@@ -571,6 +567,7 @@ def check_errors(
     driver_faults: bool = True,
     rti_errors=(),
     can_warnings=(),
+    homing_errors=None,
 ) -> tuple:
     """
     Inspect all error sources and update the latched error set.
@@ -602,7 +599,7 @@ def check_errors(
     if driver_faults:
         _collect_motor_errors(shared_data, joint_num, current_errors)
     _collect_can_errors(shared_data, joint_num, current_errors)
-    _collect_homing_errors(shared_data, joint_num, current_errors)
+    _collect_homing_errors(shared_data, current_errors, homing_errors)
     if active_CAN_gripper:
         _collect_gripper_errors(shared_data, joint_num, current_errors, driver_faults)
 
@@ -631,7 +628,8 @@ def check_errors(
 
     # ------------------------------------------------------------------
     # Decide whether the robot is in a hard error state.
-    # CAN_STALE, HOMING_FAILED and NOT_HOMED are warnings only — they do not set error_active.
+    # CAN_STALE and NOT_HOMED are warnings only — they do not set error_active (HOMING_FAILED is an error since
+    # 2026-10-14).
     # ------------------------------------------------------------------
     hard_errors = {k for k in latched_errors if not k.endswith(_WARNING_SUFFIXES)}
     error_active = bool(hard_errors)
@@ -733,9 +731,10 @@ def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, 
     return current_mode
 
 
-def _update_error_metadata(shared_data, latched_errors, error_metadata):
+def _update_error_metadata(shared_data, latched_errors, error_metadata, details=None):
     """Metadata (timestamp, tick, description, level) for newly latched keys — with an activity-log entry —
-    and removal for cleared ones. Returns True when anything changed."""
+    and removal for cleared ones. Returns True when anything changed. `details` {key: reason}: the reason of an error
+    that carries its own (a failed homing, 2026-10-14) — its description in the error list and the activity log."""
     # ── Update error metadata: add new, prune cleared ────────────────────────
     tick = int(shared_data.rti["loop_tick"][0])
     existing_error_keys = set(error_metadata)
@@ -748,6 +747,9 @@ def _update_error_metadata(shared_data, latched_errors, error_metadata):
     for key in new_error_keys:
         short_key   = key.split(":", 1)[-1]
         description = _cause_text(short_key, key)
+        reason = details.get(key) if details else None
+        if reason:
+            description = f"homing failed: {reason}"
         level = "warning" if short_key in _WARNING_SUFFIXES else "error"
         error_metadata[key] = {"timestamp": now, "tick": tick, "description": description, "level": level}
         # Activity log — debounced per-code so a flapping/marginal fault can't
@@ -759,6 +761,8 @@ def _update_error_metadata(shared_data, latched_errors, error_metadata):
                 joint_msg = f"joint {key.split(':')[0][1:]}"
             elif key.startswith("Z_") and ":" in key:
                 joint_msg = f"zone {key.split(':')[0][2:]}"
+            if reason:
+                joint_msg = f"{joint_msg}: {reason}" if joint_msg else reason
             log_activity(get_rti_activity_logger(), "RTI", level, short_key, message=joint_msg)
     for key in cleared_error_keys:
         del error_metadata[key]
@@ -803,6 +807,7 @@ def process_errors_tick(
     driver_faults: bool = True,
     rti_errors=(),
     can_warnings=(),
+    homing_errors=None,
 ) -> tuple:
     """Run one tick of error processing in the RTI superloop.
 
@@ -826,6 +831,9 @@ def process_errors_tick(
         on_hard_error:          Optional callable(new_hard_keys, tick), called on the ONE tick a hard error
                                 first latches (utility/incident_dump.py saves the last two seconds).
         driver_faults:          False until the settle after RTI's start-up clear is over (check_errors).
+        homing_errors:          {key: reason} — the homing failures the controller reported (2026-10-14): latched
+                                as hard errors, the reason as their description and in the activity log. RTI passes
+                                each once (latched in that call; the latch keeps it until Clear Errors).
 
     Returns:
         (clear_error_countdown, latched_errors, error_metadata, current_mode)
@@ -852,6 +860,7 @@ def process_errors_tick(
         driver_faults=driver_faults,
         rti_errors=rti_errors,
         can_warnings=can_warnings,
+        homing_errors=homing_errors,
     )
     shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
     # rti['safety_violation'] (the status event's "safety" field) finally means something: 1 while
@@ -867,7 +876,7 @@ def process_errors_tick(
         _new_hard = [k for k in latched_errors if k not in error_metadata and not k.endswith(_WARNING_SUFFIXES)]
         if _new_hard:
             on_hard_error(_new_hard, int(shared_data.rti["loop_tick"][0]))
-    if _update_error_metadata(shared_data, latched_errors, error_metadata):
+    if _update_error_metadata(shared_data, latched_errors, error_metadata, homing_errors):
         _publish_error_list(shared_data, error_metadata)
 
     return clear_error_countdown, latched_errors, error_metadata, current_mode

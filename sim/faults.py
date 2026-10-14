@@ -2,7 +2,8 @@
 something go wrong — a drive drops off the bus, reports a fault, loses replies, reboots; the executor or RTI dies in
 the middle of a motion; the E-stop is pressed (the simulated I/O, hardware/gpio_handler.py); S6 (2026-10-13): the five
 drive faults no other scenario raised, and the disturbances of sim/drive_sim.py — a hand pushing a joint past its soft
-limit, a runaway, a lagging drive, a buzzing hold — each tripping its safety-monitor check — and checks the runtime's reaction in the simulated activity log and the drives' real state
+limit, a runaway, a lagging drive, a buzzing hold — each tripping its safety-monitor check; 2026-10-14: a joint that
+cannot reach its endstop while homing (an obstacle: a false stall) — and checks the runtime's reaction in the simulated activity log and the drives' real state
 (the simulator's control channel, sim/drives.request). Run by tools/sim_run.py --faults; RTI's death ends the run, so
 'rti_lost' runs last.
 """
@@ -20,7 +21,8 @@ from utility import sim_mode
 
 ACTIVITY = os.path.join("temp_data", "sim", "logs", "activity_rti.log")
 ORDER = ("node_lost", "drive_fault", "drive_flags", "reply_loss", "drive_reboot", "hand_push", "push_through",
-         "runaway", "tracking_lag", "hold_buzz", "executor_lost", "estop", "rti_lost")
+         "runaway", "tracking_lag", "hold_buzz", "homing_false_stall", "executor_lost", "estop", "rti_lost")
+ARMS = os.path.join("temp_data", "sim", "data", "homing_arms.json")    # the simulated arm table (project_paths)
 # gpio_states (uint8[16], data/shared_data.py) read as a FILE, with the name prefix shared_data applies — never
 # attached (importing data.shared_data attaches every segment). In simulation the inputs live here.
 GPIO_SHM = "/dev/shm/" + os.environ.get("RCB_SHM_PREFIX", "") + "GPIO"   # nosec B108 — shared memory, not a temp file
@@ -484,6 +486,79 @@ def hold_buzz(ctx, notes):
         r.disconnect()
 
 
+def _known_arm(ctx):
+    """True when the simulated arm table holds a KNOWN arm (robotics/homing_arms.py: learned after 3 homings)."""
+    try:
+        with open(os.path.join(ctx.root, ARMS)) as fh:
+            return any(a.get("known") for a in json.load(fh).get("arms", []))
+    except (OSError, ValueError):
+        return False
+
+
+def _alias_deg(ctx, j):
+    """Where joint j's drive is now against its endstop, in joint degrees: (all the way, modulo one motor revolution).
+    The arm check compares latches modulo a revolution, so an obstacle that far is all it can see of a false stall."""
+    n = ctx.nodes()[j]
+    rev = 2.0 ** float(_cfg()["motor_encoder"][j])
+    per_tick = 360.0 / rev / abs(float(_cfg()["gear_ratio"][j]))
+    d = abs(n["position"] - n["stop"])
+    return d * per_tick, min(d % rev, rev - d % rev) * per_tick
+
+
+def homing_false_stall(ctx, notes):
+    """J2 cannot reach its endstop while homing — an obstacle where it starts (2026-10-14, the user's case: J2 left
+    away from its park pose, a load the homing current cannot lift; or something in the way). It stalls there, backs
+    off, stalls there again: the two passes agree, so only the arm check can tell. With a known arm J2 must FAIL as soon
+    as it homes — J2:HOMING_FAILED latched as an ERROR (disabled, in the status' errors), its reason in the activity
+    log, not homed; then the obstacle gone + Clear Errors + Enable + Home -> homed. Starts from a fresh homing, so the
+    obstacle sits at the homing sequence's own end pose (deterministic)."""
+    r = ctx.robot()
+    try:
+        ctx.ready(r)
+        for n in range(1, 4):                            # the end pose; on a fresh tree the arm table learns the arm
+            r.enter_idle_mode(wait=True)                 # homing starts from IDLE (a scenario before may leave EXEC)
+            r.home(wait=True)
+            if _known_arm(ctx):
+                break
+            notes.append(f"homing {n}: the arm table is still learning the simulated arm")
+            ctx.ready(r)
+        if not _known_arm(ctx):
+            notes.append("no KNOWN arm in the simulated arm table after 3 homings — the check cannot run")
+            return False
+        full, seen = _alias_deg(ctx, 1)
+        notes.append(f"J2's obstacle: {full:.1f} deg before its endstop — {seen:.2f} deg modulo a motor revolution "
+                     f"(what the arm check sees; > 1 deg needed)")
+        ctx.ready(r)
+        r.enter_idle_mode(wait=True)
+        mark = ctx.activity_mark()
+        ctx.sim(cmd="physics", node=1, kind="block", ms=600000)
+        r.home(wait=False)
+        if not _wait(lambda: r.status().get("mode") == "HOMING", 3.0):
+            notes.append(f"the homing never started (mode {r.status().get('mode')})")
+            return False
+        failed = _wait(lambda: [e for e in ctx.activity_since(mark) if e.get("code") == "HOMING_FAILED"], 90.0)
+        _wait(lambda: r.status().get("err") == 1 and r.status().get("mode") != "HOMING", 2.0)
+        st = r.status()
+        msg = failed[0].get("message", "") if failed else ""
+        notes.append(f"activity: {failed[0].get('level') if failed else None} HOMING_FAILED '{msg[:150]}'")
+        notes.append(f"status: err={st.get('err')} state={st.get('state')} mode={st.get('mode')} "
+                     f"homed={st.get('homed')} errors={st.get('errors')}")
+        caught = (bool(failed) and failed[0].get("level") == "error" and msg.startswith("joint 2:")
+                  and "checked as soon as it homed" in msg and st.get("err") == 1 and st.get("homed") is not True
+                  and st.get("state") != "ENABLED" and "J2:HOMING_FAILED" in (st.get("errors") or []))
+    finally:
+        ctx.sim(cmd="physics", node=1, kind="clear")
+    r.clear_errors(wait=True)
+    time.sleep(0.3)
+    r.enable(wait=True)
+    r.enter_idle_mode(wait=True)
+    r.home(wait=True)
+    st = r.status()
+    notes.append(f"obstacle gone + Clear Errors + Enable + Home: homed={st.get('homed')} err={st.get('err')}")
+    r.disconnect()
+    return caught and seen > 1.0 and st.get("homed") is True and st.get("err") == 0
+
+
 def rti_lost(ctx, notes):
     """RTI killed while J1 approaches its endstop in SPEED mode (homing): every drive's CAN watchdog (100 ms) must trip
     ~100 ms after the last command, and J1 stop there — not run on to the endstop (with 5 s it would have)."""
@@ -512,4 +587,5 @@ def rti_lost(ctx, notes):
 
 
 SCENARIOS = {f.__name__: f for f in (node_lost, drive_fault, drive_flags, reply_loss, drive_reboot, hand_push,
-                                     push_through, runaway, tracking_lag, hold_buzz, executor_lost, estop, rti_lost)}
+                                     push_through, runaway, tracking_lag, hold_buzz, homing_false_stall, executor_lost,
+                                     estop, rti_lost)}

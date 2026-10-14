@@ -187,6 +187,13 @@ class JointHomingState:
         # This homing's numbers for the arm table's history (robotics/homing_arms.py, 2026-10-09): set in _do_settle
         self.two_pass_diff     = None   # ticks between the two stalls
         self.release_relaxed   = None   # ticks the release let the joint move from its stall
+        # 2026-10-14: how far the joint travelled from its start to pass 1's endstop (ticks / s) — measured, not yet
+        # judged (user: "measure the travel first"); and why it failed, for the error the controller raises.
+        self._start_pos        = None   # the first valid position read on pass 1's approach
+        self._last_valid_pos   = None   # the newest valid position read on an approach (a read can come back None)
+        self.travel_ticks      = None
+        self.travel_s          = None
+        self.fail_reason       = None
 
     # ------------------------------------------------------------------
     @property
@@ -241,6 +248,11 @@ class JointHomingState:
         self._limits_sent      = False
         self.two_pass_diff     = None
         self.release_relaxed   = None
+        self._start_pos        = None
+        self._last_valid_pos   = None
+        self.travel_ticks      = None
+        self.travel_s          = None
+        self.fail_reason       = None
 
     @property
     def _label(self) -> str:
@@ -345,69 +357,7 @@ class JointHomingState:
             # Endstop/stall joint — velocity mode; detect stall + current spike
             motor.Send_data_pack_1(Position=None, Speed=speed, Current=0)
 
-            curr_pos = motor.position
-
-            # ── Windowed stall detection ──
-            # Instead of comparing adjacent positions (noisy at low speed / high
-            # loop rate), check total displacement over a _stall_window.
-            # If the motor moved less than stall_distance_threshold over the
-            # entire window, it is stalled.
-            stall_distance_threshold = max(
-                10, int(abs(speed) * self._STALL_TIME * 0.25)
-            )
-
-            if curr_pos is not None:
-                if self._stall_ref_pos is None:
-                    # First valid position reading — start the window
-                    self._stall_ref_pos = int(curr_pos)
-                    self._stall_count   = 0
-                else:
-                    displacement = abs(int(curr_pos) - self._stall_ref_pos)
-                    if displacement < stall_distance_threshold:
-                        # Not moving — count up toward the stall window
-                        self._stall_count += 1
-                    else:
-                        # Clearly moving — reset the window from current position
-                        self._stall_ref_pos = int(curr_pos)
-                        self._stall_count   = 0
-            self._last_pos = curr_pos
-
-            # ── Current detection ──
-            # Use a ratio-based approach: count how many of the last N ticks
-            # had current above threshold.  Trigger when ≥ 60% of ticks in the
-            # window are above threshold.  This handles noisy current that
-            # oscillates around the threshold (common at low homing speeds).
-            curr_current = motor.current if motor.current is not None else 0
-            abs_current = abs(curr_current)
-            if self._tick_count > self._startup_guard:
-                if abs_current >= self._current_detect_ma:
-                    self._current_count += 1
-                    self._current_above += 1
-                else:
-                    self._current_count += 1
-                    # Don't increment _current_above
-
-                # Check if we have enough samples in the window
-                current_window_ok = (
-                    self._current_count >= self._current_threshold
-                    and self._current_above >= int(self._current_threshold * 0.6)
-                )
-            else:
-                current_window_ok = False
-
-            # ── Trigger ──
-            # Primary: current above threshold for enough of the window
-            # Secondary gate: position must be stalling (not a transient spike)
-            stall_ok = self._stall_count >= self._stall_window
-            if current_window_ok and stall_ok:
-                endstop_hit      = True
-                detection_method = (
-                    f"current+stall (I={abs_current:.0f}mA, threshold="
-                    f"{self._current_detect_ma:.0f}mA, above={self._current_above}/"
-                    f"{self._current_count} ticks, "
-                    f"displacement={abs(int(curr_pos) - self._stall_ref_pos) if curr_pos is not None else '?'} "
-                    f"< {stall_distance_threshold} for {self._stall_count} ticks)"
-                )
+            endstop_hit, detection_method = self._detect_stall(motor, speed)
 
         if endstop_hit:
             pass_label = f"pass {self._pass}"
@@ -443,9 +393,25 @@ class JointHomingState:
             # Stop the motor immediately
             motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
 
+            if not self.has_hall_sensor:
+                # The position at the stall: this tick's read, else the newest valid one of the approach (the stall
+                # window has just confirmed it moved less than the threshold since). A read can come back None (the
+                # library wipes it for a health-poll reply); on 2026-10-14 pass 1's None made the two-pass check skip
+                # a false stall.
+                stall_pos = motor.position if motor.position is not None else self._last_valid_pos
+                if self._pass == 1 and self._start_pos is not None and stall_pos is not None:
+                    self.travel_ticks = int(stall_pos) - self._start_pos
+                    self.travel_s = self._tick_count * self.dt
+                    logging.info(
+                        f"[Homing] {self._label} travel to the endstop (pass 1): {self.travel_ticks:+d} ticks in "
+                        f"{self.travel_s:.3f} s (from {self._start_pos} to {stall_pos})")
             if self._pass == 1 and self.two_pass and not self.has_hall_sensor:
                 # Save pass 1 endstop position for later comparison with pass 2
-                self._pass1_pos = motor.position
+                self._pass1_pos = stall_pos
+                if self._pass1_pos is None:
+                    self._fail(shared_data, "no position was read on the way to the endstop (pass 1) — the two passes "
+                                            "cannot be compared")
+                    return 'running'
                 # Dwell briefly to let the motor actually stop before reversing.
                 # Hall sensor joints skip two-pass: the digital edge IS the
                 # reference, a second approach doesn't improve accuracy.
@@ -454,7 +420,7 @@ class JointHomingState:
             elif self._release_enabled:
                 # Release phase: command a controlled current to relieve gearbox
                 # preload, then latch the true resting endstop position.
-                self._pass2_stall_pos = motor.position
+                self._pass2_stall_pos = stall_pos if not self.has_hall_sensor else motor.position
                 self._phase         = self._RELEASE
                 self._release_count = 0
                 self._release_reads = []
@@ -470,6 +436,81 @@ class JointHomingState:
                 self._settle_count = 0
 
         return 'running'
+
+    # ------------------------------------------------------------------
+    def _detect_stall(self, motor, speed):
+        """A stall joint's endstop test for this tick: the position window, the current window, the trigger. Returns
+        (endstop_hit, detection_method). Moved out of _do_homing verbatim (2026-10-14: its complexity, radon)."""
+        endstop_hit     = False
+        detection_method = ''
+        curr_pos = motor.position
+        if curr_pos is not None:
+            self._last_valid_pos = int(curr_pos)
+            if self._pass == 1 and self._start_pos is None:
+                self._start_pos = int(curr_pos)
+
+        # ── Windowed stall detection ──
+        # Instead of comparing adjacent positions (noisy at low speed / high
+        # loop rate), check total displacement over a _stall_window.
+        # If the motor moved less than stall_distance_threshold over the
+        # entire window, it is stalled.
+        stall_distance_threshold = max(
+            10, int(abs(speed) * self._STALL_TIME * 0.25)
+        )
+
+        if curr_pos is not None:
+            if self._stall_ref_pos is None:
+                # First valid position reading — start the window
+                self._stall_ref_pos = int(curr_pos)
+                self._stall_count   = 0
+            else:
+                displacement = abs(int(curr_pos) - self._stall_ref_pos)
+                if displacement < stall_distance_threshold:
+                    # Not moving — count up toward the stall window
+                    self._stall_count += 1
+                else:
+                    # Clearly moving — reset the window from current position
+                    self._stall_ref_pos = int(curr_pos)
+                    self._stall_count   = 0
+        self._last_pos = curr_pos
+
+        # ── Current detection ──
+        # Use a ratio-based approach: count how many of the last N ticks
+        # had current above threshold.  Trigger when ≥ 60% of ticks in the
+        # window are above threshold.  This handles noisy current that
+        # oscillates around the threshold (common at low homing speeds).
+        curr_current = motor.current if motor.current is not None else 0
+        abs_current = abs(curr_current)
+        if self._tick_count > self._startup_guard:
+            if abs_current >= self._current_detect_ma:
+                self._current_count += 1
+                self._current_above += 1
+            else:
+                self._current_count += 1
+                # Don't increment _current_above
+
+            # Check if we have enough samples in the window
+            current_window_ok = (
+                self._current_count >= self._current_threshold
+                and self._current_above >= int(self._current_threshold * 0.6)
+            )
+        else:
+            current_window_ok = False
+
+        # ── Trigger ──
+        # Primary: current above threshold for enough of the window
+        # Secondary gate: position must be stalling (not a transient spike)
+        stall_ok = self._stall_count >= self._stall_window
+        if current_window_ok and stall_ok:
+            endstop_hit      = True
+            detection_method = (
+                f"current+stall (I={abs_current:.0f}mA, threshold="
+                f"{self._current_detect_ma:.0f}mA, above={self._current_above}/"
+                f"{self._current_count} ticks, "
+                f"displacement={abs(int(curr_pos) - self._stall_ref_pos) if curr_pos is not None else '?'} "
+                f"< {stall_distance_threshold} for {self._stall_count} ticks)"
+            )
+        return endstop_hit, detection_method
 
     # ------------------------------------------------------------------
     def _do_pre_clear(self, motor) -> str:
@@ -627,10 +668,10 @@ class JointHomingState:
                         f"(tick {self._settle_count})"
                     )
                     return 'running'
-                logging.error(
-                    f"[Homing] {self._label} settle: motor.position never became valid — "
-                    f"home reference NOT set, joint will be uncalibrated"
-                )
+                # A joint without a reference is not homed (2026-10-14: it used to carry on, uncalibrated).
+                self._fail(shared_data, "its position never read valid at the endstop — no home reference")
+                self._restore_limits(motor)
+                return 'failed'
 
         # Two-pass consistency check: if both passes recorded a position,
         # verify they agree within tolerance. A large difference means the
@@ -656,6 +697,9 @@ class JointHomingState:
                 f"max={self._two_pass_max_diff})"
             )
             if diff > self._two_pass_max_diff:
+                self.fail_reason = (f"the two passes stopped {diff} ticks apart (max {self._two_pass_max_diff}) — "
+                                    f"the endstop trigger is not repeatable (a false stall: the joint could not move, "
+                                    f"or something blocked it?)")
                 logging.error(
                     f"[Homing] {self._label} FAILED: two-pass difference "
                     f"{diff} ticks exceeds max {self._two_pass_max_diff} — "
@@ -761,6 +805,7 @@ class JointHomingState:
 
     # ------------------------------------------------------------------
     def _fail(self, shared_data, reason: str):
+        self.fail_reason = reason
         logging.error(f"[Homing] {self._label} FAILED: {reason}")
         shared_data.rti["homing_status"][self.j] = STATUS_FAILED
         self._phase = self._FAILED

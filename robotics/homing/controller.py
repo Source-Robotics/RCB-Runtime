@@ -157,7 +157,12 @@ class HomingController:
         # its gravity current as feedforward — the zero-speed hold let J2 / J3 sink back toward their endstops while the
         # later steps ran (16 homings ended with a joint past its soft limit) {j: motor ticks}
         self._hold_pos: dict = {}
-        self._homing_stats: dict = {}                     # {j: (two-pass diff, release relaxation)} for the history
+        self._homing_stats: dict = {}                     # {j: (two-pass diff, release relaxation, travel)} history
+        # 2026-10-14 (user: a failed homing is a latched ERROR naming its reason): every failure as (error key, reason),
+        # taken by RTI (take_failures) and latched by the error pass until Clear Errors. Before, the only trace was
+        # homing_status = 3, which the dispatch reset to 0 in the same tick — the error list never showed it.
+        self._failures: list = []
+        self.has_failures = False
 
     # ------------------------------------------------------------------
     # Public time-based properties — backward compat
@@ -585,6 +590,7 @@ class HomingController:
             result = state.tick(Motor[j], joint_obj, shared_data)
 
             if result == 'failed':
+                self._report_failure(j, getattr(state, 'fail_reason', None) or "it failed (see RTI.log)")
                 self._seq_phase = self._FAILED
                 return 'failed'
             elif result == 'done':
@@ -598,7 +604,7 @@ class HomingController:
                 pass
             elif state._triggered_pos is not None:
                 self._homed_results[j] = state._triggered_pos
-                self._homing_stats[j] = (state.two_pass_diff, state.release_relaxed)
+                self._homing_stats[j] = (state.two_pass_diff, state.release_relaxed, state.travel_ticks)
                 # For gripper: compute and store ticks_per_meter conversion factor
                 if j >= self._arm_count and hasattr(self, '_gripper_stroke_mm'):
                     stroke_m = self._gripper_stroke_mm / 1000.0
@@ -633,11 +639,20 @@ class HomingController:
                         if gear_r > 0:
                             shared_data.gripper['gripper_gear_r'][0] = gear_r
             else:
-                logging.warning(
-                    f"[Homing] {self._jlabel(j, Motor)} completed but _triggered_pos is None "
-                    f"— home reference was not set (CAN read failure during settle)"
-                )
+                # A joint that completed without a reference is not homed (2026-10-14: this was a warning, and the
+                # sequence went on).
+                reason = "it completed without a home reference (no valid position read at the endstop)"
+                logging.error(f"[Homing] {self._jlabel(j, Motor)} FAILED: {reason}")
+                shared_data.rti["homing_status"][j] = STATUS_FAILED
+                self._report_failure(j, reason)
+                self._seq_phase = self._FAILED
+                return 'failed'
             del self._active_states[j]
+            # Each arm joint against where this arm always homes, AT ONCE (2026-10-14, user) — not only once the
+            # whole sequence is through: the steps after it move joints on their references (today's J2 false stall
+            # would have been driven 1.4 rad on a wrong one, only J3's own failure stopped it).
+            if j < self._arm_count and j in self._homed_results and not self._check_arm_so_far(j, shared_data):
+                return 'failed'
 
         # Update legacy compat pointers
         if self._active_states:
@@ -687,11 +702,14 @@ class HomingController:
         arm_stats = {j: v for j, v in self._homing_stats.items() if j < self._arm_count}
         verdict = self.arm_check.judge_and_learn(latches, {
             "duration_s": round(self._seq_ticks * self.dt, 2),
-            "two_pass": {j: v[0] for j, v in arm_stats.items()}, "relaxed": {j: v[1] for j, v in arm_stats.items()}})
+            "two_pass": {j: v[0] for j, v in arm_stats.items()}, "relaxed": {j: v[1] for j, v in arm_stats.items()},
+            "travel": {j: v[2] for j, v in arm_stats.items()}})
         if verdict["kind"] == "fault":
             logging.error(verdict["text"])
-            for j, _ in verdict["off"]:
+            for j, d in verdict["off"]:
                 shared_data.rti["homing_status"][j] = STATUS_FAILED
+                self._report_failure(j, f"it homed {d:+.2f} deg from where this arm always homes — "
+                                        f"{verdict['text'].split(' — ', 1)[-1]}")
             self._seq_phase = self._FAILED
             return False
         (logging.warning if verdict["kind"] == "relearn" else logging.info)(verdict["text"])
@@ -730,8 +748,40 @@ class HomingController:
         spd = int(self.homing_speeds[j] * factor)
         return -spd if int(self.homing_directions[j]) == 1 else spd
 
+    def _check_arm_so_far(self, j: int, shared_data) -> bool:
+        """The arm joints homed so far against the arm the table recognised from them (homing_arms.HomingArms.
+        check_so_far). False — the sequence FAILED, the joint's homing_status FAILED — when an arm was recognised from the
+        first joints and this one homed off its spot. No check attached: True."""
+        if self.arm_check is None:
+            return True
+        latches = {i: int(p) for i, p in self._homed_results.items() if i < self._arm_count}
+        verdict = self.arm_check.check_so_far(latches, j)
+        if verdict["kind"] != "fault":
+            if verdict.get("text"):
+                logging.info(verdict["text"])
+            return True
+        logging.error(verdict["text"])
+        for i, d in verdict["off"]:
+            shared_data.rti["homing_status"][i] = STATUS_FAILED
+            self._report_failure(i, verdict["reason"])
+        self._seq_phase = self._FAILED
+        return False
+
+    def _report_failure(self, j: int, reason: str):
+        """One failure for the error pass: J{n}:HOMING_FAILED for an arm joint, GRIPPER_HOMING_FAILED for the gripper."""
+        key = f"J{j + 1}:HOMING_FAILED" if j < self._arm_count else "GRIPPER_HOMING_FAILED"
+        self._failures.append((key, str(reason)))
+        self.has_failures = True
+
+    def take_failures(self) -> list:
+        """The failures reported since the last call ([] if none) — RTI's error pass latches them."""
+        out, self._failures = self._failures, []
+        self.has_failures = False
+        return out
+
     def _fail(self, j: int, shared_data, reason: str):
         """Backward compat — fail the sequence."""
         logging.error(f"[Homing] {self._jlabel(j, self._Motor)} FAILED: {reason}")
+        self._report_failure(j, reason)
         shared_data.rti["homing_status"][j] = STATUS_FAILED
         self._seq_phase = self._FAILED

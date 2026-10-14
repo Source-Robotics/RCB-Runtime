@@ -9,7 +9,8 @@ Runs at normal priority on the general cores; SIGTERM / Ctrl-C stops it. S4 (202
 udp 127.0.0.1:SIMULATOR_PORT (config/networking.py) — JSON requests: {"cmd": "state"}, {"cmd": "silence" | "reboot",
 "node": n, "ms": t}, {"cmd": "fault", "node": n, "kind": FAULTS | "clear"}, {"cmd": "drop", "node": n, "every": k,
 "ms": t}; request() sends one (sim/faults.py). S6: {"cmd": "physics", "node": n, "kind": "push" | "runaway" (speed,
-ticks/s) | "lag" (tau, s) | "buzz" (ma, hz) | "clear", "ms": t} — the disturbances of sim/drive_sim.py.
+ticks/s) | "lag" (tau, s) | "buzz" (ma, hz) | "block" (dir: +1 / -1, default the endstop's side) | "clear", "ms": t}
+— the disturbances of sim/drive_sim.py.
 """
 from __future__ import annotations
 
@@ -107,9 +108,10 @@ def drive_state(d, f, ms):
             "mode": d.mode, "error": bool(d.error), "watchdog_error": bool(d.watchdog_error), "fault": d.fault,
             "estop_error": bool(d.estop_error), "wd_time_ms": d.wd_time_ms, "last_cmd_ms": d.last_cmd_ms,
             "trip_ms": d.trip_ms, "current_limit": d.current_limit, "velocity_limit": d.velocity_limit,
-            "silent": f.silent(ms), "dropped": f.dropped, "frames": d.frames, "gripper": d.gripper,
+            "silent": f.silent(ms), "dropped": f.dropped, "frames": d.frames, "gripper": d.gripper, "stop": d.stop,
             "physics": {k: v for k, v in (("push", d.push_until_ms > ms), ("runaway", d.runaway_until_ms > ms),
-                                          ("lag", d.lag_until_ms > ms), ("buzz", d.buzz_until_ms > ms)) if v}}
+                                          ("lag", d.lag_until_ms > ms), ("buzz", d.buzz_until_ms > ms),
+                                          ("block", d.block_until_ms > ms)) if v}}
 
 
 def control(drives, faults, msg, ms):
@@ -147,10 +149,14 @@ def control(drives, faults, msg, ms):
             d.lag_tau, d.lag_until_ms = max(0.0, _num(msg.get("tau"), 0.0)), until
         elif kind == "buzz":
             d.buzz_ma, d.buzz_hz, d.buzz_until_ms = _num(msg.get("ma"), 0.0), _num(msg.get("hz"), 60.0), until
+        elif kind == "block":                            # an obstacle where the joint is now, on one side
+            side = msg.get("dir")
+            d.block_at, d.block_until_ms = d.position, until
+            d.block_dir = (1 if side > 0 else -1) if isinstance(side, (int, float)) and side else d.stop_dir
         elif kind in (None, "clear", ""):
-            d.push_until_ms = d.runaway_until_ms = d.lag_until_ms = d.buzz_until_ms = -1
+            d.push_until_ms = d.runaway_until_ms = d.lag_until_ms = d.buzz_until_ms = d.block_until_ms = -1
         else:
-            return {"ok": False, "error": f"physics kind {kind!r} not in push, runaway, lag, buzz, clear"}
+            return {"ok": False, "error": f"physics kind {kind!r} not in push, runaway, lag, buzz, block, clear"}
     else:
         return {"ok": False, "error": f"unknown command {cmd!r}"}
     return {"ok": True, "now_ms": ms}

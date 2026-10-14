@@ -435,7 +435,9 @@ class _HomingDispatch:
         elif result == 'failed':
             ctx.shared_data.homed_state.set("NOT HOMED")
             ctx.shared_data.rti["homing_status"][:] = 0
-            pending = RobotMode.IDLE
+            # A reported failure latches as a hard error in this tick's error pass (2026-10-14), which ends HOMING
+            # itself (ACTIVE_ERROR, disabled); asking for IDLE as well would flip the mode to IDLE for a tick.
+            pending = None if self._homing_ctrl.has_failures else RobotMode.IDLE
         return TickResult(
             pending_mode=pending,
             gripper_owned=self._homing_ctrl.gripper_homing_active,

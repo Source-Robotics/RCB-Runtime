@@ -40,6 +40,7 @@ class GripperHomingState:
         self._phase      = self._CALIBRATING
         self._tick_count = 0
         self._sent_cmd   = False
+        self.fail_reason = None      # why it failed, for the error the controller raises (2026-10-14)
 
     @property
     def _label(self) -> str:
@@ -58,6 +59,7 @@ class GripperHomingState:
         self._phase      = self._CALIBRATING
         self._tick_count = 0
         self._sent_cmd   = False
+        self.fail_reason = None
 
     def tick(self, motor, joint_or_none, shared_data) -> str:
         """
@@ -92,6 +94,7 @@ class GripperHomingState:
                     f"[Homing] {self._label} motor object has no "
                     f"Send_gripper_calibrate method"
                 )
+                self.fail_reason = "its driver object cannot send a firmware calibration"
                 shared_data.rti["homing_status"][self.j] = STATUS_FAILED
                 self._phase = self._FAILED
                 return 'failed'
@@ -117,6 +120,8 @@ class GripperHomingState:
 
         # Timeout
         if self._tick_count > self._timeout_ticks:
+            self.fail_reason = (f"its firmware calibration did not finish within {self.timeout_s:.1f} s — check that the "
+                                f"jaws can move freely and the gripper is powered")
             logging.error(
                 f"[Homing] {self._label} firmware calibration timed out "
                 f"({self.timeout_s:.1f} s)"

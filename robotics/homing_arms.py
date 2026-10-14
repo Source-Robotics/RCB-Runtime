@@ -140,7 +140,9 @@ def history_entry(verdict: dict, utc: str, stats: dict | None) -> dict:
     return {"utc": utc, "kind": verdict["kind"], "duration_s": stats.get("duration_s"),
             "devs": {f"J{j + 1}": round(float(d), 4) for j, d in sorted(verdict.get("devs", {}).items())},
             "two_pass": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("two_pass") or {}).items()) if v is not None},
-            "relaxed": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("relaxed") or {}).items()) if v is not None}}
+            "relaxed": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("relaxed") or {}).items()) if v is not None},
+            # pass 1's travel from where the joint started to its endstop, motor ticks (2026-10-14: measured first)
+            "travel": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("travel") or {}).items()) if v is not None}}
 
 
 def apply(table: dict, verdict: dict, latches: dict, gripper: str, utc: str, stats: dict | None = None,
@@ -315,6 +317,8 @@ class HomingArms:
         self._fresh = None
         self._q: queue.Queue = queue.Queue()
         self._thread = None
+        self._so_far_arm = None        # check_so_far: the arm recognised from the first joints homed
+        self._so_far_off = False       # ... none recognised: nothing judged before the end
 
     def start(self) -> None:
         if self.path and self._thread is None:
@@ -323,8 +327,56 @@ class HomingArms:
 
     def on_homing_start(self) -> None:
         """Pick up `tools/homing_arms.py` edits made since the last homing (read off the RT thread)."""
+        self._so_far_arm = None
+        self._so_far_off = False
         if self._thread is not None:
             self._q.put(("load", None))
+
+    def check_so_far(self, latches: dict, j: int) -> dict:
+        """Mid-homing (2026-10-14, user: "check each joint at once"): joint `j` just homed; `latches` = every arm joint
+        homed so far. The arm is recognised as soon as one KNOWN arm has every joint homed so far at its usual spot;
+        each joint homed after that must be at that arm's spot too, else {"kind": "fault"} — recorded like the final
+        check's fault (last_failed + the history: 'Accept as new reference' works the same). When the first joints
+        match no known arm (another arm?) nothing is judged before the end: the final check decides, as before. In
+        memory on the RT thread (the save is queued)."""
+        fresh, self._fresh = self._fresh, None
+        if fresh is not None:
+            self.table = fresh
+        if self._so_far_off:
+            return {"kind": "skip"}
+        keys = {i: joint_key(i, self.gripper_dependent, self.gripper) for i in latches}
+        if self._so_far_arm is None:
+            known = [a for a in self.table["arms"] if a.get("known")]
+            for arm in known:
+                _, compared, off, _ = compare(arm, latches, keys, self.counts, self.gears)
+                if compared and not off:
+                    self._so_far_arm = arm["id"]
+                    return {"kind": "ok", "text": f"[Homing] arm recognised from the joints homed so far: "
+                                                  f"{arm_label(arm)} — each joint homed from now on is checked at once"}
+            self._so_far_off = True
+            if not known:                       # still learning the first arm: the end check says so
+                return {"kind": "skip"}
+            return {"kind": "skip", "text": "[Homing] the first joint(s) homed match none of the known arms (another "
+                                            "arm?) — checked once the whole sequence is through"}
+        arm = next((a for a in self.table["arms"] if a["id"] == self._so_far_arm), None)
+        if arm is None:
+            return {"kind": "skip"}
+        _, _, off, devs = compare(arm, {j: latches[j]}, keys, self.counts, self.gears)
+        if not off:
+            return {"kind": "ok"}
+        verdict = {"kind": "fault", "arm": arm["id"], "off": off, "devs": devs, "keys": keys}
+        apply(self.table, verdict, latches, self.gripper, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()), {},
+              self.prefix)
+        if self._thread is not None:
+            self._q.put(("save", copy.deepcopy(self.table)))
+        d = off[0][1]
+        why = (f"it homed {d:+.2f} deg from where arm {arm_label(arm)} always homes — checked as soon as it homed: a "
+               f"false stall (could it move? was it at its park pose? something in the way?), a skipped belt or a "
+               f"slipping coupling. Move it to its park pose and home again; after a deliberate mechanical change: "
+               f"System Info > 'Arms (homing)' > 'Accept as new reference'")
+        verdict["reason"] = why
+        verdict["text"] = f"[Homing] FAILED: J{j + 1} — {why}"
+        return verdict
 
     def judge_and_learn(self, latches: dict, stats: dict | None = None, utc: str | None = None) -> dict:
         """Called on the real-time thread when the homing sequence is complete: judge, fold in (with homing's own stats
