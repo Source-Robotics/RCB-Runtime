@@ -38,7 +38,7 @@
 
     <!-- Kinematic / dynamics parameters — used by PAR6.py to build the DH tool link -->
     <kinematics>
-        <d>-0.11745</d>                                                                    <!-- DH link offset [m] -->
+        <d>-0.1409</d>                                                                    <!-- DH link offset [m] -->
         <a>0.0</a>                                                                         <!-- DH link length [m] -->
         <alpha>3.141592653589793</alpha>                                                   <!-- DH twist angle [rad] -->
         <mass>0.41484</mass>                                                               <!-- total mass [kg] -->

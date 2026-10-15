@@ -34,8 +34,8 @@
 
     <!-- Kinematic / dynamics parameters — used by PAR6.py to build the DH tool link -->
     <kinematics>
-        <d>-0.11745</d>                                                                    <!-- DH link offset [m] TODO: measure for this variant -->
-        <a>0.0</a>                                                                         <!-- DH link length [m] -->
+        <d>-0.1409</d>                                                                    <!-- DH link offset [m] — the MSG's TCP; every MSG variant shares it (user, 2026-10-15) -->
+        <a>-0.02835</a>                                                                         <!-- DH link length [m] -->
         <alpha>3.141592653589793</alpha>                                                   <!-- DH twist angle [rad] -->
         <mass>0.37621</mass>                                                               <!-- total mass [kg] TODO: measure -->
         <com>0.03362 0.00122 -0.06832</com>                                              <!-- center of mass x y z [m] TODO: measure -->
