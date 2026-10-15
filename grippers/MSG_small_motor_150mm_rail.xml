@@ -33,7 +33,7 @@
          step abandons an unfinished one, whose timeout the firmware keeps counting (the 12th homing in a row failed).
          Measured on this gripper: ~4.5 s from where homing leaves the jaws (position 252). Missing -> 2.0 s. -->
     <homing_calibration_wait_s>5.5</homing_calibration_wait_s>
-    <homing_two_pass>1</homing_two_pass>
+    <homing_two_pass>0</homing_two_pass>   <!-- 2026-10-14 (user, homing time -3.6 s): was 1; its two passes agreed within 0-3 ticks (~0.02 mm) in 151 homings -->
     <homing_two_pass_max_diff>200</homing_two_pass_max_diff>
     <homing_backoff_s>0.8</homing_backoff_s>
     <homing_order>7</homing_order>

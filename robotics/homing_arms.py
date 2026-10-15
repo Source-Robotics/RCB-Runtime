@@ -149,8 +149,10 @@ def history_entry(verdict: dict, utc: str, stats: dict | None) -> dict:
             "relaxed": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("relaxed") or {}).items()) if v is not None},
             # pass 1's travel from where the joint started to its endstop, motor ticks (2026-10-14: measured first)
             "travel": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("travel") or {}).items()) if v is not None},
-            # where an <approach> stopped, minus the joint's latch, motor ticks (2026-10-14: check_approach learns it)
-            "approach": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("approach") or {}).items()) if v is not None}}
+            # where an <approach> stopped (at its soft contact), minus the joint's latch, motor ticks (2026-10-14:
+            # check_approach learns it; "approach" held the earlier, pressed arrivals — not comparable, not read)
+            "approach_contact": {f"J{j + 1}": int(v) for j, v in sorted((stats.get("approach") or {}).items())
+                                 if v is not None}}
 
 
 def apply(table: dict, verdict: dict, latches: dict, gripper: str, utc: str, stats: dict | None = None,
@@ -271,8 +273,8 @@ def approach_spot(arm: dict, key: str):
     recorded it and homed consistently — new / learning / known, not a fault or a relearn — motor ticks) — None until
     APPROACH_MIN homings recorded it."""
     name = key.split("@")[0]
-    vals = [e["approach"][name] for e in arm.get("history", [])
-            if e.get("kind") in ("new", "learning", "known") and name in (e.get("approach") or {})][-20:]
+    vals = [e["approach_contact"][name] for e in arm.get("history", [])
+            if e.get("kind") in ("new", "learning", "known") and name in (e.get("approach_contact") or {})][-20:]
     vals.sort()
     return vals[len(vals) // 2] if len(vals) >= APPROACH_MIN else None
 

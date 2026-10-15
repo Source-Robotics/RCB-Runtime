@@ -148,7 +148,10 @@ class HomingController:
         self._post_move_list = []                         # sequence-level post moves
         self._move_to_targets: dict = {}                  # {j: {position_rad, duration_ticks, start_ticks, end_ticks, done}}
         self._move_to_tick = 0
+        self._move_to_min_ticks = 0                       # a move_to step with a <gripper_move> lasts at least this
         self._last_gripper_move: tuple = None             # last gripper_move params — replayed as idle hold
+        self._gripper_claimed = False                     # the gripper has had a homing step: homing keeps its CAN slot
+        self._afters: list = []                           # this step's <after> blocks, running (see _afters_start)
         self._Motor = None                                # stored for log labels (set in enter())
         # robotics/homing_arms.HomingArms (2026-10-09, TODO/homing_plan.md H1) — set by RTI; None = no check
         self.arm_check = None
@@ -291,6 +294,8 @@ class HomingController:
     _approach_tick = _moves._approach_tick
     _approach_back = _moves._approach_back
     _approach_where = _moves._approach_where
+    _approach_contact = _moves._approach_contact
+    _approach_brake = _moves._approach_brake
     _approach_limits = _moves._approach_limits
 
     # ------------------------------------------------------------------
@@ -328,6 +333,9 @@ class HomingController:
                     else:
                         resolved.append(int(jref))
                 step['home_joints'] = resolved
+                step['after'] = [dict(af, home_joints=[self._arm_count if jr == 'gripper' else int(jr)
+                                                       for jr in af['home_joints']])
+                                 for af in raw_step.get('after', [])]
                 steps.append(step)
             return steps
 
@@ -355,6 +363,8 @@ class HomingController:
         self._move_to_targets = {}
         self._move_to_tick = 0
         self._last_gripper_move = None
+        self._gripper_claimed = False
+        self._afters = []
 
         # Legacy compat
         if self._steps and self._steps[0].get('home_joints'):
@@ -415,6 +425,16 @@ class HomingController:
                 f"[Homing] Step {idx}: move_to for joints "
                 f"{list(self._move_to_targets.keys())}"
             )
+            # Its <gripper_move> (2026-10-14, user: homing time) runs alongside: set here, replayed every tick by
+            # _send_idle as after a pre-move gripper_move; the step lasts at least its duration.
+            self._move_to_min_ticks = 0
+            gm = step.get('gripper_move')
+            if gm is not None and self._arm_count < self.joint_num:
+                self._last_gripper_move = (gm['position'], gm['speed'], gm['current'], gm['activate'], gm['action'],
+                                           gm['estop'], gm['release_dir'])
+                self._move_to_min_ticks = max(1, round(gm['duration_s'] / self.dt))
+                logging.info(f"[Homing] Step {idx}: the gripper to {gm['position']} (speed {gm['speed']}, "
+                             f"{gm['current']} mA) alongside, at least {gm['duration_s']:.1f} s")
             return
 
         # Check for post_moves-only step (sequence-level post moves)
@@ -483,41 +503,93 @@ class HomingController:
             self._enter_homing_phase(step)
 
     # ------------------------------------------------------------------
+    def _start_homing(self, j, gripper_mode):
+        """Start homing actuator j: its state joins _active_states (skipped, logged, without a CAN gripper)."""
+        # Use GripperHomingState for gripper firmware mode
+        if gripper_mode == 'firmware' and j >= self._arm_count:
+            if j >= self.joint_num:
+                # No CAN gripper selected — arrays were never extended, skip gracefully.
+                logging.warning(
+                    f"[Homing] Skipping {self._jlabel(j, self._Motor)} in step {self._seq_idx + 1}: "
+                    f"no CAN gripper configured (gripper_mode='firmware' — skipping)"
+                )
+                return
+            state = GripperHomingState(
+                j=j, dt=self.dt,
+                timeout_s=float(self._timeout_s[j]) if j < len(self._timeout_s)
+                          else GripperHomingState._CALIBRATE_TIMEOUT_TIME,
+                min_wait_s=getattr(self, '_gripper_calibration_wait_s', None)
+            )
+        elif j >= self.joint_num:
+            # Joint index is beyond the configured arrays — happens when a
+            # homing sequence step references the gripper (mode='motor') but
+            # the robot is using a non-CAN gripper (do_gripper=False), so the
+            # arrays were never extended.  Skip gracefully.
+            logging.warning(
+                f"[Homing] Skipping {self._jlabel(j, self._Motor)} in step {self._seq_idx + 1}: "
+                f"index out of range for homing arrays (non-CAN gripper, "
+                f"gripper_mode='{gripper_mode}' — motor homing not applicable)"
+            )
+            return
+        else:
+            state = self._make_joint_state(j)
+        self._active_states[j] = state
+        if j >= self._arm_count:
+            self._gripper_claimed = True
+
+    # ------------------------------------------------------------------
+    # <after joint="N"> (2026-10-14, user): once joint N has homed in this step, its nudges run, then its homing joins
+    # the step — stages wait -> nudge -> home -> done; the step ends when its joints AND its <after> blocks are done.
+    def _afters_nudge(self, Motor) -> set:
+        """Send the nudging <after> blocks' commands (as a pre-move <nudge>: its speed for its duration, then 0 until
+        the block's longest nudge ends). The joints commanded this tick."""
+        sent = set()
+        for af in self._afters:
+            if af['stage'] != 'nudge':
+                continue
+            af['ticks'] += 1
+            for nd in af['nudges']:
+                speed = int(nd['speed']) if af['ticks'] < max(1, round(nd['duration_s'] / self.dt)) else 0
+                Motor[nd['joint']].Send_data_pack_1(Position=None, Speed=speed, Current=0)
+                sent.add(nd['joint'])
+            if af['ticks'] >= af['nudge_ticks']:
+                af['stage'] = 'home'
+        return sent
+
+    def _afters_start(self, Motor):
+        """Advance the <after> blocks: a homed trigger starts its nudges (none: its homing); after them each of its
+        actuators starts homing once it is no longer homing in this step (the gripper's calibration ends first)."""
+        for af in self._afters:
+            if af['stage'] == 'wait' and af['joint'] not in self._active_states:
+                nudges = ", ".join(f"{self._jlabel(nd['joint'], Motor)} {nd['speed']:+.0f} ticks/s for "
+                                   f"{nd['duration_s']:.1f} s" for nd in af['nudges'])
+                homes = ", ".join(self._jlabel(j, Motor) for j in af['home_joints'])
+                logging.info(f"[Homing] {self._jlabel(af['joint'], Motor)} homed — now: "
+                             f"{'nudge ' + nudges + ', then ' if nudges else ''}homing {homes or 'nothing'}")
+                af['stage'] = 'nudge' if af['nudges'] else 'home'
+            if af['stage'] == 'home':
+                for j in af['home_joints']:
+                    if j not in af['started'] and j not in self._active_states:
+                        af['started'].add(j)
+                        self._start_homing(j, af['gripper_mode'])
+                        if j in self._active_states:
+                            logging.info(f"[Homing] Starting {self._jlabel(j, Motor)} (after "
+                                         f"{self._jlabel(af['joint'], Motor)})")
+                if len(af['started']) == len(af['home_joints']):
+                    af['stage'] = 'done'
+
     def _enter_homing_phase(self, step):
         """Start homing the joints listed in this step."""
         home_joints = step['home_joints']
         gripper_mode = step.get('gripper_mode')
         self._active_states = {}
         for j in home_joints:
-            # Use GripperHomingState for gripper firmware mode
-            if gripper_mode == 'firmware' and j >= self._arm_count:
-                if j >= self.joint_num:
-                    # No CAN gripper selected — arrays were never extended, skip gracefully.
-                    logging.warning(
-                        f"[Homing] Skipping {self._jlabel(j, self._Motor)} in step {self._seq_idx + 1}: "
-                        f"no CAN gripper configured (gripper_mode='firmware' — skipping)"
-                    )
-                    continue
-                state = GripperHomingState(
-                    j=j, dt=self.dt,
-                    timeout_s=float(self._timeout_s[j]) if j < len(self._timeout_s)
-                              else GripperHomingState._CALIBRATE_TIMEOUT_TIME,
-                    min_wait_s=getattr(self, '_gripper_calibration_wait_s', None)
-                )
-            elif j >= self.joint_num:
-                # Joint index is beyond the configured arrays — happens when a
-                # homing sequence step references the gripper (mode='motor') but
-                # the robot is using a non-CAN gripper (do_gripper=False), so the
-                # arrays were never extended.  Skip gracefully.
-                logging.warning(
-                    f"[Homing] Skipping {self._jlabel(j, self._Motor)} in step {self._seq_idx + 1}: "
-                    f"index out of range for homing arrays (non-CAN gripper, "
-                    f"gripper_mode='{gripper_mode}' — motor homing not applicable)"
-                )
-                continue
-            else:
-                state = self._make_joint_state(j)
-            self._active_states[j] = state
+            self._start_homing(j, gripper_mode)
+        self._afters = [{'joint': af['joint'], 'nudges': af['nudges'], 'home_joints': af['home_joints'],
+                         'gripper_mode': af['gripper_mode'], 'stage': 'wait', 'ticks': 0, 'started': set(),
+                         'nudge_ticks': max((max(1, round(nd['duration_s'] / self.dt)) for nd in af['nudges']),
+                                            default=0)}
+                        for af in step.get('after', [])]
         # Legacy compat: set _active_j to first joint
         if home_joints:
             self._active_j = home_joints[0]
@@ -537,14 +609,20 @@ class HomingController:
         """True when the homing controller owns the gripper CAN slot.
         RTI.py must suppress send_gripper_commands whenever this is True.
 
-        Covers three cases:
+        Covers four cases:
           - firmware/motor homing   (_HOMING phase, gripper in _active_states)
           - gripper_move pre_move   (_PRE_MOVE phase, gripper in _pre_move_targets)
           - holding last command    (_last_gripper_move set — keep suppressing so
                                     the replayed command in _send_idle is not
                                     overwritten by RTI's normal gripper loop)
+          - homed or being homed    (_gripper_claimed — from the gripper's first homing step to the end of the
+                                    sequence, 2026-10-14: its calibration ending inside a parallel step handed the
+                                    slot back to RTI, whose "go idle" gripper packs put the drive in its gripper
+                                    mode, which rewrites the current limit from the pack (200 mA) every cycle — the
+                                    motor step's 700 mA was overwritten before its first speed command switched the
+                                    mode, and it never reached its stall threshold: GRIPPER_HOMING_FAILED, timeout)
         """
-        if self._last_gripper_move is not None:
+        if self._last_gripper_move is not None or self._gripper_claimed:
             return True
         if self._seq_phase == self._HOMING:
             for j in self._active_states:
@@ -592,11 +670,12 @@ class HomingController:
     def _do_step_homing(self, Motor, Joint, shared_data) -> str:
         """Tick all active joint homing state machines in parallel."""
         active_joints = set(self._active_states.keys())
+        nudged = self._afters_nudge(Motor) if self._afters else ()
 
         # Keep non-homing joints sending zero-torque commands so their
         # CAN data stays fresh and the staleness detector never fires.
         for i in range(self.joint_num):
-            if i not in active_joints:
+            if i not in active_joints and i not in nudged:
                 self._send_idle(Motor, i, shared_data)
 
         # Tick each active joint
@@ -673,6 +752,9 @@ class HomingController:
             if j < self._arm_count and j in self._homed_results and not self._check_arm_so_far(j, shared_data):
                 return 'failed'
 
+        if self._afters:
+            self._afters_start(Motor)
+
         # Update legacy compat pointers
         if self._active_states:
             first_active = next(iter(self._active_states))
@@ -680,7 +762,7 @@ class HomingController:
             self._active_state = self._active_states[first_active]
 
         # All done? Advance to next step
-        if not self._active_states:
+        if not self._active_states and all(af['stage'] == 'done' for af in self._afters):
             return self._advance_sequence(shared_data)
 
         return 'running'

@@ -5,6 +5,7 @@ move_to (smooth interpolated joint moves), sequence-level post-moves, and how a 
 # (dummy_test_scripts/test_homing_golden.py) proves the behaviour unchanged.
 
 import logging
+import math
 
 from robotics.homing.status import STATUS_FAILED
 
@@ -58,7 +59,9 @@ def _send_idle(self, Motor, i, shared_data=None):
 # the drive's position loop sets the speed whatever gravity does, and works before homing (the encoder counts are
 # there, only the joint angles are not) — with the joint's current limit raised to `current_ma` (enough to carry the
 # arm: J3 800 mA = the gravity model's worst case + friction + ~30 %). It has arrived when the joint stops following the
-# ramp (the endstop). Then it BACKS OFF `backoff` ticks (default 3000, ~3.6 deg on J3) the same way and is handed back
+# ramp (the endstop) — softly (2026-10-14, user, after the arm still homed J2 / J3 ~0.1-0.3 deg off with the 800 mA
+# contact): as soon as it pushes `contact_ma` (150) above the current it needed while moving AND trails the ramp a little;
+# the old rule (the ramp 0.1 s ahead) stays as the backstop. Then it BACKS OFF `backoff` ticks (default 3000, ~3.6 deg on J3) the same way and is handed back
 # exactly as an <idle> joint was (user, after the first version held it pressed there: J3 then homed ~0.3 deg off its
 # usual spot, two passes ~600-870 ticks apart instead of 10-22 — the press at up to 800 mA stayed in the drivetrain):
 # its homing current limit again, the drive's Idle for the rest of the pre-moves, the zero-velocity hold after — its
@@ -67,9 +70,29 @@ def _send_idle(self, Motor, i, shared_data=None):
 _APPROACH_LAG_S = 0.1          # arrived: the joint trails the ramp by more than 0.1 s of travel ...
 _APPROACH_LAG_MIN = 400        # ... (at least this many ticks) ...
 _APPROACH_LAG_READS = 10       # ... on this many valid reads in a row
+_APPROACH_CONTACT_MA = 150     # soft arrival: pushing this much above the moving current ...
+_APPROACH_SLOW = 0.3           # ... while it has (nearly) stopped: < 30 % of the ramp's travel over the last reads
+                               # (2026-10-14: on the arm a long approach WITH gravity braked at -300 mA; near the endstop
+                               # that eased and read as +150-225 mA "contact" ~2000 ticks early, the joint still moving)
+_APPROACH_SLOW_TICKS = 3       #     (measured over at least this many ticks)
+_APPROACH_FAST = 0.7           # the moving current is learned only while it really moves (>= 70 % of the ramp) and
+                               # frozen as it slows (2026-10-14: learned while slowing at the endstop it climbed with the
+                               # push — "contact" came at ~800 mA, J3 homed +0.355 deg off again)
+_APPROACH_SOFT_LAG_S = 0.005   # ... and trailing the ramp by more than 5 ms of travel (at least 40 ticks) ...
+_APPROACH_SOFT_LAG_MIN = 40
+_APPROACH_SOFT_READS = 3       # ... on this many valid reads in a row
+_APPROACH_SETTLE_S = 0.15      # the start's acceleration: no soft arrival, the moving current not yet learned
+_APPROACH_BASE_TAU = 0.1       # s: the moving current's running mean
 _APPROACH_BACKOFF = 3000       # ticks backed off after arriving (unless the XML says)
 _APPROACH_BACK_TOL = 300       # backed off: within this many ticks of the back-off point ...
 _APPROACH_BACK_WAIT_S = 0.5    # ... or this long after the ramp got there
+_APPROACH_TRACE_S = 0.5        # the approach's log line: where it was against its ramp every this many s
+# "Brake strong, touch light" (2026-10-14, user, after the log showed J3 run 1.6-5.0 deg ahead of its ramp from a
+# high pose, braking at its whole 450 mA for ~2 s): with `brake_ma` the limit rises to it while the joint brakes
+# harder than this against its travel (gravity pulling it toward the endstop) ...
+_APPROACH_BRAKE_ON_MA = 300
+_APPROACH_BRAKE_OFF_MA = 150   # ... and is `current_ma` again once the braking eases below this — on the arm before the
+                               # contact (J3 was lifting, +280 mA, when it touched), so the contact stays light
 
 
 def _approach_setup(self, j, pm):
@@ -78,10 +101,18 @@ def _approach_setup(self, j, pm):
     speed = -speed if int(self.homing_directions[j]) == 1 else speed
     timeout_s = float(pm['timeout_s']) if pm.get('timeout_s') is not None else float(self._timeout_s[j])
     backoff = abs(float(pm['backoff'])) if pm.get('backoff') is not None else float(_APPROACH_BACKOFF)
+    contact = abs(float(pm['contact_ma'])) if pm.get('contact_ma') is not None else float(_APPROACH_CONTACT_MA)
     return {'speed': speed, 'current_ma': float(pm['current_ma']), 'timeout_ticks': max(1, round(timeout_s / self.dt)),
             'lag_max': max(_APPROACH_LAG_MIN, abs(speed) * _APPROACH_LAG_S), 'backoff': backoff, 'phase': 'approach',
+            'contact_ma': contact, 'soft_lag': max(_APPROACH_SOFT_LAG_MIN, abs(speed) * _APPROACH_SOFT_LAG_S),
+            'dt': float(self.dt),
+            'settle_ticks': max(1, round(_APPROACH_SETTLE_S / self.dt)), 'base': None, 'soft': 0, 'how': '', 'trail': [],
             'target': None, 'start': None, 'end': None, 'over': 0, 'ticks': 0, 'back_ticks': 0, 'idle_ticks': 0,
-            'last_valid': None}
+            'last_valid': None,
+            'lead': (-math.inf, 0.0), 'brake': (math.inf, 0.0), 'trace': [],
+            'trace_every': max(1, round(_APPROACH_TRACE_S / self.dt)),
+            'brake_ma': float(pm['brake_ma']) if pm.get('brake_ma') is not None else None, 'braking': False,
+            'brake_on': 0, 'brake_ticks': 0}
 
 
 def _approach_limits(self, Motor, j, current_ma):
@@ -124,21 +155,28 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
         if pos is not None:
             lag = (a['target'] - pos) * (1.0 if a['speed'] > 0 else -1.0)
             a['over'] = a['over'] + 1 if lag > a['lag_max'] else 0
-            if a['over'] >= _APPROACH_LAG_READS:
+            self._approach_contact(Motor, j, a, lag)
+            _approach_watch(a, lag, Motor[j].current)
+            if a['brake_ma'] is not None:
+                self._approach_brake(Motor, j, a)
+            if a['over'] >= _APPROACH_LAG_READS or a['soft'] >= _APPROACH_SOFT_READS:
+                _approach_report(a, label)
                 self._approach_arrival[j] = int(pos)
                 if not self._approach_where(Motor, j, int(pos), a, shared_data):
                     return 'failed'
                 travel = self._approach_travel[j] = int(pos) - int(a['start'])
                 a['phase'], a['target'] = 'backoff', float(pos)
                 a['end'] = float(pos) - (a['backoff'] if a['speed'] > 0 else -a['backoff'])
+                how = a['how'] if a['soft'] >= _APPROACH_SOFT_READS else f"the ramp {lag:.0f} ticks ahead"
                 logging.info(f"[Homing] {label} reached its endstop (approach): {travel:+d} ticks in "
-                             f"{a['ticks'] * self.dt:.3f} s (from {int(a['start'])} to {int(pos)}) — backing off "
+                             f"{a['ticks'] * self.dt:.3f} s (from {int(a['start'])} to {int(pos)}; {how}) — backing off "
                              f"{a['backoff']:.0f} ticks")
                 return 'running'
     if a['ticks'] >= a['timeout_ticks']:
         reason = (f"it did not reach its endstop within {a['timeout_ticks'] * self.dt:.1f} s of its controlled approach "
                   f"({a['speed']:+.0f} ticks/s, {a['current_ma']:.0f} mA) — something in the way, or the joint far "
                   f"from its endstop")
+        _approach_report(a, label)
         logging.error(f"[Homing] FAILED: {label} — {reason}")
         if j < len(shared_data.rti["homing_status"]):
             shared_data.rti["homing_status"][j] = STATUS_FAILED
@@ -146,6 +184,94 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
         self._seq_phase = self._FAILED
         return 'failed'
     return 'running'
+
+
+def _approach_contact(self, Motor, j, a, lag) -> None:
+    """The soft arrival (2026-10-14): the push (the drive's current toward the endstop) against its running mean while
+    moving; `a['soft']` counts the reads it is `contact_ma` above it while the joint trails the ramp."""
+    cur, pos = Motor[j].current, Motor[j].position
+    if pos is not None:                              # the last few valid reads: how fast it really moves
+        a['trail'].append((a['ticks'], int(pos)))
+        if len(a['trail']) > 8:
+            a['trail'].pop(0)
+    if cur is None or a['ticks'] <= a['settle_ticks']:
+        return
+    push = float(cur) * (1.0 if a['speed'] > 0 else -1.0)
+    if a['base'] is None:
+        a['base'] = push
+        return
+    moving = _approach_moving(a)
+    if push - a['base'] > a['contact_ma'] and lag > a['soft_lag'] and moving is not None and moving < _APPROACH_SLOW:
+        a['soft'] += 1
+        a['how'] = (f"contact: pushing {push - a['base']:+.0f} mA over the {a['base']:+.0f} mA it moved with, moving at "
+                    f"{moving:.0%} of the ramp")
+    else:
+        a['soft'] = 0
+        if moving is None or moving >= _APPROACH_FAST:
+            a['base'] += (push - a['base']) * min(1.0, self.dt / _APPROACH_BASE_TAU)
+
+
+def _approach_watch(a, lag, cur) -> None:
+    """For the approach's log line (2026-10-14, user: from a high pose J3 "drops halfway", then moves slowly): how far
+    the joint ran AHEAD of its ramp (gravity beating the current limit) and the most current it braked with (the
+    current against its travel; at the limit = it could not hold back more), and every 0.5 s both (no text built
+    here)."""
+    t = a['ticks'] * a['dt']
+    if -lag > a['lead'][0]:
+        a['lead'] = (-lag, t)
+    push = None if cur is None else float(cur) * (1.0 if a['speed'] > 0 else -1.0)
+    if push is not None and push < a['brake'][0]:
+        a['brake'] = (push, t)
+    if a['ticks'] % a['trace_every'] == 0:
+        a['trace'].append((t, -lag, push))
+
+
+def _approach_brake(self, Motor, j, a) -> None:
+    """Brake strong, touch light: `brake_ma` while the joint brakes harder than _APPROACH_BRAKE_ON_MA against its
+    travel, `current_ma` again once it brakes less than _APPROACH_BRAKE_OFF_MA (or pushes toward the endstop)."""
+    cur = Motor[j].current
+    if a['braking']:
+        a['brake_ticks'] += 1
+    if cur is None:
+        return
+    push = float(cur) * (1.0 if a['speed'] > 0 else -1.0)
+    if not a['braking'] and push < -_APPROACH_BRAKE_ON_MA:
+        a['braking'] = True
+        a['brake_on'] += 1
+        self._approach_limits(Motor, j, a['brake_ma'])
+    elif a['braking'] and push > -_APPROACH_BRAKE_OFF_MA:
+        a['braking'] = False
+        self._approach_limits(Motor, j, a['current_ma'])
+
+
+def _approach_report(a, label) -> None:
+    """The approach's log line: ahead of its ramp / braking, and the 0.5 s trace (ahead of the ramp in ticks / the
+    current toward the endstop in mA, negative = braking)."""
+    lead, lead_t = a['lead']
+    brake, brake_t = a['brake']
+    ahead = (f"ran up to {lead:.0f} ticks AHEAD of its ramp (at {lead_t:.2f} s)" if lead > 0
+             else f"never ahead of its ramp (trailed it by at least {-lead:.0f} ticks)")
+    braked = (f"braked with up to {-brake:.0f} mA (at {brake_t:.2f} s; limit {a['current_ma']:.0f} mA)"
+              if math.isfinite(brake) and brake < 0 else "never braked")
+    if a['brake_ma'] is not None:
+        braked += (f"; its {a['brake_ma']:.0f} mA brake limit on {a['brake_on']} time(s), "
+                   f"{a['brake_ticks'] * a['dt']:.2f} s in all{' (STILL ON at the end)' if a['braking'] else ''}")
+    trace = ", ".join(f"{t:.1f}s {ld:+.0f}/{'?' if p is None else f'{p:+.0f}'}" for t, ld, p in a['trace'])
+    logging.info(f"[Homing] {label} approach: {ahead}; {braked}. Every {_APPROACH_TRACE_S:.1f} s, ticks ahead of the "
+                 f"ramp / mA toward the endstop: {trace or 'none'}")
+
+
+def _approach_moving(a):
+    """How fast the joint really moved over its last valid reads (>= _APPROACH_SLOW_TICKS apart), as a fraction of the
+    ramp's speed (toward the endstop); None without two such reads."""
+    if len(a['trail']) < 2:
+        return None
+    t1, p1 = a['trail'][-1]
+    old = next(((t, p) for t, p in reversed(a['trail'][:-1]) if t1 - t >= _APPROACH_SLOW_TICKS), None)
+    if old is None:
+        return None
+    ramp = abs(a['speed']) * (t1 - old[0]) * a.get('dt', 0.004)
+    return (p1 - old[1]) * (1.0 if a['speed'] > 0 else -1.0) / ramp if ramp > 0 else None
 
 
 def _approach_where(self, Motor, j, pos, a, shared_data) -> bool:
@@ -425,7 +551,7 @@ def _do_step_move_to(self, Motor, Joint, shared_data) -> str:
 
     # Timeout safety: max duration + 2 seconds margin
     max_duration = max(
-        info['duration_ticks'] for info in self._move_to_targets.values()
+        max(info['duration_ticks'] for info in self._move_to_targets.values()), self._move_to_min_ticks
     )
     timeout_ticks = max_duration + max(1, round(2.0 / self.dt))
     if self._move_to_tick > timeout_ticks:
@@ -444,7 +570,7 @@ def _do_step_move_to(self, Motor, Joint, shared_data) -> str:
             self._hold_after_move_to(Motor, j, shared_data)
         return self._advance_sequence(shared_data)
 
-    if all_done:
+    if all_done and self._move_to_tick >= self._move_to_min_ticks:     # its <gripper_move>'s duration too
         for j in active_joints:
             self._hold_after_move_to(Motor, j, shared_data)
         return self._advance_sequence(shared_data)

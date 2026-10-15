@@ -1,67 +1,50 @@
 <homing_sequence>
 
-  <!-- Step 0: home J1 -->
+  <!-- Step 0 (2026-10-14, user: to save time): after the pre-moves (J2 idle, J3's approach, J5 nudged away from its
+       stop) J1, J2, J3 AND the gripper's firmware calibration home together. Was: J1 alone, then J2 + J3, then (after
+       J5's +5000 nudge) the gripper calibration on its own. The nudges are unchanged. -->
 
   
   <step>
     <pre_moves>
-      <idle joint="1" duration_s="4.0" />
+      <idle joint="1" duration_s="2.8" />   <!-- 2026-10-14 (user, homing time): was 4.0 s — J2 did not move during
+           it in the logged homings; 2.8 s = J5's nudge below -->
       <!-- 2026-10-14 (user): J3 is brought to its endstop by a controlled approach instead of idle (the drive's brake
-           let it free-fall when the arm was stretched out): its homing speed, current limit 800 mA (the gravity
-           model's worst case 524 mA + friction + ~30 %); then it backs off 3000 ticks (~3.6 deg) and idles as before,
-           so its homing makes its own gentle contact (held pressed there, J3 homed ~0.3 deg off). Was:
-           <idle joint="2" duration_s="4.0" /> -->
-      <approach joint="2" current_ma="800" />
+           let it free-fall when the arm was stretched out): its homing speed, current limit 450 mA, it arrives softly
+           (150 mA over the current it moved with, nearly stopped), backs off 1000 ticks (~1.2 deg) and idles as before,
+           so its homing makes its own gentle contact. 450 mA (user, "always light"): the press at contact decides
+           J3's accuracy — touching at ~400 mA it homed on its spot (+0.00..+0.04 deg), at 750-850 mA +0.23..+0.36 deg
+           (800 mA, measured on the arm); braking needs at most ~524 mA of gravity minus ~90 mA of friction. A pose
+           where J3 would have to LIFT the arm through a heavy region: it stops short and homing fails clearly.
+           Was: <idle joint="2" duration_s="4.0" />
+           brake_ma (2026-10-14, user: "brake strong, touch light"): from a high pose gravity needs ~450-550 mA to hold J3
+           back for its first ~2-4 s — at 450 mA it ran 1.6-5.0 deg ahead of its ramp (the "drop", RTI.log's
+           "approach:" line). While it brakes harder than 300 mA its limit is 800 mA; 450 mA again once the braking
+           eases below 150 mA — before the contact (it touches while lifting, ~+280 mA), so the contact stays light. -->
+      <approach joint="2" current_ma="450" brake_ma="800" backoff="1000" />
       <nudge joint="4" speed="-7000" duration_s="2.8" />
     </pre_moves>
-    <home joints="0" />
-  </step>
-    <!-- Step 1: nudge J5 away from its mechanical stop at velocity for 0.8 s,
-       then home J2, J3 in parallel. A velocity nudge is used instead of a
-       position move because the joint is not yet calibrated at this point. -->
-  <step>
-    <home joints="1,2" />
-  </step>
-
-
-  <step>
-    <pre_moves>
+    <home joints="0,1,2,gripper" mode="firmware" />
+    <!-- 2026-10-14 (user: to save time): as soon as J3 has homed, J5 nudges back (+5000, 1.9 s) and then the gripper's
+         motor homing (stall-detect against its open endstop: the position reference) starts — once its firmware
+         calibration above has finished — while J1 / J2 may still be homing. Were two steps after this one. -->
+    <after joint="2">
       <nudge joint="4" speed="5000" duration_s="1.9" />
-    </pre_moves>
-  </step>
-
-  <!-- Step 2: gripper firmware calibration — runs the gripper's built-in
-       activation/calibration sequence before motor homing. -->
-  <step>
-    <home joints="gripper" mode="firmware" />
-  </step>
-
-  <!-- Step 3: gripper motor homing — stall-detect against the endstop to
-       set the position reference (master_position). Requires homing_speed,
-       homing_direction and homing_current_ma to be set in grippers/SSG48.xml. -->
-  <step>
-    <home joints="gripper" mode="motor" />
+      <home joints="gripper" mode="motor" />
+    </after>
   </step>
 
 
-  <!-- Step 5: nudge J3 away from endstop (homed in step 1), then home J4.
-       Speed sign: positive = away from the J3 endstop (homing_direction=0 = positive motor dir,
-       so endstop was hit going positive — back off with negative speed). Tune duration_s. -->
+  <!-- J2 / J3 to J4 / J6's homing pose while the jaws close (2026-10-14, user: homing time -2.5 s): the gripper_move
+       was its own 2.5 s step before this one; the step lasts at least its duration_s, so the jaws still get 2.5 s before
+       J4 / J6 home. J2 / J3 2.5 -> 2.0 s. Removed: <pre_moves><nudge joint="5" speed="-9000" duration_s="1.8" /> —
+       a move_to step skips its pre-moves, so that J6 nudge never ran. -->
   <step>
-    <pre_moves>
-      <gripper_move position="252" speed="150" current="500"
-                activate="1" action="1" estop="0" release_dir="0"
-                    duration_s="2.5" />
-    </pre_moves>
-  </step>
-
-
-  <step>
-    <pre_moves>
-      <nudge joint="5" speed="-9000" duration_s="1.8" />
-    </pre_moves>
-    <move_to joint="1" position_rad="-1.85" duration_s="2.5" />
-    <move_to joint="2" position_rad="2.85"    duration_s="2.5" />
+    <gripper_move position="252" speed="150" current="500"
+                  activate="1" action="1" estop="0" release_dir="0"
+                  duration_s="2.5" />
+    <move_to joint="1" position_rad="-1.85" duration_s="2.0" />
+    <move_to joint="2" position_rad="2.85"    duration_s="2.0" />
   </step>
 
   <step>
@@ -69,7 +52,7 @@
   </step>
 
   <step>
-      <move_to joint="5" position_rad="3.141592654" duration_s="2.0" />
+      <move_to joint="5" position_rad="3.141592654" duration_s="1.5" />   <!-- 2026-10-14 (user): was 2.0 s -->
   </step>
 
 
@@ -78,14 +61,17 @@
     <home joints="4" />
   </step>
 
-  <!-- Step 7: move all joints to ready position over 2 seconds.
+  <!-- Step 7: move all joints to ready position over 2 seconds (2026-10-14, user: was 3 s).
        Uses smooth cubic Hermite interpolation (zero velocity at start/end).
        Each joint can have its own duration. Joints hold position after arrival. -->
 
+  <!-- 2026-10-14 (user): J2 / J3 end at -2.2 / 2.454 rad (were left at -1.85 / 2.85 from J4 / J6's homing pose). -->
   <step>
-    <move_to joint="0" position_rad="1.57" duration_s="3.0" />
-    <move_to joint="3" position_rad="0"    duration_s="3.0" />
-    <move_to joint="4" position_rad="-0.5"    duration_s="3.0" />
+    <move_to joint="0" position_rad="1.57" duration_s="2.0" />
+    <move_to joint="1" position_rad="-2.2"  duration_s="2.0" />
+    <move_to joint="2" position_rad="2.454" duration_s="2.0" />
+    <move_to joint="3" position_rad="0"    duration_s="2.0" />
+    <move_to joint="4" position_rad="-0.5"    duration_s="2.0" />
   </step>
 
 

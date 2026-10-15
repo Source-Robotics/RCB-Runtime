@@ -7,11 +7,45 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
 # Homing sequence parser
 # ---------------------------------------------------------------------------
+
+def _parse_home(home_elem: ET.Element) -> tuple[list, str | None]:
+    """A <home joints="..." mode="..."/>: the joint list ('gripper' kept as a string) and the gripper mode (None
+    without the gripper)."""
+    joints_str = home_elem.get('joints', '')
+    joint_list = []
+    has_gripper = False
+    for tok in joints_str.split(','):
+        tok = tok.strip()
+        if tok.lower() == 'gripper':
+            has_gripper = True
+            joint_list.append('gripper')
+        else:
+            joint_list.append(int(tok))
+    return joint_list, (home_elem.get('mode', 'motor') if has_gripper else None)
+
+
+def _parse_gripper_move(gm_elem: ET.Element) -> dict:
+    """A <gripper_move .../>: position and speed are 0-255; current is mA (2 bytes); activate, action, ESTOP,
+    release_dir are bitfield flags (0/1)."""
+    return {
+        'type':        'gripper_move',
+        'joint':       'gripper',   # resolved to _arm_count at runtime
+        'position':    int(gm_elem.get('position')),
+        'speed':       int(gm_elem.get('speed')),
+        'current':     int(gm_elem.get('current')),
+        'activate':    int(gm_elem.get('activate',    1)),
+        'action':      int(gm_elem.get('action',      1)),
+        'estop':       int(gm_elem.get('estop',       0)),
+        'release_dir': int(gm_elem.get('release_dir', 0)),
+        'duration_s':  float(gm_elem.get('duration_s')),
+    }
+
 
 def parse_homing_sequence(xml_path: str | Path) -> list[dict]:
     """
@@ -21,6 +55,7 @@ def parse_homing_sequence(xml_path: str | Path) -> list[dict]:
         pre_moves   : list of dicts with keys: joint (int), position_rad (float), speed (float)
         home_joints : list of int joint indices (or 'gripper' string for gripper)
         gripper_mode: None | 'motor' | 'firmware'  (only set when 'gripper' is in home_joints)
+        after       : (only when the step has <after>) list of {joint, nudges, home_joints, gripper_mode}
         post_moves  : list of dicts (same format as pre_moves; only on the last entry)
 
     Returns:
@@ -32,7 +67,7 @@ def parse_homing_sequence(xml_path: str | Path) -> list[dict]:
     steps = []
 
     for step_elem in root.findall('step'):
-        step = {'pre_moves': [], 'home_joints': [], 'gripper_mode': None, 'move_to': []}
+        step: dict[str, Any] = {'pre_moves': [], 'home_joints': [], 'gripper_mode': None, 'move_to': []}
 
         # Parse pre_moves
         pre_moves_elem = step_elem.find('pre_moves')
@@ -71,40 +106,43 @@ def parse_homing_sequence(xml_path: str | Path) -> list[dict]:
                     'speed':      float(ap_elem.get('speed')) if ap_elem.get('speed') is not None else None,
                     'timeout_s':  float(ap_elem.get('timeout_s')) if ap_elem.get('timeout_s') is not None else None,
                     'backoff':    float(ap_elem.get('backoff')) if ap_elem.get('backoff') is not None else None,
+                    'contact_ma': float(ap_elem.get('contact_ma')) if ap_elem.get('contact_ma') is not None else None,
+                    # 2026-10-14 (user, "brake strong, touch light"): the current limit while the joint brakes hard
+                    # against gravity (moves.py); missing = current_ma throughout
+                    'brake_ma':   float(ap_elem.get('brake_ma')) if ap_elem.get('brake_ma') is not None else None,
                 })
             for gm_elem in pre_moves_elem.findall('gripper_move'):
-                # position and speed are 0-255; current is mA (2 bytes).
-                # activate, action, ESTOP, release_dir are bitfield flags (0/1).
-                step['pre_moves'].append({
-                    'type':        'gripper_move',
-                    'joint':       'gripper',   # resolved to _arm_count at runtime
-                    'position':    int(gm_elem.get('position')),
-                    'speed':       int(gm_elem.get('speed')),
-                    'current':     int(gm_elem.get('current')),
-                    'activate':    int(gm_elem.get('activate',    1)),
-                    'action':      int(gm_elem.get('action',      1)),
-                    'estop':       int(gm_elem.get('estop',       0)),
-                    'release_dir': int(gm_elem.get('release_dir', 0)),
-                    'duration_s':  float(gm_elem.get('duration_s')),
-                })
+                step['pre_moves'].append(_parse_gripper_move(gm_elem))
 
         # Parse home joints
         home_elem = step_elem.find('home')
         if home_elem is not None:
-            joints_str = home_elem.get('joints', '')
-            joint_list = []
-            has_gripper = False
-            for tok in joints_str.split(','):
-                tok = tok.strip()
-                if tok.lower() == 'gripper':
-                    has_gripper = True
-                    joint_list.append('gripper')
-                else:
-                    joint_list.append(int(tok))
-            step['home_joints'] = joint_list
+            step['home_joints'], step['gripper_mode'] = _parse_home(home_elem)
 
-            if has_gripper:
-                step['gripper_mode'] = home_elem.get('mode', 'motor')
+        # <after joint="N"> (2026-10-14, user: "when J3 successfully homes start the gripper's motor homing, J5 moving
+        # to its position first, in parallel"): once joint N has homed IN THIS STEP, its nudges run (together, as
+        # pre-move nudges), then its <home> joins the step's homing — an actuator still homing in it (the gripper's
+        # firmware calibration) finishes first. The step ends when all of it is done. Only on steps that use it.
+        for af_elem in step_elem.findall('after'):
+            after: dict[str, Any] = {'joint': int(af_elem.get('joint')), 'nudges': [], 'home_joints': [],
+                                     'gripper_mode': None}
+            for nudge_elem in af_elem.findall('nudge'):
+                after['nudges'].append({
+                    'joint': int(nudge_elem.get('joint')),
+                    'speed': float(nudge_elem.get('speed')),
+                    'duration_s': float(nudge_elem.get('duration_s')),
+                })
+            af_home = af_elem.find('home')
+            if af_home is not None:
+                after['home_joints'], after['gripper_mode'] = _parse_home(af_home)
+            # A trigger the step does not home would never fire (the step would never end); a nudged joint the step
+            # homes would get two commands a tick.
+            if after['joint'] not in step['home_joints']:
+                raise ValueError(f"{xml_path}: <after joint=\"{after['joint']}\"> — that joint is not homed in its step")
+            for nd in after['nudges']:
+                if nd['joint'] in step['home_joints']:
+                    raise ValueError(f"{xml_path}: <after> nudges joint {nd['joint']}, which its step homes")
+            step.setdefault('after', []).append(after)
 
         # Parse move_to elements (smooth joint-space moves)
         for mt_elem in step_elem.findall('move_to'):
@@ -113,6 +151,12 @@ def parse_homing_sequence(xml_path: str | Path) -> list[dict]:
                 'position_rad': float(mt_elem.get('position_rad')),
                 'duration_s':   float(mt_elem.get('duration_s')),
             })
+        # A <gripper_move> directly in a move_to step (2026-10-14, user: homing time — the jaws close while J2 / J3
+        # move): sent as the step starts and held while its move_to runs; the step lasts at least its duration_s.
+        # (A move_to step skips <pre_moves>.) Only on steps that use it.
+        step_gm = step_elem.find('gripper_move')
+        if step_gm is not None:
+            step['gripper_move'] = _parse_gripper_move(step_gm)
 
         steps.append(step)
 

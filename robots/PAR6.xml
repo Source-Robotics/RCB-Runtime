@@ -368,7 +368,7 @@
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
             <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
             <homing_release_current_ma>1500</homing_release_current_ma>
-            <homing_release_duration_s>1.5</homing_release_duration_s>   <!-- NaN = skip release phase -->
+            <homing_release_duration_s>1.0</homing_release_duration_s>   <!-- 2026-10-14 (user, homing time): was 1.5; the latch is sampled at 80 % (0.8 s). NaN = skip release phase -->
             <homing_release_sample_pct>0.8</homing_release_sample_pct>
             <gear_ratio>4</gear_ratio>
             <gear_efficiency>0.98</gear_efficiency>
