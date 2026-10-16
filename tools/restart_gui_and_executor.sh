@@ -26,11 +26,11 @@ SCRIPTS=(command_executor nicegui_test)
 GUI_PORT=8081
 EXEC_PORT=29000
 
-pid_of()  { pgrep -f "^python3 $ROOT/$1.py" | head -1; }
+pid_of()  { pgrep -f "^(\S*/)?python3 $ROOT/$1.py" | head -1; }   # "python3" or ".venv/bin/python3" (2026-10-16)
 pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
 lstart()  { ps -o lstart= -p "$1" 2>/dev/null | sed 's/  */ /g'; }
 
-SUP_PID="$(pgrep -f '^python3 supervisor.py' | head -1)"
+SUP_PID="$(pgrep -f '^(\S*/)?python3 supervisor.py' | head -1)"
 if [ -z "$SUP_PID" ]; then
   echo "supervisor.py is not running — nothing would respawn the scripts. Aborting." >&2
   exit 1

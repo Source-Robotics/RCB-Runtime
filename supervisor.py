@@ -112,16 +112,22 @@ BAUD_RATE = 256000
 # Managed scripts launched and watched by this supervisor.
 RUN_ALL_SCRIPTS = True
 _ROOT = str(PROJECT_ROOT)
+# Every script runs with THIS interpreter (2026-10-16, user: "one Python for the robot and the tests"): autorun.sh
+# starts the supervisor with the repo's .venv/bin/python3, so the robot runs exactly the packages the tests run
+# (requirements.txt). Until then the scripts were started as "python3 ...": the system Python with ~/.local, whose
+# versions had drifted (numpy 2.4.6 vs the pinned 2.3.5). .venv's python3 is the same binary, real-time capability
+# included.
+_PY = sys.executable or "python3"
 SCRIPTS = {
-    "RTI":        f"python3 {_ROOT}/RTI.py",
-    "GUI":        f"python3 {_ROOT}/nicegui_test.py",
-    "HIGH_LEVEL": f"python3 {_ROOT}/command_executor.py",
+    "RTI":        f"{_PY} {_ROOT}/RTI.py",
+    "GUI":        f"{_PY} {_ROOT}/nicegui_test.py",
+    "HIGH_LEVEL": f"{_PY} {_ROOT}/command_executor.py",
     # the self-collision worker (utility/self_collision.py): the measured pose against the convex pieces on another
     # core, ~100 Hz, into shared memory for RTI's monitor and jog (TODO/self_collision_plan.md, 2026-10-06)
-    "SELF_COLLISION": f"python3 {_ROOT}/self_collision_worker.py",
+    "SELF_COLLISION": f"{_PY} {_ROOT}/self_collision_worker.py",
     # the recorder: incident dumps and captures from RTI's shared-memory trace, in its own process so they never
     # cost RTI's loop anything (utility/trace_ring.py, utility/trace_recorder.py; 2026-10-16)
-    "RECORDER": f"python3 {_ROOT}/recorder.py",
+    "RECORDER": f"{_PY} {_ROOT}/recorder.py",
 } if RUN_ALL_SCRIPTS else {}
 
 # ==========================================================================

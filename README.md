@@ -21,9 +21,8 @@ The order that reproduces the reference robot (2026-10-16). Each step names the 
    reboot — *Boot configuration*, *Free the UART from the console*.
 3. **Python 3.11 as `python3`** (Ubuntu 24.04 ships 3.12; 3.11 comes from the deadsnakes PPA) — *Python 3.11, not 3.12*.
 4. **Clone the repo** to `~/Desktop/RCB-Runtime` (any folder works; the service is rendered for it).
-5. **Python packages, twice** — *Python packages: which Python runs the robot*:
-   `python3 -m pip install --user -r requirements.txt` (the runtime) and `./scripts/install.sh` (the `.venv` for
-   tests, tools and `api_tests`).
+5. **Python packages**: `./scripts/install.sh` — the repo's `.venv` from `requirements.txt`; the robot AND the
+   tests run it — *Python packages: which Python runs the robot*.
 6. **The system part**: `sudo bash scripts/setup_system.sh` — user groups, the password-free sudo rule, the
    real-time capability on `python3`, `autorun.service` (+ `LimitMEMLOCK=infinity`), the journal / syslog limits.
    Add `--allowed-ips "IP,IP"` for the PCs that may send commands (`*` = any: isolated networks only).
@@ -229,25 +228,25 @@ not automatically enable or start a systemd service.
 
 ### Python packages: which Python runs the robot
 
-**The robot runs on the system `python3`, not on `.venv`.** `autorun.sh` starts `python3 supervisor.py`, and the
-supervisor starts every runtime process as `python3 <script>` — `/usr/bin/python3` (3.11) with the packages in
-`~/.local`. `.venv` (built by `scripts/install.sh` on the same interpreter) is what the tests, `tools/` and
-`api_tests/` run. So a new Pi needs the packages in both:
+**The robot runs on the repo's `.venv` — the same packages the tests run** (since 2026-10-16). `autorun.sh` starts
+`<repo>/.venv/bin/python3 supervisor.py`, and the supervisor starts every runtime process with its own interpreter.
+`.venv/bin/python3` is a link to the system's `/usr/bin/python3.11`, so the real-time capability set on that binary
+applies (see *Real-time priority*); the venv takes no package from `~/.local`.
 
 ```bash
-python3 -m pip install --user -r requirements.txt     # the runtime (as the robot's user, no sudo)
-./scripts/install.sh                                  # .venv for the tests and tools
-bash scripts/setup_system.sh --check                  # imports the runtime's packages with python3
+./scripts/install.sh                                  # .venv from requirements.txt (the robot, the tests, the tools)
+bash scripts/setup_system.sh --check                  # imports the runtime's packages with .venv's python3
 ```
 
-The two can drift: on the reference robot `~/.local` has numpy 2.4.6 while `requirements.txt` (and `.venv`) pins
-2.3.5. Check the robot's own versions with `python3 -m pip list --user`, the tests' with `.venv/bin/python -m pip list`.
+Before 2026-10-16 the scripts were started as plain `python3` — the system Python with `~/.local`, whose versions had
+drifted from the pins (numpy 2.4.6 vs 2.3.5): the robot did not run what the tests ran. `autorun.sh` falls back to
+the system `python3` only when the repo has no `.venv` (an update that came without one) and says so in the journal.
 
 ## Systemd Service
 
 **The reference robot runs `autorun.service`** (in the repo since 2026-10-16: `systemd/autorun.service.in` and
 `systemd/autorun.sh.in`; `scripts/setup_system.sh` installs them). It starts `<repo>/../autorun.sh` as the robot's
-user, which starts `python3 supervisor.py` — and first, if an update was staged next to the repo (the folder
+user, which starts `<repo>/.venv/bin/python3 supervisor.py` — and first, if an update was staged next to the repo (the folder
 `<repo>_PENDING` and the flag file `ready_to_swap.txt`), swaps it in, keeping the old folder as `<repo>_BACKUP`.
 Two drop-ins in `/etc/systemd/system/autorun.service.d/`: `memlock.conf` (`LimitMEMLOCK=infinity`: RTI locks its
 memory, so a memory shortage cannot stall the loop) and, optionally, `allowed-ips.conf` (`RCB_ALLOWED_IPS`; the

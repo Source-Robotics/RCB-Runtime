@@ -52,9 +52,12 @@ SHM_MODE = "/dev/shm/robot_mode"
 BOOT_TIMEOUT_S = 40.0
 VENV_PY = os.path.join(ROOT, ".venv", "bin", "python")
 EXECUTOR_PORT = 29000
-ARGV = {"drives": ["python3", "-m", "sim.drives"], "RTI": ["python3", "RTI.py"],
-        "executor": ["python3", "command_executor.py"], "worker": ["python3", "self_collision_worker.py"],
-        "recorder": ["python3", "recorder.py"], "GUI": ["python3", "nicegui_test.py"]}
+# The robot's interpreter (2026-10-16: autorun.sh starts the supervisor with .venv's python3, which starts the rest)
+PY = os.path.join(ROOT, ".venv", "bin", "python3") if os.path.exists(os.path.join(ROOT, ".venv", "bin", "python3")) \
+    else "python3"
+ARGV = {"drives": [PY, "-m", "sim.drives"], "RTI": [PY, "RTI.py"],
+        "executor": [PY, "command_executor.py"], "worker": [PY, "self_collision_worker.py"],
+        "recorder": [PY, "recorder.py"], "GUI": [PY, "nicegui_test.py"]}
 
 
 def _argv(name, coverage=False):

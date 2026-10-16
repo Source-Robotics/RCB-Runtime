@@ -6,8 +6,8 @@
 #   checked only (it prints how to fix them):
 #     kernel     a real-time kernel (/sys/kernel/realtime = 1)
 #     boot       the CAN chip, SPI, UART and I2C in /boot/firmware/config.txt; no serial console in cmdline.txt
-#     python     python3 = Python 3.11; the runtime's packages importable by it (the supervisor starts every runtime
-#                process as `python3 ...`, which uses ~/.local); the repo's .venv (tests, tools, api_tests)
+#     python     the repo's .venv on Python 3.11 with the runtime's packages: the robot runs it (autorun.sh starts the
+#                supervisor with .venv/bin/python3, which starts the rest; 2026-10-16) and so do the tests and tools
 #   applied (with sudo):
 #     groups     the user in dialout, i2c and gpio (the UART, the OLED's I2C, the GPIO header)
 #     sudo       the commands the runtime runs with sudo, password-free: /etc/sudoers.d/10-rcb-runtime — only when the
@@ -115,18 +115,26 @@ fi
 # ------------------------------------------------------------------ python
 echo "python"
 if real; then
-    PY_BIN="$(readlink -f "$(command -v python3)" 2>/dev/null)"
-    PY_VER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
-    if [ "$PY_VER" = "3.11" ]; then
-        ok "python3 is Python 3.11 ($PY_BIN)"
+    ROBOT_PY="$REPO/.venv/bin/python3"         # the robot's interpreter (2026-10-16), the tests' too
+    if [ -x "$ROBOT_PY" ]; then
+        ok ".venv: the robot's and the tests' Python"
     else
-        miss "python3 is Python ${PY_VER:-?}, not 3.11 (every pin was verified on 3.11)"
-        fix "README 'Python 3.11, not 3.12' (the deadsnakes PPA + update-alternatives)"
+        miss "no .venv: the robot would start on the system python3 and ~/.local's packages, which the tests do not run"
+        fix "as $RUN_USER: ./scripts/install.sh"
+        ROBOT_PY="python3"
+    fi
+    PY_BIN="$(readlink -f "$(command -v "$ROBOT_PY")" 2>/dev/null)"
+    PY_VER="$("$ROBOT_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
+    if [ "$PY_VER" = "3.11" ]; then
+        ok "it is Python 3.11 ($PY_BIN)"
+    else
+        miss "it is Python ${PY_VER:-?}, not 3.11 (every pin was verified on 3.11)"
+        fix "README 'Python 3.11, not 3.12' (the deadsnakes PPA), then ./scripts/install.sh"
     fi
     MODULES="numpy scipy can zmq nicegui psutil roboticstoolbox spatialmath pinocchio coal ruckig toppra Spectral_BLDC SourceRoboticsToolbox lgpio gpiozero distro serial PIL adafruit_ssd1306 board busio"
     AS_USER=()
     [ "$(id -u)" = "0" ] && AS_USER=(sudo -u "$RUN_USER" -H)
-    BAD="$("${AS_USER[@]}" python3 - "$MODULES" 2>/dev/null <<'PY'
+    BAD="$("${AS_USER[@]}" "$ROBOT_PY" - "$MODULES" 2>/dev/null <<'PY'
 import importlib, sys
 bad = []
 for m in sys.argv[1].split():
@@ -138,19 +146,13 @@ print(", ".join(bad))
 PY
 )" || BAD="(the check itself failed)"
     if [ -z "$BAD" ]; then
-        ok "the runtime's packages import under $RUN_USER's python3"
+        ok "the runtime's packages import"
     else
-        miss "the runtime's python3 cannot import: $BAD"
-        fix "as $RUN_USER: python3 -m pip install --user -r $REPO/requirements.txt  (README 'Python packages')"
-    fi
-    if [ -x "$REPO/.venv/bin/python" ]; then
-        ok ".venv (tests, tools, api_tests)"
-    else
-        miss "no .venv for the tests and tools"
-        fix "as $RUN_USER: ./scripts/install.sh"
+        miss "the robot's Python cannot import: $BAD"
+        fix "as $RUN_USER: ./scripts/install.sh  (requirements.txt into .venv; README 'Python packages')"
     fi
 else
-    skip "python3, its packages, .venv"
+    skip "the robot's Python (.venv), its packages"
 fi
 
 # ------------------------------------------------------------------ groups
@@ -241,7 +243,7 @@ fi
 # ------------------------------------------------------------------ priority
 echo "priority"
 if real; then
-    PY_BIN="${PY_BIN:-$(readlink -f "$(command -v python3)")}"
+    PY_BIN="${PY_BIN:-$(readlink -f "$(command -v python3)")}"      # .venv's python3 resolves to this binary
     if getcap "$PY_BIN" 2>/dev/null | grep -q cap_sys_nice; then
         ok "$PY_BIN has cap_sys_nice (RTI's real-time priority)"
     elif apply; then
@@ -261,11 +263,14 @@ UNIT="$ROOT/etc/systemd/system/autorun.service"
 DROPIN="$ROOT/etc/systemd/system/autorun.service.d"
 RELOAD=0
 if [ -f "$ROOT$AUTORUN_SH" ]; then
-    if grep -q "supervisor.py" "$ROOT$AUTORUN_SH"; then
-        ok "$AUTORUN_SH (left as it is)"
-    else
+    if ! grep -q "supervisor.py" "$ROOT$AUTORUN_SH"; then
         miss "$AUTORUN_SH does not start supervisor.py"
         fix "compare it with systemd/autorun.sh.in"
+    elif grep -q ".venv/bin/python3" "$ROOT$AUTORUN_SH"; then
+        ok "$AUTORUN_SH starts the supervisor with .venv's python3 (left as it is)"
+    else
+        miss "$AUTORUN_SH starts the supervisor with the system python3: the robot then runs ~/.local's packages, not the tested ones"
+        fix "replace its 'python3 supervisor.py' line with the three lines at the end of systemd/autorun.sh.in"
     fi
 elif apply; then
     write_if_changed "$ROOT$AUTORUN_SH" "$(render "$REPO/systemd/autorun.sh.in")" 0755 && did "$AUTORUN_SH"

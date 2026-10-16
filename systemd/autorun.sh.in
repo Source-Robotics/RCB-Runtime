@@ -28,6 +28,9 @@ if [ -f "$FLAG" ] && [ -d "$PENDING" ]; then
     echo "Swap complete."
 fi
 
-# Launch supervisor (it starts every runtime process with the system python3 — README "Set up a new Pi")
+# Launch supervisor with the repo's .venv (it starts every runtime process with the same interpreter — README "Set up
+# a new Pi"); the system python3 only when there is no .venv (an update that came without one)
 cd "$BOX" || exit 1
-python3 supervisor.py
+PY="$BOX/.venv/bin/python3"
+[ -x "$PY" ] || { echo "no $PY — starting with the system python3"; PY=python3; }
+"$PY" supervisor.py
