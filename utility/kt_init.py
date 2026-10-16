@@ -12,6 +12,7 @@ from collections import deque
 import numpy as np
 
 import logging
+logger = logging.getLogger("rti.startup")  # docs/logging.md "Logger names"
 from communication.can_message_handlers import fetch_kt_from_can
 
 _KT_FETCH_TIMEOUT_S = 0.35
@@ -42,14 +43,14 @@ def resolve_and_preload_kt(
     gripper_kt_from_can = 0.0
 
     if kt_source_cfg == 'xml':
-        logging.info("[Startup][Kt] kt_source=xml — using XML Kt values, skipping CAN fetch")
+        logger.info("Kt: kt_source=xml — using XML Kt values, skipping CAN fetch")
         for _i in range(joint_num):
-            logging.info(f"[Startup][Kt] J{_i+1} Kt = {motor_kt[_i]:.6f} (XML)")
+            logger.info(f"Kt: J{_i+1} Kt = {motor_kt[_i]:.6f} (XML)")
         if active_CAN_gripper:
-            logging.info(f"[Startup][Kt] Gripper Kt = {gripper_kt:.6f} (XML)")
+            logger.info(f"Kt: Gripper Kt = {gripper_kt:.6f} (XML)")
     else:
-        logging.info(
-            f"[Startup][Kt] Fetching Kt from CAN "
+        logger.info(
+            f"Kt: Fetching Kt from CAN "
             f"({_KT_FETCH_ROUNDS} round(s), {_KT_FETCH_RETRIES} attempt(s), "
             f"{_KT_FETCH_TIMEOUT_S}s each, {_KT_FETCH_SETTLE_S}s settle)..."
         )
@@ -62,9 +63,9 @@ def resolve_and_preload_kt(
             settle_s=_KT_FETCH_SETTLE_S,
         )
         for _i in range(joint_num):
-            logging.info(f"[Startup][Kt] J{_i+1} Kt = {motor_kt[_i]:.6f} ({_kt_sources[_i]})")
+            logger.info(f"Kt: J{_i+1} Kt = {motor_kt[_i]:.6f} ({_kt_sources[_i]})")
         if active_CAN_gripper:
-            logging.info(f"[Startup][Kt] Gripper Kt = {gripper_kt:.6f} ({_gripper_kt_src})")
+            logger.info(f"Kt: Gripper Kt = {gripper_kt:.6f} ({_gripper_kt_src})")
         kt_from_can = [1.0 if s == 'CAN' else 0.0 for s in _kt_sources]
         gripper_kt_from_can = 1.0 if _gripper_kt_src == 'CAN' else 0.0
 

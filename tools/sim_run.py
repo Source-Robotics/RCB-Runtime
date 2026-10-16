@@ -54,7 +54,7 @@ VENV_PY = os.path.join(ROOT, ".venv", "bin", "python")
 EXECUTOR_PORT = 29000
 ARGV = {"drives": ["python3", "-m", "sim.drives"], "RTI": ["python3", "RTI.py"],
         "executor": ["python3", "command_executor.py"], "worker": ["python3", "self_collision_worker.py"],
-        "GUI": ["python3", "nicegui_test.py"]}
+        "recorder": ["python3", "recorder.py"], "GUI": ["python3", "nicegui_test.py"]}
 
 
 def _argv(name, coverage=False):
@@ -104,7 +104,7 @@ def _log_lines_since(path, offset):
 # Simulation has no real-time core: every process shares the general cores. RTI and the simulated drives run at
 # normal priority; the dashboard, the executor and the collision worker are niced, so a busy dashboard cannot starve
 # the drives — it did once (2026-10-13: every node went silent in the same ms mid-homing, a CAN_LOST on all of them).
-NICE = {"GUI": 10, "executor": 5, "worker": 5}
+NICE = {"GUI": 10, "executor": 5, "worker": 5, "recorder": 5}
 
 
 def _start(name, argv, run_dir, env):
@@ -145,12 +145,20 @@ def main():
     if others:
         print(f"REFUSED: an RTI is running (pid {others}).")
         return 2
+    left = sim_mode.other_runtime_pids()
+    if left:
+        print("REFUSED: the runtime's programs are still running from an earlier run (they share the robot's shared "
+              "memory and the simulator's port): " + ", ".join(f"{what} (pid {pid})" for pid, what in left.items())
+              + f". Stop them: kill {' '.join(str(p) for p in left)}")
+        return 2
     if not sim_mode.interface_up(sim_mode.SIM_CAN_INTERFACE):
         print(f"REFUSED: {sim_mode.SIM_CAN_INTERFACE} is not up — {sim_mode.VCAN_HELP}")
         return 2
 
     run_dir = os.path.join(SIM_DIR, "runs", time.strftime("%Y%m%d_%H%M%S", time.gmtime()))
     os.makedirs(run_dir, exist_ok=True)
+    from utility.housekeeping import prune_folders
+    prune_folders(os.path.join(SIM_DIR, "runs"), 30)      # the newest 30 runs (2026-10-15)
     env = dict(os.environ, RCB_SIM="1", PYTHONUNBUFFERED="1")
     selfcov = None
     if args.coverage:
@@ -168,7 +176,7 @@ def main():
     try:
         procs.append(("drives", *_start("drives", _argv("drives", args.coverage), run_dir, env)))
         time.sleep(1.0)
-        for name in ("RTI", "executor", "worker") + (("GUI",) if args.gui else ()):
+        for name in ("RTI", "executor", "worker", "recorder") + (("GUI",) if args.gui else ()):
             procs.append((name, *_start(name, _argv(name, args.coverage), run_dir, env)))
 
         t0 = time.monotonic()
@@ -181,12 +189,12 @@ def main():
                 break
             mode = _read_shm_string(SHM_MODE)
             lines = _log_lines_since(SIM_RTI_LOG, log_offset)
-            if mode == "IDLE" and any("[Selfcheck]" in ln and ("PASSED" in ln or "FAILED" in ln) for ln in lines) \
+            if mode == "IDLE" and any("| rti.selfcheck" in ln and ("PASSED" in ln or "FAILED" in ln) for ln in lines) \
                     and _port_open(EXECUTOR_PORT):          # the executor loads its models for several seconds
                 break
             time.sleep(0.5)
         lines = _log_lines_since(SIM_RTI_LOG, log_offset)
-        keys = ("[SIM]", "[RTI] code:", "CAN scan", "[Selfcheck] ✓", "[Selfcheck] ✗", "FAILED", "ERROR", "CRITICAL",
+        keys = ("SIMULATION", "| code:", "CAN scan", "| ✓", "| ✗", "FAILED", "ERROR", "CRITICAL",
                 "Kt =", "start-up clear", "drive watchdog")
         print(f"\nboot: robot_mode={mode or '?'}, executor {'up' if _port_open(EXECUTOR_PORT) else 'NOT up'}, after "
               f"{time.monotonic() - t0:.1f} s; RTI.log (simulated):")
@@ -196,7 +204,7 @@ def main():
         if ok and mode != "IDLE":
             print("FAILED: RTI did not reach IDLE")
             ok = False
-        if ok and not any("[Selfcheck] ✓ PASSED" in ln for ln in lines):
+        if ok and not any("| rti.selfcheck" in ln and "| ✓ PASSED" in ln for ln in lines):
             print("FAILED: the start-up self-check did not pass")
             ok = False
         booted = ok                  # a failed TEST does not stop the fault scenarios (2026-10-13): report both
@@ -277,7 +285,7 @@ def main():
     finally:
         # the clients first, then RTI, then what RTI watches (the worker: a worker stopped under a live RTI in EXEC
         # raises SELF_COLLISION_STALE), the simulated drives last
-        order = {"GUI": 0, "executor": 1, "RTI": 2, "worker": 3, "drives": 4}
+        order = {"GUI": 0, "executor": 1, "recorder": 1, "RTI": 2, "worker": 3, "drives": 4}
         for name, p, out in sorted(procs, key=lambda t: order.get(t[0], 9)):
             code = _stop(name, p)
             out.close()

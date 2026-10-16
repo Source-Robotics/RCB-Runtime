@@ -3,6 +3,7 @@
 import os
 
 import numpy as np
+import utility.quiet_imports  # noqa: F401,E402  # first: imports roboticstoolbox without NumPy's 1.x stderr block
 from roboticstoolbox import DHRobot, RevoluteDH
 import time
 

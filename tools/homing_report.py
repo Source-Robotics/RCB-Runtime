@@ -32,10 +32,11 @@ import numpy as np
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
-_STAMP = re.compile(r"^\w+\s+\|\s+([\d.]+)\s+\|")
-_REF = re.compile(r"\[Homing\] J(\d+) \[CANID \d+\] reference set: master_pos=(-?\d+)")
-_TWO_PASS = re.compile(r"\[Homing\] J(\d+) \[CANID \d+\] two-pass difference: (\d+) ticks")
-_LATCH_FAILED = re.compile(r"\[Homing\] J(\d+) \[CANID \d+\] release: latched position None")
+from utility.logger_setup import parse_line  # noqa: E402  # both line formats (the one before 2026-10-15 too)
+
+_REF = re.compile(r"^J(\d+) \[CANID \d+\] reference set: master_pos=(-?\d+)")
+_TWO_PASS = re.compile(r"^J(\d+) \[CANID \d+\] two-pass difference: (\d+) ticks")
+_LATCH_FAILED = re.compile(r"^J(\d+) \[CANID \d+\] release: latched position None")
 
 
 def parse_sessions(lines):
@@ -43,10 +44,10 @@ def parse_sessions(lines):
     "joints": {joint index 0..: {"latch": ticks, "two_pass": ticks or None, "latch_failed": bool}}}]."""
     sessions = []
     for line in lines:
-        m = _STAMP.match(line)
-        if m is None or "[Homing]" not in line:
+        rec = parse_line(line)
+        if rec is None or rec["name"] != "rti.homing":
             continue
-        t = float(m.group(1))
+        t, line = rec["time"], rec["message"]
         if "Sequence started" in line:
             sessions.append({"t": t, "end": None, "failed": False, "joints": {}})
             continue

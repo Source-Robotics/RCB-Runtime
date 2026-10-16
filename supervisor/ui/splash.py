@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw
 from project_paths import IMAGES_DIR, OLED_UI_FONT
 from supervisor.ui import theme
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sup.ui")  # docs/logging.md "Logger names"
 
 LOGO_FILE = IMAGES_DIR / "LOGO2.ppm"   # 128x64; swap to LOGO1.ppm for the other mark
 SPLASH_SECONDS = 2.0
@@ -58,4 +58,4 @@ def show(disp, seconds=SPLASH_SECONDS):
         disp.show()
         time.sleep(seconds)
     except Exception:
-        logging.exception("Splash failed (continuing boot)")
+        logger.exception("Splash failed (continuing boot)")

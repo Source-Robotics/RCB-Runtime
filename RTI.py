@@ -27,16 +27,31 @@ import faulthandler
 import traceback   # used by the command-handler guard in the superloop
 from collections import deque
 import json
-# These used to arrive through `from utility.RTI_utils import *` (2026-10-03, refactor Phase 2). `logger` is
-# data_init's module logger — RTI.py has always logged through it, which is why RTI.log labels these lines
-# `utility.data_init`; giving RTI its own logger would change that column and is a separate, visible step.
-from utility.data_init import initialize_robot_data, logger, process_gripper_joint_data, process_joint_data
+# These used to arrive through `from utility.RTI_utils import *` (2026-10-03, refactor Phase 2). Until 2026-10-15
+# RTI.py also imported data_init's module LOGGER and logged through it (RTI.log labelled those lines
+# `utility.data_init`); RTI now has its own named loggers, defined after `import logging` below.
+from utility.data_init import initialize_robot_data, process_gripper_joint_data, process_joint_data
 from utility.signal_processing import reset_rolling_stats, update_rolling_percentiles, update_rt_loop_stats, pace_deadline
 from utility.RTI_utils import print_heartbeat
 from project_paths import RTI_LOG, SYSTEM_XML, ROBOTS_DIR, TEMP_DATA_DIR, DATA_RECIPE_DIR, GRIPPERS_DIR, CRITICAL_LOG, FILTER_CONFIG_PATH, FLASH_PERFORMED_MARKER, CELLS_DIR, PROJECT_ROOT
 from utility.code_version import describe as describe_code
 from utility import sim_mode
 import logging
+logger = logging.getLogger("rti")  # docs/logging.md "Logger names"
+log_can = logging.getLogger("rti.can")  # docs/logging.md "Logger names"
+log_dynamics = logging.getLogger("rti.dynamics")  # docs/logging.md "Logger names"
+log_errors = logging.getLogger("rti.errors")  # docs/logging.md "Logger names"
+log_exec = logging.getLogger("rti.exec")  # docs/logging.md "Logger names"
+log_filters = logging.getLogger("filters")  # docs/logging.md "Logger names"
+log_flash = logging.getLogger("rti.flash")  # docs/logging.md "Logger names"
+log_gripper = logging.getLogger("rti.gripper")  # docs/logging.md "Logger names"
+log_handler = logging.getLogger("rti.handler")  # docs/logging.md "Logger names"
+log_homing = logging.getLogger("rti.homing")  # docs/logging.md "Logger names"
+log_loop = logging.getLogger("rti.loop")  # docs/logging.md "Logger names"
+log_mode = logging.getLogger("rti.mode")  # docs/logging.md "Logger names"
+log_recipe = logging.getLogger("rti.recipe")  # docs/logging.md "Logger names"
+log_safety = logging.getLogger("rti.safety")  # docs/logging.md "Logger names"
+log_startup = logging.getLogger("rti.startup")  # docs/logging.md "Logger names"
 import sys
 import numpy as np
 from utility.robot_factory import create_robot
@@ -44,7 +59,8 @@ import threading
 import zmq
 from queue import Queue, Empty
 from gpiozero import pi_info
-from utility.logger_setup import setup_logging
+from utility.logger_setup import setup_logging, apply_log_level
+from utility.fault_details import fault_detail
 import config.xml_parser as read_XML2
 from utility.selfcheck import run_selfcheck
 from utility.state_machine import RobotMode, request_mode_change, request_enable, MAINTENANCE_MODES
@@ -53,8 +69,8 @@ from utility.error_checks import (
     LoopDegradationMonitor,
     CLEAR_ERROR_SETTLE_TICKS, CLEAR_ERROR_SEND_REPEATS, BOOT_CLEAR_TICK, _WARNING_SUFFIXES,
 )
-from utility.activity_log import get_rti_activity_logger, log_activity
-from utility.incident_dump import IncidentDumper
+from utility.activity_log import get_rti_activity_logger, log_activity, note_origin
+from utility.trace_ring import TraceWriter
 from robotics.hall_check import HallCheck, hall_joint_index
 from robotics.homing import HomingController
 from robotics.homing_arms import HomingArms
@@ -64,7 +80,7 @@ from communication.rti_protocol import CLOCK_ROBOT, CLOCK_PC, CMD_SIZE
 # ==========================================================================
 # System and Configuration
 # ==========================================================================
-from config.system_config import setup_realtime_process
+from config.system_config import lock_memory, locked_mb, setup_realtime_process
 from hardware.can_hardware import start_can_interface, place_can_path, FirstFrameWait, FastCanReader
 from config.cpu_cores import CAN_CPU_CORE, GENERAL_CPU_CORES
 from utility.can_reply_monitor import CanReplyMonitor
@@ -165,6 +181,7 @@ class LoopState:
         "filter_banks", "received_ids", "latest_commands_id", "startup_selfcheck", "startup_motor_reconfig", "loop_execution_time", "prev_time",
         # mode and pending mode request (handlers write, the loop consumes)
         "current_mode", "pending_mode_request", "pending_mode_force", "pending_mode_assertion", "pending_mode_rate_hz",
+        "command_id", "pending_mode_request_id",          # the activity log's command ids (2026-10-15)
         # errors
         "latched_errors", "error_metadata", "clear_error_countdown", "homing_failures",
         # loop statistics ring
@@ -248,7 +265,7 @@ def main():
         ranked = sorted(_tick_sections.items(), key=lambda kv: kv[1], reverse=True)
         accounted = sum(_tick_sections.values())
         top = "  ".join(f"{n}={v * 1e3:.2f}ms" for n, v in ranked[:_OVERRUN_TRACE_TOP] if v > 0)
-        logger.warning(
+        log_loop.warning(
             f"[OVERRUN #{st._overrun_trace_count}] tick={int(tick)} mode={mode} "
             f"exec={loop_total * 1e3:.3f}ms (limit {limit * 1e3:.2f}ms) | "
             f"worst: {top} | unaccounted={(loop_total - accounted) * 1e3:.2f}ms"
@@ -327,6 +344,14 @@ def main():
     # not the robot anyone tested; refusing is loud and safe (the arm never moves), as industrial real-time interfaces do.
     if not _SIM:
         setup_realtime_process(cpu_core=RT_CPU_CORE, priority=99, enforce=bool(_sys.get('realtime_required', 1)))
+        # Keep the loop's memory in RAM (2026-10-16: a memory shortage dropped RTI's code pages and stalled it 194 s).
+        # Never raises; without the service's LimitMEMLOCK it logs an ERROR and the loop runs as before. The result
+        # goes to shared memory for the health summary (MB locked, NaN = locked but not measured; 0 = not locked;
+        # -1 = simulation, not tried).
+        _locked = lock_memory()
+        shared_data.rti['memory_locked_mb'][0] = (locked_mb() or float('nan')) if _locked else 0.0
+    else:
+        shared_data.rti['memory_locked_mb'][0] = -1.0
     # The logging thread starts HERE, after the RT scheduling, so it inherits SCHED_FIFO 99 on core 3 like the
     # ZMQ listener thread does (2026-10-01): a Python thread at normal priority on another core can be preempted
     # while holding the GIL, and the loop would wait for it. At FIFO 99 on core 3 it only runs while the loop
@@ -338,22 +363,16 @@ def main():
     # Logged only now, never before setup_logging: a root logging.info() with no handler makes Python install its
     # own stderr handler, and setup_logging then saw "already configured" and set up NOTHING — no RTI.log, INFO
     # dropped, writes unqueued in the RT thread — from 2026-10-04 17:52 until this fix (2026-10-05).
-    logging.info(f"[control box] {describe_pcb(_sys.get('pcb_version', 1))}")
+    log_startup.info(f"control box {describe_pcb(_sys.get('pcb_version', 1))}")
     # Which commit this RTI runs (2026-10-13; tools/arm_smoke.py records it) — read from the .git files, no subprocess.
-    logging.info(f"[RTI] code: {describe_code(PROJECT_ROOT)}")
+    log_startup.info(f"code: {describe_code(PROJECT_ROOT)}")
     if _SIM:
-        logging.warning(f"[SIM] SIMULATION — the simulated drives on {_CAN_IF}, NOT the arm; no real-time core or "
+        log_startup.warning(f"SIMULATION — the simulated drives on {_CAN_IF}, NOT the arm; no real-time core or "
                         f"priority; the I/O simulated (no real pin read or written); logs and data under "
                         f"{TEMP_DATA_DIR.parent}")
-    # The last two seconds before a hard error -> temp_data/incidents/*.npz (utility/incident_dump.py,
-    # 2026-10-03). Its worker thread starts here for the same reason the log listener does; it yields between
-    # channels, so it never holds the interpreter for more than ~one channel of the 500-tick history.
-    _incident_dumper = IncidentDumper(TEMP_DATA_DIR / "incidents")
-    _incident_dumper.start()
-    atexit.register(_incident_dumper.stop)
     # When a script crashes with exception we write the error to log file
     def handle_exception(exc_type, exc_value, exc_traceback):
-        logging.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+        logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
     sys.excepthook = handle_exception
 
     # ==========================================================================
@@ -397,7 +416,7 @@ def main():
     _cfg_ok, _cfg_issues = read_XML2.validate_robot_config(cfg)
     if not _cfg_ok:
         for _msg in _cfg_issues:
-            logging.critical(f"[Startup] {_msg}")
+            log_startup.critical(f"{_msg}")
         raise SystemExit("RTI.py cannot start: robot XML has errors (see log above).")
 
     robot_name            = cfg['robot_name']
@@ -501,16 +520,16 @@ def main():
     _kinematics_backend = os.environ.get("RTI_KINEMATICS_BACKEND", "auto").strip().lower()
     set_kinematics_backend(_kinematics_backend)
     if _kinematics_backend == "rtb":
-        logging.info("[Startup] Kinematics backend: robotics-toolbox")
+        log_startup.info("Kinematics backend: robotics-toolbox")
     else:
         try:
             attach_pinocchio(robot)
-            logging.info(f"[Startup] Kinematics backend: {_kinematics_backend} (Pinocchio attached)")
+            log_startup.info(f"Kinematics backend: {_kinematics_backend} (Pinocchio attached)")
         except Exception:
             if _kinematics_backend == "pinocchio":
                 raise
-            logging.exception(
-                "[Startup] Pinocchio attach failed; falling back to robotics-toolbox kinematics"
+            log_startup.exception(
+                "Pinocchio attach failed; falling back to robotics-toolbox kinematics"
             )
 
     # ==========================================================================
@@ -519,7 +538,7 @@ def main():
     # Start / Restart CAN interface when starting this script
     # ==========================================================================
     if _SIM:
-        logging.warning(f"[SIM] {_CAN_IF}: no bring-up (bit rate, bus-off restart) and no CAN core placement — a "
+        log_startup.warning(f"{_CAN_IF}: no bring-up (bit rate, bus-off restart) and no CAN core placement — a "
                         f"virtual bus; the real can0 is left alone")
     else:
         start_can_interface()
@@ -543,7 +562,7 @@ def main():
     if _sys['can_read_first']:
         first_frame_wait.set_enabled(True)      # logs "[CAN] read-first ON"; a socket that cannot open: the old order
     else:
-        logger.info("[CAN] read-first OFF at start (system.xml <can_read_first>0): the old tick order")
+        log_can.info("read-first OFF at start (system.xml <can_read_first>0): the old tick order")
 
     # ==========================================================================
     # Motor objects, joint objects, filters, housekeeping — via motor_setup.py
@@ -566,7 +585,7 @@ def main():
     # RAW with joint_speed_filtered from filter_banks['speed'], and Cartesian acceleration is filtered
     # by filter_banks['tcp_accel']. The old motor_system['filters'] EMA-state arrays are left unused.
     st.filter_banks, _filter_src = load_filter_banks(FILTER_CONFIG_PATH, joint_num, delta_t)
-    logger.info(f"[filters] loaded from {_filter_src}: " +
+    log_filters.info(f"loaded from {_filter_src}: " +
                 ", ".join(f"{s}={describe_bank(b)}" for s, b in st.filter_banks.items()))
 
     st.received_ids       = motor_system['housekeeping']['received_ids']
@@ -595,7 +614,7 @@ def main():
     _dff = _sys.get("dynamics_feedforward", {"inertia": True, "coriolis": True})
     shared_data.rti["inertia_comp_enabled"][0]      = 1.0 if _dff.get("inertia", True) else 0.0
     shared_data.rti["coriolis_comp_enabled"][0]     = 1.0 if _dff.get("coriolis", True) else 0.0
-    logger.info(f"[RTI] dynamics feedforward at start: inertia {'ON' if _dff.get('inertia', True) else 'off'}, "
+    log_dynamics.info(f"dynamics feedforward at start: inertia {'ON' if _dff.get('inertia', True) else 'off'}, "
                 f"Coriolis {'ON' if _dff.get('coriolis', True) else 'off'} (system.xml <dynamics_feedforward>)")
 
     # ==========================================================================
@@ -615,7 +634,29 @@ def main():
     Motor_info_data        = robot_init_data["Motor_info_data"]
     Motor_Kt_data          = robot_init_data["Motor_Kt_data"]
     Joint_data             = robot_init_data["Joint_data"]
-    _incident_hook = _incident_dumper.hook(Joint_data)       # on the tick a hard error latches
+    # Every tick's values into a ring in shared memory, for recorder.py — the incident dumps and captures are made THERE,
+    # with its own interpreter (utility/trace_ring.py, 2026-10-16: made in RTI's process they cost loop time). The same
+    # arrays and names as the history entry (utility/data_init.process_joint_data); each keeps its identity for the run.
+    trace = TraceWriter((
+        ("j_p", shared_data.joint['joint_position']), ("j_s", shared_data.joint['joint_speed']),
+        ("j_t", shared_data.joint['joint_torque']), ("j_a", shared_data.joint['joint_acceleration']),
+        ("j_j", shared_data.joint['joint_jerk']), ("j_s_f", shared_data.joint['joint_speed_filtered']),
+        ("j_t_f", shared_data.joint['joint_torque_filtered']), ("j_a_f", shared_data.joint['joint_acceleration_filtered']),
+        ("j_j_f", shared_data.joint['joint_jerk_filtered']), ("TCP_p", shared_data.tcp['robot_pose']),
+        ("TCP_p_SE3", shared_data.tcp['robot_pose_matrix']), ("TCP_p_quat", shared_data.tcp['robot_pose_quaternion']),
+        ("TCP_s", shared_data.tcp['TCP_speed']), ("TCP_s_f", shared_data.tcp['TCP_speed_filtered']),
+        ("TCP_a", shared_data.tcp['TCP_acceleration_raw']), ("TCP_a_f", shared_data.tcp['TCP_acceleration_filtered']),
+        ("t_ext", shared_data.tcp['torque_external']), ("TCP_f_ext", shared_data.tcp['force_external']),
+        ("TCP_f_ext_tool", shared_data.tcp['force_external_tool']),
+        ("j_pc", shared_data.joint['joint_position_commanded']), ("j_sc", shared_data.joint['joint_speed_commanded']),
+        ("j_ac", shared_data.joint['joint_acceleration_commanded']), ("j_tc", shared_data.joint['joint_torque_commanded']),
+        ("TCP_p_c", shared_data.tcp['TCP_pose_commanded']), ("TCP_s_c", shared_data.tcp['TCP_speed_commanded']),
+        ("j_pt", shared_data.joint['joint_position_target']), ("j_st", shared_data.joint['joint_speed_target']),
+        ("j_at", shared_data.joint['joint_acceleration_target']), ("j_tt", shared_data.joint['joint_torque_target']),
+        ("j_t_inertia", shared_data.joint['joint_inertia_torque']), ("j_t_coriolis", shared_data.joint['joint_coriolis_torque']),
+        ("TCP_p_t", shared_data.tcp['TCP_pose_target']), ("TCP_s_t", shared_data.tcp['TCP_speed_target']),
+        ("j_err", motor_error_bytes),
+    ), tick_s=delta_t)
 
 
     scheduled_state = {"step": 0,"joint_index": 0,"device_info_counter": 0}
@@ -634,7 +675,7 @@ def main():
     # long goes idle, so none keeps running RTI's last speed or torque once RTI is gone.
     motor_watchdog_rate   = [_sys['drive_watchdog_ms']] * joint_num
     gripper_watchdog_rate = _sys['drive_watchdog_ms']
-    logging.info(f"[CAN] drive watchdog {_sys['drive_watchdog_ms']} ms on every drive (system.xml <drive_watchdog_ms>)")
+    log_can.info(f"drive watchdog {_sys['drive_watchdog_ms']} ms on every drive (system.xml <drive_watchdog_ms>)")
 
     # ==========================================================================
     # Helpers that bundle load + write_to_shared for arm and gripper configs.
@@ -718,6 +759,11 @@ def main():
     shared_data.rti["loop_tick"][0] = 0
     st.current_mode = RobotMode.BOOTING
     st.pending_mode_request = None
+    # The id of the command being handled (its "id" field), and of the command that made the pending mode request
+    # (2026-10-15): the activity log's RTI entries caused by a command carry its id, as the executor's do. A mode
+    # change RTI makes on its own (start-up done, an error, homing finished) keeps a null id.
+    st.command_id = None
+    st.pending_mode_request_id = None
     # Set alongside pending_mode_request by "set_mode:<MODE>:PARKED|FORCE". Only
     # maintenance modes (FLASHING) read these. There is no automatic test for "can
     # this pose survive losing torque", so entry requires an explicit operator
@@ -777,9 +823,9 @@ def main():
 
     def _handle_sigterm(_signum, _frame):
         faulthandler.dump_traceback_later(SHUTDOWN_WATCHDOG_S, exit=True)
-        logging.info("[RTI] SIGTERM received — shutting down gracefully.")
+        logger.info("SIGTERM received — shutting down gracefully.")
         shared_data.cleanup()
-        logging.info("[RTI] shared memory released — raising SystemExit.")   # breadcrumb (2026-10-03 hang)
+        logger.info("shared memory released — raising SystemExit.")   # breadcrumb (2026-10-03 hang)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
@@ -787,7 +833,7 @@ def main():
     # SIGKILLed RTI). The breadcrumbs above/below say how far a shutdown got; and `kill -USR1 <pid>` makes a hung RTI
     # write every thread's Python stack to stderr (logs/RTI.out.log) — the standard library's faulthandler, no cost.
     faulthandler.register(signal.SIGUSR1, all_threads=True)
-    atexit.register(lambda: logging.info("[RTI] atexit reached — interpreter shutting down."))
+    atexit.register(lambda: logger.info("atexit reached — interpreter shutting down."))
 
     # ==========================================================================
     # Error tracking state — latched faults, metadata, clear countdown
@@ -903,7 +949,7 @@ def main():
     # The Hall sensor check (robotics/hall_check.py, 2026-10-13): the robot XML's <has_hall_sensor> joint, its live
     # limits (stop() restores them; PID apply edits these arrays in place).
     hall_check = HallCheck(Motor, hall_joint_index(cfg['has_hall_sensor'], joint_num), motor_velocity_limit, motor_Ilim,
-                           ctx, shared_data.rti, shared_data.joint['joint_position'], log=logger.info)
+                           ctx, shared_data.rti, shared_data.joint['joint_position'], log=log_homing.info)
 
     MODE_HANDLERS = build_mode_dispatch(
         joint_num=joint_num,
@@ -1006,7 +1052,7 @@ def main():
     try:
         _zone_setup = read_XML2.load_zone_setup(SYSTEM_XML, CELLS_DIR, _GRIPPER_XML)
     except (ValueError, FileNotFoundError) as _e:
-        logger.critical(f"[SAFETY] safety zones: {_e} — fix the cell file (or empty <active_cell>), then restart")
+        log_safety.critical(f"safety zones: {_e} — fix the cell file (or empty <active_cell>), then restart")
         raise
     # Freedrive joint walls (utility/haptic_walls.py JOINT WALLS): per-joint specs from the robot XML
     # (<freedrive_wall>), resolved against the <haptic_walls> policy and each joint's smallest inertia. The live
@@ -1033,7 +1079,7 @@ def main():
 
     def _log_walls(walls, what):
         on = [w for w in walls if w['enabled']]
-        logger.info(f"[SAFETY] freedrive joint walls {what}: " + (", ".join(
+        log_safety.info(f"freedrive joint walls {what}: " + (", ".join(
             f"J{w['joint'] + 1} {w['at']} {np.degrees(w['lo']):.1f}/{np.degrees(w['hi']):.1f} deg "
             f"{w['f']:.2f} Hz zeta {w['zeta']:.2f} filter {1000 * w['tau']:g} ms ({np.radians(w['k']):.3g}..{np.radians(w['k']) * w['scale_max']:.3g} "
             f"Nm/deg {'by pose' if w.get('adaptive', True) else 'FIXED'}) max {w['tmax']:.2f} Nm "
@@ -1041,7 +1087,7 @@ def main():
             for w in on) or "OFF"))
         for w in walls:
             if w['note']:
-                logger.warning(f"[SAFETY] J{w['joint'] + 1} freedrive wall: {w['note']}")
+                log_safety.warning(f"J{w['joint'] + 1} freedrive wall: {w['note']}")
 
 
     st._wall_haptic = _zone_setup['haptic']
@@ -1091,12 +1137,12 @@ def main():
     from utility.friction_comp import FrictionComp
     ctx.friction_comp = FrictionComp(joint_num, cfg['friction_static_nm'], cfg['gravity_error_nm'],
                                      _sys['friction_comp'], friction_sliding=cfg['friction_sliding_nm'])
-    logger.info("[RTI] friction compensation (freedrive, switch OFF at start): " + ", ".join(
+    log_dynamics.info("friction compensation (freedrive, switch OFF at start): " + ", ".join(
         f"J{j + 1} {c:.3f} Nm" for j, c in enumerate(ctx.friction_comp.c)) +
         f" (fraction {ctx.friction_comp.fraction:g} of friction - gravity error; full beyond "
         f"{_sys['friction_comp']['band_dps']:g} deg/s, fading {_sys['friction_comp']['fade_start_dps']:g}-"
         f"{_sys['friction_comp']['fade_end_dps']:g} deg/s)")
-    logger.info(f"[SAFETY] haptic zone walls: {'ON' if haptic_walls.active else 'OFF'} "
+    log_safety.info(f"haptic zone walls: {'ON' if haptic_walls.active else 'OFF'} "
                 f"(k={haptic_walls.k:.0f} N/m, d={haptic_walls.d:.0f} N.s/m at 0.1 kg"
                 f"{' x effective mass / 0.1 kg' if haptic_walls.mass_scaled else ''}, max {haptic_walls.f_max:.0f} N)")
     _log_walls(st._joint_walls, "ON at start-up")
@@ -1150,7 +1196,7 @@ def main():
         """Close the stream and clear every scrap of its state. One place, so a half-reset
         connection cannot survive into the next session and desynchronise its framing."""
         if st.rti_tcp_conn is not None:
-            logger.warning("[RTI] TCP stream closed: %s", why)
+            log_handler.info("TCP stream closed: %s", why)
             try:
                 st.rti_tcp_conn.close()
             except OSError:
@@ -1182,14 +1228,23 @@ def main():
         _errors_active = bool(shared_data.rti['error_active'][0])
         _safety_active = bool(shared_data.rti['safety_violation'][0])
         success, reason = request_enable(_errors_active, _safety_active)
+        _before = shared_data.robot_state.get()
         if success:
             shared_data.robot_state.set("ENABLED")
+            if _before != "ENABLED":           # the activity log: the state change, with who asked (2026-10-15)
+                log_activity(_rti_activity_logger, "RTI", "info", "STATE_CHANGE", id=st.command_id,
+                             message="DISABLED → ENABLED")
         else:
             shared_data.robot_state.set(f"ENABLE_REJECTED:{reason}")
+            log_activity(_rti_activity_logger, "RTI", "warning", "ENABLE_REJECTED", id=st.command_id, message=reason)
 
 
     def _handle_disable(cmd_msg, cmd_dict):
+        _before = shared_data.robot_state.get()
         shared_data.robot_state.set("DISABLED")
+        if _before == "ENABLED":
+            log_activity(_rti_activity_logger, "RTI", "info", "STATE_CHANGE", id=st.command_id,
+                         message="ENABLED → DISABLED")
         st.pending_mode_request = RobotMode.IDLE
 
 
@@ -1216,7 +1271,7 @@ def main():
         old_val = shared_data.rti['gravity_comp_enabled'][0]
         shared_data.rti['gravity_comp_enabled'][0] = new_val
         if new_val != old_val:
-            log_activity(_rti_activity_logger, "RTI", "info", "COMPENSATION_CHANGED",
+            log_activity(_rti_activity_logger, "RTI", "info", "COMPENSATION_CHANGED", id=st.command_id,
                          message=f"gravity comp: {'ON' if new_val else 'OFF'}")
 
 
@@ -1229,9 +1284,9 @@ def main():
         old_val = shared_data.rti['friction_comp_enabled'][0]
         shared_data.rti['friction_comp_enabled'][0] = new_val
         if new_val != old_val:
-            log_activity(_rti_activity_logger, "RTI", "info", "COMPENSATION_CHANGED",
+            log_activity(_rti_activity_logger, "RTI", "info", "COMPENSATION_CHANGED", id=st.command_id,
                          message=f"friction comp: {'ON' if new_val else 'OFF'}")
-            logger.info(f"[RTI] friction compensation {'ON' if new_val else 'OFF'} (freedrive)")
+            log_dynamics.info(f"friction compensation {'ON' if new_val else 'OFF'} (freedrive)")
 
 
     def _dynamics_switch(cmd_msg, key, label):
@@ -1244,9 +1299,9 @@ def main():
         old_val = shared_data.rti[key][0]
         shared_data.rti[key][0] = new_val
         if new_val != old_val:
-            log_activity(_rti_activity_logger, "RTI", "info", "COMPENSATION_CHANGED",
+            log_activity(_rti_activity_logger, "RTI", "info", "COMPENSATION_CHANGED", id=st.command_id,
                          message=f"{label} comp: {'ON' if new_val else 'OFF'}")
-            logger.info(f"[RTI] {label} feedforward {'ON' if new_val else 'OFF'}")
+            log_dynamics.info(f"{label} feedforward {'ON' if new_val else 'OFF'}")
 
     def _handle_inertia_comp(cmd_msg, cmd_dict):
         _dynamics_switch(cmd_msg, 'inertia_comp_enabled', "inertia")
@@ -1276,14 +1331,14 @@ def main():
                                    mode_pending=st.pending_mode_request is not None,
                                    booting=st.startup_motor_reconfig < 3)
             if why:
-                logger.warning(f"[Hall check] refused: {why}")
-                log_activity(_rti_activity_logger, "RTI", "warning", "HALL_CHECK_REFUSED", message=why)
+                log_homing.warning(f"Hall check refused: {why}")
+                log_activity(_rti_activity_logger, "RTI", "warning", "HALL_CHECK_REFUSED", id=st.command_id, message=why)
             elif hall_check.active:
-                log_activity(_rti_activity_logger, "RTI", "info", "HALL_CHECK",
+                log_activity(_rti_activity_logger, "RTI", "info", "HALL_CHECK", id=st.command_id,
                              message=f"J{hall_check.joint + 1} limp: Hall sensor check ON")
         elif hall_check.active:
             hall_check.stop("stopped by the operator")
-            log_activity(_rti_activity_logger, "RTI", "info", "HALL_CHECK", message="Hall sensor check OFF")
+            log_activity(_rti_activity_logger, "RTI", "info", "HALL_CHECK", id=st.command_id, message="Hall sensor check OFF")
 
 
     def _handle_set_mode(cmd_msg, cmd_dict):
@@ -1323,7 +1378,7 @@ def main():
             try:
                 st.pending_mode_rate_hz = float(_assertion)
             except ValueError:
-                logger.warning("[RTI] set_mode:SOFT_RTI rate %r is not a number — timeout "
+                log_handler.warning("set_mode:SOFT_RTI rate %r is not a number — timeout "
                                "left unchanged", _assertion)
 
 
@@ -1332,13 +1387,13 @@ def main():
         if len(parts) == 4 and st.current_mode == RobotMode.JOG:
             _jog = MODE_HANDLERS.get(RobotMode.JOG)
             if _jog is not None:
-                _jog.set_jog(int(parts[1]), int(parts[2]), float(parts[3]))
+                _jog.set_jog(int(parts[1]), int(parts[2]), float(parts[3]), cmd_id=st.command_id)
 
 
     def _handle_jog_stop(cmd_msg, cmd_dict):
         _jog = MODE_HANDLERS.get(RobotMode.JOG)
         if _jog is not None:
-            _jog.stop_jog()
+            _jog.stop_jog(cmd_id=st.command_id)
 
 
     def _handle_jog_accel(cmd_msg, cmd_dict):
@@ -1399,7 +1454,7 @@ def main():
         try:
             epoch = int(parts[1])
         except (IndexError, ValueError):
-            logger.warning("[RTI] exec_stop without a valid epoch: %r", cmd_msg)
+            log_exec.warning("exec_stop without a valid epoch: %r", cmd_msg)
             return
         _exec = MODE_HANDLERS.get(RobotMode.EXEC)
         if st.current_mode == RobotMode.EXEC and _exec is not None:
@@ -1417,7 +1472,7 @@ def main():
             try:
                 _exec.set_completion_policy(parts[1].strip())
             except ValueError as exc:
-                logger.warning("exec_completion_policy: %s", exc)
+                log_exec.warning("exec_completion_policy: %s", exc)
 
 
     def _handle_gripper_set(cmd_msg, cmd_dict):
@@ -1435,11 +1490,11 @@ def main():
                 _gripper_fw_state['current']  = int(parts[3])
                 _gripper_fw_state['action']   = int(parts[4])
                 if st._gripper_calibrate_running or st._gripper_calibrate_pending:
-                    logger.info("[Gripper] calibrate aborted by gripper_set")
+                    log_gripper.info("calibrate aborted by gripper_set")
                     st._gripper_calibrate_running = False
                     st._gripper_calibrate_pending = False
             except ValueError as exc:
-                logger.warning("gripper_set: bad payload %s", exc)
+                log_gripper.warning("gripper_set: bad payload %s", exc)
 
 
     def _handle_gripper_calibrate(cmd_msg, cmd_dict):
@@ -1461,7 +1516,7 @@ def main():
                 if _new_mode == 1:
                     _gripper_fw_state['action'] = 0
         except ValueError as exc:
-            logger.warning("gripper_ctrl_mode: bad payload %s", exc)
+            log_gripper.warning("gripper_ctrl_mode: bad payload %s", exc)
 
 
     def _handle_set_pid_gains(cmd_msg, cmd_dict):
@@ -1518,7 +1573,7 @@ def main():
 
         parts = cmd_msg.split(":")      # see _handle_gravity_comp for why this is guarded
         if len(parts) < 2 or not parts[1].strip():
-            logger.warning("[RTI] rti_connect missing pc_ip")
+            log_handler.warning("rti_connect missing pc_ip")
             return
         pc_ip = parts[1].strip()
 
@@ -1527,12 +1582,12 @@ def main():
             try:
                 rate_hz = float(parts[2].strip())
             except ValueError:
-                logger.warning("[RTI] rti_connect rate %r is not a number — pairing as hard "
+                log_handler.warning("rti_connect rate %r is not a number — pairing as hard "
                                "RTI", parts[2])
                 rate_hz = None
             else:
                 if not np.isfinite(rate_hz) or rate_hz <= 0.0:
-                    logger.warning("[RTI] rti_connect rate %r is not a positive finite Hz — "
+                    log_handler.warning("rti_connect rate %r is not a positive finite Hz — "
                                    "pairing as hard RTI", parts[2])
                     rate_hz = None
 
@@ -1546,10 +1601,10 @@ def main():
             if req in ("udp", "tcp"):
                 want_transport = req
             else:
-                logger.warning("[RTI] rti_connect transport %r is not udp/tcp — using udp",
+                log_handler.warning("rti_connect transport %r is not udp/tcp — using udp",
                                parts[3])
         if want_transport == "tcp" and rate_hz is None:
-            logger.warning("[RTI] rti_connect: TCP is refused for hard RTI. A lost packet stalls "
+            log_handler.warning("rti_connect: TCP is refused for hard RTI. A lost packet stalls "
                            "every packet behind it, which breaks the one guarantee hard RTI "
                            "makes. Using UDP; give a rate_hz for SOFT_RTI if you want TCP.")
             want_transport = "udp"
@@ -1562,7 +1617,7 @@ def main():
             rti_tcp_sender.reset(None)
             del rti_tcp_rxbuf[:]
         st.rti_transport = want_transport
-        logger.warning("[RTI] Paired with %s over %s", pc_ip, st.rti_transport.upper())
+        log_handler.info("Paired with %s over %s", pc_ip, st.rti_transport.upper())
 
         st.rti_pc_ip = pc_ip
         rti_handler.connect_pc((pc_ip, RTI_PORT_SENDER),
@@ -1590,17 +1645,17 @@ def main():
         explicitly recovered (plan §3 / §15).
         """
         if bool(shared_data.rti['error_active'][0]):
-            logger.warning("[RTI] rti_claim rejected — error latched, clear errors first")
+            log_handler.warning("rti_claim rejected — error latched, clear errors first")
             return
         # BOTH RTI contracts. Gating on RobotMode.RTI alone would make SOFT_RTI enterable but
         # unusable — the exact "a legal transition is not a reachable one" failure that made
         # FLASHING unreachable on 2026-08-04, arriving from the other direction.
         if st.current_mode not in (RobotMode.RTI, RobotMode.SOFT_RTI):
-            logger.warning("[RTI] rti_claim rejected — mode is %s, not an RTI mode",
+            log_handler.warning("rti_claim rejected — mode is %s, not an RTI mode",
                            st.current_mode)
             return
         if rti_handler.sub_state != 'connected':
-            logger.warning("[RTI] rti_claim rejected — sub_state is '%s'", rti_handler.sub_state)
+            log_handler.warning("rti_claim rejected — sub_state is '%s'", rti_handler.sub_state)
             return
         # Seed the rate limiter from the live arm, so its first output ramps from where the
         # robot actually is rather than from 0 rad.
@@ -1611,7 +1666,7 @@ def main():
         if not rti_handler.claim_control(
                 current_tick=int(shared_data.rti["loop_tick"][0]),
                 measured_pos=shared_data.joint['joint_position'][:joint_num]):
-            logger.warning("[RTI] rti_claim rejected — see the error above")
+            log_handler.warning("rti_claim rejected — see the error above")
 
 
     def _handle_rti_set_rate_limiter(cmd_msg, cmd_dict):
@@ -1628,7 +1683,7 @@ def main():
             try:
                 rti_handler.set_tcp_velocity_limit(float(parts[1].strip()))
             except ValueError:
-                logger.warning("[RTI] rti_set_tcp_vel_limit: not a number: %r", parts[1])
+                log_handler.warning("rti_set_tcp_vel_limit: not a number: %r", parts[1])
 
 
     def _handle_rti_set_command_timeout(cmd_msg, cmd_dict):
@@ -1642,7 +1697,7 @@ def main():
             try:
                 rti_handler.set_command_timeout(float(parts[1].strip()))
             except ValueError:
-                logger.warning("[RTI] rti_set_command_timeout: not a number: %r", parts[1])
+                log_handler.warning("rti_set_command_timeout: not a number: %r", parts[1])
 
 
     def _handle_rti_set_vel_scale(cmd_msg, cmd_dict):
@@ -1652,7 +1707,7 @@ def main():
             try:
                 rti_handler.set_vel_scale(float(parts[1].strip()))
             except ValueError:
-                logger.warning("[RTI] rti_set_vel_scale: not a number: %r", parts[1])
+                log_handler.warning("rti_set_vel_scale: not a number: %r", parts[1])
 
 
     def _handle_rti_set_min_duration(cmd_msg, cmd_dict):
@@ -1666,7 +1721,7 @@ def main():
             try:
                 rti_handler.set_min_duration(float(parts[1].strip()))
             except ValueError:
-                logger.warning("[RTI] rti_set_min_duration: not a number: %r", parts[1])
+                log_handler.warning("rti_set_min_duration: not a number: %r", parts[1])
 
 
     def _handle_reload_zones(cmd_msg, cmd_dict):
@@ -1679,12 +1734,12 @@ def main():
         """
         wire = cmd_dict.get("setup") if isinstance(cmd_dict, dict) else None
         if not isinstance(wire, dict):
-            logger.error("[SAFETY] reload_zones without a setup (send it through command_executor) — zones unchanged")
+            log_safety.error("reload_zones without a setup (send it through command_executor) — zones unchanged")
             return
         try:
             setup = read_XML2.zone_setup_from_wire(wire)
         except (ValueError, KeyError, TypeError) as e:
-            logger.error(f"[SAFETY] reload_zones refused, zones unchanged: {e}")
+            log_safety.error(f"reload_zones refused, zones unchanged: {e}")
             return
         safety_monitor.set_zones(setup['zones'], setup['tool_spheres'], haptic=setup['haptic'])
         haptic_walls.set_policy(setup['haptic'])
@@ -1693,7 +1748,7 @@ def main():
         st._joint_walls = _resolve_walls(st._wall_haptic)
         haptic_walls.set_joint_walls(st._joint_walls)
         safety_monitor.set_joint_walls(st._joint_walls)
-        logger.info(f"[SAFETY] haptic walls reloaded: {'ON' if haptic_walls.active else 'OFF'} "
+        log_safety.info(f"haptic walls reloaded: {'ON' if haptic_walls.active else 'OFF'} "
                     f"(k={haptic_walls.k:.0f} N/m, d={haptic_walls.d:.0f} N.s/m at 0.1 kg"
                     f"{' x effective mass / 0.1 kg' if haptic_walls.mass_scaled else ''}, max {haptic_walls.f_max:.0f} N)")
         _log_walls(st._joint_walls, "reloaded")
@@ -1706,7 +1761,7 @@ def main():
         robot XML is written only by save_joint_walls, so an RTI restart goes back to the file."""
         specs = cmd_dict.get("specs")
         if not isinstance(specs, list) or len(specs) != joint_num:
-            logger.warning(f"[SAFETY] set_joint_walls: need {joint_num} specs, got {specs!r:.120}")
+            log_safety.warning(f"set_joint_walls: need {joint_num} specs, got {specs!r:.120}")
             return
         _wall_specs[:] = [read_XML2.wall_spec(s if isinstance(s, dict) else None, f"set_joint_walls J{i + 1}")
                           for i, s in enumerate(specs)]
@@ -1725,10 +1780,10 @@ def main():
         """
         texts = cmd_dict.get("recipes") if isinstance(cmd_dict, dict) else None
         if not isinstance(texts, dict):
-            logger.error("[RTI] reload_recipes without the files' text (send it through command_executor) — recipes unchanged")
+            log_recipe.error("reload_recipes without the files' text (send it through command_executor) — recipes unchanged")
             return
         recipe_mgr.reload_from_texts(texts)
-        logger.info(f"[RTI] recipes reloaded from {len(texts)} file(s) sent by command_executor")
+        log_recipe.info(f"recipes reloaded from {len(texts)} file(s) sent by command_executor")
 
 
     def _handle_reload_filters(cmd_msg, cmd_dict):
@@ -1740,15 +1795,15 @@ def main():
         """
         config = cmd_dict.get("config") if isinstance(cmd_dict, dict) else None
         if not isinstance(config, dict):
-            logger.error("[filters] reload_filters without a spec table (send it through command_executor) — filters unchanged")
+            log_filters.error("reload_filters without a spec table (send it through command_executor) — filters unchanged")
             return
         try:
             banks = build_filter_banks(config, joint_num, delta_t)
         except (ValueError, KeyError, TypeError) as e:
-            logger.error(f"[filters] reload refused, filters unchanged: {e}")
+            log_filters.error(f"reload refused, filters unchanged: {e}")
             return
         st.filter_banks = banks
-        logger.info("[filters] hot-reloaded from the table command_executor parsed (config/filters.xml)")
+        log_filters.info("hot-reloaded from the table command_executor parsed (config/filters.xml)")
 
 
     def _handle_set_payload(cmd_msg, cmd_dict):
@@ -1759,10 +1814,18 @@ def main():
         """
         ok, msg = apply_payload_command(cmd_dict, _payload_model, haptic_walls, shared_data.rti, cfg['safety']['max_payload_kg'])
         if ok:
-            logger.info(f"[payload] {msg}")
-            log_activity(_rti_activity_logger, "RTI", "info", "PAYLOAD_CHANGED", message=msg)
+            log_dynamics.info(f"payload: {msg}")
+            log_activity(_rti_activity_logger, "RTI", "info", "PAYLOAD_CHANGED", id=st.command_id, message=msg)
         else:
-            logger.warning(f"[payload] set_payload refused: {msg}")
+            log_dynamics.warning(f"payload: set_payload refused: {msg}")
+
+
+    def _handle_set_log_level(cmd_msg, cmd_dict):
+        """set_log_level:<name>:<LEVEL> — one logger's level in THIS process (the executor set its own and forwarded
+        it; utility/logger_setup.apply_log_level). Cold; not persisted."""
+        parts = cmd_msg.split(":", 2)
+        ok, text = apply_log_level(parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
+        (logger.info if ok else logger.warning)(f"log level: {text}")
 
 
     def _handle_rti_set_state_rate(cmd_msg, cmd_dict):
@@ -1777,7 +1840,7 @@ def main():
             try:
                 rti_handler.set_state_rate(float(parts[1].strip()))
             except ValueError:
-                logger.warning("[RTI] rti_set_state_rate: not a number: %r", parts[1])
+                log_handler.warning("rti_set_state_rate: not a number: %r", parts[1])
 
 
     def _handle_rti_set_pace(cmd_msg, cmd_dict):
@@ -1792,7 +1855,7 @@ def main():
             try:
                 rti_handler.set_pace(float(parts[1].strip()))
             except ValueError:
-                logger.warning("[RTI] rti_set_pace: not a number: %r", parts[1])
+                log_handler.warning("rti_set_pace: not a number: %r", parts[1])
 
 
     def _handle_rti_set_servo_generator(cmd_msg, cmd_dict):
@@ -1814,7 +1877,7 @@ def main():
             if len(parts) > 4 and parts[4].strip():
                 self_lookahead = float(parts[4].strip())
         except ValueError:
-            logger.warning("[RTI] rti_set_servo_generator: bad numeric payload: %r", cmd_msg)
+            log_handler.warning("rti_set_servo_generator: bad numeric payload: %r", cmd_msg)
             return
         rti_handler.set_servo_generator(parts[1].strip(), gain=gain, lookahead=lookahead,
                                         self_lookahead=self_lookahead)
@@ -1856,11 +1919,11 @@ def main():
         known = recipe_mgr.names          # a @property, NOT a method — calling it raised
                                           # TypeError and killed the RT loop (see below)
         if name not in known:
-            logger.warning("[RTI] set_recipe refused: %r is not a known recipe. Available: %s",
+            log_recipe.warning("set_recipe refused: %r is not a known recipe. Available: %s",
                            name, ", ".join(known))
             return
         shared_data.active_recipe.set(name)
-        logger.info("[RTI] Active recipe -> %s", name)
+        log_recipe.info("Active recipe -> %s", name)
 
 
     def _handle_rti_set_start_pose_check(cmd_msg, cmd_dict):
@@ -1878,7 +1941,7 @@ def main():
         try:
             rti_handler.set_lowpass_filter(float(parts[1].strip()))
         except ValueError as exc:
-            logger.warning("rti_set_lowpass: bad payload %s", exc)
+            log_handler.warning("rti_set_lowpass: bad payload %s", exc)
 
 
     def _handle_rti_release(cmd_msg, cmd_dict):
@@ -1888,7 +1951,7 @@ def main():
         the PC's UDP sender is already dead. If neither arrives the timeout covers it.
         """
         if not rti_handler.request_release():
-            logger.warning("[RTI] rti_release ignored — sub_state is '%s'", rti_handler.sub_state)
+            log_handler.warning("rti_release ignored — sub_state is '%s'", rti_handler.sub_state)
 
 
     def _handle_rti_disconnect(cmd_msg, cmd_dict):
@@ -1958,6 +2021,7 @@ def main():
         "reload_recipes":           _handle_reload_recipes,
         "reload_filters":           _handle_reload_filters,
         "set_payload":              _handle_set_payload,
+        "set_log_level":            _handle_set_log_level,    # diagnostics (2026-10-15)
         "reload_zones":             _handle_reload_zones,
         "set_joint_walls":          _handle_set_joint_walls,
         "rti_set_min_duration":     _handle_rti_set_min_duration,
@@ -2067,8 +2131,13 @@ def main():
         _profile_last = _profile_mark(_profile_last, "motor_gripper_shared")
 
     def _history_entry():
-        """This tick's Joint_data entry (the measurement's last step; the finite differences read it next tick)."""
+        """This tick's Joint_data entry (the measurement's last step; the finite differences read it next tick), and the
+        same tick in the shared-memory trace (utility/trace_ring.py)."""
         nonlocal _profile_last
+        _hist_t = time.perf_counter()
+        # .value, not str(): RobotMode is a (str, Enum), and str() on it yields "RobotMode.IDLE" rather than the bare name
+        _hist_mode = getattr(st.current_mode, "value", st.current_mode)
+        _hist_period_ms = shared_data.rti["loop_period"][0] * 1e3
         # ==========================================================================
         # Fill queues for joint + TCP level
         # ========================================================================== 
@@ -2104,7 +2173,7 @@ def main():
                            shared_data.joint['joint_torque_target'],
                            shared_data.tcp['TCP_pose_target'],
                            shared_data.tcp['TCP_speed_target'],
-                           time.perf_counter(),
+                           _hist_t,
                            st.loop_execution_time,
                            _tick_now,
                            motor_error_bytes,
@@ -2119,14 +2188,16 @@ def main():
                            rti_ok=shared_data.rti["control_success_rate"][0],
                            rti_miss=shared_data.rti["rti_consecutive_misses"][0],
                            rti_state=shared_data.rti["rti_substate"][0],
-                           # .value, not str(): RobotMode is a (str, Enum), and str() on it
-                           # yields "RobotMode.IDLE" rather than the bare name the PC expects.
-                           mode=getattr(st.current_mode, "value", st.current_mode),
+                           mode=_hist_mode,
                            # MEASURED period, not delta_t — see the tag registry for why.
-                           period_ms=shared_data.rti["loop_period"][0] * 1e3,
+                           period_ms=_hist_period_ms,
                            # when this tick's CAN read ran (CLOCK_REALTIME, the clock candump stamps frames with)
                            can_read_t=_can_age_buf[2],
                         )
+        # ...and the same tick into the shared-memory trace for recorder.py (one C call of these arrays, ~9 us)
+        trace.write(_hist_t, st.loop_execution_time, _tick_now, shared_data.rti["rti_seq_rx_last"][0],
+                    shared_data.rti["control_success_rate"][0], shared_data.rti["rti_consecutive_misses"][0],
+                    shared_data.rti["rti_substate"][0], _hist_mode, _hist_period_ms, _can_age_buf[2])
         _profile_last = _profile_mark(_profile_last, "joint_history")
 
     def _measure():
@@ -2176,6 +2247,12 @@ def main():
                           motor_kt=motor_kt, motor_signs=motor_signs, robot=robot, jacobian_out=tcp_jacobian)
         _profile_last = _profile_mark(_profile_last, "joint_tcp_shared")
         _history_entry()
+
+    def _fault_detail(key):
+        """The measured value behind a key that latches THIS tick (utility/fault_details.py, 2026-10-15) — the error
+        list's description and the activity entry's message. Cold: _update_error_metadata asks only for new keys."""
+        return fault_detail(key, safety_monitor.details, shared_data.rti, shared_data.motor, shared_data.gripper,
+                            Motor_data, Gripper_data, int(shared_data.rti["loop_tick"][0]), delta_t, joint_num)
 
     def _check_safety():
         """The EXEC link watchdog, the loop monitor, the safety monitor and the error pass (latches, mode)."""
@@ -2230,11 +2307,11 @@ def main():
             loop_critical=_loop_critical and not _SIM,
             monitor_errors=_monitor_errors,
             monitor_warnings=safety_monitor.warnings,
-            on_hard_error=_incident_hook,
             # The settle after the start-up clear (sent at tick BOOT_CLEAR_TICK): a driver reports the watchdog trip the
             # last run's end and the set-up left it until the clear lands.
             driver_faults=_tick_now > BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS,
             homing_errors=st.homing_failures,
+            detail_of=_fault_detail,
         )
         if st.homing_failures:
             st.homing_failures.clear()             # latched by the call above (the latch keeps them until Clear Errors)
@@ -2295,8 +2372,8 @@ def main():
         _stats_warmup_wipe = _stats_tick == 2 or _stats_boot_wipe
         if _stats_warmup_wipe or shared_data.loop_stats_reset_signal.get() == "1":
             if _stats_boot_wipe:
-                logger.info(
-                    f"[RTI] Boot peaks discarded at tick {int(LOOP_STATS_WARMUP_TICKS)} — "
+                log_loop.info(
+                    f"Boot peaks discarded at tick {int(LOOP_STATS_WARMUP_TICKS)} — "
                     f"period {shared_data.rti['max_loop_period'][0]*1e3:.3f} ms, "
                     f"exec {shared_data.rti['max_loop_execution_time'][0]*1e3:.3f} ms, "
                     f"jitter {shared_data.rti['max_jitter'][0]*1e6:.1f} us, "
@@ -2372,7 +2449,7 @@ def main():
         if _tick_now == BOOT_CLEAR_TICK:
             send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
                               Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper, all_motors=True)
-            logging.info("[ERRORS] start-up clear sent to every driver at tick %d; their own faults are read from "
+            log_errors.info("start-up clear sent to every driver at tick %d; their own faults are read from "
                          "tick %d.", BOOT_CLEAR_TICK, BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS + 1)
 
         # ==========================================================================
@@ -2454,12 +2531,18 @@ def main():
                 # A bad command must cost the command, never the loop. Logged CRITICAL with the
                 # offending message and a full traceback so it is loud rather than silent —
                 # swallowing it quietly would be its own failure mode.
+                _mode_request_before = st.pending_mode_request
+                st.command_id = _cmd_dict.get("id")
+                note_origin(st.command_id, _cmd_dict.get("origin"))   # who sent it: its activity entries name them
                 try:
                     _handler(_cmd_msg, _cmd_dict)
                 except Exception:
-                    logger.critical("[RTI] Command handler RAISED on %r — command IGNORED, the "
+                    logger.critical("Command handler RAISED on %r — command IGNORED, the "
                                     "control loop continues.\n%s",
                                     _cmd_msg, traceback.format_exc())
+                if st.pending_mode_request is not None and st.pending_mode_request is not _mode_request_before:
+                    st.pending_mode_request_id = st.command_id      # this command asked for the mode change
+                st.command_id = None
 
             try:
                 status_socket.send_string("done", zmq.NOBLOCK)
@@ -2500,7 +2583,7 @@ def main():
                     st.rti_tcp_conn = _conn
                     rti_tcp_sender.reset(_conn)
                     del rti_tcp_rxbuf[:]
-                    logger.warning("[RTI] TCP stream accepted from %s", _addr[0])
+                    log_handler.info("TCP stream accepted from %s", _addr[0])
             if st.rti_tcp_conn is None:
                 rti_udp_data = None
             else:
@@ -2526,7 +2609,7 @@ def main():
             if rti_udp_data is not None:
                 # Process data. Lazy %s, not an f-string: this runs every streaming tick and the root
                 # logger is at INFO, so the packet's repr is never built unless DEBUG is on (hot-path rule).
-                logging.debug("Received valid RTI data: %s", rti_udp_data)
+                log_handler.debug("Received valid RTI data: %s", rti_udp_data)
 
         # Update per-tick TickContext fields (attribute swap, no allocation)
         # The handler sends its state packet through ctx.socket_sender.sendto() and must not
@@ -2581,13 +2664,13 @@ def main():
                     _worst_gravity = float(np.max(np.abs(
                         shared_data.joint['joint_gravity_torque'][:joint_num])))
                     if st.pending_mode_assertion == "FORCE":
-                        logging.warning(
-                            f"[RTI][Flash] Entering {new_mode} via FORCE — operator "
+                        log_flash.warning(
+                            f"Entering {new_mode} via FORCE — operator "
                             f"asserts the arm is supported WITHOUT parking "
                             f"(gravity {_worst_gravity:.2f} Nm).")
                     else:
-                        logging.info(
-                            f"[RTI][Flash] Entering {new_mode} — operator confirmed "
+                        log_flash.info(
+                            f"Entering {new_mode} — operator confirmed "
                             f"the arm is PARKED (gravity {_worst_gravity:.2f} Nm).")
 
                 # Exit old mode handler (e.g. homing restores motor configs)
@@ -2606,7 +2689,7 @@ def main():
                     _now_tick = _tick_now
                     for _i in range(joint_num + active_CAN_gripper):
                         Motor_data[_i][-1]["tick"] = _now_tick
-                    logging.info("[RTI][Flash] CAN freshness re-based on FLASHING exit")
+                    log_flash.info("CAN freshness re-based on FLASHING exit")
 
                     # A flash REBOOTS the driver, and the encoders are on the motors,
                     # so the flashed joint's position reference is gone. Nothing else
@@ -2622,22 +2705,24 @@ def main():
                             shared_data.homed_state.set("NOT HOMED")
                             shared_data.rti["homing_status"][:] = 0
                             shared_data.rti["joint_homed"][:] = 0
-                            logging.error("[RTI][Flash] Firmware was flashed — "
+                            log_flash.error("Firmware was flashed — "
                                           "HOMING INVALIDATED. Re-home before moving.")
+                            log_activity(_rti_activity_logger, "RTI", "warning", "HOMING_INVALIDATED",
+                                         message="firmware was flashed")
                     except OSError as _err:
                         # Never let housekeeping take the loop down; fail LOUD and
                         # unhomed rather than silently keeping a stale reference.
                         shared_data.homed_state.set("NOT HOMED")
                         shared_data.rti["homing_status"][:] = 0
                         shared_data.rti["joint_homed"][:] = 0
-                        logging.error(f"[RTI][Flash] Could not read the flash marker "
+                        log_flash.error(f"Could not read the flash marker "
                                       f"({_err}) — clearing homing anyway.")
 
                 _from_mode = st.current_mode
                 st.current_mode = new_mode
                 shared_data.robot_mode.set(st.current_mode)
-                logging.info(f"[RTI][Mode] → {st.current_mode}")
-                log_activity(_rti_activity_logger, "RTI", "info", "MODE_CHANGE",
+                log_mode.info(f"→ {st.current_mode}")
+                log_activity(_rti_activity_logger, "RTI", "info", "MODE_CHANGE", id=st.pending_mode_request_id,
                              message=f"{_from_mode} → {st.current_mode}")
 
                 # Apply the streaming contract BEFORE enter(). Both RTI modes share one
@@ -2655,8 +2740,11 @@ def main():
                 if _new_handler is not None and hasattr(_new_handler, 'enter'):
                     _new_handler.enter(ctx)
             else:
-                logging.warning(f"[RTI][Mode] Request '{st.pending_mode_request}' rejected: {reason}")
+                log_mode.warning(f"Request '{st.pending_mode_request}' rejected: {reason}")
+                log_activity(_rti_activity_logger, "RTI", "warning", "MODE_REJECTED", id=st.pending_mode_request_id,
+                             message=f"{st.current_mode} → {st.pending_mode_request}: {reason}")
             st.pending_mode_request = None
+            st.pending_mode_request_id = None
             st.pending_mode_force = False
             st.pending_mode_assertion = ""
             st.pending_mode_rate_hz = None
@@ -2719,7 +2807,7 @@ def main():
                 _gripper_fw_state['_idle_repeats'] = GRIPPER_IDLE_PACK_REPEATS
             if st._gripper_calibrate_pending and active_CAN_gripper:
                 Motor[joint_num].Send_gripper_calibrate()
-                logger.info("[Gripper] firmware calibrate sent")
+                log_gripper.info("firmware calibrate sent")
                 st._gripper_calibrate_pending = False
                 st._gripper_calibrate_running = True
                 st._gripper_calibrate_ticks   = 0
@@ -2731,7 +2819,7 @@ def main():
                 Motor[joint_num].Send_gripper_data_pack()
                 st._gripper_calibrate_ticks += 1
                 if st._gripper_calibrate_ticks > _GRIPPER_CALIBRATE_MAX_TICKS:
-                    logger.warning("[Gripper] firmware calibration timed out")
+                    log_gripper.warning("firmware calibration timed out")
                     st._gripper_calibrate_running = False
             else:
                 send_gripper_commands(

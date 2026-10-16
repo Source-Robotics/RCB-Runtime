@@ -3,7 +3,9 @@
 # (dummy_test_scripts/test_homing_golden.py) proves the behaviour unchanged.
 
 import logging
+logger = logging.getLogger("rti.homing")  # docs/logging.md "Logger names"
 import math
+import time
 
 import numpy as np
 
@@ -11,7 +13,7 @@ from robotics.homing import config as _config
 from robotics.homing import moves as _moves
 from robotics.homing.gripper import GripperHomingState
 from robotics.homing.joint import JointHomingState
-from robotics.homing.status import STATUS_FAILED
+from robotics.homing.status import STATUS_FAILED, log_milestone
 
 
 class HomingController:
@@ -274,7 +276,7 @@ class HomingController:
         for _ in range(self._LIMIT_REPEATS):
             for i in range(joint_num):
                 Motor[i].Send_Limits(Velocity_limit=int(velocity_limit[i]), Current_limit=int(current_limit[i]))
-        logging.info(f"[Homing] {what} sent to {joint_num} joints ({self._LIMIT_REPEATS}x)")
+        logger.info(f"{what} sent to {joint_num} joints ({self._LIMIT_REPEATS}x)")
 
     # ------------------------------------------------------------------
     def exit(self, Motor, joint_num):
@@ -392,10 +394,18 @@ class HomingController:
         self._enter_step(0)
 
         mode_desc = "parallel" if self._homing_steps is not None else "sequential"
-        logging.info(
-            f"[Homing] Sequence started ({mode_desc}) — "
+        logger.info(
+            f"Sequence started ({mode_desc}) — "
             f"{len(self._steps)} steps, {self.joint_num} actuators"
         )
+        self._started_at = time.monotonic()
+        log_milestone("HOMING_STARTED", f"{mode_desc}: {len(self._steps)} steps, {self.joint_num} actuators")
+
+    def log_completed(self):
+        """HOMING_COMPLETED in the activity log, with how long the homing took."""
+        t0 = getattr(self, "_started_at", None)
+        took = f" in {time.monotonic() - t0:.1f} s" if t0 is not None else ""
+        log_milestone("HOMING_COMPLETED", f"{len(self._homed_results)} actuators homed{took}")
 
     # ------------------------------------------------------------------
     def _enter_step(self, idx):
@@ -421,8 +431,8 @@ class HomingController:
                     'done':           False,
                 }
             self._seq_phase = self._MOVE_TO
-            logging.info(
-                f"[Homing] Step {idx}: move_to for joints "
+            logger.info(
+                f"Step {idx}: move_to for joints "
                 f"{list(self._move_to_targets.keys())}"
             )
             # Its <gripper_move> (2026-10-14, user: homing time) runs alongside: set here, replayed every tick by
@@ -433,7 +443,7 @@ class HomingController:
                 self._last_gripper_move = (gm['position'], gm['speed'], gm['current'], gm['activate'], gm['action'],
                                            gm['estop'], gm['release_dir'])
                 self._move_to_min_ticks = max(1, round(gm['duration_s'] / self.dt))
-                logging.info(f"[Homing] Step {idx}: the gripper to {gm['position']} (speed {gm['speed']}, "
+                logger.info(f"Step {idx}: the gripper to {gm['position']} (speed {gm['speed']}, "
                              f"{gm['current']} mA) alongside, at least {gm['duration_s']:.1f} s")
             return
 
@@ -509,8 +519,8 @@ class HomingController:
         if gripper_mode == 'firmware' and j >= self._arm_count:
             if j >= self.joint_num:
                 # No CAN gripper selected — arrays were never extended, skip gracefully.
-                logging.warning(
-                    f"[Homing] Skipping {self._jlabel(j, self._Motor)} in step {self._seq_idx + 1}: "
+                logger.warning(
+                    f"Skipping {self._jlabel(j, self._Motor)} in step {self._seq_idx + 1}: "
                     f"no CAN gripper configured (gripper_mode='firmware' — skipping)"
                 )
                 return
@@ -525,8 +535,8 @@ class HomingController:
             # homing sequence step references the gripper (mode='motor') but
             # the robot is using a non-CAN gripper (do_gripper=False), so the
             # arrays were never extended.  Skip gracefully.
-            logging.warning(
-                f"[Homing] Skipping {self._jlabel(j, self._Motor)} in step {self._seq_idx + 1}: "
+            logger.warning(
+                f"Skipping {self._jlabel(j, self._Motor)} in step {self._seq_idx + 1}: "
                 f"index out of range for homing arrays (non-CAN gripper, "
                 f"gripper_mode='{gripper_mode}' — motor homing not applicable)"
             )
@@ -564,7 +574,7 @@ class HomingController:
                 nudges = ", ".join(f"{self._jlabel(nd['joint'], Motor)} {nd['speed']:+.0f} ticks/s for "
                                    f"{nd['duration_s']:.1f} s" for nd in af['nudges'])
                 homes = ", ".join(self._jlabel(j, Motor) for j in af['home_joints'])
-                logging.info(f"[Homing] {self._jlabel(af['joint'], Motor)} homed — now: "
+                logger.info(f"{self._jlabel(af['joint'], Motor)} homed — now: "
                              f"{'nudge ' + nudges + ', then ' if nudges else ''}homing {homes or 'nothing'}")
                 af['stage'] = 'nudge' if af['nudges'] else 'home'
             if af['stage'] == 'home':
@@ -573,7 +583,7 @@ class HomingController:
                         af['started'].add(j)
                         self._start_homing(j, af['gripper_mode'])
                         if j in self._active_states:
-                            logging.info(f"[Homing] Starting {self._jlabel(j, Motor)} (after "
+                            logger.info(f"Starting {self._jlabel(j, Motor)} (after "
                                          f"{self._jlabel(af['joint'], Motor)})")
                 if len(af['started']) == len(af['home_joints']):
                     af['stage'] = 'done'
@@ -597,10 +607,10 @@ class HomingController:
         self._seq_phase = self._HOMING
         if len(home_joints) > 1:
             labels = [self._jlabel(j, self._Motor) for j in home_joints]
-            logging.info(f"[Homing] Parallel homing [{', '.join(labels)}]")
+            logger.info(f"Parallel homing [{', '.join(labels)}]")
         elif home_joints:
-            logging.info(
-                f"[Homing] Starting {self._jlabel(home_joints[0], self._Motor)} "
+            logger.info(
+                f"Starting {self._jlabel(home_joints[0], self._Motor)} "
                 f"(step {self._seq_idx + 1}/{len(self._steps)})"
             )
 
@@ -649,7 +659,7 @@ class HomingController:
         if self._seq_phase == self._FAILED:
             return 'failed'
         if self._seq_phase == self._IDLE:
-            logging.warning("[Homing] step() called before start()")
+            logger.warning("step() called before start()")
             return 'running'
         self._seq_ticks += 1
 
@@ -719,8 +729,8 @@ class HomingController:
                             encoder_counts = 2 ** _GRIPPER_ENCODER_BITS
                             tpm = encoder_counts / (4.0 * math.pi * gear_r)
                             shared_data.gripper['gripper_ticks_per_meter'][0] = tpm
-                            logging.info(
-                                f"[Homing] Gripper ticks_per_meter = {tpm:.1f} "
+                            logger.info(
+                                f"Gripper ticks_per_meter = {tpm:.1f} "
                                 f"(from Gear_r={gear_r}, encoder={_GRIPPER_ENCODER_BITS}bit, "
                                 f"endstop={state._triggered_pos}, stroke={self._gripper_stroke_mm}mm)"
                             )
@@ -730,8 +740,8 @@ class HomingController:
                             if endstop_ticks > 0 and stroke_m > 0:
                                 tpm = endstop_ticks / stroke_m
                                 shared_data.gripper['gripper_ticks_per_meter'][0] = tpm
-                                logging.warning(
-                                    f"[Homing] Gripper Gear_r not set — estimating ticks_per_meter = {tpm:.1f} "
+                                logger.warning(
+                                    f"Gripper Gear_r not set — estimating ticks_per_meter = {tpm:.1f} "
                                     f"from homing travel (may be inaccurate if gripper was not fully closed at power-on)"
                                 )
                         if gear_r > 0:
@@ -740,7 +750,7 @@ class HomingController:
                 # A joint that completed without a reference is not homed (2026-10-14: this was a warning, and the
                 # sequence went on).
                 reason = "it completed without a home reference (no valid position read at the endstop)"
-                logging.error(f"[Homing] {self._jlabel(j, Motor)} FAILED: {reason}")
+                logger.error(f"{self._jlabel(j, Motor)} FAILED: {reason}")
                 shared_data.rti["homing_status"][j] = STATUS_FAILED
                 self._report_failure(j, reason)
                 self._seq_phase = self._FAILED
@@ -782,11 +792,12 @@ class HomingController:
                 return 'failed'
             self._seq_phase = self._DONE
             shared_data.homed_state.set("HOMED")
-            logging.info("[Homing] All joints homed successfully.")
-            logging.info("[Homing] ── Home positions set per joint ─────────────")
+            logger.info("All joints homed successfully.")
+            self.log_completed()
+            logger.info("── Home positions set per joint ─────────────")
             for j in sorted(self._homed_results):
-                logging.info(f"[Homing]   {self._jlabel(j, self._Motor)}: endstop encoder pos = {self._homed_results[j]}")
-            logging.info("[Homing] ─────────────────────────────────────────────")
+                logger.info(f"  {self._jlabel(j, self._Motor)}: endstop encoder pos = {self._homed_results[j]}")
+            logger.info("─────────────────────────────────────────────")
             return 'done'
 
         self._enter_step(next_idx)
@@ -807,7 +818,7 @@ class HomingController:
             "travel": {j: v[2] for j, v in arm_stats.items()},
             "approach": {j: a - latches[j] for j, a in self._approach_arrival.items() if j in latches}})
         if verdict["kind"] == "fault":
-            logging.error(verdict["text"])
+            logger.error(verdict["text"])
             for j, d in verdict["off"]:
                 shared_data.rti["homing_status"][j] = STATUS_FAILED
                 self._report_failure(j, (verdict.get("reasons") or {}).get(j)
@@ -815,7 +826,7 @@ class HomingController:
                                         f"{verdict['text'].split(' — ', 1)[-1]}")
             self._seq_phase = self._FAILED
             return False
-        (logging.warning if verdict["kind"] == "relearn" else logging.info)(verdict["text"])
+        (logger.warning if verdict["kind"] == "relearn" else logger.info)(verdict["text"])
         return True
 
     # ------------------------------------------------------------------
@@ -861,9 +872,9 @@ class HomingController:
         verdict = self.arm_check.check_so_far(latches, j)
         if verdict["kind"] != "fault":
             if verdict.get("text"):
-                logging.info(verdict["text"])
+                logger.info(verdict["text"])
             return True
-        logging.error(verdict["text"])
+        logger.error(verdict["text"])
         for i, d in verdict["off"]:
             shared_data.rti["homing_status"][i] = STATUS_FAILED
             self._report_failure(i, verdict["reason"])
@@ -884,7 +895,7 @@ class HomingController:
 
     def _fail(self, j: int, shared_data, reason: str):
         """Backward compat — fail the sequence."""
-        logging.error(f"[Homing] {self._jlabel(j, self._Motor)} FAILED: {reason}")
+        logger.error(f"{self._jlabel(j, self._Motor)} FAILED: {reason}")
         self._report_failure(j, reason)
         shared_data.rti["homing_status"][j] = STATUS_FAILED
         self._seq_phase = self._FAILED

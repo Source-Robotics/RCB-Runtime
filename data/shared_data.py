@@ -12,6 +12,7 @@ Description:
     Supports runtime joint count change via shared_data.setup(joints=N)
 """
 
+import logging
 import numpy as np
 from multiprocessing import shared_memory, resource_tracker
 import json
@@ -26,21 +27,34 @@ import os
 # the dashboard, the api_tests) = the names are exactly what they always were.
 _SHM_PREFIX = os.environ.get("RCB_SHM_PREFIX", "")
 
+# This module logs, it does not print (2026-10-15): under the supervisor a print only reached logs/<NAME>.out.log
+# (~200 lines per process start, 29,046 in GUI.out.log) and the supervisor's went to the journal. The per-block
+# attach / create lines are DEBUG (off at the default INFO level); setup() logs ONE summary with the counts — a process
+# that CREATED blocks it should have attached (RTI not running) shows there. A process that sets up its shared memory
+# before its logging (RTI, the supervisor, the dashboard) loses the summary; a wrong-size block is a WARNING and
+# reaches stderr even then (Python's last-resort handler).
+logger = logging.getLogger("shm")  # docs/logging.md "Logger names"
+_blocks_attached = 0   # counted per setup(); the summary line reports them
+_blocks_created = 0
+
 # ======================= SharedString Class ==========================
 class SharedString:
     """A wrapper for string shared memory with 4-byte length prefix."""
     def __init__(self, name: str, size: int = 256):
+        global _blocks_attached, _blocks_created
         name = _SHM_PREFIX + name
         self.size = size
         try:
             self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
             self.shm.buf[:size] = b'\x00' * size  # type: ignore[index]  # SharedMemory.buf is typed Optional; a created segment always has one
             self.created = True
-            print(f"[INFO] Shared string '{name}' created ({size} bytes).")
+            _blocks_created += 1
+            logger.debug(f"string '{name}' created ({size} bytes)")
         except FileExistsError:
             self.shm = shared_memory.SharedMemory(name=name)
             self.created = False
-            print(f"[INFO] Shared string '{name}' attached (already exists).")
+            _blocks_attached += 1
+            logger.debug(f"string '{name}' attached")
         # Prevent resource_tracker from unlinking this segment on process exit;
         # lifetime is managed explicitly (shared across processes).
         resource_tracker.unregister(self.shm._name, "shared_memory")  # type: ignore[attr-defined]  # the private name the resource tracker registered
@@ -129,6 +143,7 @@ motor_config = {}  # Per-joint PID gains and limits currently loaded to motor dr
 
 # ======================= Helper ==========================
 def _attach_or_create(name: str, dtype, count: int):
+    global _blocks_attached, _blocks_created
     name = _SHM_PREFIX + name
     try:
         shm = shared_memory.SharedMemory(name=name)
@@ -139,24 +154,26 @@ def _attach_or_create(name: str, dtype, count: int):
         expected_size = np.dtype(dtype).itemsize * count
         if shm.size != expected_size:
             # Stale segment with wrong size (e.g. dtype changed) — recreate it.
-            print(f"[WARN] Shared memory '{name}' has wrong size "
-                  f"({shm.size} bytes, expected {expected_size}). Unlinking and recreating.")
+            logger.warning(f"'{name}' has the wrong size ({shm.size} bytes, expected {expected_size}) — "
+                           f"unlinking and recreating")
             shm.close()
             shm.unlink()
             raise FileNotFoundError  # fall through to create branch
 
         arr = np.ndarray((count,), dtype=dtype, buffer=shm.buf)
-        print(f"[INFO] Attached to existing shared memory: {name}")
+        _blocks_attached += 1
+        logger.debug(f"attached {name}")
     except FileNotFoundError:
         size = np.dtype(dtype).itemsize * count
         shm = shared_memory.SharedMemory(create=True, size=size, name=name)
         # --- FIX FOR LINUX ---
         # Stop the resource tracker from destroying this memory when this process exits
         resource_tracker.unregister(shm._name, "shared_memory")  # type: ignore[attr-defined]  # the private name the resource tracker registered
-        
+
         arr = np.ndarray((count,), dtype=dtype, buffer=shm.buf)
         arr[:] = 0
-        print(f"[INFO] Created new shared memory: {name} ({size} bytes)")
+        _blocks_created += 1
+        logger.debug(f"created {name} ({size} bytes)")
     except Exception as e:
         raise RuntimeError(f"Failed to attach/create {name}: {e}")
     return shm, arr
@@ -186,13 +203,14 @@ def setup(joints: int = 6, force_reinit: bool = False):
     global rti, rti_shms, gripper_shms, gripper
     global system_info_shms
     global motor_config_shms, motor_config
+    global _blocks_attached, _blocks_created
 
     if _initialized and not force_reinit and joints == joint_num:
         return
 
     # Clean up old per-joint blocks if changing joint count
     if _initialized and joints != joint_num:
-        print(f"[RTI] Reconfiguring from {joint_num} → {joints} joints – cleaning old blocks...")
+        logger.info(f"reconfiguring from {joint_num} to {joints} joints — closing the old blocks")
         for shm in motor_shms.values():  # type: ignore[attr-defined]  # only reached after setup() filled it (re-setup with another joint count)
             shm.close()
         for shm in joint_shms.values():  # type: ignore[attr-defined]  # only reached after setup() filled it (re-setup with another joint count)
@@ -200,7 +218,8 @@ def setup(joints: int = 6, force_reinit: bool = False):
         ext_shms["torque_external"].close()  # type: ignore[index]  # only reached after setup() filled it (re-setup with another joint count)
 
     joint_num = max(1, joints)
-    print(f"\n[RTI] Initializing shared memory for {joint_num}-DOF robot...\n")
+    _blocks_attached = _blocks_created = 0
+    logger.debug(f"setting up the shared memory of a {joint_num}-DOF robot")
 
     # ========================= String-based states =========================
     robot_mode  = SharedString("robot_mode", 256)
@@ -596,6 +615,9 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "payload_com_x",
         "payload_com_y",
         "payload_com_z",
+        # RTI's locked memory (config/system_config.lock_memory, 2026-10-16): the RAM locked at its start [MB]; 0 = the
+        # lock failed (the service's LimitMEMLOCK), -1 = not tried (simulation). The health summary reads it.
+        "memory_locked_mb",
         # --- Self-collision (utility/self_collision.py, self_collision_worker.py; TODO/self_collision_plan.md 2026-10-06) ---
         # Written by the collision WORKER process (another core, ~100 Hz) from the measured pose; read by RTI's safety
         # monitor and jog handler each tick. Frames: 0 = base, 1-5 = the links after joints 1-5, 6 = the tool.
@@ -797,7 +819,8 @@ def setup(joints: int = 6, force_reinit: bool = False):
         gripper[name] = arr
 
     _initialized = True
-    print("All shared memory elements are attached or created successfully.\n")
+    logger.info(f"{_blocks_attached + _blocks_created} blocks ready for a {joint_num}-DOF robot: "
+                f"{_blocks_attached} attached, {_blocks_created} created")
 
 
 def cleanup():
@@ -837,7 +860,7 @@ def cleanup():
             try: shm.close()
             except Exception: pass
 
-    print("[shared_data] Shared memory handles closed.")
+    logger.debug("handles closed")
 
 
 # Allow RTI(7) shortcut

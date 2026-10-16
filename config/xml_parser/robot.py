@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import logging
+logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -169,7 +170,6 @@ def _fill_mode_limit_defaults(cfg: dict) -> dict:
     Mutates cfg in place and returns it.
     """
     import numpy as _np
-    _log = logging.getLogger(__name__)
 
     for mode, entries in _MODE_LIMIT_MAP.items():
         for _tag, key, ceiling_key in entries:
@@ -180,8 +180,8 @@ def _fill_mode_limit_defaults(cfg: dict) -> dict:
             over = vals > ceiling
             if over.any():
                 for i in _np.where(over)[0]:
-                    _log.warning(
-                        "[XML] %s joint %d is %.4g, above the hardware limit %s=%.4g — "
+                    logger.warning(
+                        "robot XML %s joint %d is %.4g, above the hardware limit %s=%.4g — "
                         "clamped. A per-mode block can lower a limit, never raise it.",
                         key, int(i), float(vals[i]), ceiling_key, float(ceiling[i]))
                 vals = _np.minimum(vals, ceiling)
@@ -223,7 +223,7 @@ def _voltage_limit_or_default(value: float | np.ndarray) -> float | np.ndarray:
     filled = np.where(np.isnan(arr), DEFAULT_VOLTAGE_LIMIT_MV, arr)
     clamped = np.asarray(clamp_voltage_limit(filled), dtype=float)
     if np.any(clamped != filled):
-        logging.warning("[XML] voltage_limit below the %.0f mV floor (and not the 0 = use-VBUS "
+        logger.warning("robot XML voltage_limit below the %.0f mV floor (and not the 0 = use-VBUS "
                         "sentinel) — clamped up.", MIN_VOLTAGE_LIMIT_MV)
     return float(clamped) if clamped.ndim == 0 else clamped
 
@@ -242,7 +242,7 @@ def _hold_osc_ma(values: Iterable[float | None]) -> list[float]:
         elif 0.0 <= v <= 5000.0:
             out.append(v)
         else:
-            logging.warning("[robot XML] joint %d <hold_oscillation_ma> = %s is outside [0, 5000] — using %s",
+            logger.warning("robot XML joint %d <hold_oscillation_ma> = %s is outside [0, 5000] — using %s",
                             i, v, HOLD_OSC_DEFAULT_MA)
             out.append(HOLD_OSC_DEFAULT_MA)
     return out
@@ -259,17 +259,17 @@ def _parse_collision_pairs(elem, tag: str, frame_b: int | None = None) -> list[d
             a = int(p.get("a", p.get("with")))
             b = frame_b if frame_b is not None else int(p.get("b"))
         except (TypeError, ValueError):
-            logging.warning("[robot XML] <%s><pair> %d has no valid frames — ignored", tag, i + 1)
+            logger.warning("robot XML <%s><pair> %d has no valid frames — ignored", tag, i + 1)
             continue
         if not (0 <= a <= 6 and 0 <= b <= 6) or a == b:
-            logging.warning("[robot XML] <%s><pair a=%s b=%s> is not a pair of frames 0-6 — ignored", tag, a, b)
+            logger.warning("robot XML <%s><pair a=%s b=%s> is not a pair of frames 0-6 — ignored", tag, a, b)
             continue
         def _mm(name):
             v = p.get(name)
             try:
                 return None if v is None else max(0.0, float(v))
             except ValueError:
-                logging.warning("[robot XML] <%s><pair> %s=%r is not a number — ignored", tag, name, v)
+                logger.warning("robot XML <%s><pair> %s=%r is not a number — ignored", tag, name, v)
                 return None
         out.append({"a": min(a, b), "b": max(a, b), "planner_mm": _mm("planner_mm"), "monitor_mm": _mm("monitor_mm"),
                     "check": (p.get("check", "on").strip().lower() not in ("off", "0", "false"))})
@@ -286,7 +286,7 @@ def _nonneg(values: Iterable[float | None], tag: str, hi: float) -> list[float]:
         elif 0.0 <= v <= hi:
             out.append(v)
         else:
-            logging.warning("[robot XML] joint %d <%s> = %s is outside [0, %s] — using 0", i, tag, v, hi)
+            logger.warning("robot XML joint %d <%s> = %s is outside [0, %s] — using 0", i, tag, v, hi)
             out.append(0.0)
     return out
 
@@ -473,13 +473,13 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         try:
             values = [float(v) for v in park_tag.text.split()]
         except ValueError:
-            logging.warning("[robot.xml] <park_pose> is not a list of numbers — ignored")
+            logger.warning("robot XML <park_pose> is not a list of numbers — ignored")
         else:
             if len(values) == cfg['joint_num']:
                 cfg['park_pose'] = values
             else:
-                logging.warning(
-                    "[robot.xml] <park_pose> has %d values but the robot has %d "
+                logger.warning(
+                    "robot XML <park_pose> has %d values but the robot has %d "
                     "joints — ignored", len(values), cfg['joint_num'])
 
     # ---- optional homing sequence file ----

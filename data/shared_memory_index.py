@@ -15,12 +15,7 @@ Dependencies: os, sys
 
 from multiprocessing import shared_memory
 import numpy as np
-import logging
-
-logger = logging.getLogger(__name__)
-# Debug flag (can be set externally or toggled)
-
-logger.info("shared_memory_index.py")
+# (An import-time INFO line that said only "shared_memory_index.py" was removed 2026-10-15: no information.)
 
 
 # GPIO indexes

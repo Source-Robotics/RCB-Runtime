@@ -25,6 +25,7 @@ tick late, each read finding the previous one — is not counted. In the normal 
 40 %) and this would undercount. B is off; the strict count needs each command's departure (69 has it from candump).
 """
 import logging
+logger = logging.getLogger("rti.can")  # docs/logging.md "Logger names"
 
 CAN_REPLY_MISSED_WARNING = "CAN_REPLY_MISSED_WARNING"
 WINDOW_S = 1.0           # the window the misses are counted over
@@ -103,16 +104,16 @@ class CanReplyMonitor:
                 lasted = self._burst[j] * self.delta_t
                 if key in self.warnings:
                     self.warnings.discard(key)
-                    logging.info(f"[CAN] J{j + 1}: replies back on time after {lasted:.1f} s; the gap peaked at "
+                    logger.info(f"J{j + 1}: replies back on time after {lasted:.1f} s; the gap peaked at "
                                  f"{self._peak[j]} missed in {self.window} ticks ({self.total[j]} missed since the start)")
                 else:
-                    logging.info(f"[CAN] J{j + 1}: a {lasted:.1f} s burst of late replies (peak {self._peak[j]} missed in "
+                    logger.info(f"J{j + 1}: a {lasted:.1f} s burst of late replies (peak {self._peak[j]} missed in "
                                  f"{self.window} ticks; {self.total[j]} since the start) — not sustained, no warning "
                                  f"(usually load on the Pi)")
                 self._burst[j] = 0
                 self._bursting -= 1
             elif key not in self.warnings and self._burst[j] >= self.sustain_ticks:
                 self.warnings.add(key)
-                logging.warning(f"[CAN] J{j + 1}: its replies have kept missing RTI's read for "
+                logger.warning(f"J{j + 1}: its replies have kept missing RTI's read for "
                                 f"{self._burst[j] * self.delta_t:.1f} s ({c} of the last {self.window}) — its measured "
                                 f"state is a tick old (TODO/servo_mode_options.md §17.23)")

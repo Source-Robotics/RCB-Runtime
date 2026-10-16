@@ -43,6 +43,7 @@ Description:
 """
 
 import logging
+logger = logging.getLogger("rti.errors")  # docs/logging.md "Logger names"
 import time
 
 from utility.state_machine import RobotMode, MAINTENANCE_MODES
@@ -115,9 +116,11 @@ from utility.error_catalog import ERROR_DESCRIPTIONS
 
 
 def _cause_text(short_key: str, fallback: str) -> str:
-    """Cause string for log text — short_keys not in the catalog fall back to the raw key."""
+    """The key's catalog TITLE with its number and code — "Drive watchdog tripped (2103 WATCHDOG)" — for the error
+    list and RTI.log (2026-10-15, the message standard; the cause / effect / fix are looked up by whoever shows
+    them). A key not in the catalog falls back to the raw key."""
     entry = ERROR_DESCRIPTIONS.get(short_key)
-    return entry["cause"] if entry else fallback
+    return f"{entry['title']} ({entry['number']} {short_key})" if entry else fallback
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +245,8 @@ def tick_clear_countdown(
                 shared_data.gripper[k][:] = 0
             for k in _GRIPPER_MOTOR_ERROR_SHARED_KEYS:
                 shared_data.gripper[k][:] = 0
-        logging.info(
-            "[ERRORS] Settle period complete — latch and error flags cleared. "
+        logger.info(
+            "Settle period complete — latch and error flags cleared. "
             "check_errors() will re-latch any still-active faults on the next poll cycle."
         )
     return countdown, latched_errors
@@ -261,7 +264,7 @@ def clear_errors(latched_errors: set, shared_data=None) -> set:
     latched_errors.clear()
     if shared_data is not None:
         shared_data.rti["CAN_node_connection_error"][:] = 0
-    logging.info("[ERRORS] Error latch cleared by user. Active errors will re-latch immediately.")
+    logger.info("Error latch cleared by user. Active errors will re-latch immediately.")
     return latched_errors
 
 
@@ -535,21 +538,14 @@ def _collect_gripper_errors(shared_data, joint_num, current_errors, faults=True)
 
 
 def _log_new_error(key):
-    """Log an error the first time it appears — warnings at WARNING, everything else at ERROR."""
-    short_key = key.split(":", 1)[-1]          # strips the "J{i}:" prefix if present
+    """Log an error the first time it appears — a warning key at WARNING, everything else at ERROR.
+    "Joint 3: Drive watchdog tripped (2103 WATCHDOG)". The warning keys are _WARNING_SUFFIXES — the ONE list; until
+    2026-10-15 this function had its own two lists, and LOOP_DEGRADED (a warning) was logged at ERROR."""
+    short_key = key.split(":", 1)[-1]          # strips the "J{i}:" / "Z_{zone}:" prefix if present
     description = _cause_text(short_key, key)
-    if key.startswith("J") and ":" in key:
-        joint_idx = key.split(":")[0][1:]      # e.g. "J3:TEMPERATURE" → "3" (the joint's 1-based number)
-        if short_key in ("CAN_STALE", "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING",
-                         "OVERSPEED_WARNING", "TRACKING_WARNING", "HOLD_OSCILLATION_WARNING",
-                         "CAN_REPLY_MISSED_WARNING"):
-            logging.warning(f"[WARNING] Joint {joint_idx}: {description}")
-        else:
-            logging.error(f"[ERROR] Joint {joint_idx}: {description}")
-    elif short_key in ("NOT_HOMED", "ZONE_WARNING", "TCP_OVERSPEED_WARNING", "SELF_COLLISION_WARNING", "SELF_COLLISION_STALE"):
-        logging.warning(f"[WARNING] {description}")
-    else:
-        logging.error(f"[ERROR] {description}")
+    where = _where(key)
+    text = f"{where[0].upper()}{where[1:]}: {description}" if where else description
+    (logger.warning if short_key in _WARNING_SUFFIXES else logger.error)(text)
 
 
 def check_errors(
@@ -654,8 +650,8 @@ def _handle_clear_signal(shared_data, Motor, Motor_errors_data, joint_num, clear
         )
         clear_error_countdown = CLEAR_ERROR_SETTLE_TICKS
         shared_data.clear_error_signal.set("0")
-        logging.info(
-            f"[ERRORS] CAN clear sent to errored motors. "
+        logger.info(
+            f"CAN clear sent to errored motors. "
             f"Settling for {CLEAR_ERROR_SETTLE_TICKS} ticks before wiping latch."
         )
     return clear_error_countdown
@@ -671,15 +667,19 @@ def _invalidate_homing_on_errors(shared_data, latched_errors):
     if disconnect_errors and shared_data.homed_state.get() == "HOMED":
         shared_data.homed_state.set("NOT HOMED")
         shared_data.rti["homing_status"][:] = 0
-        logging.error(f"[RTI] Connection lost ({disconnect_errors}) — homing invalidated.")
+        logger.error(f"Connection lost ({disconnect_errors}) — homing invalidated.")
+        log_activity(get_rti_activity_logger(), "RTI", "warning", "HOMING_INVALIDATED",
+                     message=f"connection lost: {', '.join(sorted(disconnect_errors))}")
 
     # ── Position past a physical endstop → the reference is wrong → invalidate homing ──
     beyond = {k for k in latched_errors if k.endswith(":" + BEYOND_ENDSTOP)} if latched_errors else ()
     if beyond and shared_data.homed_state.get() == "HOMED":
         shared_data.homed_state.set("NOT HOMED")
         shared_data.rti["homing_status"][:] = 0
-        logging.error(f"[RTI] Measured position past an endstop ({beyond}) — the position reference "
+        logger.error(f"Measured position past an endstop ({beyond}) — the position reference "
                       f"cannot be trusted; homing invalidated.")
+        log_activity(get_rti_activity_logger(), "RTI", "warning", "HOMING_INVALIDATED",
+                     message=f"measured past an endstop: {', '.join(sorted(beyond))}")
 
 
 def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, error_active):
@@ -688,8 +688,12 @@ def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, 
     # ── Hard error → force DISABLED / ACTIVE_ERROR (velocity-hold) ─────────
     if error_active and current_mode != RobotMode.BOOTING:
         if shared_data.robot_state.get() != "DISABLED":
+            _was_enabled = shared_data.robot_state.get() == "ENABLED"
             shared_data.robot_state.set("DISABLED")
-            logging.error("[RTI] Error active — robot disabled.")
+            logger.error("Error active — robot disabled.")
+            if _was_enabled:                   # nobody asked: the error did it (2026-10-15)
+                log_activity(get_rti_activity_logger(), "RTI", "info", "STATE_CHANGE",
+                             message="ENABLED → DISABLED: an error latched")
         # MAINTENANCE_MODES are exempt from the forced mode change — they still
         # go DISABLED above (motors ARE limp), but they keep the mode.
         #
@@ -709,7 +713,9 @@ def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, 
                 homing_ctrl.exit(Motor, joint_num)
                 shared_data.homed_state.set("NOT HOMED")
                 shared_data.rti["homing_status"][:] = 0
-                logging.error("[RTI] Error during homing — homing aborted, homed state cleared.")
+                logger.error("Error during homing — homing aborted, homed state cleared.")
+                log_activity(get_rti_activity_logger(), "RTI", "warning", "HOMING_ABORTED",
+                             message="an error latched during homing")
                 # Restore normal PID config in shared memory — homing_ctrl.exit() restores
                 # motor limits via CAN but error_checks bypasses _HomingDispatch.exit().
                 mc = getattr(homing_ctrl, '_motor_config', None)
@@ -723,18 +729,20 @@ def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, 
                     )
             current_mode = RobotMode.ACTIVE_ERROR
             shared_data.robot_mode.set(current_mode)
-            logging.error("[RTI] Error active — entering ACTIVE_ERROR (velocity-hold).")
+            logger.error("Error active — entering ACTIVE_ERROR (velocity-hold).")
     elif not error_active and current_mode == RobotMode.ACTIVE_ERROR:
         current_mode = RobotMode.IDLE
         shared_data.robot_mode.set(current_mode)
-        logging.info("[RTI] Errors cleared — returning to IDLE.")
+        logger.info("Errors cleared — returning to IDLE.")
     return current_mode
 
 
-def _update_error_metadata(shared_data, latched_errors, error_metadata, details=None):
+def _update_error_metadata(shared_data, latched_errors, error_metadata, details=None, detail_of=None):
     """Metadata (timestamp, tick, description, level) for newly latched keys — with an activity-log entry —
     and removal for cleared ones. Returns True when anything changed. `details` {key: reason}: the reason of an error
-    that carries its own (a failed homing, 2026-10-14) — its description in the error list and the activity log."""
+    that carries its own (a failed homing, 2026-10-14). `detail_of(key) -> str | None` (2026-10-15): the measured
+    value behind any other key — the safety monitor's trip value, a drive's temperature, the loop's period — asked
+    only for a key that latches THIS tick (cold), so its text costs the loop nothing on the other ticks."""
     # ── Update error metadata: add new, prune cleared ────────────────────────
     tick = int(shared_data.rti["loop_tick"][0])
     existing_error_keys = set(error_metadata)
@@ -748,25 +756,44 @@ def _update_error_metadata(shared_data, latched_errors, error_metadata, details=
         short_key   = key.split(":", 1)[-1]
         description = _cause_text(short_key, key)
         reason = details.get(key) if details else None
-        if reason:
-            description = f"homing failed: {reason}"
+        if reason is None and detail_of is not None:
+            try:
+                reason = detail_of(key)
+            except Exception as exc:           # a detail must never take the error pass down
+                logger.warning(f"detail of {key}: {exc}")
+        if reason:                             # "Joint homing failed: <reason> (4002 HOMING_FAILED)"
+            cat = ERROR_DESCRIPTIONS.get(short_key)
+            description = (f"{cat['title']}: {reason} ({cat['number']} {short_key})" if cat
+                           else f"{short_key}: {reason}")
         level = "warning" if short_key in _WARNING_SUFFIXES else "error"
         error_metadata[key] = {"timestamp": now, "tick": tick, "description": description, "level": level}
         # Activity log — debounced per-code so a flapping/marginal fault can't
         # spam the file (design doc §4). joint_idx folded into `message` since
         # `code` in the catalog is the short_key, not the "J{i}:KEY" form.
         if _activity_rate_limiter.allow(short_key, _ACTIVITY_MIN_INTERVAL):
-            joint_msg = None
-            if key.startswith("J") and ":" in key:
-                joint_msg = f"joint {key.split(':')[0][1:]}"
-            elif key.startswith("Z_") and ":" in key:
-                joint_msg = f"zone {key.split(':')[0][2:]}"
+            joint_msg = _where(key)
             if reason:
                 joint_msg = f"{joint_msg}: {reason}" if joint_msg else reason
             log_activity(get_rti_activity_logger(), "RTI", level, short_key, message=joint_msg)
     for key in cleared_error_keys:
         del error_metadata[key]
+        # The clear, too (2026-10-15): same code as the latch, level info, so the activity log shows how long a
+        # fault lasted — a warning that clears itself, or the operator's Clear Errors. Debounced like the latch.
+        short_key = key.split(":", 1)[-1]
+        if _activity_rate_limiter.allow(short_key + "/cleared", _ACTIVITY_MIN_INTERVAL):
+            where = _where(key)
+            log_activity(get_rti_activity_logger(), "RTI", "info", short_key,
+                         message=f"{where}: cleared" if where else "cleared")
     return error_metadata_changed
+
+
+def _where(key):
+    """'joint 3' for "J3:KEY", 'zone x' for "Z_x:KEY", None for a robot-wide key."""
+    if key.startswith("J") and ":" in key:
+        return f"joint {key.split(':')[0][1:]}"
+    if key.startswith("Z_") and ":" in key:
+        return f"zone {key.split(':')[0][2:]}"
+    return None
 
 
 def _publish_error_list(shared_data, error_metadata):
@@ -808,6 +835,7 @@ def process_errors_tick(
     rti_errors=(),
     can_warnings=(),
     homing_errors=None,
+    detail_of=None,
 ) -> tuple:
     """Run one tick of error processing in the RTI superloop.
 
@@ -876,7 +904,7 @@ def process_errors_tick(
         _new_hard = [k for k in latched_errors if k not in error_metadata and not k.endswith(_WARNING_SUFFIXES)]
         if _new_hard:
             on_hard_error(_new_hard, int(shared_data.rti["loop_tick"][0]))
-    if _update_error_metadata(shared_data, latched_errors, error_metadata, homing_errors):
+    if _update_error_metadata(shared_data, latched_errors, error_metadata, homing_errors, detail_of):
         _publish_error_list(shared_data, error_metadata)
 
     return clear_error_countdown, latched_errors, error_metadata, current_mode

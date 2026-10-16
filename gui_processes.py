@@ -27,6 +27,7 @@ PROCESSES = (
     ("Executor", "command_executor.py", False),
     ("GUI", "nicegui_test.py", False),
     ("Supervisor", "supervisor.py", False),
+    ("Recorder", "recorder.py", False),                  # incident dumps + captures (2026-10-16)
     ("Block program", "blockly.runner", True),
     ("Firmware flasher", "flash_motor_firmware.py", True),
 )

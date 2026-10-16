@@ -24,7 +24,7 @@ import socket
 import json
 import select
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.net")  # docs/logging.md "Logger names"
 
 
 # =============================================================================
@@ -138,7 +138,7 @@ def enqueue_command(command_queue, msg, depth_state):
     depth = command_queue.qsize()
     if depth >= COMMAND_QUEUE_WARN_DEPTH:
         if not depth_state["warned"]:
-            logger.warning(f"[ZMQ] {depth} commands waiting for the RT loop (it takes one per tick) — is it draining?")
+            logger.warning(f"{depth} commands waiting for the RT loop (it takes one per tick) — is it draining?")
             depth_state["warned"] = True
     elif depth_state["warned"]:
         depth_state["warned"] = False
@@ -428,7 +428,7 @@ def drain_rti_udp(sock, allowed_ip, allowed_port):
         if len(data) >= RTI_RECV_BUF:
             # Cannot distinguish "exactly buffer-sized" from "truncated", so treat both as
             # suspect rather than feeding a possibly-headless packet to the unpacker.
-            logging.warning("[RTI] dropped a %d-byte datagram — at or over the %d-byte "
+            logger.warning("dropped a %d-byte datagram — at or over the %d-byte "
                             "receive buffer, so it may be truncated", len(data), RTI_RECV_BUF)
             continue
         if ((allowed_ip is None or addr[0] == allowed_ip) and

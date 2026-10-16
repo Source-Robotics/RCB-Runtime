@@ -21,7 +21,7 @@ import numpy as np
 
 from utility.system_temperature import get_raspberry_pi_temperature
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.selfcheck")  # docs/logging.md "Logger names"
 
 # CAN command IDs for the four telemetry response types
 _CMD_TEMPERATURE = 23
@@ -45,9 +45,9 @@ def _check_can_scan(scan_received_ids, joint_num, active_CAN_gripper, results):
     missing = [n for n in expected_nodes if scan_ids[n] == 0]
     results["missing_nodes"] = missing
     if missing:
-        logger.warning(f"[Selfcheck] Missing CAN nodes: {missing}")
+        logger.warning(f"Missing CAN nodes: {missing}")
     else:
-        logger.info(f"[Selfcheck] CAN scan OK — all {len(expected_nodes)} node(s) present")
+        logger.info(f"CAN scan OK — all {len(expected_nodes)} node(s) present")
     return missing
 
 
@@ -114,10 +114,10 @@ def _telemetry_list(raw, joint_num, results, key, label, info_label, timeout):
     missing = [i for i, v in enumerate(values) if v is None]
     if missing:
         logger.warning(
-            f"[Selfcheck] {label} not received for joint(s) {missing} "
+            f"{label} not received for joint(s) {missing} "
             f"— no CAN response within {timeout}s"
         )
-    logger.info(f"[Selfcheck] {info_label}: {values}")
+    logger.info(f"{info_label}: {values}")
     return values
 
 
@@ -132,13 +132,13 @@ def _motor_errors(err_raw, joint_num, results, timeout):
     no_err_resp  = [i for i, e in enumerate(motor_errors) if e is None]
     if no_err_resp:
         logger.warning(
-            f"[Selfcheck] Error state not received for joint(s) {no_err_resp} "
+            f"Error state not received for joint(s) {no_err_resp} "
             f"— no CAN response within {timeout}s"
         )
     if error_joints:
-        logger.warning(f"[Selfcheck] Motor errors on joint(s) {error_joints}: {motor_errors}")
+        logger.warning(f"Motor errors on joint(s) {error_joints}: {motor_errors}")
     else:
-        logger.info("[Selfcheck] Motor errors: none")
+        logger.info("Motor errors: none")
     return motor_errors, error_joints
 
 
@@ -157,14 +157,14 @@ def _overall(results, missing, motor_errors, error_joints):
     results["pass"] = passed
 
     if passed:
-        logger.info("[Selfcheck] ✓ PASSED — all checks OK")
+        logger.info("✓ PASSED — all checks OK")
     else:
         fail_reasons = []
         if missing:
             fail_reasons.append(f"missing CAN nodes={missing}")
         if error_joints:
             fail_reasons.append(f"motor errors on joint(s) {error_joints}")
-        logger.warning(f"[Selfcheck] ✗ FAILED — {', '.join(fail_reasons)}")
+        logger.warning(f"✗ FAILED — {', '.join(fail_reasons)}")
     return passed
 
 
@@ -198,7 +198,7 @@ def run_selfcheck(
                     voltages, firmware_versions, pi_temp
     """
     results = {}
-    logger.info("[Selfcheck] ========== STARTUP SELFCHECK ==========")
+    logger.info("========== STARTUP SELFCHECK ==========")
 
     missing = _check_can_scan(scan_received_ids, joint_num, active_CAN_gripper, results)
     _request_telemetry(Motor, joint_num)
@@ -213,10 +213,10 @@ def run_selfcheck(
     # 8. Raspberry Pi CPU temperature
     pi_temp = get_raspberry_pi_temperature()
     results["pi_temp"] = pi_temp
-    logger.info(f"[Selfcheck] Pi CPU temperature: {pi_temp} °C")
+    logger.info(f"Pi CPU temperature: {pi_temp} °C")
 
     _write_firmware_versions(shared_data, firmware_versions)
     _overall(results, missing, motor_errors, error_joints)
 
-    logger.info("[Selfcheck] ===========================================")
+    logger.info("===========================================")
     return results

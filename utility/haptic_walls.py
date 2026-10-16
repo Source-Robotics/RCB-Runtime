@@ -83,6 +83,7 @@ from collections.abc import Callable
 from typing import Any
 
 import logging
+logger = logging.getLogger("rti.safety")  # docs/logging.md "Logger names"
 
 import numpy as np
 
@@ -106,7 +107,7 @@ def make_effective_inertia(robot: Any) -> Callable[[np.ndarray, np.ndarray], Non
         from utility.pinocchio_attach import build_pinocchio_dynamics
         model, data = build_pinocchio_dynamics(robot)
     except Exception as exc:
-        logging.warning(f"[SAFETY] joint walls: no dynamics model ({exc}) — joint walls off")
+        logger.warning(f"joint walls: no dynamics model ({exc}) — joint walls off")
         return None
     nv = model.nv
 
@@ -126,7 +127,7 @@ def make_inverse_mass(robot: Any) -> Callable[[np.ndarray, np.ndarray], None] | 
         from utility.pinocchio_attach import build_pinocchio_dynamics
         model, data = build_pinocchio_dynamics(robot)
     except Exception as exc:
-        logging.warning(f"[SAFETY] zone walls: no dynamics model ({exc}) — not mass-normalised")
+        logger.warning(f"zone walls: no dynamics model ({exc}) — not mass-normalised")
         return None
     nv = model.nv
 
@@ -167,7 +168,7 @@ def effective_inertia_range(fn: Callable[[np.ndarray, np.ndarray], None], lo: np
                 lo_v[j] = min(lo_v[j], float(r.fun))
         return lo_v, hi_v
     except Exception as exc:
-        logging.warning(f"[SAFETY] joint walls: inertia range failed ({exc}) — joint walls off")
+        logger.warning(f"joint walls: inertia range failed ({exc}) — joint walls off")
         return None
 
 

@@ -3,6 +3,7 @@
 # (dummy_test_scripts/test_homing_golden.py) proves the behaviour unchanged.
 
 import logging
+logger = logging.getLogger("rti.homing")  # docs/logging.md "Logger names"
 import math
 from typing import TYPE_CHECKING
 
@@ -163,8 +164,8 @@ def from_config(cls, xml_config: dict, joint_num: int) -> 'HomingController':
         obj._gripper_gear_r                = float(xml_config.get('gripper_gear_r', 0.0) or 0.0)
         obj._gripper_calibration_wait_s    = _gget('homing_calibration_wait_s', GripperHomingState._MIN_WAIT_S)
         if obj._gripper_calibration_wait_s >= g_timeout:
-            logging.warning(
-                f"[Homing] gripper homing_calibration_wait_s ({obj._gripper_calibration_wait_s} s) is not below its "
+            logger.warning(
+                f"gripper homing_calibration_wait_s ({obj._gripper_calibration_wait_s} s) is not below its "
                 f"homing_timeout_s ({g_timeout} s) — its firmware calibration step can only time out"
             )
     return obj

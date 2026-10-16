@@ -10,7 +10,7 @@ import logging
 import numpy as np
 
 
-_val_logger = logging.getLogger(__name__)
+_val_logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 
 
 # Required per-joint XML tags — must exist and be a finite positive number
@@ -189,11 +189,11 @@ def _log_issues(issues: list[str]) -> bool:
     ok = not any(i.startswith("[ERROR]") for i in issues)
     for msg in issues:
         if msg.startswith("[ERROR]"):
-            _val_logger.error(f"[XML Validation] {msg}")
+            _val_logger.error(f"XML validation: {msg.removeprefix('[ERROR] ')}")
         else:
-            _val_logger.warning(f"[XML Validation] {msg}")
+            _val_logger.warning(f"XML validation: {msg.removeprefix('[WARNING] ')}")
     if ok and not issues:
-        _val_logger.info("[XML Validation] OK — all checks passed")
+        _val_logger.info("XML validation: OK — all checks passed")
     return ok
 
 

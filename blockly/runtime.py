@@ -73,7 +73,7 @@ class ProgramFailed(Exception):
 
 
 _settings = {"host": "127.0.0.1", "port": DEFAULT_PORT, "move_timeout": DEFAULT_MOVE_TIMEOUT,
-             "client_factory": lambda: RobotClient(sync=False), "emit": None, "control_wait": CONTROL_WAIT_S,
+             "client_factory": lambda: RobotClient(sync=False, name="blocks"), "emit": None, "control_wait": CONTROL_WAIT_S,
              "dry_run": False}
 _cv = threading.Condition()     # an RLock inside: stop() from a signal handler cannot deadlock on it
 _flags = {"stop": False, "paused": False, "step": False, "robot_paused": False}

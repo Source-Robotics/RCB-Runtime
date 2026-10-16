@@ -57,6 +57,44 @@ def other_rti_pids(proc_root="/proc", self_pid=None):
     return sorted(out)
 
 
+# The runtime's other programs (2026-10-16): a copy left running by an earlier run (killed with its terminal) shares
+# the robot's shared memory and the simulator's port — on 2026-10-16 a 12-hour-old simulated drives process blocked
+# the simulator's port ("drives exited during the boot") and an old self-collision worker kept writing into the live
+# shared memory.
+RUNTIME_PROGRAMS = {b"sim.drives": "simulated drives", b"self_collision_worker.py": "self-collision worker",
+                    b"recorder.py": "recorder", b"command_executor.py": "executor", b"nicegui_test.py": "dashboard",
+                    b"supervisor.py": "supervisor"}
+
+
+def other_runtime_pids(proc_root="/proc", self_pid=None) -> dict:
+    """{pid: what} of the runtime's other programs running now: Python processes whose program is one of them (not the
+    launcher shells — a token with no whitespace that is or ends in the program's name)."""
+    me = os.getpid() if self_pid is None else self_pid
+    out: dict[int, str] = {}
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit() or int(name) == me:
+            continue
+        try:
+            with open(os.path.join(proc_root, name, "cmdline"), "rb") as fh:
+                argv = [a for a in fh.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if not argv or not os.path.basename(argv[0]).startswith(b"python"):
+            continue                              # a Python process only (an editor with recorder.py open is not one)
+        for a in argv[1:]:                        # -m, coverage's own arguments, then the program
+            if any(c in a for c in (b" ", b"\t")):
+                continue
+            hit = next((what for prog, what in RUNTIME_PROGRAMS.items() if a == prog or a.endswith(b"/" + prog)), None)
+            if hit:
+                out[int(name)] = hit
+                break
+    return dict(sorted(out.items()))
+
+
 def refuse_reason(sys_root="/sys", proc_root="/proc", self_pid=None):
     """Why a simulated RTI must not start here, or None."""
     others = other_rti_pids(proc_root, self_pid)

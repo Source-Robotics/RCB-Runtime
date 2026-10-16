@@ -32,6 +32,9 @@ QUEUED = "queued"         # placed on the motion queue → planner → RTI
 ALWAYS_OPEN = frozenset({
     # reads — monitoring is never exclusive, on any robot
     "get_joints", "get_pose", "get_status", "get_digital_input", "is_reachable", "get_zones",
+    # Diagnostics (2026-10-15): move nothing, change no limit — a health query, a logger's level, a telemetry
+    # capture into a file on the robot.
+    "get_health", "set_log_level", "capture_telemetry", "stop_capture",
     "get_joint_walls",
     # make-it-safer — anyone, always, no exceptions
     "stop", "pause", "disable", "safety_stop", "clear_errors",
@@ -69,6 +72,11 @@ COMMAND_RULES = {
     "get_joints":     (IMMEDIATE, None, None, False),
     "get_pose":       (IMMEDIATE, None, None, False),
     "get_status":     (IMMEDIATE, None, None, False),
+    # --- diagnostics (2026-10-15; docs/logging.md) ---
+    "get_health":        (IMMEDIATE, None, None, False),
+    "set_log_level":     (IMMEDIATE, None, None, False),
+    "capture_telemetry": (IMMEDIATE, None, None, False),
+    "stop_capture":      (IMMEDIATE, None, None, False),
     # IK only, moves nothing — any mode, any state, homed or not (`near` defaults to the measured
     # joints, which only picks WHICH solution is returned, never whether one exists).
     "is_reachable":   (IMMEDIATE, None, None, False),

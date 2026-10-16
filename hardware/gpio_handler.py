@@ -26,7 +26,7 @@ from data.shared_memory_index import (
 from data import shared_data
 from utility import sim_mode
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("io")  # docs/logging.md "Logger names"
 
 # GPIO state constants for clarity
 HIGH = 1
@@ -157,7 +157,7 @@ def initialize_gpio():
             shared_data.gpio_states[idx] = LOW
         shared_data.gpio_states[ESTOP_1] = HIGH          # active LOW: HIGH = released
         shared_data.gpio_states[ESTOP_2] = HIGH
-        logger.info("[SIM] GPIO simulated: no real pin is read or written — inputs and outputs live in shared memory "
+        logger.info("GPIO simulated: no real pin is read or written — inputs and outputs live in shared memory "
                     "(E-stop released, inputs off)")
         return
     init_gpio()
@@ -300,7 +300,7 @@ def configure_estop(channels, disagree_ticks=50):
     _estop_disagree_limit = max(1, int(disagree_ticks))
     _estop_disagree_count = 0
     _estop_fault = False
-    logger.info(f"[E-stop] hardware channels in use: {_estop_channels}"
+    logger.info(f"E-stop hardware channels in use: {_estop_channels}"
                 + (f" (cross-checked, fault after {_estop_disagree_limit} ticks of disagreement)" if _estop_channels == 2
                    else " (channel 2 not trusted on this PCB)"))
 
@@ -327,12 +327,12 @@ def check_estop_active():
             _estop_disagree_count += 1
             if _estop_disagree_count > _estop_disagree_limit and not _estop_fault:
                 _estop_fault = True
-                logger.error(f"[E-stop] CHANNEL FAULT: channel {1 if hw_estop else 2} reads pressed, the other released, "
+                logger.error(f"E-stop CHANNEL FAULT: channel {1 if hw_estop else 2} reads pressed, the other released, "
                              f"for {_estop_disagree_count} ticks — a broken wire or contact; treated as PRESSED until both agree")
             hw_estop = True
         else:
             if _estop_fault:
-                logger.warning("[E-stop] channel fault cleared — both channels agree again")
+                logger.warning("E-stop channel fault cleared — both channels agree again")
             _estop_disagree_count = 0
             _estop_fault = False
 

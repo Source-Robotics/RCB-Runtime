@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import logging
+logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -53,21 +54,21 @@ def wall_spec(raw: dict | None, where: str = "freedrive_wall") -> dict:
     if at in ("soft", "hard"):
         spec["at"] = at
     elif at not in ("", "auto", "none"):
-        logging.warning("%s: at=%r must be soft or hard — using the default", where, raw.get("at"))
+        logger.warning("%s: at=%r must be soft or hard — using the default", where, raw.get("at"))
     fd = str(raw.get("freedrive") or "warn").strip().lower()
     if fd in ("warn", "stop"):
         spec["freedrive"] = fd
     else:
-        logging.warning("%s: freedrive=%r must be warn or stop — using warn", where, raw.get("freedrive"))
+        logger.warning("%s: freedrive=%r must be warn or stop — using warn", where, raw.get("freedrive"))
     sc = str(raw.get("scaling") or "").strip().lower()
     if sc in WALL_SCALINGS:
         spec["scaling"] = sc
     elif sc not in ("", "auto", "none"):
-        logging.warning("%s: scaling=%r must be adaptive or fixed — using auto (adaptive)", where, raw.get("scaling"))
+        logger.warning("%s: scaling=%r must be adaptive or fixed — using auto (adaptive)", where, raw.get("scaling"))
     for old in _WALL_FIELDS_BEFORE_2026_10_02:
         val = raw.get(old)
         if val is not None and str(val).strip().lower() not in ("", "auto", "none"):
-            logging.warning("%s: %s=%r is no longer used — the wall is set by frequency_hz and damping_ratio "
+            logger.warning("%s: %s=%r is no longer used — the wall is set by frequency_hz and damping_ratio "
                             "(2026-10-02); using auto. Re-tune it in the Walls tab.", where, old, val)
     for key in WALL_NUMBERS:
         val = raw.get(key)
@@ -76,13 +77,13 @@ def wall_spec(raw: dict | None, where: str = "freedrive_wall") -> dict:
         try:
             v = float(val)
         except (TypeError, ValueError):
-            logging.warning("%s: %s=%r is not a number — using auto", where, key, val)
+            logger.warning("%s: %s=%r is not a number — using auto", where, key, val)
             continue
         if not (np.isfinite(v) and v >= 0.0):
-            logging.warning("%s: %s=%r must be >= 0 — using auto", where, key, val)
+            logger.warning("%s: %s=%r must be >= 0 — using auto", where, key, val)
             continue
         if key == "filter_ms" and v > WALL_FILTER_MAX_MS:
-            logging.warning("%s: filter_ms=%r is past the stability table (%g ms) — using auto", where, val,
+            logger.warning("%s: filter_ms=%r is past the stability table (%g ms) — using auto", where, val,
                             WALL_FILTER_MAX_MS)
             continue
         spec[key] = v

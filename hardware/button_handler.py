@@ -28,7 +28,7 @@ import time
 import logging
 from gpiozero import Button as GpioButton
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sup.ui")  # docs/logging.md "Logger names"
 logger.info("button_handler.py")
 
 # Press timings (seconds)

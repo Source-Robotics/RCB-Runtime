@@ -117,7 +117,7 @@ from utility.kinematics_backend import set_kinematics_backend
 from utility.activity_log import get_exec_activity_logger, log_activity
 from utility.zones import ZONE_WARNING, first_path_violation, robot_spheres
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("exec.planner")  # docs/logging.md "Logger names"
 _activity_logger = get_exec_activity_logger()
 
 
@@ -509,7 +509,7 @@ class TrajectoryPlanner(Thread):
                 try:
                     self._traj_sock.send(pack_fence(self._epoch), flags=zmq.NOBLOCK)
                 except zmq.ZMQError as e:            # RTI not draining: its stop waits for the fence, then gives up
-                    logger.error(f"[Planner] stop fence {self._epoch} not sent: {e}")
+                    logger.error(f"stop fence {self._epoch} not sent: {e}")
 
     @property
     def epoch(self):
@@ -532,7 +532,7 @@ class TrajectoryPlanner(Thread):
         """Accept motion again after an abort. command_executor calls this on clear_errors."""
         with self.abort_gate:
             if self._abort is not None:
-                logger.info(f"[Planner] abort cleared (was: {self._abort['code']})")
+                logger.info(f"abort cleared (was: {self._abort['code']})")
             self._abort = None
 
     def interrupt(self, code, message):
@@ -543,7 +543,7 @@ class TrajectoryPlanner(Thread):
         with self.abort_gate:
             if self._abort is None:
                 self._abort = {"cid": None, "code": code, "message": message}
-                logger.error(f"[Planner] motion ABORTED: {message}")
+                logger.error(f"motion ABORTED: {message}")
             self.flush()
         self._resync = True
 
@@ -590,7 +590,7 @@ class TrajectoryPlanner(Thread):
     # ------------------------------------------------------------------ #
 
     def run(self):
-        logger.info("[Planner] started")
+        logger.info("started")
         while self._running:
             # While a tail is held, RTI is burning through the body we already sent and
             # we are on a clock — poll fast enough that noticing a command isn't itself
@@ -699,14 +699,14 @@ class TrajectoryPlanner(Thread):
             self._mark_completed(cmd)
         except PlannerError as e:
             cid = self._cmd_id(cmd)
-            logger.error(f"[Planner] command {cid} failed: {e.code}: {e.message}")
+            logger.error(f"command {cid} failed: {e.code}: {e.message}")
             self._mark_error(cmd, e.code, e.message)
             self._report_error(cid, e.code, e.message)
             log_activity(_activity_logger, "EXEC", "error", e.code, id=cid, message=e.message,
                          command=self._fmt_command(cmd))
         except Exception as e:
             cid = self._cmd_id(cmd)
-            logger.error(f"[Planner] command {cid} failed: {e}")
+            logger.error(f"command {cid} failed: {e}")
             self._mark_error(cmd, "PLAN_FAIL", str(e))
             self._report_error(cid, "PLAN_FAIL", str(e))
             log_activity(_activity_logger, "EXEC", "error", "PLAN_FAIL", id=cid, message=str(e),
@@ -805,7 +805,7 @@ class TrajectoryPlanner(Thread):
 
         if chain[0].options.profile != "toppra":
             logger.warning(
-                f"[Planner] zone blend requires profile='toppra' (got "
+                f"zone blend requires profile='toppra' (got "
                 f"'{chain[0].options.profile}') — planning {len(chain)} "
                 f"commands individually instead.")
             for cmd in chain:
@@ -824,7 +824,7 @@ class TrajectoryPlanner(Thread):
             self._check_zones(sample.positions, sample.positions[0], f"blended chain of {len(chain)}")
         except Exception as e:
             logger.warning(
-                f"[Planner] zone blend failed for a {len(chain)}-command chain: "
+                f"zone blend failed for a {len(chain)}-command chain: "
                 f"{e} — planning individually instead.")
             for cmd in chain:
                 self._run_single(cmd)
@@ -1118,7 +1118,7 @@ class TrajectoryPlanner(Thread):
         try:
             return float(self._read_exec_runway())
         except Exception as e:
-            logger.error(f"[Planner] cannot read RTI runway ({e}) — will not hold a tail")
+            logger.error(f"cannot read RTI runway ({e}) — will not hold a tail")
             return None
 
     def _choose_split(self, sample, boundaries, splice_ctx):
@@ -1289,7 +1289,7 @@ class TrajectoryPlanner(Thread):
         # Without this line, splicing would simply stop happening one day and nothing would
         # explain why.
         logger.info(
-            f"[Planner] not holding a tail: body would be only {split * self._dt:.2f}s "
+            f"not holding a tail: body would be only {split * self._dt:.2f}s "
             f"(+{leftover_s:.2f}s already buffered in RTI), under the {family} lane's "
             f"{min_body:.2f}s minimum — this move is sent whole and will stop at its "
             f"target")
@@ -1445,7 +1445,7 @@ class TrajectoryPlanner(Thread):
         self._last_exit_speed = None
         self._active_command = None
         held_cmds = len(chain) - sent_cmds
-        logger.info(f"[Planner] holding tail: sent {split}/{n} samples "
+        logger.info(f"holding tail: sent {split}/{n} samples "
                     f"({split * self._dt:.2f}s of {n * self._dt:.2f}s), "
                     f"{n - split} samples / {held_cmds} command(s) held for a splice")
 
@@ -1571,7 +1571,7 @@ class TrajectoryPlanner(Thread):
         chain, boundaries = held["chain"], held["boundaries"]
         n = sample.positions.shape[0]
         remaining = chain[held["sent_cmds"]:]
-        logger.info(f"[Planner] committing held tail ({reason}) — {n - split} samples "
+        logger.info(f"committing held tail ({reason}) — {n - split} samples "
                     f"({(n - split) * self._dt:.2f}s), {len(remaining)} command(s)")
 
         start_idx = split
@@ -1653,7 +1653,7 @@ class TrajectoryPlanner(Thread):
                 reject = e.message
 
         if reject is not None:
-            logger.info(f"[Planner] splice REJECTED for {len(cmds)} command(s) "
+            logger.info(f"splice REJECTED for {len(cmds)} command(s) "
                         f"[{cids}]: {reject} — the in-flight move will finish normally, "
                         f"then they run as a fresh chain")
             log_activity(_activity_logger, "EXEC", "info", "BLEND_SPLICE_REJECTED",
@@ -1701,7 +1701,7 @@ class TrajectoryPlanner(Thread):
         self._held = None
         for c in cmds:
             self._mark_started(c)
-        logger.info(f"[Planner] SPLICED {len(cmds)} command(s) ({ctx['family']}) into the "
+        logger.info(f"SPLICED {len(cmds)} command(s) ({ctx['family']}) into the "
                     f"in-flight move at sample {split} — continuation "
                     f"{cont.positions.shape[0]} samples, {len(new_chain)} command(s)")
         log_activity(_activity_logger, "EXEC", "info", "BLEND_SPLICED",
@@ -1719,7 +1719,7 @@ class TrajectoryPlanner(Thread):
             return
         batch = self._blend_buffer
         self._blend_buffer = []
-        logger.info(f"[Planner] splicing {len(batch)} buffered command(s) ({why})")
+        logger.info(f"splicing {len(batch)} buffered command(s) ({why})")
         self._try_splice(batch)
 
     def _continuation_speed_scale(self, held):
@@ -1940,7 +1940,7 @@ class TrajectoryPlanner(Thread):
         """
         if family != "joint":
             logger.warning(
-                f"[Planner] blend_mode='ruckig_corner' is joint-space only (got a "
+                f"blend_mode='ruckig_corner' is joint-space only (got a "
                 f"'{family}' chain) — planning {len(chain)} commands individually instead.")
             for cmd in chain:
                 self._run_single(cmd)
@@ -1948,7 +1948,7 @@ class TrajectoryPlanner(Thread):
 
         if chain[0].options.profile != "ruckig":
             logger.warning(
-                f"[Planner] blend_mode='ruckig_corner' requires profile='ruckig' (got "
+                f"blend_mode='ruckig_corner' requires profile='ruckig' (got "
                 f"'{chain[0].options.profile}') — planning {len(chain)} commands "
                 f"individually instead.")
             for cmd in chain:
@@ -1963,7 +1963,7 @@ class TrajectoryPlanner(Thread):
             self._check_zones(sample.positions, sample.positions[0], f"ruckig_corner chain of {len(chain)}")
         except Exception as e:
             logger.warning(
-                f"[Planner] ruckig corner blend failed for a {len(chain)}-command chain: "
+                f"ruckig corner blend failed for a {len(chain)}-command chain: "
                 f"{e} — planning individually instead.")
             for cmd in chain:
                 self._run_single(cmd)
@@ -2228,7 +2228,7 @@ class TrajectoryPlanner(Thread):
             # wait_idle. _map_boundaries_to_timed already guarantees strictly
             # increasing boundaries; this guard makes a regression loud, not silent.
             if end_idx <= start_idx:
-                logger.error(f"[Planner] blended-chain boundary collapse at cmd {i} "
+                logger.error(f"blended-chain boundary collapse at cmd {i} "
                              f"(start={start_idx}, end={end_idx}) — forcing a 1-sample "
                              f"range so the checkpoint still fires")
                 end_idx = min(start_idx + 1, n)
@@ -2494,8 +2494,8 @@ class TrajectoryPlanner(Thread):
             # disagreed (should be rare — see trajectory_profiles.py's derivation
             # notes) — fall back to planning this move with no boundary velocity at
             # all rather than propagate a broken profile. Safe but suboptimal, same
-            # philosophy as SEND_TIMEOUT/GRIPPER_TIMEOUT elsewhere in this file.
-            logger.warning(f"[Planner] blend infeasible for id={cid}, "
+            # philosophy as SEND_TIMEOUT/GRIPPER_SETTLE_TIMEOUT elsewhere in this file.
+            logger.warning(f"blend infeasible for id={cid}, "
                            f"planning normally instead: {e}")
             timed = time_parameterizer.parameterize(
                 path, self._max_vel, max_accel, self._dt,
@@ -2538,7 +2538,7 @@ class TrajectoryPlanner(Thread):
             if DEFAULT_IK_CONFIG.is_singularity_warning(condition, sigma_min):
                 diagnostic["singularity_warning"] = True
                 logger.warning(
-                    f"[Planner] IK target near singularity: condition={condition:.1f}, "
+                    f"IK target near singularity: condition={condition:.1f}, "
                     f"sigma_min={sigma_min:.3e}")
         except Exception as exc:
             diagnostic["singularity_warning"] = str(exc)
@@ -2621,7 +2621,7 @@ class TrajectoryPlanner(Thread):
                 command=f"move_pose({', '.join(map(str, args))})" if args else "move_pose",
                 message=(f"condition={self._last_diagnostic.get('jacobian_condition'):.1f}, "
                          f"sigma_min={self._last_diagnostic.get('jacobian_sigma_min'):.3e}"))
-        logger.info(f"[Planner] move_pose id={cid} IK via {solver} -> "
+        logger.info(f"move_pose id={cid} IK via {solver} -> "
                     f"{np.round(np.rad2deg(q), 2).tolist()} deg")
         return q
 
@@ -2704,7 +2704,7 @@ class TrajectoryPlanner(Thread):
                 f"{result.failure_message} at sample {result.first_failure_index}")
 
         logger.info(
-            f"[Planner] {ctype} id={cid} solved {cart_path.num_samples} "
+            f"{ctype} id={cid} solved {cart_path.num_samples} "
             f"IK samples via {solver_name} (dry_run={bool(dry_run)})")
         return result
 
@@ -2897,7 +2897,7 @@ class TrajectoryPlanner(Thread):
         try:
             result = solver.solve(dense, pos_spline[0])
         except Exception as exc:
-            logger.warning(f"[Planner] per-sample IK failed ({exc}); keeping the splined path")
+            logger.warning(f"per-sample IK failed ({exc}); keeping the splined path")
             return None
         pos = np.asarray(result.positions, dtype=np.float64)
         if pos.shape != pos_spline.shape:
@@ -3185,7 +3185,7 @@ class TrajectoryPlanner(Thread):
         dry_run = bool(options.dry_run)
         result = self._solve_move_linear_path(ctype, start, args, cid, options, dry_run=dry_run)
         if dry_run:
-            logger.info(f"[Planner] {ctype} dry-run id={cid}; no trajectory sent")
+            logger.info(f"{ctype} dry-run id={cid}; no trajectory sent")
             return None
         # The profile must be timed against CARTESIAN distance, not joint distance — see
         # _cartesian_arclength.
@@ -3326,7 +3326,7 @@ class TrajectoryPlanner(Thread):
                 result.failure_code or "IK_PARTIAL_PATH",
                 f"{result.failure_message} at sample {result.first_failure_index}")
         logger.info(
-            f"[Planner] {ctype} id={cid} solved {cart_path.num_samples} IK samples via "
+            f"{ctype} id={cid} solved {cart_path.num_samples} IK samples via "
             f"{solver_name} (dry_run={bool(dry_run)})")
         return result
 
@@ -3363,7 +3363,7 @@ class TrajectoryPlanner(Thread):
             })
             if scale < 1.0:
                 logger.warning(
-                    "[Planner] curve timing slowed to %.0f%% after curvature acceleration check",
+                    "curve timing slowed to %.0f%% after curvature acceleration check",
                     scale * 100.0)
             return sample
         raise last_error
@@ -3372,7 +3372,7 @@ class TrajectoryPlanner(Thread):
         dry_run = bool(options.dry_run)
         result = self._solve_curve_path(ctype, start, args, cid, options, dry_run=dry_run)
         if dry_run:
-            logger.info(f"[Planner] {ctype} dry-run id={cid}; no trajectory sent")
+            logger.info(f"{ctype} dry-run id={cid}; no trajectory sent")
             return None
         return self._retime_curve_path(result, options)
 
@@ -3407,7 +3407,7 @@ class TrajectoryPlanner(Thread):
             self._status_sock.send_json(
                 {"checkpoint_id": cid or "", "status": "complete"}, flags=zmq.NOBLOCK)
         except zmq.Again:
-            logger.error(f"[Planner] could not report completion for {cid}")
+            logger.error(f"could not report completion for {cid}")
 
     def _plan_and_send(self, cmd):
         ctype = self._cmd_name(cmd)
@@ -3476,7 +3476,7 @@ class TrajectoryPlanner(Thread):
             # ends at rest (v_corner=0 from the default above), which correctly
             # breaks any in-flight blend chain once it takes effect.
             self._last_exit_speed = v_corner if v_corner > 1e-9 else None
-            logger.info(f"[Planner] {ctype} id={cid} → {sample.num_points} waypoints "
+            logger.info(f"{ctype} id={cid} → {sample.num_points} waypoints "
                         f"({(sample.num_points - 1) * self._dt:.2f}s)")
         # else: _send_chunks already reported the error; leave _last_endpoint and
         # _last_exit_speed alone so the next command starts from the last state we
@@ -3535,7 +3535,7 @@ class TrajectoryPlanner(Thread):
             while True:
                 with self.abort_gate:
                     if self._cmd_epoch != self._epoch:
-                        logger.info(f"[Planner] id={cid}: not sent — the program was stopped (epoch "
+                        logger.info(f"id={cid}: not sent — the program was stopped (epoch "
                                     f"{self._cmd_epoch} -> {self._epoch})")
                         return True
                     try:
@@ -3544,7 +3544,7 @@ class TrajectoryPlanner(Thread):
                     except zmq.Again:
                         pass
                 if time.monotonic() >= deadline:
-                    logger.error(f"[Planner] send timed out (RTI not draining) — "
+                    logger.error(f"send timed out (RTI not draining) — "
                                 f"{end_idx}/{range_end} waypoints sent for id={cid}")
                     self._report_error(cid, "SEND_TIMEOUT",
                                        "RTI not consuming trajectory batches")
@@ -3584,18 +3584,18 @@ class TrajectoryPlanner(Thread):
 
         rti_msg = f"gripper_set:{position}:{speed}:{current}:1"
         self._cmd_sock.send_string(json.dumps({"msg": rti_msg, "id": cid, "source": "planner"}))
-        logger.info(f"[Planner] {ctype} id={cid} → {rti_msg}")
+        logger.info(f"{ctype} id={cid} → {rti_msg}")
 
         if self._read_gripper_status is None:
             # No gripper status feed wired up — can't track real completion, so at
             # least don't hang the caller forever. Fire-and-forget as a fallback.
-            logger.warning(f"[Planner] no read_gripper_status configured — "
+            logger.warning(f"no read_gripper_status configured — "
                            f"id={cid} checkpoints immediately, not on real completion")
             try:
                 self._status_sock.send_json(
                     {"checkpoint_id": cid, "status": "complete"}, flags=zmq.NOBLOCK)
             except zmq.Again:
-                logger.error(f"[Planner] could not report gripper checkpoint for {cid}")
+                logger.error(f"could not report gripper checkpoint for {cid}")
             return
 
         # (cid, deadline, commanded target, consecutive-nonzero count). The target
@@ -3662,16 +3662,16 @@ class TrajectoryPlanner(Thread):
             # previous command. Say so once rather than silently completing.
             if streak == self.GRIPPER_DEBOUNCE_TICKS:
                 logger.warning(
-                    f"[Planner] gripper id={cid} ignoring object_detection={obj}: "
+                    f"gripper id={cid} ignoring object_detection={obj}: "
                     f"inconsistent with travel from {position} to {target} "
                     f"(likely stale from the previous command)")
 
         # --- 3. timeout ---------------------------------------------------------
         if time.monotonic() >= deadline:
             self._pending_gripper = None
-            logger.error(f"[Planner] gripper id={cid} timed out waiting to settle "
+            logger.error(f"gripper id={cid} timed out waiting to settle "
                          f"(object_detection={obj}, position={position}, target={target})")
-            self._report_error(cid, "GRIPPER_TIMEOUT",
+            self._report_error(cid, "GRIPPER_SETTLE_TIMEOUT",
                                "gripper did not report a settled position in time")
 
     def _code_matches_direction(self, obj, target, position):
@@ -3706,9 +3706,9 @@ class TrajectoryPlanner(Thread):
             self._status_sock.send_json(
                 {"checkpoint_id": cid, "status": "complete",
                  "gripper_object": int(obj)}, flags=zmq.NOBLOCK)
-            logger.info(f"[Planner] gripper id={cid} settled — {reason}")
+            logger.info(f"gripper id={cid} settled — {reason}")
         except zmq.Again:
-            logger.error(f"[Planner] could not report gripper checkpoint for {cid}")
+            logger.error(f"could not report gripper checkpoint for {cid}")
 
     def _report_error(self, cid, code, message):
         # The abort's STATE CHANGES — the latch, and dropping everything queued behind the
@@ -3726,14 +3726,14 @@ class TrajectoryPlanner(Thread):
                 {"checkpoint_id": cid or "", "status": "error",
                  "code": code, "message": message}, flags=zmq.NOBLOCK)
         except zmq.Again:
-            logger.error(f"[Planner] could not report error for {cid} (status backpressure)")
+            logger.error(f"could not report error for {cid} (status backpressure)")
         for cmd in dropped:
             self._report_aborted(cmd, aborting)
 
     # Failures that do NOT abort the program. Gripper outcomes and the strict-completion settle
     # timeout stay per-command for now (user decision 2026-09-30); ABORTED is the abort itself.
     # SETTLE_TIMEOUT is reported by RTI, never by the planner — listed so the rule is in one place.
-    NON_ABORTING_CODES = frozenset({"ABORTED", "GRIPPER_TIMEOUT", "SUPERSEDED", "SETTLE_TIMEOUT"})
+    NON_ABORTING_CODES = frozenset({"ABORTED", "GRIPPER_SETTLE_TIMEOUT", "SUPERSEDED", "SETTLE_TIMEOUT"})
 
     # Joint-limit comparison slack (rad): absorbs float noise, far below anything physical.
     JOINT_LIMIT_TOL = 1e-6
@@ -3765,7 +3765,7 @@ class TrajectoryPlanner(Thread):
         Returns the dropped commands; the CALLER reports them ABORTED, after the failure itself.
         """
         cid, code, message = abort["cid"], abort["code"], abort["message"]
-        logger.error(f"[Planner] motion ABORTED: command {cid} failed ({code}: {message}) — "
+        logger.error(f"motion ABORTED: command {cid} failed ({code}: {message}) — "
                      f"the rest of the program is cancelled until clear_errors")
         log_activity(_activity_logger, "EXEC", "error", "MOTION_ABORTED", id=cid,
                      message=f"{code}: {message}")
@@ -3894,7 +3894,7 @@ class TrajectoryPlanner(Thread):
         warn = first_path_violation(zones, poses, spheres, start_pose, reaction="warn")
         if warn is not None:
             zone = warn[0]
-            logger.warning(f"[Planner] {label}: passes through warn-zone '{zone['name']}' "
+            logger.warning(f"{label}: passes through warn-zone '{zone['name']}' "
                            f"({1000.0 * warn[2]:.1f} mm) — allowed, reaction=warn")
             log_activity(_activity_logger, "EXEC", "warning", ZONE_WARNING,
                          message=f"{label} passes through zone '{zone['name']}'")

@@ -11,6 +11,29 @@ multiple robot arms through XML files in `config/`, `robots/`, and `grippers/`.
 > motors disabled or the robot mechanically safe, and verify E-stop, power, CAN,
 > homing, and joint limits before enabling motion.
 
+## Set up a new Pi — the checklist
+
+The order that reproduces the reference robot (2026-10-16). Each step names the section that explains it;
+`scripts/setup_system.sh` does the system-level part and checks all of it.
+
+1. **Flash the real-time image** and check it — *OS image*.
+2. **Boot settings**: CAN, SPI, UART and I2C in `/boot/firmware/config.txt`, no serial console on the UART, then
+   reboot — *Boot configuration*, *Free the UART from the console*.
+3. **Python 3.11 as `python3`** (Ubuntu 24.04 ships 3.12; 3.11 comes from the deadsnakes PPA) — *Python 3.11, not 3.12*.
+4. **Clone the repo** to `~/Desktop/RCB-Runtime` (any folder works; the service is rendered for it).
+5. **Python packages, twice** — *Python packages: which Python runs the robot*:
+   `python3 -m pip install --user -r requirements.txt` (the runtime) and `./scripts/install.sh` (the `.venv` for
+   tests, tools and `api_tests`).
+6. **The system part**: `sudo bash scripts/setup_system.sh` — user groups, the password-free sudo rule, the
+   real-time capability on `python3`, `autorun.service` (+ `LimitMEMLOCK=infinity`), the journal / syslog limits.
+   Add `--allowed-ips "IP,IP"` for the PCs that may send commands (`*` = any: isolated networks only).
+7. **Check everything**: `bash scripts/setup_system.sh --check` (exit 0 = nothing missing; run it with the arm
+   disabled — it starts a Python that imports the runtime's packages).
+8. **Reboot**, then read `logs/RTI.log` for `real-time setup OK`, `memory locked`, `interrupt threads ... on core 2
+   alone` and the self-check; home the arm.
+9. **Local material**: `docs/`, `TODO/` and the test nets in `dummy_test_scripts/` are NOT in git (only this README
+   and `docs/pin_map.md` are) — copy them from the reference Pi, and back them up now and then.
+
 ## Supported Target
 
 First public target:
@@ -108,24 +131,35 @@ sudo usermod -aG dialout,i2c,gpio "$USER"   # then log out and back in
 `scripts/check_system.py` reports these as **warnings, not failures**, so an install
 without them still says it passed — and then the UART, OLED and GPIO silently do not work.
 
-**Passwordless sudo for the CAN interface.** `start_can_interface()` in
-`hardware/can_hardware.py` shells out to `sudo ip link set can0 ...` with `check=True`.
-Under systemd there is no tty, so without a password-free rule that call fails and `can0`
-never comes up; run by hand it stops to prompt in the middle of startup. The OLED menu's
-reboot / shutdown actions use `sudo -n`, which simply does nothing without it.
+**Passwordless sudo for what the runtime runs.** Under systemd there is no tty, so every
+`sudo` the runtime runs must be password-free or it fails:
 
-The development robot has blanket `NOPASSWD: ALL`. A scoped rule is enough:
+- `start_can_interface()` (`hardware/can_hardware.py`): `sudo ip link set can0 ...`, `sudo ifconfig` — without it
+  `can0` never comes up;
+- `place_can_path()` (same file, at every RTI start since 2026-10-12): `sudo taskset -pc` on the CAN chip's interrupt
+  threads (core 2 alone), `sudo tee .../power/control` (the SPI controller's power saving off) and
+  `sudo systemctl set-property --runtime user.slice AllowedCPUs=...` (your sessions on cores 0-1) — without it RTI
+  logs an ERROR and the CAN path shares cores with everything else (CAN freezes under load);
+- the OLED menu's reboot / power off (`sudo -n`, does nothing without it).
 
-```bash
-sudo tee /etc/sudoers.d/10-rcb-runtime >/dev/null <<'EOF'
-%gpio ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/ifconfig, /usr/sbin/reboot, /usr/sbin/poweroff
-EOF
-sudo chmod 0440 /etc/sudoers.d/10-rcb-runtime
-sudo visudo -c                 # must print "parsed OK" before you log out
+The reference robot has blanket `NOPASSWD: ALL`. `scripts/setup_system.sh` checks each of those commands and, only if
+one still asks for a password, writes this scoped rule to `/etc/sudoers.d/10-rcb-runtime` (validated with `visudo`,
+then checked again):
+
+```
+USER ALL=(root) NOPASSWD: /usr/sbin/ip, /usr/sbin/ifconfig, /usr/sbin/reboot, /usr/sbin/poweroff
+USER ALL=(root) NOPASSWD: /usr/bin/taskset ^-pc [0-9\,-]+ [0-9]+$
+USER ALL=(root) NOPASSWD: /usr/bin/tee ^/sys/devices/[A-Za-z0-9._\:/-]+/power/control$
+USER ALL=(root) NOPASSWD: /usr/bin/systemctl ^set-property --runtime user[.]slice AllowedCPUs\=[0-9\,-]+$
 ```
 
-Check paths with `command -v ip` first — they differ between distributions, and a rule
-naming a path that does not exist grants nothing.
+The arguments of the last three are regular expressions (sudo 1.9.10+): a plain `*` would let `tee` write any file.
+
+**Real-time priority.** RTI asks for `SCHED_FIFO` 99 on core 3 and refuses to start without it
+(`<realtime_required>` in `config/system.xml`). The reference robot grants it with a file capability on the
+interpreter: `sudo setcap cap_sys_nice=eip $(readlink -f $(command -v python3))` (the setup script does it). Every
+`python3` process may then raise its own priority; a side effect: the C library drops `TMPDIR` / `LD_*` from such a
+process's environment (the test runner passes `RCB_TMPDIR` instead).
 
 ### Wiring and pin map
 
@@ -193,19 +227,45 @@ The installer creates `.venv`, installs `requirements.txt`, creates runtime
 folders, and runs a system check. It asks before installing apt packages and does
 not automatically enable or start a systemd service.
 
-**`.venv` is what runs the robot.** The system Python (`~/.local`) carries different
-versions of several packages, so check dependencies with `.venv/bin/python -m pip list`
-— a bare `python3` will show you an environment the robot does not use, and has already
-caused two "it's installed" / "it isn't installed" mix-ups.
+### Python packages: which Python runs the robot
+
+**The robot runs on the system `python3`, not on `.venv`.** `autorun.sh` starts `python3 supervisor.py`, and the
+supervisor starts every runtime process as `python3 <script>` — `/usr/bin/python3` (3.11) with the packages in
+`~/.local`. `.venv` (built by `scripts/install.sh` on the same interpreter) is what the tests, `tools/` and
+`api_tests/` run. So a new Pi needs the packages in both:
+
+```bash
+python3 -m pip install --user -r requirements.txt     # the runtime (as the robot's user, no sudo)
+./scripts/install.sh                                  # .venv for the tests and tools
+bash scripts/setup_system.sh --check                  # imports the runtime's packages with python3
+```
+
+The two can drift: on the reference robot `~/.local` has numpy 2.4.6 while `requirements.txt` (and `.venv`) pins
+2.3.5. Check the robot's own versions with `python3 -m pip list --user`, the tests' with `.venv/bin/python -m pip list`.
 
 ## Systemd Service
 
-> ⚠️ **NOT PROPERLY TESTED YET.** The unit template renders and the commands below are
-> correct in form, but the service has not been through a full boot-to-running validation
-> on a clean machine. Day-to-day development on the reference robot does **not** use it —
-> see *Manual Run (how development is actually done)* below.
+**The reference robot runs `autorun.service`** (in the repo since 2026-10-16: `systemd/autorun.service.in` and
+`systemd/autorun.sh.in`; `scripts/setup_system.sh` installs them). It starts `<repo>/../autorun.sh` as the robot's
+user, which starts `python3 supervisor.py` — and first, if an update was staged next to the repo (the folder
+`<repo>_PENDING` and the flag file `ready_to_swap.txt`), swaps it in, keeping the old folder as `<repo>_BACKUP`.
+Two drop-ins in `/etc/systemd/system/autorun.service.d/`: `memlock.conf` (`LimitMEMLOCK=infinity`: RTI locks its
+memory, so a memory shortage cannot stall the loop) and, optionally, `allowed-ips.conf` (`RCB_ALLOWED_IPS`; the
+reference robot sets it to `*` in a drop-in named `allow-any-ip.conf` — systemd reads drop-ins in name order, the last
+one wins; the setup script names every one that sets it).
 
-After a successful manual install, install the service template:
+```bash
+sudo systemctl restart autorun.service      # every process; RTI restarting clears homing — re-home
+sudo systemctl stop autorun.service         # the arm goes limp ~0.1 s later (drive watchdog): support or park it
+journalctl -u autorun.service -f
+```
+
+The older template below (`rcb-runtime.service`: `.venv` + `LimitRTPRIO` instead of the capability) has never been
+validated on a clean machine. **Never enable both** — two supervisors would start; the setup script's check says so.
+
+> ⚠️ **NOT PROPERLY TESTED YET** (the `rcb-runtime.service` template).
+
+To install that template instead:
 
 ```bash
 ./scripts/install_service.sh
@@ -224,10 +284,14 @@ sudo systemctl status rcb-runtime.service
 journalctl -u rcb-runtime.service -f
 ```
 
-## Manual Run (how development is actually done)
+## Manual Run
 
-On the reference robot the three runtime processes are started **by hand**, each in its own
-terminal, over **VS Code Remote-SSH**. This is the normal working setup, not a fallback:
+> Since 2026-10-12 the reference robot runs everything under the service: RTI confines interactive sessions to cores
+> 0-1 at its start, so an RTI started from a shell cannot get its real-time core (it refuses to start). Restart pieces
+> with the service, or `tools/restart_gui_and_executor.sh` for the executor and the dashboard. The by-hand setup below
+> is how development was done before; it still works for the executor and the dashboard.
+
+Earlier, the runtime processes were started **by hand**, each in its own terminal, over **VS Code Remote-SSH**:
 
 ```bash
 source .venv/bin/activate
@@ -275,6 +339,8 @@ instead of a traceback.
 | `RTI.py` | Real-time control loop, CAN owner, shared-memory writer |
 | `command_executor.py` | High-level command dispatch |
 | `nicegui_test.py` | NiceGUI dashboard |
+| `self_collision_worker.py` | Checks the measured pose against the arm's collision pieces (~100 Hz) |
+| `recorder.py` | Incident dumps and telemetry captures from RTI's shared-memory trace |
 | `supervisor.py` | OLED/buttons/LEDs, UART PCB IO, process supervision |
 
 `nicegui_test.py` is the operator dashboard (the earlier `gui.py` was removed on 2026-10-03; it was launched by nothing).

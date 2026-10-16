@@ -88,7 +88,7 @@ class HallCheck:
         self.ctx.hall_check_joint = self.joint
         self.active = True
         if self.log:
-            self.log(f"[Hall check] J{self.joint + 1} limp (current limit 0) — turn it by hand; its Hall pin is read "
+            self.log(f"Hall check J{self.joint + 1} limp (current limit 0) — turn it by hand; its Hall pin is read "
                      f"every tick")
         return None
 
@@ -101,7 +101,7 @@ class HallCheck:
         changes = int(self.rti["hall_check_changes"][0])
         self._publish_off()
         if self.log:
-            self.log(f"[Hall check] J{self.joint + 1} stopped ({reason}); {changes} pin change(s) seen; its limits "
+            self.log(f"Hall check J{self.joint + 1} stopped ({reason}); {changes} pin change(s) seen; its limits "
                      f"restored ({int(self.velocity_limit[self.joint])} / {int(self.current_limit[self.joint])} mA)")
 
     # ------------------------------------------------------------------------------------------------ per tick

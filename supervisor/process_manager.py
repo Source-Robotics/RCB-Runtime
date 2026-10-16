@@ -24,15 +24,20 @@ import signal
 import subprocess
 import psutil
 import logging
-from project_paths import PROJECT_ROOT
+import time
+from project_paths import PROJECT_ROOT, TEMP_DATA_DIR
+from utility.housekeeping import RECORDINGS_BUDGET_BYTES, copy_truncate, enforce_budget, rotate_by_size
 from utility.system_temperature import get_raspberry_pi_temperature
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sup.process")  # docs/logging.md "Logger names"
 
 LOG_DIR = PROJECT_ROOT / "logs"
 _TERM_TIMEOUT = 5  # seconds to wait for graceful exit before SIGKILL
 OUT_LOG_MAX_BYTES = 20 * 1024 * 1024   # rotate <name>.out.log at (re)start when it is bigger than this
 OUT_LOG_KEEP = 3                        # ...keeping <name>.out.log.1 .. .3
+_temp_unreadable = False                # the temperature warning is logged once per failure streak
+BUDGET_CHECK_S = 3600.0                 # the test recordings' budget is checked once an hour (2026-10-15)
+_last_budget_check = [float("-inf")]    # monotonic time of the last check (the first monitor pass checks)
 
 
 # ==========================================================================
@@ -40,18 +45,38 @@ OUT_LOG_KEEP = 3                        # ...keeping <name>.out.log.1 .. .3
 # ==========================================================================
 def _rotate_out_log(path, max_bytes=OUT_LOG_MAX_BYTES, keep=OUT_LOG_KEEP):
     """<name>.out.log -> .1 -> .2 ... (the oldest dropped) when it is over max_bytes. Called only before a
-    script starts, so no running child is writing to the file being renamed."""
-    try:
-        if not path.exists() or path.stat().st_size <= max_bytes:
-            return
-        for i in range(keep - 1, 0, -1):
-            older = path.with_name(f"{path.name}.{i}")
-            if older.exists():
-                older.replace(path.with_name(f"{path.name}.{i + 1}"))
-        path.replace(path.with_name(f"{path.name}.1"))
+    script starts, so no running child is writing to the file being renamed (utility/housekeeping.py)."""
+    if rotate_by_size(str(path), max_bytes, keep):
         logger.info(f"Rotated {path.name} (was over {max_bytes // (1024 * 1024)} MB)")
-    except OSError as e:
-        logger.warning(f"Could not rotate {path.name}: {e}")
+
+
+def _cap_running_out_logs(processes, max_bytes=OUT_LOG_MAX_BYTES, keep=OUT_LOG_KEEP):
+    """A RUNNING child's <name>.out.log over max_bytes is copied to .1 and truncated (2026-10-15): until then it grew
+    for as long as the child ran — RTI runs for weeks. Checked every monitor pass; a stat per file."""
+    for name in processes:
+        path = LOG_DIR / f"{name}.out.log"
+        if copy_truncate(str(path), max_bytes, keep):
+            logger.info(f"Rotated {path.name} while {name} runs (was over {max_bytes // (1024 * 1024)} MB)")
+
+
+def _check_recordings_budget(now=None, root=TEMP_DATA_DIR, budget=RECORDINGS_BUDGET_BYTES):
+    """Once an hour (the first monitor pass too): the test recordings in temp_data together at most `budget` (1 GB),
+    the oldest runs deleted first (utility/housekeeping.enforce_budget; user, 2026-10-15). Returns the deleted run
+    keys. Never raises: housekeeping must not take the supervisor down."""
+    now = time.monotonic() if now is None else now
+    if now - _last_budget_check[0] < BUDGET_CHECK_S:
+        return []
+    _last_budget_check[0] = now
+    try:
+        before, after, deleted = enforce_budget(root, budget)
+    except Exception as exc:                      # pragma: no cover - enforce_budget does not raise
+        logger.warning(f"recordings budget check failed: {exc}")
+        return []
+    if deleted:
+        logger.info(f"Test recordings over the {budget // 1_000_000} MB budget ({before / 1e6:.0f} MB): deleted the "
+                    f"oldest {len(deleted)} run(s), now {after / 1e6:.0f} MB: {', '.join(deleted[:5])}"
+                    f"{' ...' if len(deleted) > 5 else ''}")
+    return deleted
 
 
 def _spawn(name, cmd):
@@ -66,7 +91,7 @@ def _spawn(name, cmd):
         start_new_session=True,  # new pgid so we can kill the whole tree later
     )
     proc._logf = logf  # keep a reference so the file handle isn't GC'd
-    logger.info(f"✅ Started {name} (PID: {proc.pid})")
+    logger.info(f"Started {name} (PID {proc.pid})")
     return proc
 
 
@@ -98,7 +123,7 @@ def _terminate(name, proc):
         _close_log(proc)
         return
 
-    logger.info(f"🛑 Stopping {name} (PID: {proc.pid})...")
+    logger.info(f"Stopping {name} (PID {proc.pid})")
     _signal_group(proc, signal.SIGTERM)
     try:
         proc.wait(timeout=_TERM_TIMEOUT)
@@ -110,7 +135,7 @@ def _terminate(name, proc):
         except subprocess.TimeoutExpired:
             logger.error(f"{name} survived SIGKILL (zombie?)")
     _close_log(proc)
-    logger.info(f"✅ {name} stopped.")
+    logger.info(f"{name} stopped")
 
 
 # ==========================================================================
@@ -135,7 +160,7 @@ def kill_stale(SCRIPTS):
             is_python = "python" in os.path.basename(cmd[0])
             joined = " ".join(cmd)
             if is_python and any(p in joined for p in paths):
-                logger.info(f"🧹 Killing stale process {proc.pid}: {joined}")
+                logger.warning(f"Killing a stale process from a previous run, PID {proc.pid}: {joined}")
                 proc.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
@@ -154,17 +179,17 @@ def stop_scripts(processes):
     for name, proc in list(processes.items()):
         _terminate(name, proc)
         del processes[name]
-    logger.info("✅ All managed scripts stopped.")
+    logger.info("All managed scripts stopped")
 
 
 def restart_script(name, processes, SCRIPTS):
     """Restart a stalled or crashed script — old tree is fully killed first."""
-    logger.info(f"♻️ Restarting {name}...")
+    logger.info(f"Restarting {name}")
     proc = processes.get(name)
     if proc is not None:
         _terminate(name, proc)
     processes[name] = _spawn(name, SCRIPTS[name])
-    logger.info(f"✅ Restarted {name} (PID: {processes[name].pid})")
+    logger.info(f"Restarted {name} (PID {processes[name].pid})")
 
 
 def monitor_scripts(emergency_stop, processes, SCRIPTS):
@@ -180,14 +205,14 @@ def monitor_scripts(emergency_stop, processes, SCRIPTS):
     # Emergency stop: kill everything and report.
     if emergency_stop:
         stop_scripts(processes)
-        logger.info("🛑 Emergency stop activated! All processes terminated.")
+        logger.warning("Emergency stop: all managed scripts terminated")
         for name in SCRIPTS:
             status_dict[name] = {"status": "stopped (emergency)"}
         return status_dict
 
     # Recover after an emergency stop was lifted.
     if not processes and not emergency_stop:
-        logger.info("🔁 Emergency stop lifted. Restarting all scripts...")
+        logger.info("Emergency stop lifted — restarting all managed scripts")
         start_scripts(SCRIPTS=SCRIPTS, processes=processes)
         for name in SCRIPTS:
             status_dict[name] = {"status": "restarted after estop"}
@@ -198,23 +223,29 @@ def monitor_scripts(emergency_stop, processes, SCRIPTS):
         process = processes.get(name)
 
         if process is None:
-            logger.info(f"⚠️ {name} not in process list! Restarting...")
+            logger.error(f"{name} is not in the process list — restarting it")
             restart_script(name, processes, SCRIPTS)
             status_dict[name] = {"status": "restarted (missing)"}
             continue
 
         if process.poll() is not None:
-            logger.info(f"❌ {name} stopped unexpectedly (exit {process.returncode})! "
+            logger.error(f"{name} stopped unexpectedly (exit {process.returncode}) — restarting it. "
                         f"See logs/{name}.out.log")
             restart_script(name, processes, SCRIPTS)
             status_dict[name] = {"status": "restarted (crashed)"}
         else:
             status_dict[name] = {"status": "running"}
 
+    _cap_running_out_logs(processes)
+    _check_recordings_budget()
+
     # Raspberry Pi temperature.
     temp = get_raspberry_pi_temperature()
     status_dict["temperature_C"] = round(temp, 2) if temp is not None else None
-    if temp is None:
-        logger.info("❌ Could not read Raspberry Pi temperature.")
+    # Once per failure streak, not every pass (it ran every SCRIPT_MONITOR_TIME, at INFO, 2026-10-15).
+    global _temp_unreadable
+    if temp is None and not _temp_unreadable:
+        logger.warning("Could not read the Raspberry Pi temperature (reported again once it has been read)")
+    _temp_unreadable = temp is None
 
     return status_dict

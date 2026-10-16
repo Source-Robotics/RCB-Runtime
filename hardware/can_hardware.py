@@ -23,7 +23,7 @@ import can
 import time
 import subprocess
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.can")  # docs/logging.md "Logger names"
 
 # Requested CAN TX socket buffer. The kernel caps the request at
 # net.core.wmem_max and then doubles it, so on a stock system (wmem_max
@@ -225,7 +225,7 @@ def place_can_path(can_core, general_cores, interface="can0", sys_root="/sys", p
     dev = os.path.realpath(os.path.join(sys_root, "class", "net", interface, "device"))
     parts = can_spi_parts(dev)
     if parts is None:
-        logger.info(f"[CAN] '{interface}' is not an SPI CAN chip ({dev}) — no interrupt threads to place")
+        logger.info(f"'{interface}' is not an SPI CAN chip ({dev}) — no interrupt threads to place")
     else:
         chip, controller_dir = parts
         controller = os.path.basename(controller_dir)
@@ -280,10 +280,10 @@ def place_can_path(can_core, general_cores, interface="can0", sys_root="/sys", p
     except (subprocess.CalledProcessError, OSError, ValueError) as e:
         result["problems"].append(f"user.slice AllowedCPUs={cpus}: {e}")
     if result["problems"]:
-        logger.error(f"[CAN] could not give the CAN path core {can_core} alone: {'; '.join(result['problems'])} — "
+        logger.error(f"could not give the CAN path core {can_core} alone: {'; '.join(result['problems'])} — "
                      f"CAN traffic can stall (api_tests/69_can_gaps.py measures it)")
     else:
-        logger.info(f"[CAN] interrupt threads {', '.join(result['threads']) or '(none)'} on core {can_core} alone; "
+        logger.info(f"interrupt threads {', '.join(result['threads']) or '(none)'} on core {can_core} alone; "
                     f"user programs on cores {result['user_cpus']}; SPI power: {result['power']}")
     return result
 
@@ -345,17 +345,17 @@ class FirstFrameWait:
                 self._sock.settimeout(self.timeout_s)
             except OSError as e:
                 self._sock = None
-                logger.error(f"[CAN] read-first: cannot open a socket on {self.interface}: {e} — stays OFF (the old tick order)")
+                logger.error(f"read-first: cannot open a socket on {self.interface}: {e} — stays OFF (the old tick order)")
                 return False
             self.waits = self.timeouts = 0
             self.wait_sum = self.wait_max = 0.0
             self.enabled = True
-            logger.info(f"[CAN] read-first ON: RTI reads CAN at the start of each tick and waits (up to "
+            logger.info(f"read-first ON: RTI reads CAN at the start of each tick and waits (up to "
                         f"{self.timeout_s * 1e3:.1f} ms) for its first frame to leave (TODO/can_tx_timing_plan.md option B)")
             return True
         self.enabled = False
         mean = self.wait_sum / self.waits * 1e3 if self.waits else 0.0
-        logger.info(f"[CAN] read-first OFF after {self.waits} waits: mean {mean:.3f} ms, max {self.wait_max * 1e3:.3f} ms, "
+        logger.info(f"read-first OFF after {self.waits} waits: mean {mean:.3f} ms, max {self.wait_max * 1e3:.3f} ms, "
                     f"{self.timeouts} timed out")
         try:
             self._sock.close()
@@ -544,7 +544,7 @@ def count_can_tx_drops(communication, window_s=CAN_TX_DROP_LOG_WINDOW_S):
             counter["last_error"] = str(e)
             now = time.monotonic()
             if now - counter["last_log"] >= window_s:
-                logger.warning(f"[CAN] {counter['pending']} frame(s) dropped — the TX queue refused them ({e}); "
+                logger.warning(f"{counter['pending']} frame(s) dropped — the TX queue refused them ({e}); "
                                f"{counter['dropped']} since start")
                 counter["pending"] = 0
                 counter["last_log"] = now

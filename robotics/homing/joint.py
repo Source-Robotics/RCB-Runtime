@@ -4,10 +4,11 @@ second approach, release, settle (the home reference), the optional post-home mo
 # (dummy_test_scripts/test_homing_golden.py) proves the behaviour unchanged.
 
 import logging
+logger = logging.getLogger("rti.homing")  # docs/logging.md "Logger names"
 import math
 
 from robotics.homing.reference import _update_home_reference
-from robotics.homing.status import STATUS_DONE, STATUS_FAILED, STATUS_RUNNING
+from robotics.homing.status import STATUS_DONE, STATUS_FAILED, STATUS_RUNNING, log_milestone
 
 
 class JointHomingState:
@@ -223,8 +224,8 @@ class JointHomingState:
                     Velocity_limit=int(self.normal_velocity_limit),
                     Current_limit=int(self.normal_ilim),
                 )
-            logging.info(
-                f"[Homing] {self._label} current limit restored to "
+            logger.info(
+                f"{self._label} current limit restored to "
                 f"{self.normal_ilim:.0f} mA (was homing limit)"
             )
 
@@ -298,8 +299,8 @@ class JointHomingState:
                     Velocity_limit=int(self.normal_velocity_limit),
                     Current_limit=int(self.homing_current_ma),
                 )
-            logging.info(
-                f"[Homing] {self._label} current limit set to "
+            logger.info(
+                f"{self._label} current limit set to "
                 f"{self.homing_current_ma:.0f} mA for homing"
             )
             self._limits_sent = True
@@ -368,8 +369,8 @@ class JointHomingState:
 
         if endstop_hit:
             pass_label = f"pass {self._pass}"
-            logging.info(
-                f"[Homing] {self._label} endstop detected via {detection_method} "
+            logger.info(
+                f"{self._label} endstop detected via {detection_method} "
                 f"({pass_label}, tick={self._tick_count}, pos={motor.position})"
             )
 
@@ -385,8 +386,8 @@ class JointHomingState:
                                f"the Hall sensor still triggered right after backing off "
                                f"{self._HALL_PRE_CLEAR_MAX} times — check the sensor and its magnet")
                     return 'running'
-                logging.warning(
-                    f"[Homing] {self._label} Hall triggered too early "
+                logger.warning(
+                    f"{self._label} Hall triggered too early "
                     f"(tick={self._tick_count} ≤ guard={self._hall_pre_clear_guard}) "
                     f"— joint likely started on/near sensor, backing off to clear"
                 )
@@ -409,8 +410,8 @@ class JointHomingState:
                 if self._pass == 1 and self._start_pos is not None and stall_pos is not None:
                     self.travel_ticks = int(stall_pos) - self._start_pos
                     self.travel_s = self._tick_count * self.dt
-                    logging.info(
-                        f"[Homing] {self._label} travel to the endstop (pass 1): {self.travel_ticks:+d} ticks in "
+                    logger.info(
+                        f"{self._label} travel to the endstop (pass 1): {self.travel_ticks:+d} ticks in "
                         f"{self.travel_s:.3f} s (from {self._start_pos} to {stall_pos})")
             if self._pass == 1 and self.two_pass and not self.has_hall_sensor:
                 # Save pass 1 endstop position for later comparison with pass 2
@@ -437,8 +438,8 @@ class JointHomingState:
                 self._release_count = 0
                 self._release_reads = []
                 self._triggered_pos = None  # will be latched during release
-                logging.info(
-                    f"[Homing] {self._label} entering release phase: "
+                logger.info(
+                    f"{self._label} entering release phase: "
                     f"{self.release_current_ma:.0f} mA for "
                     f"{self.release_duration_s:.3f} s, "
                     f"sample at {self.release_sample_pct if not math.isnan(self.release_sample_pct) else 1.0:.0%}"
@@ -538,8 +539,8 @@ class JointHomingState:
 
         if self._pre_clear_count >= self._pre_clear_ticks:
             motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
-            logging.info(
-                f"[Homing] {self._label} pre-clear backoff complete "
+            logger.info(
+                f"{self._label} pre-clear backoff complete "
                 f"({self._pre_clear_ticks * self.dt:.3f} s / {self._pre_clear_ticks} ticks), "
                 f"restarting approach"
             )
@@ -568,8 +569,8 @@ class JointHomingState:
         if self._dwell_count >= self._dwell_ticks:
             self._phase         = self._BACKOFF
             self._backoff_count = 0
-            logging.info(
-                f"[Homing] {self._label} dwell complete, starting backoff"
+            logger.info(
+                f"{self._label} dwell complete, starting backoff"
             )
         return 'running'
 
@@ -584,8 +585,8 @@ class JointHomingState:
             motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
             self._phase       = self._PAUSE
             self._pause_count = 0
-            logging.info(
-                f"[Homing] {self._label} backed off ({self.backoff_s:.3f} s / "
+            logger.info(
+                f"{self._label} backed off ({self.backoff_s:.3f} s / "
                 f"{self._backoff_ticks} ticks), pausing before second approach"
             )
         return 'running'
@@ -606,8 +607,8 @@ class JointHomingState:
             self._last_pos      = None
             self._triggered_pos = None
             self._pass2_stall_pos = None
-            logging.info(
-                f"[Homing] {self._label} pause complete, starting slow second approach "
+            logger.info(
+                f"{self._label} pause complete, starting slow second approach "
                 f"({self.rehome_speed_factor*100:.0f}% speed)"
             )
         return 'running'
@@ -619,8 +620,8 @@ class JointHomingState:
         self._two_pass_done = True
         diff = abs(int(pass2_pos) - int(self._pass1_pos))
         self.two_pass_diff = diff
-        logging.info(
-            f"[Homing] {self._label} two-pass difference: "
+        logger.info(
+            f"{self._label} two-pass difference: "
             f"{diff} ticks (pass1={self._pass1_pos}, "
             f"pass2={pass2_pos}, "
             f"max={self._two_pass_max_diff})"
@@ -629,8 +630,8 @@ class JointHomingState:
             self.fail_reason = (f"the two passes stopped {diff} ticks apart (max {self._two_pass_max_diff}) — "
                                 f"the endstop trigger is not repeatable (a false stall: the joint could not move, "
                                 f"or something blocked it?)")
-            logging.error(
-                f"[Homing] {self._label} FAILED: two-pass difference "
+            logger.error(
+                f"{self._label} FAILED: two-pass difference "
                 f"{diff} ticks exceeds max {self._two_pass_max_diff} — "
                 f"endstop trigger is not repeatable"
             )
@@ -670,8 +671,8 @@ class JointHomingState:
         if self._release_count == self._release_sample_tick:
             reads = self._release_reads
             self._triggered_pos = int(round(sum(reads) / len(reads))) if reads else None
-            logging.info(
-                f"[Homing] {self._label} release: latched position "
+            logger.info(
+                f"{self._label} release: latched position "
                 f"{self._triggered_pos} at tick {self._release_count}/"
                 f"{self._release_ticks} (mean of {len(reads)} of the last {self._release_avg_ticks} reads)"
             )
@@ -680,16 +681,16 @@ class JointHomingState:
             # If position wasn't captured at sample point (e.g. was None), grab it now
             if self._triggered_pos is None and motor.position is not None:
                 self._triggered_pos = motor.position
-                logging.warning(
-                    f"[Homing] {self._label} release: sample at configured tick "
+                logger.warning(
+                    f"{self._label} release: sample at configured tick "
                     f"failed, using end-of-release position {self._triggered_pos}"
                 )
             # Stop current command before moving to settle
             motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
             self._phase        = self._SETTLE
             self._settle_count = 0
-            logging.info(
-                f"[Homing] {self._label} release complete "
+            logger.info(
+                f"{self._label} release complete "
                 f"({self.release_duration_s:.3f} s), pos={self._triggered_pos}"
             )
         return 'running'
@@ -713,8 +714,8 @@ class JointHomingState:
                 self._triggered_pos = motor.position
             else:
                 if self._settle_count < self._settle_ticks * 2:
-                    logging.debug(
-                        f"[Homing] {self._label} settle: motor.position is None, retrying "
+                    logger.debug(
+                        f"{self._label} settle: motor.position is None, retrying "
                         f"(tick {self._settle_count})"
                     )
                     return 'running'
@@ -731,8 +732,8 @@ class JointHomingState:
         pass2_pos = self._pass2_stall_pos if self._pass2_stall_pos is not None else self._triggered_pos
         if self._pass2_stall_pos is not None and self._triggered_pos is not None:
             self.release_relaxed = int(self._triggered_pos) - int(self._pass2_stall_pos)
-            logging.info(
-                f"[Homing] {self._label} release relaxed "
+            logger.info(
+                f"{self._label} release relaxed "
                 f"{int(self._triggered_pos) - int(self._pass2_stall_pos):+d} ticks "
                 f"(stall {self._pass2_stall_pos} -> latched {self._triggered_pos})"
             )
@@ -745,16 +746,17 @@ class JointHomingState:
             if self.is_arm_joint and joint_or_none is not None:
                 _update_home_reference(joint_or_none, self._triggered_pos,
                                        self.home_offset)
-                logging.info(
-                    f"[Homing] {self._label} reference set: "
+                logger.info(
+                    f"{self._label} reference set: "
                     f"master_pos={self._triggered_pos}, "
                     f"home_offset={self.home_offset:.4f} rad"
                 )
             else:
-                logging.info(
-                    f"[Homing] {self._label} homed at encoder pos "
+                logger.info(
+                    f"{self._label} homed at encoder pos "
                     f"{self._triggered_pos}"
                 )
+            log_milestone("HOMING_JOINT_HOMED", f"{self._label}: endstop at encoder {self._triggered_pos}")
 
         shared_data.rti["homing_status"][j] = STATUS_DONE
 
@@ -776,8 +778,8 @@ class JointHomingState:
             self._post_move_ok     = 0
             self._tick_count       = 0
             self._phase            = self._POST_MOVE
-            logging.info(
-                f"[Homing] {self._label} moving to post-home position "
+            logger.info(
+                f"{self._label} moving to post-home position "
                 f"{self.post_home_position:.4f} rad"
             )
             return 'running'
@@ -795,8 +797,8 @@ class JointHomingState:
             self._post_move_target = int(
                 joint_or_none.get_encoder_position(self.post_home_position)
             )
-            logging.info(
-                f"[Homing] {self._label} post-home target: "
+            logger.info(
+                f"{self._label} post-home target: "
                 f"{self.post_home_position:.4f} rad "
                 f"→ {self._post_move_target} ticks"
             )
@@ -809,8 +811,8 @@ class JointHomingState:
 
         # Timeout — don't block the rest of the sequence if the move fails
         if self._tick_count > self._timeout_ticks:
-            logging.warning(
-                f"[Homing] {self._label} post-home move timed out ({self.timeout_s:.1f} s) "
+            logger.warning(
+                f"{self._label} post-home move timed out ({self.timeout_s:.1f} s) "
                 f"— continuing to next joint"
             )
             motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
@@ -826,7 +828,7 @@ class JointHomingState:
                 self._post_move_ok = 0
 
         if self._post_move_ok >= self._post_move_stable:
-            logging.info(f"[Homing] {self._label} reached post-home position.")
+            logger.info(f"{self._label} reached post-home position.")
             motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
             self._phase = self._DONE
             return 'done'
@@ -836,6 +838,6 @@ class JointHomingState:
     # ------------------------------------------------------------------
     def _fail(self, shared_data, reason: str):
         self.fail_reason = reason
-        logging.error(f"[Homing] {self._label} FAILED: {reason}")
+        logger.error(f"{self._label} FAILED: {reason}")
         shared_data.rti["homing_status"][self.j] = STATUS_FAILED
         self._phase = self._FAILED

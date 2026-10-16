@@ -8,6 +8,7 @@ Split out of the single-file config/xml_parser.py on 2026-10-03 (refactor Phase 
 from __future__ import annotations
 
 import logging
+logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -90,7 +91,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         can_read_first = 0
     else:
         if _crf_text not in ("1", "true", "yes", "on"):
-            logging.warning(f"[system.xml] <can_read_first>{_crf_text!r} is not 0/1 — ON (read first, send early)")
+            logger.warning(f"system.xml <can_read_first>{_crf_text!r} is not 0/1 — ON (read first, send early)")
         can_read_first = 1
     # <drive_watchdog_ms>: every drive's CAN watchdog in ms (2026-10-13, user: "normal times" — it was 5000 per drive in
     # the robot / gripper XMLs, a bring-up value, no longer read). One value for every drive: it is about RTI's link,
@@ -101,7 +102,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
     except ValueError:
         drive_watchdog_ms = None
     if drive_watchdog_ms is None or not DRIVE_WATCHDOG_MIN_MS <= drive_watchdog_ms <= DRIVE_WATCHDOG_MAX_MS:
-        logging.warning(f"[system.xml] <drive_watchdog_ms>{_wd_text!r} is not a whole number of ms in "
+        logger.warning(f"system.xml <drive_watchdog_ms>{_wd_text!r} is not a whole number of ms in "
                         f"{DRIVE_WATCHDOG_MIN_MS}..{DRIVE_WATCHDOG_MAX_MS} — using {DRIVE_WATCHDOG_DEFAULT_MS} ms")
         drive_watchdog_ms = DRIVE_WATCHDOG_DEFAULT_MS
     # <control_box><pcb_version>: which PCB is fitted (hardware/control_box.py has the capability table; the
@@ -111,7 +112,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
     try:
         pcb_version = int(float(_pcb_text))
     except ValueError:
-        logging.warning(f"[system.xml] <pcb_version>{_pcb_text!r} is not a number — assuming PCB v1")
+        logger.warning(f"system.xml <pcb_version>{_pcb_text!r} is not a number — assuming PCB v1")
         pcb_version = 1
 
     # <display_timezone>: the zone times are SHOWN in (utility/display_time.py) — "system" (default) = the Pi's own zone;
@@ -122,7 +123,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
             import zoneinfo
             zoneinfo.ZoneInfo(display_timezone)
         except (ValueError, zoneinfo.ZoneInfoNotFoundError):
-            logging.warning(f"[system.xml] <display_timezone>{display_timezone!r} is not a known time zone — using the Pi's own")
+            logger.warning(f"system.xml <display_timezone>{display_timezone!r} is not a known time zone — using the Pi's own")
             display_timezone = "system"
 
     return {
@@ -224,12 +225,12 @@ def _parse_maintenance_defaults(elem: ET.Element | None) -> dict:
         try:
             val = float(text)
         except ValueError:
-            logging.warning("[system.xml] <maintenance_defaults><%s> is not a number "
+            logger.warning("system.xml <maintenance_defaults><%s> is not a number "
                             "(%r) — using %s", key, text, default)
             continue
         lo, hi = _MAINTENANCE_DEFAULT_BOUNDS[key]
         if not (lo <= val <= hi):
-            logging.warning("[system.xml] <maintenance_defaults><%s> = %s is outside "
+            logger.warning("system.xml <maintenance_defaults><%s> = %s is outside "
                             "[%s, %s] — using %s", key, val, lo, hi, default)
             continue
         out[key] = val
@@ -273,7 +274,7 @@ def _parse_dynamics_feedforward(elem: ET.Element | None) -> dict:
         elif text in ("0", "false", "off", "no"):
             out[key] = False
         else:
-            logging.warning("[system.xml] <dynamics_feedforward><%s> is not 0/1 (%r) — ON", key, text)
+            logger.warning("system.xml <dynamics_feedforward><%s> is not 0/1 (%r) — ON", key, text)
     return out
 
 
@@ -290,16 +291,16 @@ def _parse_friction_comp(elem: ET.Element | None) -> dict:
         try:
             val = float(text)
         except ValueError:
-            logging.warning("[system.xml] <friction_comp><%s> is not a number (%r) — using %s", key, text, default)
+            logger.warning("system.xml <friction_comp><%s> is not a number (%r) — using %s", key, text, default)
             continue
         lo, hi = _FRICTION_COMP_BOUNDS[key]
         if not (lo <= val <= hi):
-            logging.warning("[system.xml] <friction_comp><%s> = %s is outside [%s, %s] — using %s", key, val, lo, hi,
+            logger.warning("system.xml <friction_comp><%s> = %s is outside [%s, %s] — using %s", key, val, lo, hi,
                             default)
             continue
         out[key] = val
     if out["fade_end_dps"] <= out["fade_start_dps"]:
-        logging.warning("[system.xml] <friction_comp> fade_end_dps must be above fade_start_dps — using %s / %s",
+        logger.warning("system.xml <friction_comp> fade_end_dps must be above fade_start_dps — using %s / %s",
                         _FRICTION_COMP_FALLBACK["fade_start_dps"], _FRICTION_COMP_FALLBACK["fade_end_dps"])
         out["fade_start_dps"] = _FRICTION_COMP_FALLBACK["fade_start_dps"]
         out["fade_end_dps"] = _FRICTION_COMP_FALLBACK["fade_end_dps"]
@@ -403,35 +404,35 @@ def _parse_self_collision(elem: ET.Element | None) -> dict:
             continue
         if key == "jaws":
             if text.lower() not in _SELF_COLLISION_JAWS:
-                logging.warning("[system.xml] <self_collision><jaws> must be swept or measured (got %r) — using %s", text, default)
+                logger.warning("system.xml <self_collision><jaws> must be swept or measured (got %r) — using %s", text, default)
                 continue
             out[key] = text.lower()
             continue
         if isinstance(default, str):
             mode = {"0": "off", "1": "stop"}.get(text, text.lower())
             if mode not in ("off", "warn", "stop"):
-                logging.warning("[system.xml] <self_collision><%s> must be off, warn or stop (got %r) — using %s", key, text, default)
+                logger.warning("system.xml <self_collision><%s> must be off, warn or stop (got %r) — using %s", key, text, default)
                 continue
             out[key] = mode
             continue
         try:
             val = int(text) if isinstance(default, int) else float(text)
         except ValueError:
-            logging.warning("[system.xml] <self_collision><%s> is not a number (%r) — using %s", key, text, default)
+            logger.warning("system.xml <self_collision><%s> is not a number (%r) — using %s", key, text, default)
             continue
         lo, hi = _SELF_COLLISION_BOUNDS[key]
         if not (lo <= val <= hi):
-            logging.warning("[system.xml] <self_collision><%s> = %s is outside [%s, %s] — using %s", key, val, lo, hi, default)
+            logger.warning("system.xml <self_collision><%s> = %s is outside [%s, %s] — using %s", key, val, lo, hi, default)
             continue
         out[key] = val
     if out["monitor_margin_mm"] > out["planner_margin_mm"]:
-        logging.warning("[system.xml] <self_collision> monitor_margin_mm (%s) > planner_margin_mm (%s): a legal program could "
+        logger.warning("system.xml <self_collision> monitor_margin_mm (%s) > planner_margin_mm (%s): a legal program could "
                         "be stopped mid-move — using the planner margin for the monitor", out["monitor_margin_mm"], out["planner_margin_mm"])
         out["monitor_margin_mm"] = out["planner_margin_mm"]
     # the jog margin sits between the two: above the monitor's (a jog must come to rest before the trip line — at the
     # monitor margin itself a jog ended exactly ON it, 2026-10-07) and at most the planner's
     if out["jog_margin_mm"] <= out["monitor_margin_mm"]:
-        logging.warning("[system.xml] <self_collision> jog_margin_mm (%s) <= monitor_margin_mm (%s): a jog would come to rest on "
+        logger.warning("system.xml <self_collision> jog_margin_mm (%s) <= monitor_margin_mm (%s): a jog would come to rest on "
                         "the monitor's trip line — using the monitor margin + 3 mm", out["jog_margin_mm"], out["monitor_margin_mm"])
         out["jog_margin_mm"] = out["monitor_margin_mm"] + 3.0
     if out["jog_margin_mm"] > out["planner_margin_mm"]:
@@ -452,7 +453,7 @@ def _parse_safety_monitor(elem: ET.Element | None) -> dict:
         if isinstance(default, str):                 # a check mode
             mode = {"0": "off", "1": "stop"}.get(text, text.lower())
             if mode not in ("off", "warn", "stop"):
-                logging.warning("[system.xml] <safety_monitor><%s> must be off, warn or stop (got %r) — using %s",
+                logger.warning("system.xml <safety_monitor><%s> must be off, warn or stop (got %r) — using %s",
                                 key, text, default)
                 continue
             out[key] = mode
@@ -460,12 +461,12 @@ def _parse_safety_monitor(elem: ET.Element | None) -> dict:
         try:
             val = int(text) if isinstance(default, int) else float(text)
         except ValueError:
-            logging.warning("[system.xml] <safety_monitor><%s> is not a number (%r) — using %s",
+            logger.warning("system.xml <safety_monitor><%s> is not a number (%r) — using %s",
                             key, text, default)
             continue
         lo, hi = _SAFETY_MONITOR_BOUNDS[key]
         if not (lo <= val <= hi):
-            logging.warning("[system.xml] <safety_monitor><%s> = %s is outside [%s, %s] — using %s",
+            logger.warning("system.xml <safety_monitor><%s> = %s is outside [%s, %s] — using %s",
                             key, val, lo, hi, default)
             continue
         out[key] = val
@@ -489,17 +490,17 @@ def _parse_rti_defaults(elem: ET.Element | None) -> dict:
         try:
             val = int(text) if isinstance(default, int) else float(text)
         except ValueError:
-            logging.warning("[system.xml] <rti_defaults><%s> is not a number (%r) — "
+            logger.warning("system.xml <rti_defaults><%s> is not a number (%r) — "
                             "using %s", key, text, default)
             continue
         lo, hi = _RTI_DEFAULT_BOUNDS[key]
         if not (lo <= val <= hi):
-            logging.warning("[system.xml] <rti_defaults><%s> = %s is outside [%s, %s] — "
+            logger.warning("system.xml <rti_defaults><%s> = %s is outside [%s, %s] — "
                             "using %s", key, val, lo, hi, default)
             continue
         out[key] = val
     if out["success_bad"] > out["success_warn"]:
-        logging.warning("[system.xml] success_bad (%s) > success_warn (%s) — the 'bad' "
+        logger.warning("system.xml success_bad (%s) > success_warn (%s) — the 'bad' "
                         "threshold would fire first. Swapping them.",
                         out["success_bad"], out["success_warn"])
         out["success_warn"], out["success_bad"] = out["success_bad"], out["success_warn"]

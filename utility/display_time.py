@@ -14,6 +14,7 @@ One setting per robot box: the dashboard is one shared page for every browser, s
 from __future__ import annotations
 
 import calendar
+import math
 import datetime as _dt
 import os
 import re
@@ -66,6 +67,20 @@ def _dt_local(ts: float) -> _dt.datetime:
 def fmt(ts: float, pattern: str = "%Y-%m-%d %H:%M:%S") -> str:
     """An epoch time (as the logs store it) in the chosen zone. `%Z` gives the zone's abbreviation (CEST, UTC)."""
     return _dt_local(float(ts)).strftime(pattern)
+
+
+# THE way the dashboard shows an event's time (2026-10-15, user: "be consistent"): the Errors, Activity Log and Logs
+# tabs all use it. Date and time in the chosen zone, to the microsecond — the resolution the files keep (the text
+# logs' ISO stamps, the activity log's and the error list's epoch floats).
+PRECISE_PATTERN = "%Y-%m-%d %H:%M:%S"
+
+
+def fmt_precise(ts: float) -> str:
+    """"2026-10-15 19:19:10.292626" in the chosen zone."""
+    ts = float(ts)
+    whole = math.floor(ts)                 # the second and its fraction apart: datetime ROUNDS a fraction (1.9999996
+    micro = min(int((ts - whole) * 1_000_000), 999_999)   # -> 2.0), which put the seconds one ahead of it
+    return f"{fmt(whole, PRECISE_PATTERN)}.{micro:06d}"   # truncated, as the log files' formatter does
 
 
 def utc_text_to_ts(text: str) -> float:

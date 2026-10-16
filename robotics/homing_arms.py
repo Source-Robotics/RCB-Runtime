@@ -38,6 +38,7 @@ import copy
 import hashlib
 import json
 import logging
+logger = logging.getLogger("rti.homing")  # docs/logging.md "Logger names"
 import math
 import os
 import queue
@@ -195,19 +196,19 @@ def describe(table: dict, verdict: dict) -> str:
     label = arm_label(arm) if arm else "?"
     kind = verdict["kind"]
     if kind == "known":
-        return f"[Homing] arm recognised: {label} — {verdict['agree']}/{verdict['compared']} joints within {TOL_DEG:g} deg of their usual spot"
+        return f"arm recognised: {label} — {verdict['agree']}/{verdict['compared']} joints within {TOL_DEG:g} deg of their usual spot"
     if kind == "fault":
         off = ", ".join(f"J{j + 1} {d:+.2f} deg" for j, d in verdict["off"])
-        return (f"[Homing] FAILED: {off} away from where arm {label} always homes "
+        return (f"FAILED: {off} away from where arm {label} always homes "
                 f"(a false stall, a skipped belt or a slipping coupling?) — home again; if that joint's mechanics were "
                 f"changed on purpose: .venv/bin/python tools/homing_arms.py --accept-last")
     if kind == "learning":
-        return (f"[Homing] arm {label} — learning its homing spots, {arm['homings']}/{KNOWN_AFTER}"
+        return (f"arm {label} — learning its homing spots, {arm['homings']}/{KNOWN_AFTER}"
                 + (" — now KNOWN: a joint more than 1 deg off fails homing from now on" if arm["known"] else ""))
     if kind == "relearn":
         off = ", ".join(f"J{j + 1} {d:+.2f} deg" for j, d in verdict["off"])
-        return f"[Homing] arm {label} — homed differently than before ({off}) while still learning: learning starts over, 1/{KNOWN_AFTER}"
-    return (f"[Homing] no known arm matches — learning a new one, {label}, 1/{KNOWN_AFTER} "
+        return f"arm {label} — homed differently than before ({off}) while still learning: learning starts over, 1/{KNOWN_AFTER}"
+    return (f"no known arm matches — learning a new one, {label}, 1/{KNOWN_AFTER} "
             f"(name it: .venv/bin/python tools/homing_arms.py --name {verdict['arm']} NAME)")
 
 
@@ -381,7 +382,7 @@ class HomingArms:
                 _, compared, off, devs = compare(arm, latches, keys, self.counts, self.gears)
                 if compared and not off:
                     self._so_far_arm = arm["id"]
-                    return {"kind": "ok", "text": f"[Homing] arm recognised from the joints homed so far: "
+                    return {"kind": "ok", "text": f"arm recognised from the joints homed so far: "
                                                   f"{arm_label(arm)} — each joint homed from now on is checked at once"}
                 if compared and (closest is None or max(abs(d) for _, d in off) < closest[0]):
                     closest = (max(abs(d) for _, d in off), arm, off)
@@ -389,7 +390,7 @@ class HomingArms:
             if closest is None:                 # still learning the first arm (or nothing comparable): the end check
                 return {"kind": "skip"}
             if self.table.get("learn_next"):
-                return {"kind": "skip", "text": "[Homing] the first joint(s) homed match none of the known arms — "
+                return {"kind": "skip", "text": "the first joint(s) homed match none of the known arms — "
                                                 "learning a new arm (requested: 'learn a new arm on the next homing')"}
             # 2026-10-14 (user): no longer "another arm?" — a joint that false-stalled first (J1 could not turn in a
             # folded pose) made every later joint unchecked and the sequence went on to the gripper on wrong references
@@ -400,7 +401,7 @@ class HomingArms:
                    f"to its park pose and home again; a different arm: System Info > 'Arms (homing)' > 'Learn a new arm "
                    f"on the next homing'")
             return {"kind": "fault", "unknown": True, "off": off, "reason": f"it {why}",
-                    "text": f"[Homing] FAILED: {', '.join(f'J{i + 1}' for i, _ in off)} — it {why}"}
+                    "text": f"FAILED: {', '.join(f'J{i + 1}' for i, _ in off)} — it {why}"}
         arm = next((a for a in self.table["arms"] if a["id"] == self._so_far_arm), None)
         if arm is None:
             return {"kind": "skip"}
@@ -418,7 +419,7 @@ class HomingArms:
                f"slipping coupling. Move it to its park pose and home again; after a deliberate mechanical change: "
                f"System Info > 'Arms (homing)' > 'Accept as new reference'")
         verdict["reason"] = why
-        verdict["text"] = f"[Homing] FAILED: J{j + 1} — {why}"
+        verdict["text"] = f"FAILED: J{j + 1} — {why}"
         return verdict
 
     def judge_and_learn(self, latches: dict, stats: dict | None = None, utc: str | None = None) -> dict:
@@ -461,7 +462,7 @@ class HomingArms:
                f"Info > 'Arms (homing)' > 'Learn a new arm on the next homing'")
         return {"kind": "fault", "unknown": True, "arm": arm["id"], "off": off,
                 "reasons": {i: f"it homed {d:+.2f} deg from where the closest known arm's J{i + 1} homes — {why}"
-                            for i, d in off}, "text": f"[Homing] FAILED: {why}"}
+                            for i, d in off}, "text": f"FAILED: {why}"}
 
     def check_approach(self, j: int, arrival: int, toward: int) -> dict:
         """<approach> (2026-10-14, user: J3's approach stopped 7 deg short, against the arm's own base, and homing went
@@ -496,7 +497,7 @@ class HomingArms:
                f"way (the arm against itself or its base?), or the joint could not carry the arm there. Move the arm to "
                f"its park pose and home again; a different arm: System Info > 'Arms (homing)' > 'Learn a new arm on the "
                f"next homing'")
-        return {"kind": "fault", "reason": f"{why}", "text": f"[Homing] FAILED: J{j + 1} — {why}"}
+        return {"kind": "fault", "reason": f"{why}", "text": f"FAILED: J{j + 1} — {why}"}
 
     def _run(self) -> None:
         from utility.incident_dump import _leave_the_rt_core
@@ -509,4 +510,4 @@ class HomingArms:
                 elif what == "save":
                     save_table(self.path, table)
             except Exception as exc:                       # never take homing down over a file
-                logging.getLogger(__name__).warning("[Homing] arm table %s failed: %s", what, exc)
+                logger.warning("arm table %s failed: %s", what, exc)

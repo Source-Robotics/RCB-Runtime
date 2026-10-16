@@ -19,7 +19,7 @@ import Spectral_BLDC as Spectral
 import SourceRoboticsToolbox
 import numpy as np
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.can")  # docs/logging.md "Logger names"
 
 
 # ==========================================================================

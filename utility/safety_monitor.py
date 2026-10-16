@@ -106,6 +106,7 @@ and a tuple are built only on the tick something fires.
 from __future__ import annotations
 
 import logging
+logger = logging.getLogger("rti.safety")  # docs/logging.md "Logger names"
 import math
 
 import numpy as np
@@ -283,7 +284,7 @@ class SafetyMonitor:
         self._ho_thr2, self._ho_clear2 = thr * thr, 0.25 * thr * thr          # squared: no sqrt per tick
         self.hold_osc_mode = check_mode(policy.get("hold_oscillation", "off"))
         if self.hold_osc_mode == "stop":                                       # warn-only by design (the user's ask)
-            logging.warning("[SAFETY] <hold_oscillation> supports off | warn — using warn")
+            logger.warning("<hold_oscillation> supports off | warn — using warn")
             self.hold_osc_mode = "warn"
         self.check_hold_osc = (self.hold_osc_mode != "off" and i_meas is not None and v_cmd is not None
                                and bool(np.isfinite(thr).any()))
@@ -329,6 +330,8 @@ class SafetyMonitor:
         self._z_tol = float(policy.get("zone_tolerance", 0.005))
         self._zones_on = bool(policy.get("zones", 1)) and tcp_pose is not None
         self.warnings = set()               # live warning keys (zones, soft limits); error_checks reads it
+        self.details = {}                   # key -> the measured value behind it, written when it fires (2026-10-15):
+                                            # the error list's and the activity log's message (error_checks detail_of)
         self.set_zones(zones, tool_spheres, log=False, haptic=haptic)
         self.set_joint_walls(joint_walls, log=False)
         self._warn_config()
@@ -360,7 +363,7 @@ class SafetyMonitor:
             self.warnings.discard(k)                     # the soft-limit warnings stay
         self.check_zones = self._zones_on and nz > 0
         if log:
-            logging.info(f"[SAFETY] zones reloaded: {nz} enabled, {len(self._spheres)} robot sphere(s), "
+            logger.info(f"zones reloaded: {nz} enabled, {len(self._spheres)} robot sphere(s), "
                          f"zone checks {'ON' if self.check_zones else 'OFF'}")
 
     def set_joint_walls(self, walls, log=True):
@@ -394,7 +397,7 @@ class SafetyMonitor:
         self.check_passive_bound = self._check_pb_policy and bool(np.isfinite(self._pb_lo).any()
                                                                   or np.isfinite(self._pb_hi).any())
         if log:
-            logging.info(f"[SAFETY] joint walls set: pushed through at {self._pb_text()}")
+            logger.info(f"joint walls set: pushed through at {self._pb_text()}")
 
     def _pb_text(self):
         parts = []
@@ -418,11 +421,11 @@ class SafetyMonitor:
         margin = np.minimum(self._in_lo - self._end_in_lo, self._end_in_hi - self._in_hi)
         tight = np.flatnonzero(np.isfinite(margin) & (margin + self.end_tol <= self.tol))
         for i in tight:
-            logging.warning(f"[SAFETY] J{i + 1}: soft-to-hard margin {np.degrees(margin[i]):.2f} deg + the "
+            logger.warning(f"J{i + 1}: soft-to-hard margin {np.degrees(margin[i]):.2f} deg + the "
                             f"{np.degrees(self.end_tol):.2f} deg endstop tolerance is not larger than the "
                             f"{np.degrees(self.tol):.2f} deg tolerance — OUT_OF_RANGE and BEYOND_ENDSTOP would fire together")
-        logging.info(
-            f"[SAFETY] monitor {'ON' if self.enabled else 'OFF'}: out-of-range {self.check_range} (warning only in "
+        logger.info(
+            f"monitor {'ON' if self.enabled else 'OFF'}: out-of-range {self.check_range} (warning only in "
             f"IDLE/ACTIVE_ERROR), freedrive bounds {self._pb_text() if self.check_passive_bound else 'off'}, "
             f"beyond-endstop {self.check_endstop}, overspeed {self.speed_mode if self.check_speed else 'off'}, "
             f"tracking {self.tracking_mode if self.check_tracking else 'off'}, "
@@ -595,21 +598,22 @@ class SafetyMonitor:
                     self._a_tcp = True
             if self._a_tcp and self._c_tcp == self._n_tcp:
                 self._a_tcp = False
+                msg = f"TCP speed {s:.3f} m/s above the {self._tcp_trip:.3f} m/s trip for {self._n_tcp} ticks"
                 if self.tcp_mode == "warn":
                     self.warnings.add(TCP_OVERSPEED_WARNING)
                     self._pk_tcp = s
-                    logging.warning(f"[SAFETY] TCP speed {s:.3f} m/s above the {self._tcp_trip:.3f} m/s trip "
-                                    f"for {self._n_tcp} ticks — reaction: warn")
+                    self.details[TCP_OVERSPEED_WARNING] = msg
+                    logger.warning(msg + " — reaction: warn")
                 else:
-                    logging.error(f"[SAFETY] TCP speed {s:.3f} m/s above the {self._tcp_trip:.3f} m/s trip "
-                                  f"for {self._n_tcp} ticks")
+                    self.details[TCP_OVERSPEED] = msg
+                    logger.error(msg)
                     fired = (fired or []) + [TCP_OVERSPEED]
             if self._pk_tcp > 0.0:                           # a live TCP warning: track its peak, clear it
                 if s > self._pk_tcp:
                     self._pk_tcp = s
                 if self._a_tcp:
                     self.warnings.discard(TCP_OVERSPEED_WARNING)
-                    logging.info(f"[SAFETY] TCP back under {self._tcp_limit:.3f} m/s; the excursion peaked at "
+                    logger.info(f"TCP back under {self._tcp_limit:.3f} m/s; the excursion peaked at "
                                  f"{self._pk_tcp:.3f} m/s")
                     self._pk_tcp = 0.0
         if self.check_zones:
@@ -664,7 +668,7 @@ class SafetyMonitor:
         if inside.size:
             names = ", ".join(f"{self._sc_names[k // 7]} and {self._sc_names[k % 7]} {1e3 * self._sc_gaps[k]:.1f} mm"
                               for k in inside)
-            logging.warning(f"[SAFETY] self-collision: this active period starts with {names} — within the monitor "
+            logger.warning(f"self-collision: this active period starts with {names} — within the monitor "
                             f"margin already (escape rule): moving apart is allowed; SELF_COLLISION if a pair gets "
                             f"{1e3 * SC_ESCAPE_TOL_M:g} mm closer or another pair comes within the margin")
 
@@ -683,11 +687,11 @@ class SafetyMonitor:
             self._sc_stale = stale
             if stale:
                 self.warnings.add(SELF_COLLISION_STALE)
-                logging.warning(f"[SAFETY] the self-collision worker has not updated shared memory for {SC_STALE_S:g} s — "
+                logger.warning(f"the self-collision worker has not updated shared memory for {SC_STALE_S:g} s — "
                                 f"self-collisions are NOT being watched (SELF_COLLISION_STALE)")
             else:
                 self.warnings.discard(SELF_COLLISION_STALE)
-                logging.info("[SAFETY] the self-collision worker is back")
+                logger.info("the self-collision worker is back")
         if stale:
             self._sc_c = 0
             return fired
@@ -709,12 +713,15 @@ class SafetyMonitor:
                 gap_mm = 1e3 * float(self._sc_gaps[k])
                 why = ("" if not np.isfinite(self._sc_thr[k]) else
                        f" — closer than the {1e3 * (self._sc_thr[k] + SC_ESCAPE_TOL_M):.1f} mm they started this active period at")
+                msg = f"{pair} are {gap_mm:.1f} mm apart on the measured pose{why}"
                 if self.sc_mode == "warn":
                     self.warnings.add(SELF_COLLISION_WARNING)
                     self._sc_live = True
-                    logging.warning(f"[SAFETY] self-collision (warn): {pair} are {gap_mm:.1f} mm apart on the measured pose{why} — no stop (warn mode)")
+                    self.details[SELF_COLLISION_WARNING] = msg
+                    logger.warning(f"self-collision (warn): {msg} — no stop (warn mode)")
                 else:
-                    logging.error(f"[SAFETY] {SELF_COLLISION}: {pair} are {gap_mm:.1f} mm apart on the measured pose{why}")
+                    self.details[SELF_COLLISION] = msg
+                    logger.error(f"{SELF_COLLISION}: {msg}")
                     fired = fired if fired is not None else []
                     fired.append(SELF_COLLISION)
         else:
@@ -724,7 +731,7 @@ class SafetyMonitor:
                 if self._sc_live:
                     self._sc_live = False
                     self.warnings.discard(SELF_COLLISION_WARNING)
-                    logging.info("[SAFETY] self-collision warning cleared: the links are apart again")
+                    logger.info("self-collision warning cleared: the links are apart again")
         return fired
 
     def _hold_osc_fire(self, fire):
@@ -735,7 +742,9 @@ class SafetyMonitor:
             self._ho_live[i] = True
             self._ho_pk[i] = self._ho_ms[i]
             self.warnings.add(self._k_how[i])
-            logging.warning(f"[SAFETY] J{i + 1} oscillates while holding: {self._ho_ms[i] ** 0.5:.0f} mA of fast current "
+            self.details[self._k_how[i]] = (f"{self._ho_ms[i] ** 0.5:.0f} mA of fast current ripple, over "
+                                            f"{self._ho_thr[i]:g} mA for {self._ho_sustain_s:.1f} s")
+            logger.warning(f"J{i + 1} oscillates while holding: {self._ho_ms[i] ** 0.5:.0f} mA of fast current "
                             f"ripple (over {self._ho_thr[i]:g} mA for {self._ho_sustain_s:.1f} s) — the drive is fighting itself (a "
                             f"buzz/whine): most likely its PID gains are too high; else its encoder (magnet) or the "
                             f"mechanics. No stop (warn).")
@@ -754,7 +763,7 @@ class SafetyMonitor:
                 self._ho_live[i] = False
                 self.warnings.discard(self._k_how[i])
                 pk = self._ho_pk[i] ** 0.5
-                logging.info(f"[SAFETY] J{i + 1} hold oscillation over ({'level back down' if still[i] else 'it moves'});"
+                logger.info(f"J{i + 1} hold oscillation over ({'level back down' if still[i] else 'it moves'});"
                              f" it peaked at {pk:.0f} mA ({100.0 * pk / self._ho_thr[i]:.0f}% of the "
                              f"{self._ho_thr[i]:g} mA threshold)")
             else:
@@ -768,8 +777,8 @@ class SafetyMonitor:
             armed[i] = False
             peak[i] = values[i]
             self.warnings.add(wkeys[i])
-            logging.warning(f"[SAFETY] J{i + 1} {name} (warn): {what} {k(values[i]):.2f} {unit} above the trip "
-                            f"{k(trip[i]):.2f} {unit} — no stop (warn mode)")
+            self.details[wkeys[i]] = f"{what} {k(values[i]):.2f} {unit} above the trip {k(trip[i]):.2f} {unit}"
+            logger.warning(f"J{i + 1} {name} (warn): {self.details[wkeys[i]]} — no stop (warn mode)")
         return True
 
     def _warn_track(self, armed, wkeys, peak, values, what, ref, per_s=False):
@@ -785,7 +794,7 @@ class SafetyMonitor:
                 peak[i] = values[i]
             if armed[i]:
                 self.warnings.discard(key)
-                logging.info(f"[SAFETY] J{i + 1} {what} back to normal; the excursion peaked at "
+                logger.info(f"J{i + 1} {what} back to normal; the excursion peaked at "
                              f"{np.degrees(peak[i]):.2f} {unit} ({100.0 * peak[i] / ref[i]:.0f}% of "
                              f"{np.degrees(ref[i]):.2f} {unit})")
             else:
@@ -799,18 +808,21 @@ class SafetyMonitor:
             self._a_pb[i] = False
             lo, hi = np.degrees(self._pb_in_lo[i]), np.degrees(self._pb_in_hi[i])
             if self._pb_wall[i]:
-                msg = (f"J{i + 1} pushed through its freedrive wall: {np.degrees(q[i]):.2f} deg, wall at [{lo:.2f}, "
-                       f"{hi:.2f}] deg, breakthrough {np.degrees(self._pb_in_lo[i] - self._pb_lo[i]):.1f} deg")
+                detail = (f"{np.degrees(q[i]):.2f} deg, wall at [{lo:.2f}, {hi:.2f}] deg, breakthrough "
+                          f"{np.degrees(self._pb_in_lo[i] - self._pb_lo[i]):.1f} deg")
+                msg = f"J{i + 1} pushed through its freedrive wall: {detail}"
                 if self._pb_warn[i]:
                     self.warnings.add(self._k_wallw[i])
                     self._pb_warned = True
-                    logging.warning(f"[SAFETY] {msg} — reaction: warn")
+                    self.details[self._k_wallw[i]] = detail
+                    logger.warning(f"{msg} — reaction: warn")
                     continue
-                logging.error(f"[SAFETY] {JOINT_WALL}: {msg} — reaction: stop")
+                self.details[self._k_pb[i]] = detail
+                logger.error(f"{JOINT_WALL}: {msg} — reaction: stop")
             else:
-                logging.error(f"[SAFETY] J{i + 1} {HARD_LIMIT}: {np.degrees(q[i]):.2f} deg outside the hard limits "
-                              f"[{lo:.2f}, {hi:.2f}] deg (+/- {np.degrees(self.tol):.2f} tolerance; no endstop: the "
-                              f"cable wind-up boundary)")
+                self.details[self._k_pb[i]] = (f"{np.degrees(q[i]):.2f} deg outside the hard limits [{lo:.2f}, {hi:.2f}] "
+                                               f"deg (+/- {np.degrees(self.tol):.2f} tolerance)")
+                logger.error(f"J{i + 1} {HARD_LIMIT}: {self.details[self._k_pb[i]]}; no endstop: the cable wind-up boundary")
             fired = fired if fired is not None else []
             fired.append(self._k_pb[i])
         return fired
@@ -823,7 +835,7 @@ class SafetyMonitor:
             if key in self.warnings:
                 if self._pb_in_lo[i] <= q[i] <= self._pb_in_hi[i]:
                     self.warnings.discard(key)
-                    logging.info(f"[SAFETY] J{i + 1} back inside its freedrive wall")
+                    logger.info(f"J{i + 1} back inside its freedrive wall")
                 else:
                     live = True
         self._pb_warned = live
@@ -850,12 +862,14 @@ class SafetyMonitor:
             for i in np.flatnonzero(b):
                 if new[i]:
                     self.warnings.add(self._k_soft[i])
-                    logging.warning(f"[SAFETY] J{i + 1} is past its soft limit ({np.degrees(q[i]):.2f} deg, "
+                    self.details[self._k_soft[i]] = (f"{np.degrees(q[i]):.2f} deg, limits [{np.degrees(self.soft_lo[i]):.2f}, "
+                                                     f"{np.degrees(self.soft_hi[i]):.2f}] deg")
+                    logger.warning(f"J{i + 1} is past its soft limit ({np.degrees(q[i]):.2f} deg, "
                                     f"limits [{np.degrees(self.soft_lo[i]):.2f}, {np.degrees(self.soft_hi[i]):.2f}]) "
                                     f"— JOG, EXEC and RTI will only move it back in")
                 else:
                     self.warnings.discard(self._k_soft[i])
-                    logging.info(f"[SAFETY] J{i + 1} back inside its soft limits")
+                    logger.info(f"J{i + 1} back inside its soft limits")
             self._w_soft[:] = new
             self._soft_warned = bool(new.any())
         return past
@@ -892,8 +906,9 @@ class SafetyMonitor:
             fired = fired if fired is not None else []
             for i in np.flatnonzero(bad):
                 fired.append(self._k_rng[i])
-                logging.error(f"[SAFETY] J{i + 1} {OUT_OF_RANGE}: driven {np.degrees(d[i] - ref[i]):.2f} deg FURTHER past "
-                              f"its soft limit (now {np.degrees(d[i]):.2f} deg past) while outside it")
+                self.details[self._k_rng[i]] = (f"driven {np.degrees(d[i] - ref[i]):.2f} deg further past its soft limit, "
+                                                f"now {np.degrees(d[i]):.2f} deg past")
+                logger.error(f"J{i + 1} {OUT_OF_RANGE}: {self.details[self._k_rng[i]]} while outside it")
                 ref[i] = d[i]
                 self._c_deep[i] = 0
         return fired
@@ -917,7 +932,7 @@ class SafetyMonitor:
                     ref[i] = math.nan
                     if self._z_wkeys[i] in self.warnings:
                         self.warnings.discard(self._z_wkeys[i])
-                        logging.info(f"[SAFETY] left zone '{zones[i]['name']}'")
+                        logger.info(f"left zone '{zones[i]['name']}'")
                 continue
             if warn_now[i] and not armed[i]:
                 ref[i] = math.nan                            # a warned excursion carries no reference onward
@@ -946,14 +961,16 @@ class SafetyMonitor:
             verb = "went further out of" if deeper else "left"
         else:
             verb = "went deeper into" if deeper else "entered"
-        msg = (f"[SAFETY] {what} {verb} {zone['kind']} {zone['shape']} zone '{zone['name']}': "
+        msg = (f"{what} {verb} {zone['kind']} {zone['shape']} zone '{zone['name']}': "
                f"{1000.0 * pen:.1f} mm past its surface, "
                f"TCP at ({m[3]:.3f}, {m[7]:.3f}, {m[11]:.3f}) m")
         if warn:
             self.warnings.add(self._z_wkeys[i])
-            logging.warning(msg + " — reaction: warn")
+            self.details[self._z_wkeys[i]] = msg
+            logger.warning(msg + " — reaction: warn")
             return fired
-        logging.error(msg)
+        self.details[self._z_ekeys[i]] = msg
+        logger.error(msg)
         fired = fired if fired is not None else []
         fired.append(self._z_ekeys[i])
         return fired
@@ -967,10 +984,10 @@ class SafetyMonitor:
             v = np.degrees(values[i])
             unit = "deg/s" if per_s else "deg"
             if lo is None:
-                logging.error(f"[SAFETY] J{i + 1} {name}: {what} {v:.2f} {unit} above the {bound} "
-                              f"{np.degrees(hi[i]):.2f} {unit}")
+                detail = f"{what} {v:.2f} {unit} above the {bound} {np.degrees(hi[i]):.2f} {unit}"
             else:
-                logging.error(f"[SAFETY] J{i + 1} {name}: {what} {v:.2f} deg outside the {bound} "
-                              f"[{np.degrees(lo[i]):.2f}, {np.degrees(hi[i]):.2f}] deg (+/- "
-                              f"{np.degrees(self.tol if tol is None else tol):.2f} tolerance)")
+                detail = (f"{what} {v:.2f} deg outside the {bound} [{np.degrees(lo[i]):.2f}, {np.degrees(hi[i]):.2f}] deg "
+                          f"(+/- {np.degrees(self.tol if tol is None else tol):.2f} tolerance)")
+            self.details[keys[i]] = detail
+            logger.error(f"J{i + 1} {name}: {detail}")
         return fired

@@ -28,7 +28,9 @@ import sys
 import threading
 import time
 
-from blockly import programs
+from blockly import programs, run_records
+from project_paths import LOGS_DIR
+from utility.housekeeping import rotate_by_size
 from robotclient import RobotClient
 from robotclient.constants import DEFAULT_PORT
 from robotclient.exceptions import RobotError
@@ -43,11 +45,11 @@ CHECK_BUSY_MODES = ("HOMING", "JOG", "RTI", "SOFT_RTI", "FLASHING")   # the arm 
 STOP_TERM_S = 1.0
 STOP_KILL_S = 2.0
 
-_settings = {"host": "127.0.0.1", "port": DEFAULT_PORT, "client_factory": lambda: RobotClient(sync=False),
-             "runner_args": [], "log_path": os.path.join(ROOT, "logs", "block_programs.log")}
+_settings = {"host": "127.0.0.1", "port": DEFAULT_PORT, "client_factory": lambda: RobotClient(sync=False, name="blocks"),
+             "runner_args": [], "log_path": os.path.join(str(LOGS_DIR), "block_programs.log")}   # LOGS_DIR: the simulator's / a net's own
 _lock = threading.RLock()
 _run = {"proc": None, "program": None, "state": "idle", "block": None, "error": None, "exit": None,
-        "started": None, "seq": 0}
+        "started": None, "seq": 0, "record": None}
 _events = collections.deque(maxlen=MAX_EVENTS)
 _robot = {"client": None}
 
@@ -56,13 +58,14 @@ class RunError(Exception):
     """A run request that cannot be done now; the message is for the user."""
 
 
-def configure(host=None, port=None, client_factory=None, runner_args=None, log_path=None):
+def configure(host=None, port=None, client_factory=None, runner_args=None, log_path=None, record_dir=None):
     """Where the robot is, the client for the server's own connection, extra runner arguments (the nets pass a
-    fake client), where the runners' stderr goes."""
+    fake client), where the runners' stderr goes, where the run records go (blockly/run_records.py)."""
     for key, value in (("host", host), ("port", port), ("client_factory", client_factory),
                        ("runner_args", runner_args), ("log_path", log_path)):
         if value is not None:
             _settings[key] = value
+    run_records.configure(record_dir)
 
 
 def start(name):
@@ -121,7 +124,7 @@ def check(name, workspace, points):
     seconds = round(time.monotonic() - t0, 1)
     if done.stderr.strip():
         with open(_settings["log_path"], "a") as log:
-            log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} check {name!r}\n{done.stderr}")
+            log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} check {name!r}\n{done.stderr}")
     events = []
     for line in done.stdout.splitlines():
         try:
@@ -145,14 +148,17 @@ def _start(name, path):
         cmd = [sys.executable, "-m", "blockly.runner", path, "--stop-on-eof",
                "--host", str(_settings["host"]), "--port", str(_settings["port"]), *_settings["runner_args"]]
         os.makedirs(os.path.dirname(_settings["log_path"]), exist_ok=True)
+        # No run holds the file now: rotate it when it is over 2 MB, keeping 3 (it grew without a limit until
+        # 2026-10-15; utility/housekeeping.py). Stamps are UTC since then, as every other log.
+        rotate_by_size(_settings["log_path"], 2_000_000, keep=3)
         with open(_settings["log_path"], "a") as log:
-            log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} run {name!r}\n")
+            log.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} run {name!r}\n")
             log.flush()
             proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
                                     text=True, bufsize=1)
         _events.clear()
         _run.update(proc=proc, program=name, state="starting", block=None, error=None, exit=None,
-                    started=time.time())
+                    started=time.time(), record=run_records.begin(name, path))   # the durable record (2026-10-15)
         _record({"type": "run", "program": name})
         threading.Thread(target=_read, args=(proc,), name="block-program-reader", daemon=True).start()
     return snapshot()
@@ -219,6 +225,7 @@ def _record(event):
         _run["seq"] += 1
         event = {"seq": _run["seq"], "t": round(time.time(), 3), **event}
         _events.append(event)
+        run_records.append(_run.get("record"), event)
         if event.get("type") == "state":
             _run["state"] = event.get("state")
         elif event.get("type") == "block":
@@ -245,6 +252,7 @@ def _read(proc):
     with _lock:
         _run["exit"] = code
     _record({"type": "run_end", "exit": code})
+    run_records.finish(_run.get("record"), code, _run["state"], _run["error"])
 
 
 def _send(word):

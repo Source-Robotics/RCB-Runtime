@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sup")  # docs/logging.md "Logger names"
 
 
 def get_raspberry_pi_temperature() -> float | None:

@@ -61,7 +61,7 @@ Which channels the software trusts is decided by the fitted board — `<control_
 `config/system.xml`, table in `hardware/control_box.py` (2026-10-04). **PCB v1: E-Stop 2 (GPIO6) always reads
 pressed (a layout fault), so `check_estop_active()` reads E-Stop 1 only.** From v2 both channels are read and
 cross-checked: any channel pressed = pressed; the two disagreeing for more than 50 ticks (200 ms) is a channel
-fault — treated as pressed and logged once (`[E-stop] CHANNEL FAULT`) until both agree again.
+fault — treated as pressed and logged once (`io | E-stop CHANNEL FAULT`) until both agree again.
 
 ## General GPIO
 

@@ -16,7 +16,7 @@ from robotics.robot_kinematics import (
 )
 from utility.kinematics_backend import set_kinematics_backend
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("kin")  # docs/logging.md "Logger names"
 
 
 @dataclass(frozen=True)

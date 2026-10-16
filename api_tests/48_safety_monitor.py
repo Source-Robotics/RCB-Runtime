@@ -57,7 +57,7 @@ def monitor_live():
                 tail = fh.read()[-400000:]
         except OSError:
             continue
-        if "[SAFETY] monitor ON" in tail:
+        if "[SAFETY] monitor ON" in tail or "| rti.safety    | monitor ON" in tail:   # the old line format, the new
             return True
     return False
 

@@ -27,6 +27,12 @@ Contact: petar@source-robotics.com
 
 import json
 import logging
+logger = logging.getLogger("exec")  # docs/logging.md "Logger names"
+log_control = logging.getLogger("exec.control")  # docs/logging.md "Logger names"
+log_forward = logging.getLogger("exec.forward")  # docs/logging.md "Logger names"
+log_status = logging.getLogger("exec.status")  # docs/logging.md "Logger names"
+log_stop = logging.getLogger("exec.stop")  # docs/logging.md "Logger names"
+log_tcp = logging.getLogger("exec.tcp")  # docs/logging.md "Logger names"
 import math
 import socket
 from contextlib import nullcontext
@@ -39,7 +45,7 @@ from queue import Queue, Full
 import numpy as np
 import zmq
 
-from project_paths import HIGH_LEVEL_LOG, SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, CELLS_DIR, DATA_RECIPE_DIR, FILTER_CONFIG_PATH, PROJECT_ROOT
+from project_paths import HIGH_LEVEL_LOG, SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, CELLS_DIR, DATA_RECIPE_DIR, FILTER_CONFIG_PATH, PROJECT_ROOT, TEMP_DATA_DIR
 from utility.code_version import describe as describe_code
 from data.shared_memory_index import (
     ISOLATED_INPUT_1, ISOLATED_INPUT_2, ISOLATED_INPUT_3,
@@ -67,7 +73,12 @@ from motion.exec_commands import (
     DEFAULT_PROFILE, MotionOptions, QueuedCommand, normalize_profile_name, normalize_ik_solver_name,
 )
 from motion.ik_config import DEFAULT_FK_JACOBIAN_BACKEND
-from utility.activity_log import get_exec_activity_logger, log_activity
+from utility.activity_log import get_exec_activity_logger, log_activity, note_origin, origin_of
+from utility.error_catalog import entry as catalog_entry
+from utility.health import assess as assess_health
+from utility.incident_dump import CAPTURE_MAX_S, CAPTURE_MIN_S, safe_capture_name
+from utility.trace_ring import recorder_alive
+from utility.logger_setup import apply_log_level
 
 # ========================================================================== #
 # Setup
@@ -164,6 +175,8 @@ cfg = read_XML2.load_full_robot_config(
     str(_sys['robot_xml_path']), grippers_dir=GRIPPERS_DIR,
     active_gripper=_sys['active_gripper'])
 JOINT_NUM = int(cfg['joint_num'])
+_can_gripper_raw = cfg.get('gripper_CAN_gripper', 0)          # as RTI reads it (NaN = none)
+_HAS_CAN_GRIPPER = not (isinstance(_can_gripper_raw, float) and np.isnan(_can_gripper_raw)) and int(_can_gripper_raw) == 1
 TICK_S = float(cfg['delta_t'])        # RTI's tick (s), published in the status (tick_s)
 # Safety zones of the active cell (config/cells/<active_cell>.xml; utility/zones.py). A bad cell file
 # RAISES here: running without the zones the operator configured would be silently disarming them.
@@ -171,7 +184,7 @@ _GRIPPER_XML = GRIPPERS_DIR / f"{_sys['active_gripper']}.xml"
 try:
     _zone_setup = read_XML2.load_zone_setup(SYSTEM_XML, CELLS_DIR, _GRIPPER_XML)
 except (ValueError, FileNotFoundError) as _e:
-    logging.critical(f"[EXEC] safety zones: {_e} — fix the cell file (or empty <active_cell>), then restart")
+    logger.critical(f"safety zones: {_e} — fix the cell file (or empty <active_cell>), then restart")
     raise
 # Velocity and acceleration come from the ROBOT XML — <exec_limits> per joint, which is EXEC's
 # own share of the hardware ceiling in <joint_*_limit>.
@@ -220,13 +233,13 @@ def _build_robot_model():
         from utility.pinocchio_attach import attach_pinocchio
         robot = create_robot(_sys["active_robot"], gripper_name=cfg.get("gripper_name", ""))
     except Exception:
-        logging.exception(
-            "[EXEC] could not construct planner robot model; move_pose will be unavailable")
+        logger.exception(
+            "could not construct planner robot model; move_pose will be unavailable")
         return None
 
     try:
         attach_pinocchio(robot)
-        logging.info("[EXEC] Pinocchio helpers attached to planner robot model")
+        logger.info("Pinocchio helpers attached to planner robot model")
         # Self-collision (TODO/self_collision_plan.md): the convex pieces of the arm + the active gripper, checked on every
         # planned path. ENABLED and unloadable = an error at start (the cell-file rule), never a silent "no check".
         _self_collision_model = None
@@ -234,12 +247,12 @@ def _build_robot_model():
             try:
                 _self_collision_model = _build_self_collision(robot)
             except Exception as _e:
-                logging.critical(f"[EXEC] self-collision: {_e} — fix the geometry files named in the robot / gripper XML, "
+                logger.critical(f"self-collision: {_e} — fix the geometry files named in the robot / gripper XML, "
                                  f"or set <self_collision><enabled>0</enabled>, then restart")
                 raise SystemExit(2)
     except Exception:
-        logging.exception(
-            "[EXEC] Pinocchio attach failed for planner robot model; "
+        logger.exception(
+            "Pinocchio attach failed for planner robot model; "
             "move_pose with ik_solver='pinocchio' will be unavailable")
     return robot
 
@@ -283,11 +296,29 @@ _owner_last = 0.0               # last owned command from the holder
 
 
 def _client_label(conn):
+    """The connection's IDENTITY ("ip:port") — what control ownership compares. Unique per connection."""
     try:
         ip, port = conn.getpeername()[:2]
         return f"{ip}:{port}"
     except OSError:
         return "unknown"
+
+
+# The name each client gives itself (2026-10-15): the robotclient sends "client" with every message — "dashboard",
+# "blocks", "pick_place.py on lab-pc". A client that sends none (an older robotclient, a raw socket) stays "ip:port".
+_client_names: dict[object, str] = {}   # connection -> the name it gave
+
+
+def _client_origin(conn):
+    """Who a connection is, for people: "dashboard (127.0.0.1)", "pick_place.py on lab-pc (192.168.0.50)", or
+    "192.168.0.50:51234" for a client without a name. The activity log's `origin`."""
+    name = _client_names.get(conn)
+    if not name:
+        return _client_label(conn)
+    try:
+        return f"{name} ({conn.getpeername()[0]})"
+    except OSError:
+        return name
 
 
 # rti['rti_substate'] (motion/rti_handler.py SUBSTATE_CODE): 0 unpaired, 1 connected, 2 control_active,
@@ -347,17 +378,17 @@ def _claim_control(conn, force=False):
         if _owner_conn is not None and _owner_conn is not conn:
             if not force and not _owner_stale_locked():
                 held = time.time() - _owner_since
-                return False, (f"control is held by {_owner_label} (for {held:.0f}s). "
+                return False, (f"control is held by {_client_origin(_owner_conn)} (for {held:.0f}s). "
                                f"It frees automatically after "
                                f"{CONTROL_IDLE_TIMEOUT_S:.0f}s idle, or call "
                                f"take_control(force=True) to take it now.")
-            logging.warning("[CTRL] %s TOOK control from %s (%s)", _client_label(conn),
-                            _owner_label, "forced" if force else "previous holder idle")
+            log_control.warning("%s TOOK control from %s (%s)", _client_origin(conn),
+                                _client_origin(_owner_conn), "forced" if force else "previous holder idle")
         if _owner_conn is not conn:
             _owner_conn = conn
             _owner_label = _client_label(conn)
             _owner_since = time.time()
-            logging.info("[CTRL] control acquired by %s", _owner_label)
+            log_control.info("control acquired by %s", _client_origin(conn))
         _owner_last = time.time()
         return True, None
 
@@ -449,7 +480,7 @@ def _await_physical_confirm(who, timeout=FORCE_CONFIRM_TIMEOUT_S, alive=None):
     rti["force_confirm_pending"][0] = 1.0
     rti["force_confirm_deadline"][0] = deadline
     shared_data.force_confirm_who.set(str(who))
-    logging.warning("[CTRL] %s is requesting a FORCED takeover — waiting at the control box "
+    log_control.warning("%s is requesting a FORCED takeover — waiting at the control box "
                     "(hold B2 = allow, B1 = deny, %.0f s)", who, timeout)
     try:
         allow_armed = not _button_pressed(_BTN_ALLOW)   # seen UP at least once this wait
@@ -462,7 +493,7 @@ def _await_physical_confirm(who, timeout=FORCE_CONFIRM_TIMEOUT_S, alive=None):
             if not deny:
                 deny_armed = True
             elif deny_armed:
-                logging.warning("[CTRL] takeover DENIED at the control box for %s", who)
+                log_control.warning("takeover DENIED at the control box for %s", who)
                 return False, ("DENIED at the control box — someone there refused this "
                                "takeover.")
 
@@ -475,7 +506,7 @@ def _await_physical_confirm(who, timeout=FORCE_CONFIRM_TIMEOUT_S, alive=None):
                 if held_since is None:
                     held_since = now
                 elif now - held_since >= FORCE_ALLOW_HOLD_S:
-                    logging.warning("[CTRL] takeover ALLOWED at the control box for %s", who)
+                    log_control.warning("takeover ALLOWED at the control box for %s", who)
                     return True, None
             time.sleep(_FORCE_POLL_S)
         if not allow_armed:
@@ -497,7 +528,7 @@ def _release_control(conn, why):
     with _owner_lock:
         if _owner_conn is not conn:
             return False
-        logging.info("[CTRL] control released by %s (%s)", _owner_label, why)
+        log_control.info("control released by %s (%s)", _client_origin(conn), why)
         _owner_conn = None
         _owner_label = None
         return True
@@ -514,22 +545,29 @@ _rti_sock.connect(ZMQ_CMD_SOCKET)
 
 
 def reply(conn, obj):
-    """Send one newline-delimited JSON object to a client (thread-safe)."""
+    """Send one newline-delimited JSON object to a client (thread-safe). An error reply carries its catalog
+    "number", "title" and "fix" next to its "code" (2026-10-15, utility/error_catalog.py; docs/error_codes.md) —
+    what a program's exception shows its user (robotclient.exceptions.CommandRejected)."""
     if conn is None:
         return
+    if obj.get("status") == "error" and obj.get("code") and "number" not in obj:
+        cat = catalog_entry(obj["code"])
+        if cat is not None:
+            obj = {**obj, "number": cat["number"], "title": cat["title"], "fix": cat["fix"]}
     try:
         with _client_send_lock:
             conn.sendall((json.dumps(obj) + "\n").encode())
     except Exception as e:
-        logging.error(f"[TCP] send to client failed: {e}")
+        log_tcp.error(f"send to client failed: {e}")
 
 
 def send_to_rti(msg_str, cid, source):
-    """Forward a command to RTI in its existing wire format: {"msg","id","source"}."""
-    payload = json.dumps({"msg": msg_str, "id": cid, "source": source})
+    """Forward a command to RTI in its existing wire format: {"msg","id","source"} — plus "origin", who sent it
+    (2026-10-15), so RTI's activity entries for the command name the client too."""
+    payload = json.dumps({"msg": msg_str, "id": cid, "source": source, "origin": origin_of(cid)})
     with _rti_send_lock:
         _rti_sock.send_string(payload)
-    logging.info(f"[RTI] forwarded '{msg_str}' (id={cid})")
+    log_forward.info(f"forwarded '{msg_str}' (id={cid})")
 
 
 def send_payload_to_rti(payload, cid, source):
@@ -538,10 +576,10 @@ def send_payload_to_rti(payload, cid, source):
     Needed by set_pid_gains, whose RTI handler reads its joint + gain fields off the command
     dict rather than parsing a colon string. `payload` must carry the "msg" key itself.
     """
-    out = json.dumps({**payload, "id": cid, "source": source})
+    out = json.dumps({**payload, "id": cid, "source": source, "origin": origin_of(cid)})
     with _rti_send_lock:
         _rti_sock.send_string(out)
-    logging.info(f"[RTI] forwarded '{payload.get('msg')}' (id={cid})")
+    log_forward.info(f"forwarded '{payload.get('msg')}' (id={cid})")
 
 
 def _next_command_seq():
@@ -620,6 +658,26 @@ def _recipe_names():
     try:
         from project_paths import DATA_RECIPE_DIR
         return sorted(p.stem for p in DATA_RECIPE_DIR.glob("*.xml"))
+    except Exception:
+        return []
+
+
+def _error_details():
+    """The latched errors with what a program needs to show its user (2026-10-15): [{"key", "number", "title",
+    "level", "since"}], newest last; [] when clean. The catalog's number and title by the key's code (a "J3:" / "Z_x:"
+    prefix stripped); `since` the epoch time it latched. Never raises (a status push must not fail on it)."""
+    try:
+        data = shared_data.error_state.get_json()
+        if data in (None, "NONE", []):
+            return []
+        out = []
+        for e in data:
+            if not isinstance(e, dict) or "key" not in e:
+                continue
+            cat = catalog_entry(e["key"]) or {}
+            out.append({"key": e["key"], "number": cat.get("number"), "title": cat.get("title", ""),
+                        "level": e.get("level", "error"), "since": e.get("timestamp")})
+        return out
     except Exception:
         return []
 
@@ -729,7 +787,7 @@ def _reach_model():
                 _reach["sc"] = _build_self_collision(_reach["model"])
             except Exception as e:                  # loadable at start, so a file changed since: refuse, never "no check"
                 _reach["sc_error"] = str(e)
-                logging.error(f"[EXEC] is_reachable: no self-collision model ({e})")
+                logger.error(f"is_reachable: no self-collision model ({e})")
     return _reach["model"]
 
 
@@ -785,7 +843,7 @@ def _handle_reload_zones(args, cid, conn):
     # The parsed, validated setup travels WITH the command (2026-10-04): RTI rebuilds its zones from it
     # (config.xml_parser.zone_setup_from_wire) and reads no file in its loop.
     send_payload_to_rti({"msg": "reload_zones", "setup": zones_summary(setup)}, cid, "TCP")
-    logging.info(f"[EXEC] zones reloaded: cell '{setup['cell']}', "
+    logger.info(f"zones reloaded: cell '{setup['cell']}', "
                  f"{sum(z['enabled'] for z in setup['zones'])} of {len(setup['zones'])} zones enabled")
     reply(conn, {"id": cid, "status": "ok", "data": zones_summary(setup)})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="reload_zones")
@@ -805,7 +863,7 @@ def _handle_reload_filters(args, cid, conn):
                             "message": f"{FILTER_CONFIG_PATH.name}: {e} — the filters in force are unchanged"})
     send_payload_to_rti({"msg": "reload_filters", "config": config}, cid, "TCP")
     kinds = {sig: sorted({sp.get("kind", "none") for sp in specs}) for sig, specs in config.items()}
-    logging.info(f"[EXEC] filters parsed and sent to RTI: {kinds}")
+    logger.info(f"filters parsed and sent to RTI: {kinds}")
     reply(conn, {"id": cid, "status": "ok", "data": {"signals": kinds}})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="reload_filters")
 
@@ -821,7 +879,7 @@ def _handle_reload_recipes(args, cid, conn):
         _log_exec_reject(cid, "RECIPE_DIR", str(e), command="reload_recipes")
         return reply(conn, {"id": cid, "status": "error", "code": "RECIPE_DIR", "message": str(e)})
     send_payload_to_rti({"msg": "reload_recipes", "recipes": texts}, cid, "TCP")
-    logging.info(f"[EXEC] {len(texts)} recipe file(s) read and sent to RTI: {sorted(texts)}")
+    logger.info(f"{len(texts)} recipe file(s) read and sent to RTI: {sorted(texts)}")
     reply(conn, {"id": cid, "status": "ok", "data": {"files": sorted(texts)}})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="reload_recipes")
 
@@ -845,6 +903,88 @@ def _handle_set_payload(args, cid, conn):
                                                      "max_payload_kg": float(cfg['safety']['max_payload_kg'])}})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
                  command=_fmt_command("set_payload", [payload["mass"], payload["com"]]))
+
+
+# --- diagnostics (2026-10-15; docs/logging.md "Runtime log levels", "Health", "Captures") -------------------------
+def _handle_set_log_level(args, cid, conn):
+    """set_log_level [name, level] — one logger's level in the executor AND in RTI (forwarded), no restart. Open to
+    every client (it moves nothing). The names: utility/logger_setup.NAMES (+ toppra / can); the levels DEBUG / INFO /
+    WARNING / ERROR. Not persisted. The GUI's and the supervisor's loggers are their own processes' (the Logs tab sets
+    the GUI's itself)."""
+    name = args[0] if isinstance(args, (list, tuple)) and len(args) >= 1 else None
+    level = args[1] if isinstance(args, (list, tuple)) and len(args) >= 2 else None
+    ok, why = apply_log_level(name, level)
+    if not ok:
+        _log_exec_reject(cid, "BAD_ARGS", why, command=_fmt_command("set_log_level", [name, level]))
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": why})
+    name, level = str(name).strip(), str(level).strip().upper()
+    log_control.info("log level %s -> %s (%s)", name, level, _client_origin(conn))
+    send_to_rti(f"set_log_level:{name}:{level}", cid, "TCP")      # RTI applies the same to its own copy of the logger
+    reply(conn, {"id": cid, "status": "ok", "data": {"name": name, "level": level}})
+    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
+                 command=_fmt_command("set_log_level", [name, level]))
+
+
+_capture_request_str = None
+
+
+def _capture_request():
+    """The shared string the recorder reads capture requests from (made on the first capture)."""
+    global _capture_request_str
+    if _capture_request_str is None:
+        _capture_request_str = shared_data.SharedString("capture_request", 1024)
+    return _capture_request_str
+
+
+def _handle_capture_telemetry(args, cid, conn):
+    """capture_telemetry [seconds, name] — the recorder (recorder.py, its own process since 2026-10-16) records RTI's
+    per-tick channels from its before-window (system.xml <recorder before_s>, 5 s by default) before this request to
+    `seconds` (1-60) after it into temp_data/captures/<UTC>_<name>.npz
+    (the Recordings tab > Captures lists and plots it). RTI does nothing for it: it writes its shared-memory trace every tick anyway.
+    The request goes to shared memory (capture_request) with the tick it was asked at. Refused (CAPTURE_REFUSED) when
+    no recorder runs. The recorder's activity log says CAPTURE_STARTED / CAPTURE_SAVED (or CAPTURE_REFUSED: one is
+    already running)."""
+    seconds = args[0] if isinstance(args, (list, tuple)) and len(args) >= 1 else 10.0
+    name = args[1] if isinstance(args, (list, tuple)) and len(args) >= 2 else ""
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        seconds = float("nan")
+    if not (CAPTURE_MIN_S <= seconds <= CAPTURE_MAX_S):
+        why = f"the length must be {CAPTURE_MIN_S:g} to {CAPTURE_MAX_S:g} s, not {args[0]!r}"
+        _log_exec_reject(cid, "BAD_ARGS", why, command=_fmt_command("capture_telemetry", [seconds, name]))
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": why})
+    name = safe_capture_name(name)
+    if not recorder_alive():
+        why = "the recorder is not running (recorder.py; the supervisor restarts it) — nothing was recorded"
+        _log_exec_reject(cid, "CAPTURE_REFUSED", why, command=_fmt_command("capture_telemetry", [seconds, name]))
+        return reply(conn, {"id": cid, "status": "error", "code": "CAPTURE_REFUSED", "message": why})
+    _capture_request().set_json({"seq": str(time.time_ns()), "seconds": seconds, "name": name,
+                                 "request_tick": int(shared_data.rti["loop_tick"][0]), "id": cid,
+                                 "origin": origin_of(cid)})
+    reply(conn, {"id": cid, "status": "ok", "data": {"seconds": seconds, "name": name,
+                                                     "folder": str(TEMP_DATA_DIR / "captures")}})
+    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
+                 command=_fmt_command("capture_telemetry", [seconds, name]))
+
+
+def _handle_stop_capture(args, cid, conn):
+    """stop_capture — end the running capture now; the recorder saves what it has (CAPTURE_SAVED "stopped early"), or
+    says CAPTURE_REFUSED when none runs. Refused here when no recorder runs. 2026-10-16."""
+    if not recorder_alive():
+        why = "the recorder is not running (recorder.py; the supervisor restarts it)"
+        _log_exec_reject(cid, "CAPTURE_REFUSED", why, command="stop_capture")
+        return reply(conn, {"id": cid, "status": "error", "code": "CAPTURE_REFUSED", "message": why})
+    _capture_request().set_json({"seq": str(time.time_ns()), "action": "stop", "id": cid, "origin": origin_of(cid)})
+    reply(conn, {"id": cid, "status": "ok"})
+    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="stop_capture")
+
+
+def _handle_get_health(args, cid, conn):
+    """get_health — the robot's health summary (utility/health.py): one level and one line per component (the control
+    loop, CAN, the drives, the gripper, errors, homing, the executor, the self-collision worker, the processes, disk,
+    memory, the CPU temperature, the clock). Open to every client; ~60 ms (it watches the counters advance)."""
+    reply(conn, {"id": cid, "status": "ok", "data": assess_health(shared_data, JOINT_NUM, TICK_S, has_gripper=_HAS_CAN_GRIPPER)})
 
 
 # Freedrive joint walls (utility/haptic_walls.py JOINT WALLS, docs/safety_zones.md §2b). The executor keeps the
@@ -996,7 +1136,7 @@ def _handle_set_joint_wall(args, cid, conn):
         _walls["specs"] = specs
         send_payload_to_rti({"msg": "set_joint_walls", "specs": specs}, cid, "TCP")
         data = _walls_reply(specs)
-    logging.info(f"[EXEC] J{joint} freedrive wall set live: {spec}")
+    logger.info(f"J{joint} freedrive wall set live: {spec}")
     reply(conn, {"id": cid, "status": "ok", "data": data})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="set_joint_wall")
 
@@ -1013,7 +1153,7 @@ def _handle_save_joint_walls(args, cid, conn):
             return reply(conn, {"id": cid, "status": "error", "code": "SAVE_FAILED", "message": msg})
         _walls["saved"] = [dict(s) for s in _walls["specs"]]
         data = _walls_reply(_walls["specs"])
-    logging.info(f"[EXEC] freedrive walls saved to {path.name} ({n} joints)")
+    logger.info(f"freedrive walls saved to {path.name} ({n} joints)")
     reply(conn, {"id": cid, "status": "ok", "data": data})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="save_joint_walls")
 
@@ -1170,7 +1310,7 @@ def _confirm_exec_stop(epoch, cid):
         time.sleep(0.004)
     msg = (f"RTI did not confirm the stop within {STOP_CONFIRM_S:.1f} s (an RTI started before 2026-10-14, or its "
            f"fence was lost) — switched to IDLE instead")
-    logging.error(f"[STOP] {msg}")
+    log_stop.error(f"{msg}")
     log_activity(_exec_activity_logger, "EXEC", "error", "STOP_FALLBACK", id=cid, message=msg)
     send_to_rti("set_mode:IDLE", cid, "TCP")
     return False
@@ -1388,7 +1528,7 @@ def _handle_set_force_confirm(args, cid, conn):
             return reply(conn, {"id": cid, "status": "error", "code": "CONTROL_HELD",
                                 "message": why, "holder": holder})
     shared_data.rti["force_confirm_enabled"][0] = 1.0 if on else 0.0
-    logging.warning("[CTRL] forced-takeover button confirmation %s", "ENABLED" if on else "DISABLED")
+    log_control.warning("forced-takeover button confirmation %s", "ENABLED" if on else "DISABLED")
     _broadcast_status(current_status())
     reply(conn, {"id": cid, "status": "ok", "data": {"force_confirm": on}})
 
@@ -1424,7 +1564,7 @@ def _confirmed_takeover_worker(cid, conn):
                                 "message": why, "holder": control_holder()})
         _complete_takeover(cid, conn, force=True)
     except Exception as exc:
-        logging.exception("[CTRL] confirmed takeover crashed")
+        log_control.exception("confirmed takeover crashed")
         reply(conn, {"id": cid, "status": "error", "code": "INTERNAL",
                      "message": f"takeover failed: {exc}"})
     finally:
@@ -1476,6 +1616,10 @@ IMMEDIATE_HANDLERS = {
     "get_joints":       _handle_get_joints,
     "get_pose":         _handle_get_pose,
     "get_status":       _handle_get_status,
+    "get_health":       _handle_get_health,            # diagnostics (2026-10-15)
+    "set_log_level":    _handle_set_log_level,
+    "capture_telemetry": _handle_capture_telemetry,
+    "stop_capture": _handle_stop_capture,
     "is_reachable":     _handle_is_reachable,
     "get_zones":        _handle_get_zones,
     "reload_zones":     _handle_reload_zones,
@@ -1588,20 +1732,20 @@ def checkpoint_listener():
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.PULL)
     sock.bind(ZMQ_EXEC_STATUS_SOCKET)
-    logging.info(f"[EXEC] checkpoint listener bound to {ZMQ_EXEC_STATUS_SOCKET}")
+    logger.info(f"checkpoint listener bound to {ZMQ_EXEC_STATUS_SOCKET}")
 
     while True:
         try:
             status = sock.recv_json()
         except Exception as e:
-            logging.error(f"[EXEC] checkpoint recv error: {e}")
+            logger.error(f"checkpoint recv error: {e}")
             continue
 
         cid = status.get("checkpoint_id")
         with _pending_lock:
             conn = pending_client.pop(cid, None)
         if conn is None:
-            logging.info(f"[EXEC] status for unknown/closed id={cid}: {status.get('status')}")
+            logger.info(f"status for unknown/closed id={cid}: {status.get('status')}")
             continue
 
         out = {"id": cid, "status": status.get("status", "complete")}
@@ -1615,7 +1759,7 @@ def checkpoint_listener():
         if "gripper_object" in status:
             out["gripper_object"] = status["gripper_object"]
         reply(conn, out)
-        logging.info(f"[EXEC] routed {out['status']} for id={cid}")
+        logger.info(f"routed {out['status']} for id={cid}")
 
 
 # ========================================================================== #
@@ -1647,6 +1791,9 @@ def current_status():
         # field in the published state is what makes them distinguishable.
         # Push-on-change, so this costs nothing while nothing is wrong.
         "errors": _error_keys(),
+        # ...and for each one the catalog's number and title, its level and when it latched (2026-10-15): a program
+        # shows "2103 Drive watchdog tripped (J3:WATCHDOG)" instead of a bare key; robot.errors() returns this list.
+        "error_details": _error_details(),
         # Why queued motion is being refused, if it is: {cid, code, message} of the failure that
         # aborted the program, or None. Cleared by clear_errors.
         "motion_aborted": _planner.abort_info() if _planner is not None else None,
@@ -1698,7 +1845,7 @@ def status_watcher():
     period = 1.0 / STATUS_POLL_HZ
     last = None
     last_mode = None
-    logging.info(f"[STATUS] watcher running ({STATUS_POLL_HZ:.0f} Hz check, push-on-change)")
+    log_status.info(f"watcher running ({STATUS_POLL_HZ:.0f} Hz check, push-on-change)")
     while True:
         evt = current_status()
         mode = evt.get("mode")
@@ -1751,6 +1898,9 @@ def _read_lines(conn):
 
 def dispatch(msg, conn):
     cid = msg.get("id") or generate_short_id()
+    if msg.get("client"):                  # the client's own name; kept per connection (2026-10-15)
+        _client_names[conn] = str(msg["client"])[:60]
+    note_origin(cid, _client_origin(conn))
     cmd = msg.get("cmd")
     args = msg.get("args", []) or []
 
@@ -1833,7 +1983,7 @@ def handle_client(conn, addr):
         # workstation, are different clients. Keying by IP also silently dropped the earlier
         # connection's entry when the same host reconnected.
         active_clients[conn] = conn
-    logging.info(f"[TCP] client connected {ip}:{port}")
+    log_tcp.info(f"client connected {ip}:{port}")
     reply(conn, current_status())   # snapshot so the client isn't blind until first change
     try:
         for line in _read_lines(conn):
@@ -1844,20 +1994,21 @@ def handle_client(conn, addr):
                 continue
             dispatch(msg, conn)
     except ConnectionResetError:
-        logging.info(f"[TCP] {ip}:{port} reset")
+        log_tcp.info(f"{ip}:{port} reset")
     except Exception as e:
-        logging.error(f"[TCP] {ip}:{port} handler error: {e}")
+        log_tcp.error(f"{ip}:{port} handler error: {e}")
     finally:
         with _clients_lock:
             active_clients.pop(conn, None)
         # A dropped TCP connection must never hold the robot hostage.
         _release_control(conn, "disconnected")
+        _client_names.pop(conn, None)          # after the release, so its log line still names the client
         # Drop any of this client's pending completions.
         with _pending_lock:
             for cid in [c for c, cn in pending_client.items() if cn is conn]:
                 pending_client.pop(cid, None)
         conn.close()
-        logging.info(f"[TCP] {ip}:{port} disconnected")
+        log_tcp.info(f"{ip}:{port} disconnected")
 
 
 def tcp_server(host="0.0.0.0", port=TCP_PORT):
@@ -1865,9 +2016,9 @@ def tcp_server(host="0.0.0.0", port=TCP_PORT):
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((host, port))
         s.listen(5)
-        logging.info(f"[TCP] server listening on {host}:{port}")
+        log_tcp.info(f"server listening on {host}:{port}")
         if ALLOW_ANY_IP:
-            logging.warning("[TCP] IP ACCESS LIST DISABLED (RCB_ALLOWED_IPS=*) — any machine "
+            log_tcp.warning("IP ACCESS LIST DISABLED (RCB_ALLOWED_IPS=*) — any machine "
                             "that can reach %s:%d may connect. Exclusive control ownership, "
                             "not the IP list, is what stops two parties commanding at once.",
                             host, port)
@@ -1875,7 +2026,7 @@ def tcp_server(host="0.0.0.0", port=TCP_PORT):
             conn, addr = s.accept()
             ip, _ = addr
             if not ALLOW_ANY_IP and ip not in ALLOWED_IPS:
-                logging.warning(f"[TCP] rejected connection from {ip}")
+                log_tcp.warning(f"rejected connection from {ip}")
                 try:
                     conn.sendall(b'{"status":"error","code":"FORBIDDEN"}\n')
                 finally:
@@ -1890,7 +2041,7 @@ def tcp_server(host="0.0.0.0", port=TCP_PORT):
 def main():
     global _planner, ROBOT_MODEL
     # Which commit this executor runs (2026-10-13; tools/arm_smoke.py records it).
-    logging.info(f"[EXEC] code: {describe_code(PROJECT_ROOT)}")
+    logger.info(f"code: {describe_code(PROJECT_ROOT)}")
     if ROBOT_MODEL is None:
         ROBOT_MODEL = _build_robot_model()
     _planner = TrajectoryPlanner(
@@ -1920,7 +2071,7 @@ def main():
     threading.Thread(target=checkpoint_listener, daemon=True).start()
     threading.Thread(target=status_watcher, daemon=True).start()
     threading.Thread(target=executor_heartbeat, daemon=True).start()
-    logging.info(f"[EXEC] command hub ready — {JOINT_NUM} joints, "
+    logger.info(f"command hub ready — {JOINT_NUM} joints, "
                  f"vmax={np.round(MAX_VEL, 2).tolist()} rad/s, "
                  f"amax={np.round(MAX_ACCEL, 2).tolist()} rad/s^2 (from robot XML)")
     tcp_server()

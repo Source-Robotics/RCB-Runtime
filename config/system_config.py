@@ -15,16 +15,18 @@ License: GNU General Public License v3.0
 Contact: petar@source-robotics.com
 """
 
+import ctypes
 import logging
 import os
 import re
+import resource
 import psutil
 import platform
 import distro
 from gpiozero import pi_info
 import numpy as np
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("proc")  # docs/logging.md "Logger names"
 
 
 # ==========================================================================
@@ -66,9 +68,7 @@ def setup_realtime_process(cpu_core=3, priority=99, enforce=False):
         psutil.Process(pid).cpu_affinity([cpu_core])
         os.sched_setscheduler(pid, os.SCHED_FIFO, os.sched_param(priority))
     except Exception as e:
-        logger.warning(f"Failed to set real-time parameters: {e}")
-        logger.warning("Running without real-time guarantees")
-        print(f"[RT setup] FAILED: {e}")
+        logger.warning(f"real-time setup FAILED to set the real-time parameters: {e} — running without real-time guarantees")
 
     # Verify what actually applied — single source of truth post-call
     actual_policy = os.sched_getscheduler(pid)
@@ -82,17 +82,68 @@ def setup_realtime_process(cpu_core=3, priority=99, enforce=False):
 
     summary = f"SCHED_{policy_name} prio={actual_prio} affinity={actual_aff}"
     if actual_policy == os.SCHED_FIFO and actual_prio == priority and actual_aff == [cpu_core]:
-        logger.info(f"[RT setup] OK — {summary}")
-        print(f"[RT setup] OK — {summary}")
+        logger.info(f"real-time setup OK — {summary}")
     else:
-        logger.warning(f"[RT setup] DEGRADED — wanted SCHED_FIFO {priority} on core {cpu_core}, got {summary}")
-        print(f"[RT setup] DEGRADED — wanted SCHED_FIFO {priority} on core {cpu_core}, got {summary}")
+        logger.warning(f"real-time setup DEGRADED — wanted SCHED_FIFO {priority} on core {cpu_core}, got {summary}")
         if enforce:
             raise RuntimeError(
                 f"[RT setup] real-time scheduling is required and not available (got {summary}). Run under "
                 f"the service (root, PREEMPT_RT), or set <realtime_required>0</realtime_required> in "
                 f"config/system.xml to run without real-time guarantees.")
         return False
+    return True
+
+
+# <sys/mman.h> on Linux (arm64 and x86 use these values)
+MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT = 1, 2, 4
+MEMLOCK_FIX = ("the service needs LimitMEMLOCK=infinity: /etc/systemd/system/autorun.service.d/memlock.conf with "
+               "'[Service]' and 'LimitMEMLOCK=infinity', then 'sudo systemctl daemon-reload' and a restart")
+
+
+def _libc():
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def locked_mb():
+    """The RAM this process has locked, in MB ("Locked:" in /proc/self/smaps_rollup — the resident pages), or None.
+    Not VmLck: that counts every address range marked for locking (all ~1.1 GB of RTI's with MCL_ONFAULT), not RAM."""
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Locked:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def lock_memory():
+    """Keep RTI's memory in RAM (2026-10-16). Never raises; returns True when locked (`locked_mb()` then says how
+    much RAM).
+
+    Why: on 2026-10-16 a test process ran the Pi (4 GB, no swap) out of memory; the kernel dropped RTI's code pages
+    to make room, every tick then waited for them to be read back from the SD card, and the loop stalled 194 s (the
+    drives' watchdogs tripped, J3 sank). Real-time loops lock their memory for this reason (mlockall).
+
+    MCL_ONFAULT: the pages RTI has touched are locked now and every page it touches later as it is touched — not the
+    whole address space (RTI maps ~1.1 GB but uses ~250 MB; MCL_CURRENT | MCL_FUTURE alone would pin all 1.1 GB and
+    every new thread stack in full). MCL_CURRENT is checked against the process's whole address space, so it needs
+    RLIMIT_MEMLOCK above that (the service's LimitMEMLOCK; 8 MB by default -> ENOMEM)."""
+    try:
+        libc = _libc()
+        if libc.mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0:
+            err = os.strerror(ctypes.get_errno())
+            soft = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
+            limit = "unlimited" if soft == resource.RLIM_INFINITY else f"{soft / 1048576:.0f} MB"
+            logger.error(f"memory NOT locked ({err}; the locked-memory limit is {limit}) — a memory shortage on this "
+                         f"Pi can stall the loop; {MEMLOCK_FIX}")
+            return False
+    except Exception as e:
+        logger.error(f"memory NOT locked: {e!r} — a memory shortage on this Pi can stall the loop")
+        return False
+    mb = locked_mb()
+    logger.info(f"memory locked (mlockall on fault): {'?' if mb is None else f'{mb:.0f}'} MB of RAM now, and every "
+                f"page it touches from here on")
     return True
 
 

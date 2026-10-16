@@ -44,6 +44,7 @@ logs/self_collision.log.
 from __future__ import annotations
 
 import logging
+logger = logging.getLogger("sc")  # docs/logging.md "Logger names"
 import math
 import os
 import signal
@@ -166,7 +167,7 @@ def ray_cycle(model, rti, joint_num, soft_lo, soft_hi, state) -> None:
         jaw_q = scan.get("jaw_q")
         jaws = (f"jaws {100 * float(jaw_q[0] / model.jaw_strokes[0]):.0f} % closed (as at the jog's start)"
                 if model.jaws == "measured" and jaw_q is not None and jaw_q.size else "jaws swept")
-        logging.info(f"[SC] jog session {int(sess)}: the jog margin begins {math.degrees(scan['s_free']):.2f} deg along its ray "
+        logger.info(f"jog session {int(sess)}: the jog margin begins {math.degrees(scan['s_free']):.2f} deg along its ray "
                      f"({seen}){' — escaping: the start is inside the margin' if scan['inside'] else ''}; stops at "
                      f"{np.round(stop, 2).tolist()} deg, {jaws}")
 
@@ -176,7 +177,7 @@ def main() -> int:
     try:
         os.sched_setaffinity(0, CORES)
     except (AttributeError, OSError) as e:                                        # pragma: no cover
-        logging.warning(f"[SC] could not pin to cores {sorted(CORES)}: {e}")
+        logger.warning(f"could not pin to cores {sorted(CORES)}: {e}")
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)
 
@@ -190,7 +191,7 @@ def main() -> int:
     rti, joint, gripper = shared_data.rti, shared_data.joint, shared_data.gripper
 
     if not policy["enabled"]:
-        logging.info("[SC] self-collision checking is OFF in config/system.xml — idling")
+        logger.info("self-collision checking is OFF in config/system.xml — idling")
         while not _stop:
             time.sleep(1.0)
         return 0
@@ -203,7 +204,7 @@ def main() -> int:
         pairs = cfg["self_collision"]["pairs"] + cfg["gripper_collision"]["pairs"]
         model = SelfCollisionModel(robot, robot_geo, tool_geo, policy, pairs)
     except Exception as e:
-        logging.critical(f"[SC] cannot build the self-collision model: {e} — fix the geometry files named in the robot / "
+        logger.critical(f"cannot build the self-collision model: {e} — fix the geometry files named in the robot / "
                          f"gripper XML, or set <self_collision><enabled>0</enabled>. Nothing is watching self-collisions.")
         raise SystemExit(2)
     # the measured-jaws model (S3f): only for a CAN gripper whose file lists its jaws; the swept model stays the fallback
@@ -213,7 +214,7 @@ def main() -> int:
     if policy.get("jaws") == "measured":
         why_not = measured_jaws_refusal(cfg, tool_geo)
         if why_not:
-            logging.warning(f"[SC] <jaws>measured</jaws> but {why_not} — the jaws stay swept over their stroke")
+            logger.warning(f"<jaws>measured</jaws> but {why_not} — the jaws stay swept over their stroke")
         else:
             measured = SelfCollisionModel(robot, robot_geo, tool_geo, policy, pairs, jaws="measured",
                                           jaw_band_m=float(policy["jaw_band_mm"]) / 1000.0)
@@ -222,7 +223,7 @@ def main() -> int:
     planner_margin = float(policy["planner_margin_mm"]) / 1000.0
     soft_lo = np.asarray(cfg["software_joint_limit_negative"], dtype=np.float64)[:joint_num]
     soft_hi = np.asarray(cfg["software_joint_limit_positive"], dtype=np.float64)[:joint_num]
-    logging.info(f"[SC] worker up: {model.geom.ngeoms} pieces, {model.n_pairs} pairs, {policy['worker_hz']:g} Hz, margins planner "
+    logger.info(f"worker up: {model.geom.ngeoms} pieces, {model.n_pairs} pairs, {policy['worker_hz']:g} Hz, margins planner "
                  f"{1e3 * planner_margin:g} / jog {policy['jog_margin_mm']:g} / monitor {policy['monitor_margin_mm']:g} mm, jaws "
                  + (f"measured (band {policy['jaw_band_mm']:g} mm, else swept)" if measured is not None else "swept")
                  + f", cores {sorted(CORES)}, log {os.path.relpath(LOG_FILE, _ROOT)}")
@@ -245,8 +246,8 @@ def main() -> int:
         homed = bool(np.all(homed_view[:joint_num] == 1)) and shared_data.homed_state.get() == "HOMED"  # type: ignore[union-attr]  # set by shared_data.setup() at start
         if homed != homed_live:
             homed_live = homed
-            logging.info("[SC] robot homed — watching the measured pose" if homed else
-                         "[SC] robot not homed — the measured angles mean nothing until it is: clear / no block, heartbeat only")
+            logger.info("robot homed — watching the measured pose" if homed else
+                         "robot not homed — the measured angles mean nothing until it is: clear / no block, heartbeat only")
         if not homed:
             rti["sc_hit"][0], rti["sc_min_gap"][0] = 0.0, planner_margin
             rti["sc_pair_gaps"][:] = np.inf
@@ -269,9 +270,9 @@ def main() -> int:
             src = "measured" if c is not None else "swept"
             if src != jaws_live:
                 jaws_live = src
-                logging.info(f"[SC] jaws: placed where the gripper reports them ({'firmware' if int(rti['gripper_ctrl_mode'][0]) == FIRMWARE_MODE else 'motor'} mode)"
+                logger.info(f"jaws: placed where the gripper reports them ({'firmware' if int(rti['gripper_ctrl_mode'][0]) == FIRMWARE_MODE else 'motor'} mode)"
                              if c is not None else
-                             "[SC] jaws: swept over their stroke — the gripper's position is not trustworthy now (firmware mode "
+                             "jaws: swept over their stroke — the gripper's position is not trustworthy now (firmware mode "
                              "uncalibrated, motor mode not homed" + ("" if motor_ok else " or homing toward its closed end") + ", or stale)")
             if c is not None:
                 measured.set_jaws(c)
@@ -290,7 +291,7 @@ def main() -> int:
             rti["sc_hit"][0] = 1.0
             if not hit_live:
                 hit_live = True
-                logging.warning(f"[SC] within the monitor margin: {active.describe(a, b)} {1e3 * gap:.1f} mm apart "
+                logger.warning(f"within the monitor margin: {active.describe(a, b)} {1e3 * gap:.1f} mm apart "
                                 f"(q = {np.round(np.degrees(q), 1).tolist()} deg"
                                 + (f", jaws {100 * active.jaw_closed:.0f} % closed" if active.jaws == "measured" else "") + ")")  # type: ignore[operator]  # jaws == 'measured' -> jaw_closed is a float
         else:
@@ -299,7 +300,7 @@ def main() -> int:
             rti["sc_min_gap"][0] = planner_margin
             if hit_live:
                 hit_live = False
-                logging.info("[SC] clear again")
+                logger.info("clear again")
         # 1b. the dashboard's readout (every 20th cycle; before the ray, which may move the jaws to its session's)
         n_cycle += 1
         if n_cycle % READOUT_EVERY == 0:
@@ -321,7 +322,7 @@ def main() -> int:
         now = time.monotonic()
         if now >= next_stats:
             ct = np.array(cycle_times) * 1e3
-            logging.info(f"[SC] {len(ct)} cycles: median {np.median(ct):.2f} ms, p99 {np.percentile(ct, 99):.2f}, max {ct.max():.2f} ms "
+            logger.info(f"{len(ct)} cycles: median {np.median(ct):.2f} ms, p99 {np.percentile(ct, 99):.2f}, max {ct.max():.2f} ms "
                          f"({100 * ct.mean() / (1e3 * period):.0f} % of the {1e3 * period:.0f} ms period)")
             cycle_times.clear(); next_stats = now + STATS_EVERY_S
         t_next += period
@@ -330,7 +331,7 @@ def main() -> int:
             time.sleep(sleep)
         elif sleep < -period:
             t_next = time.monotonic()                              # far behind: re-base, no catch-up burst
-    logging.info("[SC] stopped")
+    logger.info("stopped")
     return 0
 
 

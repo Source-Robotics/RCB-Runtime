@@ -15,7 +15,7 @@ beyond what the newest known board has.
 """
 import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("io")  # docs/logging.md "Logger names"
 
 PCB_CAPABILITIES = {
     1: {
@@ -40,14 +40,14 @@ def capabilities(pcb_version) -> dict:
     try:
         v = int(pcb_version)
     except (TypeError, ValueError):
-        logger.warning(f"[control box] pcb_version {pcb_version!r} is not a number — assuming PCB v1")
+        logger.warning(f"control box pcb_version {pcb_version!r} is not a number — assuming PCB v1")
         v = 1
     if v in PCB_CAPABILITIES:
         return dict(PCB_CAPABILITIES[v])
     if v < 1:
-        logger.warning(f"[control box] pcb_version {v} is below 1 — assuming PCB v1")
+        logger.warning(f"control box pcb_version {v} is below 1 — assuming PCB v1")
         return dict(PCB_CAPABILITIES[1])
-    logger.warning(f"[control box] pcb_version {v} is newer than this software knows (latest known v{LATEST_KNOWN_PCB}) "
+    logger.warning(f"control box pcb_version {v} is newer than this software knows (latest known v{LATEST_KNOWN_PCB}) "
                    f"— using the v{LATEST_KNOWN_PCB} table; add the new board to hardware/control_box.py")
     return dict(PCB_CAPABILITIES[LATEST_KNOWN_PCB])
 

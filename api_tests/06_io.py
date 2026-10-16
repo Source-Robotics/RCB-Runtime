@@ -147,7 +147,7 @@ def _summarise(trace, label):
 
 
 def _errors_collector(robot):
-    """Capture motion errors so SUPERSEDED / GRIPPER_TIMEOUT can be asserted."""
+    """Capture motion errors so SUPERSEDED / GRIPPER_SETTLE_TIMEOUT can be asserted."""
     seen = []
     robot.on_motion_error(lambda info: seen.append(info))
     return seen
@@ -249,14 +249,14 @@ def test_gripper_supersede(robot, args):
 
 
 def test_gripper_timeout(robot, args):
-    """Probe the GRIPPER_TIMEOUT path. Not in the checklist.
+    """Probe the GRIPPER_SETTLE_TIMEOUT path. Not in the checklist.
 
     HARDWARE FINDING 2026-08-06: blocking the jaws does NOT reach this path. The
     gripper reports "object detected while closing" (code 2) for an obstruction
     exactly as it does for a part — it cannot tell them apart, and should not
     have to. So the command completes normally in ~0.4 s, correctly.
 
-    GRIPPER_TIMEOUT fires only when the gripper reports NOTHING for
+    GRIPPER_SETTLE_TIMEOUT fires only when the gripper reports NOTHING for
     GRIPPER_SETTLE_TIMEOUT_S — a CAN dropout or a firmware hang mid-move, not a
     mechanical obstruction. Staging that by hand means pulling the gripper's CAN
     connection while a move is in flight, which also disturbs every joint on the
@@ -267,7 +267,7 @@ def test_gripper_timeout(robot, args):
     of wedging the motion queue, and reports the reason.
     """
     print("\n=== GRIPPER TIMEOUT (jaws must be BLOCKED for this to mean anything) ===")
-    print("  Expecting GRIPPER_TIMEOUT after GRIPPER_SETTLE_TIMEOUT_S (5s default).")
+    print("  Expecting GRIPPER_SETTLE_TIMEOUT after GRIPPER_SETTLE_TIMEOUT_S (5s default).")
 
     # OPEN FIRST. Without this the test is a no-op: if the gripper is already
     # closed (which it is, after every other test in this suite), the close
@@ -302,7 +302,7 @@ def test_gripper_timeout(robot, args):
               f"{outcome.code}), not a timeout.")
         print("  A blocked jaw and a gripped part are the same signal; the gripper")
         print("  cannot distinguish them. The queue resolved cleanly, which is the")
-        print("  property that matters here. GRIPPER_TIMEOUT needs a gripper that")
+        print("  property that matters here. GRIPPER_SETTLE_TIMEOUT needs a gripper that")
         print("  reports NOTHING (CAN dropout / firmware hang) — see the docstring.")
     elif not codes:
         print("  Completed with no error and no object reported — unexpected.")
@@ -443,7 +443,7 @@ def run():
     p.add_argument("--gripper-supersede", action="store_true",
                    help="queue two gripper commands; the first must report SUPERSEDED")
     p.add_argument("--gripper-timeout", action="store_true",
-                   help="BLOCK THE JAWS first: expect GRIPPER_TIMEOUT, not a hang")
+                   help="BLOCK THE JAWS first: expect GRIPPER_SETTLE_TIMEOUT, not a hang")
     p.add_argument("--gripper-object", action="store_true",
                    help="prompts you to place an object: expect detect 1/2, not 3")
     p.add_argument("--gripper-sequencing", action="store_true",

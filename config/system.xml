@@ -300,4 +300,10 @@
              many mm above it (computed every 20th worker cycle, 5 Hz) -->
         <readout_mm>30</readout_mm>
     </self_collision>
+    <!-- 2026-10-16: the recorder (recorder.py) — incident dumps and captures from RTI's shared-memory trace.
+         Incidents: before_s / after_s: seconds kept before / after a fault (1-30 / 0.5-10); incident_keep: files kept
+         (1-50, the oldest deleted first); min_interval_s: at most one incident file per this many seconds (1-600).
+         Captures: capture_before_s: seconds kept before the request (0-30); capture_keep: files kept (1-20).
+         Applied within ~1 s of a change; the dashboard's Recordings tab edits it (utility/recorder_settings.py). -->
+    <recorder before_s="5" after_s="2" incident_keep="20" min_interval_s="10" capture_before_s="5" capture_keep="10"/>
 </system>

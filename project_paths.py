@@ -79,6 +79,7 @@ MOTOR_DATA_LOG   = LOGS_DIR / "motor_data.log"
 CRITICAL_LOG     = LOGS_DIR / "critical_errors.log"   # Persistent critical error log
 ACTIVITY_RTI_LOG  = LOGS_DIR / "activity_rti.log"     # Unified activity log — RTI-owned entries
 ACTIVITY_EXEC_LOG = LOGS_DIR / "activity_exec.log"    # Unified activity log — EXEC-owned entries
+ACTIVITY_REC_LOG  = LOGS_DIR / "activity_rec.log"     # Unified activity log — the recorder's (captures; 2026-10-16)
 
 # ─── Font / assets ───────────────────────────────────────────────────────────
 OLED_FONT        = IMAGES_DIR / "Roboto-VariableFont_wdth,wght.ttf"

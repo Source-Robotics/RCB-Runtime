@@ -14,6 +14,8 @@ License: GNU General Public License v3.0
 Contact: petar@source-robotics.com
 """
 
+import logging
+
 import numpy as np
 from spatialmath import SE3
 
@@ -22,6 +24,8 @@ from utility.kinematics_backend import (
     should_use_pinocchio,
     write_rpy_xyz,
 )
+
+logger = logging.getLogger("kin")  # docs/logging.md "Logger names"
 
 
 # ==========================================================================
@@ -106,7 +110,7 @@ def calculate_inverse_kinematics(robot, target_pose, q0=None, method='chan',
             return solution[0]
         return solution
     except Exception as e:
-        print(f"[Kinematics][WARNING] IK failed: {e}")
+        logger.warning(f"IK failed: {e}")   # was a print: a real warning hidden in stdout (2026-10-15)
         return None
 
 

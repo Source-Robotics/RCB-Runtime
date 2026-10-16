@@ -1,15 +1,11 @@
 """Safety and configuration checks used by the RT loop."""
 
 import numpy as np
-import time
 
 
-def real_time_test():
-    """Print actual sleep duration — verifies the RT kernel is active (should be ~1.000 s)."""
-    t1 = time.perf_counter()
-    time.sleep(1)
-    t2 = time.perf_counter()
-    print(f"sleep time is {t2 - t1}")
+# real_time_test() (a 1 s sleep whose duration it printed) was removed on 2026-10-15: never called, and the
+# services log instead of printing. The real-time check is config/system_config.setup_realtime_process's
+# "[RT setup] OK" line in RTI.log.
 
 
 def is_singular(robot, joint_angles):

@@ -27,7 +27,7 @@ import struct
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.can")  # docs/logging.md "Logger names"
 
 _CAN_EFF_FLAG, _CAN_RTR_FLAG, _CAN_SFF_MASK = 0x80000000, 0x40000000, 0x7FF
 SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)         # Linux; also the SCM type of the ancillary data
@@ -74,7 +74,7 @@ class LoopDelayMeter:
             self._sock = open_socket(interface)
         except OSError as e:
             self._sock = None
-            logger.error(f"[CAN] loop-delay meter: cannot open a socket on {interface}: {e} — no live loop delay")
+            logger.error(f"loop-delay meter: cannot open a socket on {interface}: {e} — no live loop delay")
 
     # ------------------------------------------------------------------ per tick (cheap)
     def on_read(self, tick, reply_times, read_first, sending):

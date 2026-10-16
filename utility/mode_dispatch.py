@@ -40,6 +40,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+import logging
+logger = logging.getLogger("rti.loop")  # docs/logging.md "Logger names"
 import os
 import time
 
@@ -94,15 +96,17 @@ def _mode_profile_record(samples):
 
     if _mode_profile_count >= _MODE_PROFILE_INTERVAL:
         total_ns = sum(_mode_profile_sum.values())
-        print(f"\n[RTI mode_dispatch profile] last {_mode_profile_count} calls")
+        # One queued log record per report (RTI logs through a queue), not a blocking print in the RT thread.
+        lines = [f"dispatch profile, last {_mode_profile_count} calls:"]
         for name in _MODE_PROFILE_NAMES:
             avg_ms = (_mode_profile_sum[name] / _mode_profile_count) / 1e6
             max_ms = _mode_profile_max[name] / 1e6
             share = (_mode_profile_sum[name] / total_ns * 100.0) if total_ns > 0 else 0.0
-            print(f"  {name:<14} avg={avg_ms:8.3f} ms  max={max_ms:8.3f} ms  share={share:5.1f}%")
+            lines.append(f"  {name:<14} avg={avg_ms:8.3f} ms  max={max_ms:8.3f} ms  share={share:5.1f}%")
             _mode_profile_sum[name] = 0
             _mode_profile_max[name] = 0
         _mode_profile_count = 0
+        logger.info("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

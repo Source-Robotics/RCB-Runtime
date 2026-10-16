@@ -116,12 +116,11 @@ def last_homing_utc(log_path):
             tail = fh.read().decode(errors="replace").splitlines()
     except OSError:
         return None
+    from utility.logger_setup import parse_line   # both line formats (the one before 2026-10-15 too)
     for line in reversed(tail):
-        if "[Homing] Sequence started" in line:
-            try:
-                return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(line.split("|")[1])))
-            except (IndexError, ValueError):
-                return None
+        rec = parse_line(line)
+        if rec is not None and rec["name"] == "rti.homing" and rec["message"].startswith("Sequence started"):
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(rec["time"]))
     return None
 
 

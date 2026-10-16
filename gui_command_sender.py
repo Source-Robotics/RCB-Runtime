@@ -18,6 +18,7 @@ thread owns the RobotClient and:
 This module has no NiceGUI dependency so it can be unit-tested without a UI.
 """
 import logging
+logger = logging.getLogger("gui")  # docs/logging.md "Logger names"
 import queue
 import threading
 
@@ -64,7 +65,7 @@ class ExecCommandSender:
         self._ip = ip
         self._port = port
         self._on_error = on_error or (lambda label, exc: None)
-        self._robot = robot if robot is not None else RobotClient()
+        self._robot = robot if robot is not None else RobotClient(name="dashboard")   # its name in the activity log
         self._connected = False
         self._q = queue.Queue(maxsize=_QUEUE_MAX)
         self._stop = threading.Event()
@@ -77,7 +78,7 @@ class ExecCommandSender:
         try:
             self._q.put_nowait((fn, label))
         except queue.Full:
-            logging.warning("[GUI] command '%s' dropped: sender backlog full", label)
+            logger.warning("command '%s' dropped: sender backlog full", label)
             self._on_error(label, RuntimeError("command sender backlog full"))
 
     def submit_async(self, fn, label=""):
@@ -101,7 +102,7 @@ class ExecCommandSender:
             try:
                 fn(self._robot)
             except Exception as exc:
-                logging.warning("[GUI] command '%s' failed: %s", label, exc)
+                logger.warning("command '%s' failed: %s", label, exc)
                 self._on_error(label, exc)
         threading.Thread(target=_one, name=f"gui-exec-{label or 'async'}", daemon=True).start()
 
@@ -139,10 +140,10 @@ class ExecCommandSender:
         try:
             self._robot.connect(self._ip, self._port)
             self._connected = True
-            logging.info("[GUI] connected to command_executor at %s:%s", self._ip, self._port)
+            logger.info("connected to command_executor at %s:%s", self._ip, self._port)
         except Exception as exc:                       # connection refused / timeout / etc.
             self._connected = False
-            logging.warning("[GUI] command_executor connect failed: %s", exc)
+            logger.warning("command_executor connect failed: %s", exc)
         return self._connected
 
     def _run(self):
@@ -157,7 +158,7 @@ class ExecCommandSender:
             try:
                 fn(self._robot)
             except Exception as exc:                    # rejection, timeout, dropped socket
-                logging.warning("[GUI] command '%s' failed: %s", label, exc)
+                logger.warning("command '%s' failed: %s", label, exc)
                 if not self._robot.connected:           # force a reconnect on the next submit
                     self._connected = False
                 self._on_error(label, exc)

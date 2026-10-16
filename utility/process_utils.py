@@ -34,7 +34,7 @@ import logging
 
 import psutil
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("proc")  # docs/logging.md "Logger names"
 
 _POLICY_NAME = {
     os.SCHED_FIFO:  "FIFO",
@@ -79,8 +79,7 @@ def setup_process(core, rt: bool = False, priority: int = 0) -> bool:
         if rt:
             os.sched_setscheduler(pid, os.SCHED_FIFO, os.sched_param(priority))
     except Exception as exc:
-        logger.warning(f"[proc setup] FAILED to set affinity/scheduling: {exc}")
-        print(f"[proc setup] FAILED: {exc}")
+        logger.warning(f"setup FAILED to set affinity/scheduling: {exc}")
     elsewhere = pin_all_threads(cores)
 
     # Verify what actually applied — single source of truth post-call.
@@ -96,12 +95,10 @@ def setup_process(core, rt: bool = False, priority: int = 0) -> bool:
     ok = (actual_policy == want_policy and actual_prio == want_prio and actual_aff == cores and not elsewhere)
 
     if ok:
-        logger.info(f"[proc setup] OK — {summary}")
-        print(f"[proc setup] OK — {summary}")
+        logger.info(f"setup OK — {summary}")
     else:
         want = f"SCHED_{policy_name(want_policy)} prio={want_prio} on core {core}"
-        logger.warning(f"[proc setup] DEGRADED — wanted {want}, got {summary}")
-        print(f"[proc setup] DEGRADED — wanted {want}, got {summary}")
+        logger.warning(f"setup DEGRADED — wanted {want}, got {summary}")
     return ok
 
 
@@ -120,7 +117,7 @@ def pin_all_threads(cores, task_dir="/proc/self/task", set_affinity=os.sched_set
         except ProcessLookupError:
             continue                     # the thread ended between the listing and now
         except OSError as exc:
-            logger.warning(f"[proc setup] thread {tid}: cannot set its affinity: {exc}")
+            logger.warning(f"setup thread {tid}: cannot set its affinity: {exc}")
             elsewhere += 1
     return elsewhere
 

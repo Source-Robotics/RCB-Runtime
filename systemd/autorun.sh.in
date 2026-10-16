@@ -1,0 +1,33 @@
+#!/bin/bash
+# Started by autorun.service at boot (scripts/setup_system.sh installs both; this file lives NEXT TO the repo folder,
+# not inside it, because it may swap that folder). If an update was staged — the folder {{REPO}}_PENDING and the flag
+# file ready_to_swap.txt next to it — the current folder becomes {{REPO}}_BACKUP and the staged one takes its place.
+
+# Define paths
+BOX="{{REPO}}"
+PENDING="${BOX}_PENDING"
+BACKUP="${BOX}_BACKUP"
+FLAG="$(dirname "$BOX")/ready_to_swap.txt"
+
+# If update is staged, do the swap
+if [ -f "$FLAG" ] && [ -d "$PENDING" ]; then
+    echo "Update detected — swapping folders..."
+
+    # Backup current version
+    if [ -d "$BACKUP" ]; then
+        rm -rf "$BACKUP"
+    fi
+    if [ -d "$BOX" ]; then
+        mv "$BOX" "$BACKUP"
+    fi
+
+    # Move new version into place
+    mv "$PENDING" "$BOX"
+    rm "$FLAG"
+
+    echo "Swap complete."
+fi
+
+# Launch supervisor (it starts every runtime process with the system python3 — README "Set up a new Pi")
+cd "$BOX" || exit 1
+python3 supervisor.py

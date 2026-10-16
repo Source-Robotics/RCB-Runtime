@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 import logging
 from project_paths import OLED_FONT
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sup.ui")  # docs/logging.md "Logger names"
 
 
 def init_display():

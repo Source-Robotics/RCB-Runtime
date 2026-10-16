@@ -64,7 +64,7 @@ from utility.tick_types import TickResult, ControlOutput
 from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, fence_epoch, unpack_batch
 from config.networking import ZMQ_EXEC_TRAJECTORY_SOCKET, ZMQ_EXEC_STATUS_SOCKET, background_zmq_context
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.exec")  # docs/logging.md "Logger names"
 
 COMPLETION_COMMANDED = 0
 COMPLETION_SETTLED = 1
@@ -463,7 +463,7 @@ class ExecHandler:
             if self._arm_at_rest(ctx) or self._rest_wait >= self._rest_wait_max:
                 if not self._idle_asked:
                     self._idle_asked = True
-                    logger.info("[EXEC] stop: braked along the path, at rest %.0f ms after the stop (%s) -> IDLE",
+                    logger.info("stop: braked along the path, at rest %.0f ms after the stop (%s) -> IDLE",
                                 self._stop_ticks * ctx.delta_t * 1000.0,
                                 "measured still" if self._rest_wait < self._rest_wait_max else
                                 "still moving after %.1f s — IDLE anyway" % self.STOP_REST_MAX_S)
@@ -518,7 +518,7 @@ class ExecHandler:
         if self._rx_epoch < n:
             return self._tick_ok, self._hold(ctx)
         self._stop_done = n
-        logger.info("[EXEC] stop: braked along the path, at rest %.0f ms after the stop; the program dropped "
+        logger.info("stop: braked along the path, at rest %.0f ms after the stop; the program dropped "
                     "(epoch %d), holding here in EXEC", self._stop_ticks * ctx.delta_t * 1000.0, n)
         self._reset_playback()
         self._mirror_exec_state(ctx)
@@ -697,7 +697,7 @@ class ExecHandler:
         try:
             return unpack_batch(raw)
         except Exception as e:  # malformed batch — drop it, don't crash the RT loop
-            logger.error(f"[EXEC] Dropped malformed trajectory batch: {e}")
+            logger.error(f"Dropped malformed trajectory batch: {e}")
             return None
 
     def _begin_completion(self, checkpoint_id, flags=0):

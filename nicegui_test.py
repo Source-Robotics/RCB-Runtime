@@ -11,6 +11,7 @@ import queue
 import json
 import gc
 import logging
+logger = logging.getLogger("gui")  # docs/logging.md "Logger names"
 import sys       # Firmware tab: spawns the flasher CLI with this interpreter
 import signal    # Firmware tab: SIGINT to cancel a running flash
 
@@ -23,10 +24,16 @@ import signal    # Firmware tab: SIGINT to cancel a running flash
 # smoothness. Reference counting still frees everything promptly regardless.
 gc.set_threshold(50_000, 500, 1000)   # default is (700, 10, 10)
 
+# The dashboard's own log, logs/gui.log (2026-10-15). Until then this process never set up logging: its INFO lines
+# were dropped and its warnings reached GUI.out.log through Python's last-resort handler, without a time.
+from project_paths import GUI_LOG                       # noqa: E402
+from utility.logger_setup import setup_logging          # noqa: E402
+setup_logging(str(GUI_LOG), log_to_console=True)
+
 from gui_command_sender import ExecCommandSender, GUI_IDLE_RELEASE_S, auto_release_due
 from config.xml_parser import load_system_config, load_full_robot_config
 from config.system_config import publish_static_system_info, publish_memory_info, publish_disk_info
-from project_paths import SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, ACTIVITY_RTI_LOG, ACTIVITY_EXEC_LOG, CONFIG_DIR
+from project_paths import SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, ACTIVITY_RTI_LOG, ACTIVITY_EXEC_LOG, ACTIVITY_REC_LOG, CONFIG_DIR
 from utility.signal_filters import FILTER_KINDS
 # Pure constants — importing rti_handler pulls no hardware, it is the RT-side motion
 # generator module. Used so the RTI panel shows the real budget rather than a copy of it
@@ -99,75 +106,9 @@ _RTI_SUBSTATE_UI = {
 _plot_last_t      = 0.0
 _plot_period_ema  = 0.0
 
-# ─── Activity Log tailer state ──────────────────────────────────────────────
-# Read position is `None` until first tailed. On first tail, seek near the end
-# instead of from byte 0 — bounds GUI startup cost against a long-running,
-# multi-MB rotated log instead of re-parsing its entire history. On rotation
-# (RotatingFileHandler renames the current file away and starts a fresh one at
-# the same path — file size drops below our tracked position), reset to 0.
-_ACTIVITY_LOG_SOURCES = {"RTI": str(ACTIVITY_RTI_LOG), "EXEC": str(ACTIVITY_EXEC_LOG)}
-_ACTIVITY_INITIAL_TAIL_BYTES = 256_000
-_ACTIVITY_MAX_ROWS = 500
-_activity_tail_pos = {name: None for name in _ACTIVITY_LOG_SOURCES}
-_activity_entries  = []   # bounded, sorted newest-first; rebuilt each refresh
-
-
-def _tail_activity_log(name, path):
-    """Read whatever's new in one activity log file since the last call."""
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return []
-
-    pos = _activity_tail_pos[name]
-    # Only the initial fuzzy seek (size - N bytes) can land mid-line — every
-    # later `pos` came from a previous f.tell() and is already an exact line
-    # boundary, so the partial-line discard below must not fire for those.
-    first_open = pos is None
-    if first_open:
-        pos = max(0, size - _ACTIVITY_INITIAL_TAIL_BYTES)
-    elif size < pos:
-        pos = 0  # rotation — file was replaced, start over from the fresh one
-
-    entries = []
-    try:
-        with open(path, "r") as f:
-            f.seek(pos)
-            if first_open and pos > 0:
-                f.readline()  # discard a possibly-partial line from the fuzzy seek
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-            _activity_tail_pos[name] = f.tell()
-    except OSError:
-        pass
-    return entries
-
-
-def _fmt_activity_row(e, idx):
-    ts = e.get("timestamp")
-    if isinstance(ts, (int, float)):
-        time_str = f"{display_time.fmt(ts, '%H:%M:%S')}.{int((ts % 1) * 1000):03d}"
-    else:
-        time_str = "?"
-    detail = e.get("message") or ""
-    if not detail:
-        detail = " → ".join(x for x in (e.get("cause"), e.get("fix")) if x)
-    return {
-        "key": f"{ts}_{idx}",
-        "time": time_str,
-        "source": e.get("source", ""),
-        "level": e.get("level", "info"),
-        "code": e.get("code", ""),
-        "id": e.get("id") or "",
-        "command": e.get("command") or "",
-        "detail": detail,
-    }
+# ─── Activity Log: gui_activity_tab.py (2026-10-15) ────────────────────────────
+_ACTIVITY_LOG_SOURCES = {"RTI": str(ACTIVITY_RTI_LOG), "EXEC": str(ACTIVITY_EXEC_LOG),
+                         "REC": str(ACTIVITY_REC_LOG)}      # the recorder's captures (2026-10-16)
 
 
 def fmt(x, decimals=3):
@@ -194,7 +135,7 @@ _gui_toasts = queue.Queue()   # (message, type) pending toasts → drained in th
 
 def _on_exec_error(label, exc):
     if label and label.endswith("_poll"):         # a background poll (Walls tab): log it, never toast it
-        logging.debug("[GUI] %s failed: %s", label, exc)
+        logger.debug("%s failed: %s", label, exc)
         return
     _gui_toasts.put((f"{label or 'command'}: {exc}", "negative"))
 
@@ -455,16 +396,6 @@ rti_columns = [
 # Processes panel (System Info tab): gui_processes.py (processes, threads, the core plan; 2026-10-13).
 process_columns = PROCESS_COLUMNS
 
-activity_columns = [
-    {'name': 'time',    'label': 'Time',    'field': 'time',    'align': 'left'},
-    {'name': 'source',  'label': 'Source',  'field': 'source',  'align': 'left'},
-    {'name': 'level',   'label': 'Level',   'field': 'level',   'align': 'left'},
-    {'name': 'code',    'label': 'Code',    'field': 'code',    'align': 'left'},
-    {'name': 'id',      'label': 'ID',      'field': 'id',      'align': 'left'},
-    {'name': 'command', 'label': 'Command', 'field': 'command', 'align': 'left'},
-    {'name': 'detail',  'label': 'Detail',  'field': 'detail',  'align': 'left'},
-]
-
 pid_columns = [
     {'name': 'joint',    'label': 'Joint',          'field': 'joint'},
     {'name': 'KPP',      'label': 'KPP (Pos P)',    'field': 'KPP'},
@@ -508,7 +439,7 @@ with ui.card().classes("w-full mb-2"):
             from gui_self_collision import add_self_collision_badge
             add_self_collision_badge(shared_data, _sys_cfg["self_collision"], int(_sys_cfg["joint_num"]))
         except Exception:
-            logging.exception("self-collision badge unavailable")
+            logger.exception("self-collision badge unavailable")
         # Who holds control. Shown on every tab: the failure it prevents is a colleague's
         # script and this dashboard both believing they are driving.
         control_badge     = ui.badge("CONTROL: ---").props("color=grey outline")
@@ -524,7 +455,7 @@ with ui.card().classes("w-full mb-2"):
             from blockly.nicegui_tab import add_program_badge
             add_program_badge(open_blocks=lambda: tabs.set_value('Blocks'))
         except Exception:
-            logging.exception("block program badge unavailable")
+            logger.exception("block program badge unavailable")
         ui.separator().props("vertical")
         robot_cmd_label = ui.label("CMD: ---").classes("font-mono text-sm text-gray-500")
         recipe_label    = ui.label("Recipe: ---").classes("font-mono text-sm text-gray-500")
@@ -855,6 +786,8 @@ with ui.tabs().classes("w-full") as tabs:
     tab_sysinfo = ui.tab('System Info',    icon='computer')
     tab_errors  = ui.tab('Errors',         icon='error')
     tab_activity = ui.tab('Activity Log',  icon='history')
+    tab_logs    = ui.tab('Logs',           icon='article')     # the log files + support bundle (gui_logs_tab.py)
+    tab_incidents = ui.tab('Recordings',   icon='video_library')  # captures + incident dumps (gui_incidents_tab.py)
     tab_pid     = ui.tab('PID Config',     icon='tune')
     tab_filters = ui.tab('Tune Filters',   icon='graphic_eq')
     tab_preview = ui.tab('Plan Preview',   icon='play_circle')
@@ -1090,7 +1023,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             from gui_jaw_view import add_jaw_view
             add_jaw_view(shared_data, _xml_cfg, int(_sys_cfg["joint_num"]))
         except Exception:
-            logging.exception("jaw view unavailable")
+            logger.exception("jaw view unavailable")
 
     # ─── RT Diagnostics ─────────────────────────────────────
     with ui.tab_panel(tab_diag):
@@ -1403,10 +1336,20 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                     shared_data, _exec_sender.submit,
                     hall_joint_index(_xml_cfg["has_hall_sensor"], int(_sys_cfg["joint_num"])))
             except Exception:
-                logging.exception("Hall sensor check card unavailable")
+                logger.exception("Hall sensor check card unavailable")
 
     # ─── System Info ────────────────────────────────────────
     with ui.tab_panel(tab_sysinfo):
+        # The health summary first (utility/health.py, gui_health_card.py, 2026-10-15): one level per component
+        try:
+            from gui_health_card import add_health_card
+            from utility.health import assess as _assess_health
+            add_health_card(assess_fn=lambda: _assess_health(shared_data, int(_sys_cfg["joint_num"]),
+                                                             float(_xml_cfg.get('delta_t') or 0.004),
+                                                             has_gripper=_gui_has_can_gripper()),
+                            is_visible=lambda: _active_tab_name(tabs.value) == 'System Info')
+        except Exception:
+            logger.exception("health card unavailable")
         with ui.row().classes("gap-4 items-start flex-wrap mb-3"):
             with ui.card().classes("flex-1 min-w-64"):
                 ui.label("Platform").classes("text-sm font-semibold mb-2 text-gray-600 uppercase tracking-wide")
@@ -1436,7 +1379,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 from gui_time_card import add_time_card
                 add_time_card(str(SYSTEM_XML))
             except Exception:
-                logging.exception("time card unavailable")
+                logger.exception("time card unavailable")
 
             with ui.card().classes("flex-1 min-w-48"):
                 ui.label("Disk").classes("text-sm font-semibold mb-2 text-gray-600 uppercase tracking-wide")
@@ -1462,7 +1405,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             from gui_homing_arms import add_homing_arms_card
             add_homing_arms_card(shared_data, _xml_cfg, int(_sys_cfg["joint_num"]))
         except Exception:
-            logging.exception("homing arms card unavailable")
+            logger.exception("homing arms card unavailable")
 
     # ─── Errors ───────────────────────────────────────────────
     with ui.tab_panel(tab_errors):
@@ -1472,26 +1415,48 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             with errors_container:
                 errors_no_errors_label = ui.label("No active errors.").classes("text-positive")
 
-    # ─── Activity Log ───────────────────────────────────────────
-    # Read-only tail of logs/activity_rti.log + logs/activity_exec.log, merged
-    # by timestamp. Separate from the "Active Errors" panel above — this is
-    # persistent history (command lifecycle, mode changes, jog/limit events,
-    # hardware faults), not the live error latch. See TODO/activity_log_design.md.
+    # ─── Activity Log (gui_activity_tab.py, 2026-10-15) ─────────
+    # The event history (logs/activity_rti.log + logs/activity_exec.log), merged by time; everything shown, filters
+    # narrow it. Separate from the Errors tab, which is the live error latch. docs/logging.md "The activity log".
     with ui.tab_panel(tab_activity):
         with ui.card().classes("w-full"):
             ui.label("Activity Log").classes("text-sm font-semibold mb-1 text-gray-600 uppercase tracking-wide")
-            ui.label("Most recent entries first. Full history: logs/activity_rti.log, logs/activity_exec.log.") \
-                .classes("text-xs text-gray-400 mb-2")
-            activity_table = ui.table(
-                columns=activity_columns, rows=[], row_key='key',
-            ).classes("w-full").props("dense flat bordered")
-            activity_table.add_slot('body-cell-level', r'''
-                <q-td :props="props">
-                    <q-badge :color="props.value === 'error' ? 'negative' : props.value === 'warning' ? 'orange' : 'grey-6'">
-                        {{ props.value }}
-                    </q-badge>
-                </q-td>
-            ''')
+            try:
+                from gui_activity_tab import add_activity_tab
+                add_activity_tab(is_visible=lambda: _active_tab_name(tabs.value) == 'Activity Log',
+                                 sources=_ACTIVITY_LOG_SOURCES, fmt_time=display_time.fmt_precise)
+            except Exception:
+                logger.exception("Activity Log tab unavailable")
+                ui.label("Activity Log tab unavailable — see logs/gui.log").classes("text-negative")
+
+    # ─── Logs (the log files, the support bundle; gui_logs_tab.py, 2026-10-15) ───
+    with ui.tab_panel(tab_logs):
+        try:
+            from gui_logs_tab import add_logs_tab
+            add_logs_tab(is_visible=lambda: _active_tab_name(tabs.value) == 'Logs',
+                         robot_fn=lambda: _robot_snapshot(),        # defined further down
+                         fmt_time=display_time.fmt_precise,      # one time format in every tab
+                         zone_name=display_time.zone_name,
+                         # runtime log levels (2026-10-15): RTI + the executor through set_log_level
+                         level_fn=lambda name, level: _exec_sender.submit(
+                             lambda r, n=name, lv=level: r.set_log_level(n, lv), label="set_log_level"))
+        except Exception:
+            logger.exception("Logs tab unavailable")
+            ui.label("Logs tab unavailable — see logs/gui.log").classes("text-negative")
+
+    # ─── Recordings: sub-tabs Captures (on request) and Incidents (around a fault); gui_incidents_tab.py ───
+    with ui.tab_panel(tab_incidents):
+        try:
+            from gui_incidents_tab import add_incidents_tab
+            add_incidents_tab(is_visible=lambda: _active_tab_name(tabs.value) == 'Recordings',
+                              fmt_time=display_time.fmt_precise,
+                              capture_fn=lambda seconds, name: _exec_sender.submit(
+                                  lambda r, s=seconds, n=name: r.capture_telemetry(s, n), label="capture_telemetry"),
+                              stop_fn=lambda: _exec_sender.submit(lambda r: r.stop_capture(), label="stop_capture"),
+                              joint_num=int(_sys_cfg["joint_num"]))
+        except Exception:
+            logger.exception("Recordings tab unavailable")
+            ui.label("Recordings tab unavailable — see logs/gui.log").classes("text-negative")
 
     # ─── PID Config ───────────────────────────────────────────
     with ui.tab_panel(tab_pid):
@@ -2944,8 +2909,13 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
 try:
     from blockly.nicegui_tab import add_blockly_tab
     add_blockly_tab(app, tabs, 'Blocks')
+    try:
+        from blockly.nicegui_tab import add_runs_card
+        add_runs_card(tabs, 'Blocks', display_time.fmt_precise)     # the program run history (2026-10-15)
+    except Exception:
+        logger.exception("program runs card unavailable")
 except Exception:
-    logging.exception("Blocks tab unavailable")
+    logger.exception("Blocks tab unavailable")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3574,6 +3544,19 @@ def _active_tab_name(value):
     return getattr(value, '_props', {}).get('name', 'Joints & TCP')
 
 
+def _gui_has_can_gripper() -> bool:
+    raw = _xml_cfg.get('gripper_CAN_gripper', 0)
+    return not (isinstance(raw, float) and math.isnan(raw)) and int(raw) == 1
+
+
+def _robot_snapshot() -> dict:
+    """The robot's state for the support bundle's info.txt (gui_logs_tab.py); None for a block not set up."""
+    def read(block, how="get"):
+        return getattr(block, how)() if block is not None else None
+    return {"robot_state": read(shared_data.robot_state), "robot_mode": read(shared_data.robot_mode),
+            "homed": read(shared_data.homed_state), "errors": read(shared_data.error_state, "get_json")}
+
+
 def update_tables():
     global _prev_rti_tick, _rti_stale_cnt
     global _gui_last_t, _gui_exec_last, _gui_period_ema, _gui_exec_ema, _gui_period_peak, _gui_exec_peak
@@ -4190,27 +4173,19 @@ def update_tables():
             if error_data in (None, "NONE", []):
                 ui.label("No active errors.").classes("text-positive")
             else:
+                # One block per latched key (2026-10-15, the message standard): number, code and title; where; when;
+                # then the catalog's cause / effect / fix (gui_activity_tab.error_view; utility/error_catalog.py).
+                from gui_activity_tab import error_view
                 for err in error_data:
-                    ts   = f"{err['timestamp']:.6f}"
-                    tick = err.get("tick", "?")
-                    key  = err["key"]
-                    desc = err.get("description", "")
-                    level = err.get("level", "error")
-                    color = "text-warning" if level == "warning" else "text-negative"
-                    tag   = "WARNING" if level == "warning" else "ERROR"
-                    ui.label(f"[{tag}] [{ts} | tick {tick}]  {key} — {desc}").classes(color)
-
-    # ── Activity Log tab ──────────────────────────────────────
-    if _tab == 'Activity Log':
-        for name, path in _ACTIVITY_LOG_SOURCES.items():
-            _activity_entries.extend(_tail_activity_log(name, path))
-        if _activity_entries:
-            _activity_entries.sort(key=lambda e: e.get("timestamp") or 0)
-            del _activity_entries[:-_ACTIVITY_MAX_ROWS]
-            activity_table.rows = [
-                _fmt_activity_row(e, i) for i, e in enumerate(reversed(_activity_entries))
-            ]
-            activity_table.update()
+                    v = error_view(err, display_time.fmt_precise)
+                    color = "text-warning" if v["level"] == "warning" else "text-negative"
+                    with ui.column().classes("gap-0 mb-2"):
+                        ui.label(f"{v['level'].upper()}  {v['code']}  {v['title']}"
+                                 + (f"  ({v['where']})" if v['where'] else "")).classes(f"{color} font-semibold")
+                        ui.label(f"{v['time']}  tick {v['tick']}  {v['description']}").classes("text-xs text-gray-500")
+                        for name in ("cause", "effect", "fix"):
+                            if v[name]:
+                                ui.label(f"{name.capitalize()}: {v[name]}").classes("text-xs whitespace-normal")
 
     # ── GUI exec time (measured after all tab updates) ────────
     _gui_exec      = (time.monotonic() - _t_start) * 1e3

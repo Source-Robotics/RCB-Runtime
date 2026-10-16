@@ -20,18 +20,29 @@ from .exceptions import RobotConnectionError, RobotTimeout, CommandRejected
 
 class _Pending:
     """Tracks the lifecycle of one in-flight command id."""
-    __slots__ = ("ack", "done", "data", "error", "queued")
+    __slots__ = ("ack", "done", "data", "error", "error_info", "queued")
 
     def __init__(self):
         self.ack = threading.Event()    # first reply seen (queued / ok / error)
         self.done = threading.Event()   # terminal reply seen (ok / complete / error)
         self.data = None
         self.error = None               # (code, message) or None
+        self.error_info = {}            # the catalog's number / title / fix of that error, when sent (2026-10-15)
         self.queued = False
 
 
+def default_client_name():
+    """"<script> on <host>" — how the robot names a client that gives no name (e.g. "pick_place.py on lab-pc")."""
+    import os
+    import sys
+    script = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] not in ("", "-c") else "python"
+    return f"{script} on {socket.gethostname()}"
+
+
 class Connection:
-    def __init__(self):
+    def __init__(self, name=None):
+        # Sent as "client" with every message: the robot's activity log names who asked (2026-10-15).
+        self.name = name or default_client_name()
         self._sock = None
         self._recv_thread = None
         self._connected = False
@@ -154,7 +165,7 @@ class Connection:
         p = _Pending()
         with self._lock:
             self._pending[cid] = p
-        msg = {"id": cid, "cmd": cmd, "args": args or []}
+        msg = {"id": cid, "cmd": cmd, "args": args or [], "client": self.name}
         if options:
             msg["options"] = options
         payload = json.dumps(msg) + "\n"
@@ -224,6 +235,7 @@ class Connection:
                 p.data = msg.get("data")
             elif status == "error":
                 p.error = (msg.get("code", "ERROR"), msg.get("message", ""))
+                p.error_info = {k: msg[k] for k in ("number", "title", "fix") if msg.get(k) is not None}
             # "complete" carries no data of its own EXCEPT for gripper commands,
             # which report WHY they settled: 1/2 = an object stopped the jaws
             # (opening/closing), 3 = reached the target with nothing there. Kept
@@ -242,7 +254,7 @@ class Connection:
             if status == "complete" and p.queued and self.on_motion_complete:
                 self.on_motion_complete(cid)
             elif status == "error" and p.queued:
-                failure = {"id": cid, "code": p.error[0], "message": p.error[1]}
+                failure = {"id": cid, "code": p.error[0], "message": p.error[1], **p.error_info}
                 with self._lock:
                     self._motion_errors.append(failure)
                 if self.on_motion_error:
@@ -334,12 +346,12 @@ class Connection:
         # looked is a motion failure — reported once, by wait_done / wait_idle (MotionFailed) — not ALSO here
         # (2026-10-13: the simulated suite saw one JOINT_LIMIT counted twice).
         if p.error is not None and not p.queued:
-            raise CommandRejected(*p.error)
+            raise CommandRejected(*p.error, **p.error_info)
 
     @staticmethod
     def wait_done(p, timeout):
         if not p.done.wait(timeout):
             raise RobotTimeout("command did not complete within timeout")
         if p.error is not None:
-            raise CommandRejected(*p.error)
+            raise CommandRejected(*p.error, **p.error_info)
         return p.data

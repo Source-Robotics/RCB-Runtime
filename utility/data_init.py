@@ -8,9 +8,11 @@ import logging
 import numpy as np
 from collections import deque
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti")  # docs/logging.md "Logger names"
 
-MAX_DATA_POINTS = 500  # History of data points we receive from CAN bus
+MAX_DATA_POINTS = 500  # History of data points we receive from CAN bus (2 s at 250 Hz). Back from 1250 on 2026-10-16:
+                       # the incident dumps and captures read the shared-memory trace now (utility/trace_ring.py,
+                       # recorder.py), not this history — nothing here reads more than the newest entries.
 
 
 # --------------------------------------------------------------------------- #

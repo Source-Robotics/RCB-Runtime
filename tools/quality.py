@@ -37,7 +37,8 @@ NETS_DIR = os.path.join(ROOT, "dummy_test_scripts")
 # THE runtime source — what the robot runs (not tests, tools or archives). One list for every check.
 RUNTIME_FILES = ["RTI.py", "command_executor.py", "supervisor.py", "nicegui_test.py", "project_paths.py",
                  "self_collision_worker.py", "gui_command_sender.py", "gui_hall_check.py", "gui_homing_arms.py",
-                 "gui_jaw_view.py", "gui_processes.py", "gui_self_collision.py", "gui_time_card.py", "gui_walls_tab.py"]
+                 "gui_activity_tab.py", "gui_jaw_view.py", "gui_logs_tab.py", "gui_processes.py", "gui_self_collision.py", "gui_time_card.py",
+                 "gui_walls_tab.py"]
 RUNTIME_PKGS = ["blockly", "communication", "config", "data", "hardware", "motion", "robotclient", "robotics",
                 "robots", "sim", "supervisor", "utility"]
 RADON_MAX_CC = 30            # a function above this cyclomatic complexity (radon rank E / F) is a finding

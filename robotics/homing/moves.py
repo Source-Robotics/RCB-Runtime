@@ -5,6 +5,7 @@ move_to (smooth interpolated joint moves), sequence-level post-moves, and how a 
 # (dummy_test_scripts/test_homing_golden.py) proves the behaviour unchanged.
 
 import logging
+logger = logging.getLogger("rti.homing")  # docs/logging.md "Logger names"
 import math
 
 from robotics.homing.status import STATUS_FAILED
@@ -141,7 +142,7 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
     a['ticks'] += 1
     if a['ticks'] == 1:
         self._approach_limits(Motor, j, a['current_ma'])
-        logging.info(f"[Homing] {label} approaching its endstop: {a['speed']:+.0f} ticks/s (a position ramp), current "
+        logger.info(f"{label} approaching its endstop: {a['speed']:+.0f} ticks/s (a position ramp), current "
                      f"limit {a['current_ma']:.0f} mA")
     if a['target'] is None:
         if a['last_valid'] is None:                 # no position yet: hold still until one is read
@@ -168,7 +169,7 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
                 a['phase'], a['target'] = 'backoff', float(pos)
                 a['end'] = float(pos) - (a['backoff'] if a['speed'] > 0 else -a['backoff'])
                 how = a['how'] if a['soft'] >= _APPROACH_SOFT_READS else f"the ramp {lag:.0f} ticks ahead"
-                logging.info(f"[Homing] {label} reached its endstop (approach): {travel:+d} ticks in "
+                logger.info(f"{label} reached its endstop (approach): {travel:+d} ticks in "
                              f"{a['ticks'] * self.dt:.3f} s (from {int(a['start'])} to {int(pos)}; {how}) — backing off "
                              f"{a['backoff']:.0f} ticks")
                 return 'running'
@@ -177,7 +178,7 @@ def _approach_tick(self, Motor, j, shared_data) -> str:
                   f"({a['speed']:+.0f} ticks/s, {a['current_ma']:.0f} mA) — something in the way, or the joint far "
                   f"from its endstop")
         _approach_report(a, label)
-        logging.error(f"[Homing] FAILED: {label} — {reason}")
+        logger.error(f"FAILED: {label} — {reason}")
         if j < len(shared_data.rti["homing_status"]):
             shared_data.rti["homing_status"][j] = STATUS_FAILED
         self._report_failure(j, reason)
@@ -257,7 +258,7 @@ def _approach_report(a, label) -> None:
         braked += (f"; its {a['brake_ma']:.0f} mA brake limit on {a['brake_on']} time(s), "
                    f"{a['brake_ticks'] * a['dt']:.2f} s in all{' (STILL ON at the end)' if a['braking'] else ''}")
     trace = ", ".join(f"{t:.1f}s {ld:+.0f}/{'?' if p is None else f'{p:+.0f}'}" for t, ld, p in a['trace'])
-    logging.info(f"[Homing] {label} approach: {ahead}; {braked}. Every {_APPROACH_TRACE_S:.1f} s, ticks ahead of the "
+    logger.info(f"{label} approach: {ahead}; {braked}. Every {_APPROACH_TRACE_S:.1f} s, ticks ahead of the "
                  f"ramp / mA toward the endstop: {trace or 'none'}")
 
 
@@ -283,7 +284,7 @@ def _approach_where(self, Motor, j, pos, a, shared_data) -> bool:
     if verdict["kind"] != "fault":
         return True
     Motor[j].Send_data_pack_1(Position=None, Speed=0, Current=0)      # stop pushing
-    logging.error(verdict["text"])
+    logger.error(verdict["text"])
     if j < len(shared_data.rti["homing_status"]):
         shared_data.rti["homing_status"][j] = STATUS_FAILED
     self._report_failure(j, verdict["reason"])
@@ -305,7 +306,7 @@ def _approach_back(self, Motor, j, pos, label) -> str:
                   or a['back_ticks'] * self.dt >= _APPROACH_BACK_WAIT_S):
         self._approach_limits(Motor, j, self.homing_current_ma[j])
         a['phase'] = 'idle'
-        logging.info(f"[Homing] {label} backed off to {a['last_valid']} — idle until its homing (current limit "
+        logger.info(f"{label} backed off to {a['last_valid']} — idle until its homing (current limit "
                      f"{self.homing_current_ma[j]:.0f} mA again)")
     return 'running'
 
@@ -401,8 +402,8 @@ def _do_step_pre_move(self, Motor, Joint, shared_data) -> str:
 
     # Timeout — use per-step timeout that respects timed pre-move durations
     if self._move_tick_count > self._pre_move_timeout_ticks:
-        logging.warning(
-            f"[Homing] Pre-move timed out at step {self._seq_idx + 1} "
+        logger.warning(
+            f"Pre-move timed out at step {self._seq_idx + 1} "
             f"— joint(s) {list(active_move_joints)} could not reach target "
             f"(robot may not be calibrated yet). Continuing to homing."
         )
@@ -453,7 +454,7 @@ def _do_step_post_move(self, Motor, Joint, shared_data) -> str:
             all_arrived = False
 
     if self._move_tick_count > self._move_timeout_ticks:
-        logging.warning("[Homing] Post-move timed out — finishing")
+        logger.warning("Post-move timed out — finishing")
         all_arrived = True
 
     if all_arrived:
@@ -463,11 +464,12 @@ def _do_step_post_move(self, Motor, Joint, shared_data) -> str:
             return 'failed'
         self._seq_phase = self._DONE
         shared_data.homed_state.set("HOMED")
-        logging.info("[Homing] All joints homed successfully.")
-        logging.info("[Homing] ── Home positions set per joint ─────────────")
+        logger.info("All joints homed successfully.")
+        self.log_completed()
+        logger.info("── Home positions set per joint ─────────────")
         for j in sorted(self._homed_results):
-            logging.info(f"[Homing]   {self._jlabel(j, self._Motor)}: endstop encoder pos = {self._homed_results[j]}")
-        logging.info("[Homing] ─────────────────────────────────────────────")
+            logger.info(f"  {self._jlabel(j, self._Motor)}: endstop encoder pos = {self._homed_results[j]}")
+        logger.info("─────────────────────────────────────────────")
         return 'done'
 
     return 'running'
@@ -503,8 +505,8 @@ def _do_step_move_to(self, Motor, Joint, shared_data) -> str:
             info['end_ticks'] = int(
                 Joint[j].get_encoder_position(info['position_rad'])
             )
-            logging.info(
-                f"[Homing] move_to {self._jlabel(j, Motor)}: "
+            logger.info(
+                f"move_to {self._jlabel(j, Motor)}: "
                 f"{info['start_ticks']} → {info['end_ticks']} ticks "
                 f"({info['position_rad']:.4f} rad) over "
                 f"{info['duration_ticks']} ticks "
@@ -543,7 +545,7 @@ def _do_step_move_to(self, Motor, Joint, shared_data) -> str:
 
             if info.get('settle_ok', 0) >= self._move_stable_ticks:
                 info['done'] = True
-                logging.info(f"[Homing] move_to {self._jlabel(j, Motor)} arrived and settled.")
+                logger.info(f"move_to {self._jlabel(j, Motor)} arrived and settled.")
             else:
                 all_done = False
         else:
@@ -564,7 +566,7 @@ def _do_step_move_to(self, Motor, Joint, shared_data) -> str:
                 jt = Joint[j]
                 deg = (int(pos) - info['end_ticks']) * 360.0 / (jt.encoder_max_counts * jt.gear_ratio)
                 short.append(f"{self._jlabel(j, Motor).split(' ')[0]} {deg:+.3f} deg")
-        logging.warning("[Homing] move_to timed out — advancing"
+        logger.warning("move_to timed out — advancing"
                         + (f" (not within {self._MOVE_TOL_TICKS} ticks: {', '.join(short)} from the target)" if short else ""))
         for j in active_joints:
             self._hold_after_move_to(Motor, j, shared_data)

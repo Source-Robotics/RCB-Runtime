@@ -40,6 +40,11 @@ import sys
 import time
 import queue
 import logging
+logger = logging.getLogger("sup")  # docs/logging.md "Logger names"
+log_can_link = logging.getLogger("sup.can_link")  # docs/logging.md "Logger names"
+log_gpio = logging.getLogger("sup.gpio")  # docs/logging.md "Logger names"
+log_pcb = logging.getLogger("sup.pcb")  # docs/logging.md "Logger names"
+log_process = logging.getLogger("sup.process")  # docs/logging.md "Logger names"
 import threading
 import subprocess
 
@@ -86,7 +91,7 @@ setup_logging(str(SUPERVISOR_LOG), log_to_console=DEBUG, critical_log_file=str(C
 
 def handle_exception(exc_type, exc_value, exc_traceback):
     """Write any uncaught exception to the log before the process dies."""
-    logging.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
 
 
 sys.excepthook = handle_exception
@@ -114,6 +119,9 @@ SCRIPTS = {
     # the self-collision worker (utility/self_collision.py): the measured pose against the convex pieces on another
     # core, ~100 Hz, into shared memory for RTI's monitor and jog (TODO/self_collision_plan.md, 2026-10-06)
     "SELF_COLLISION": f"python3 {_ROOT}/self_collision_worker.py",
+    # the recorder: incident dumps and captures from RTI's shared-memory trace, in its own process so they never
+    # cost RTI's loop anything (utility/trace_ring.py, utility/trace_recorder.py; 2026-10-16)
+    "RECORDER": f"python3 {_ROOT}/recorder.py",
 } if RUN_ALL_SCRIPTS else {}
 
 # ==========================================================================
@@ -127,7 +135,7 @@ try:
     ser = serial.Serial(UART_PORT, BAUD_RATE, timeout=0.5)
 except (serial.SerialException, OSError) as exc:
     # Degrade gracefully: the OLED + buttons still work, only PCB comms are lost.
-    logging.error(f"Could not open UART {UART_PORT}: {exc}. PCB comms disabled.")
+    log_pcb.error(f"Could not open UART {UART_PORT}: {exc}. PCB comms disabled.")
     ser = None
 
 led_state = False
@@ -148,7 +156,7 @@ def _apply_contrast():
             disp.contrast(int(state.settings["contrast"]))
             state.ui["_applied_contrast"] = state.settings["contrast"]
         except Exception:
-            logging.exception("Could not set OLED contrast")
+            logger.exception("Could not set OLED contrast")
 
 
 def update_display():
@@ -160,7 +168,7 @@ def update_display():
             disp.image(screen.img)
             disp.show()
         except Exception:
-            logging.exception("Display update failed")
+            logger.exception("Display update failed")
         time.sleep(DISPLAY_REFRESH_TIME)
 
 
@@ -169,11 +177,11 @@ def update_display():
 # ==========================================================================
 def _power_off(command):
     """Cleanly stop managed scripts, then reboot / shut down the Pi."""
-    logging.warning(f"{command} requested from OLED menu — stopping scripts first")
+    logger.warning(f"{command} requested from OLED menu — stopping scripts first")
     try:
         stop_scripts(state.processes)
     except Exception:
-        logging.exception("Error stopping scripts before power action")
+        log_process.exception("Error stopping scripts before power action")
     subprocess.run(["sudo", "-n", command], check=False)
 
 
@@ -194,7 +202,7 @@ def _drain_actions():
             elif cmd[0] == "shutdown":
                 _power_off("poweroff")
         except Exception:
-            logging.exception(f"Menu action failed: {cmd}")
+            logger.exception(f"Menu action failed: {cmd}")
 
 
 def monitor_can_link():
@@ -219,15 +227,15 @@ def monitor_can_link():
                 previous = None          # interface gone; re-baseline on return
             else:
                 if previous is None:
-                    logging.info("[CAN link] baseline — %s",
+                    log_can_link.info("baseline — %s",
                                  format_can_link_stats(current))
                 else:
                     message = describe_can_link_change(previous, current)
                     if message:
-                        logging.warning("[CAN link] %s", message)
+                        log_can_link.warning("%s", message)
                 previous = current
         except Exception:
-            logging.exception("CAN link monitor pass failed")
+            log_can_link.exception("CAN link monitor pass failed")
         time.sleep(CAN_LINK_MONITOR_TIME)
 
 
@@ -243,9 +251,9 @@ def update_script_supervisor():
             )
             # Every SCRIPT_MONITOR_TIME: DEBUG only. Crashes and restarts are logged by the process
             # manager when they happen (2026-10-01: this line + the blink-tick lines were ~100 MB/day).
-            logging.debug(state.global_monitor_data)
+            log_process.debug(state.global_monitor_data)
         except Exception:
-            logging.exception("Script supervisor pass failed")
+            log_process.exception("Script supervisor pass failed")
         time.sleep(SCRIPT_MONITOR_TIME)
 
 
@@ -285,7 +293,7 @@ def on_blink_tick():
     now = tuple(v for i, v in enumerate(shared_data.gpio_states) if i not in (LED1, LED2))
     if now != _last_gpio_logged:
         _last_gpio_logged = now
-        logging.info(f"GPIO state: {list(shared_data.gpio_states)}")
+        log_gpio.info(f"GPIO state: {list(shared_data.gpio_states)}")
 
 
 def shutdown():
@@ -293,7 +301,7 @@ def shutdown():
     try:
         stop_scripts(state.processes)  # don't leave RTI/GUI/HL orphaned holding their ports
     except Exception:
-        logging.exception("Error stopping managed scripts on shutdown")
+        log_process.exception("Error stopping managed scripts on shutdown")
     try:
         led1.off()
         led2.off()
@@ -304,7 +312,7 @@ def shutdown():
             ser.close()
         except Exception:
             pass
-    logging.info("Supervisor shutdown complete")
+    logger.info("Supervisor shutdown complete")
 
 
 # ==========================================================================
@@ -354,7 +362,7 @@ def main():
             elapsed = time.perf_counter() - start_time
             time.sleep(max(LOOP_TIME - elapsed, 0))
     except KeyboardInterrupt:
-        logging.info("Supervisor interrupted by user")
+        logger.info("Supervisor interrupted by user")
     finally:
         shutdown()
 

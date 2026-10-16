@@ -66,7 +66,7 @@ from utility.serialization import (
     serialize_gripper_config,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.recipe")  # docs/logging.md "Logger names"
 
 
 # ================================================================
@@ -121,10 +121,10 @@ def load_recipe_from_file(xml_path: str | Path) -> Optional[DataRecipe]:
     try:
         root = ET.parse(xml_path).getroot()
     except FileNotFoundError:
-        logger.error(f"[DataRecipe] File not found: {xml_path}")
+        logger.error(f"File not found: {xml_path}")
         return None
     except ET.ParseError as e:
-        logger.error(f"[DataRecipe] XML parse error in '{xml_path}': {e}")
+        logger.error(f"XML parse error in '{xml_path}': {e}")
         return None
     return _recipe_from_root(root, xml_path.name)
 
@@ -136,7 +136,7 @@ def load_recipe_from_text(text: str, label: str) -> Optional[DataRecipe]:
     try:
         root = ET.fromstring(text)
     except ET.ParseError as e:
-        logger.error(f"[DataRecipe] XML parse error in '{label}': {e}")
+        logger.error(f"XML parse error in '{label}': {e}")
         return None
     return _recipe_from_root(root, label)
 
@@ -145,13 +145,13 @@ def _recipe_from_root(root: ET.Element, label: str) -> Optional[DataRecipe]:
     """One parsed <recipe> root -> DataRecipe, or None (logged) when it is not a usable recipe."""
     if root.tag != "recipe":
         logger.error(
-            f"[DataRecipe] '{label}': root element must be <recipe>, got <{root.tag}> — skipped."
+            f"'{label}': root element must be <recipe>, got <{root.tag}> — skipped."
         )
         return None
 
     name = root.get("name", "").strip()
     if not name:
-        logger.warning(f"[DataRecipe] '{label}': <recipe> has no name attribute — skipped.")
+        logger.warning(f"'{label}': <recipe> has no name attribute — skipped.")
         return None
 
     fields: list = []
@@ -162,7 +162,7 @@ def _recipe_from_root(root: ET.Element, label: str) -> Optional[DataRecipe]:
         if not tag:
             continue
         if tag not in TAGS:
-            logger.warning(f"[DataRecipe] Recipe '{name}': unknown tag '{tag}' — skipped.")
+            logger.warning(f"Recipe '{name}': unknown tag '{tag}' — skipped.")
             continue
         fields.append(tag)
         prec_str = field_el.get("precision")
@@ -171,14 +171,14 @@ def _recipe_from_root(root: ET.Element, label: str) -> Optional[DataRecipe]:
                 overrides[tag] = int(prec_str)
             except ValueError:
                 logger.warning(
-                    f"[DataRecipe] Recipe '{name}': bad precision value for '{tag}' — using default."
+                    f"Recipe '{name}': bad precision value for '{tag}' — using default."
                 )
 
     if not fields:
-        logger.warning(f"[DataRecipe] Recipe '{name}' has no valid fields — skipped.")
+        logger.warning(f"Recipe '{name}' has no valid fields — skipped.")
         return None
 
-    logger.info(f"[DataRecipe] Loaded '{name}' ({len(fields)} fields) from '{label}'.")
+    logger.info(f"Loaded '{name}' ({len(fields)} fields) from '{label}'.")
     return DataRecipe(name=name, fields=fields, precision_overrides=overrides)
 
 
@@ -257,7 +257,7 @@ class RecipeManager:
         """
         loaded: dict = {}
         if not self.recipe_dir.is_dir():
-            logger.error(f"[RecipeManager] Directory not found: {self.recipe_dir}")
+            logger.error(f"Directory not found: {self.recipe_dir}")
         else:
             for xml_file in sorted(self.recipe_dir.glob("*.xml")):
                 recipe = load_recipe_from_file(xml_file)
@@ -283,12 +283,12 @@ class RecipeManager:
             self._cached_name   = ""
             self._cached_recipe = self._fallback
             logger.info(
-                f"[RecipeManager] {len(loaded)} recipe(s) loaded from '{self.recipe_dir}': "
+                f"{len(loaded)} recipe(s) loaded from '{self.recipe_dir}': "
                 f"{list(loaded.keys())}"
             )
         else:
             logger.warning(
-                f"[RecipeManager] No recipes found in '{self.recipe_dir}' — fallback active."
+                f"No recipes found in '{self.recipe_dir}' — fallback active."
             )
 
     def get(self, name: str) -> DataRecipe:
@@ -303,7 +303,7 @@ class RecipeManager:
             return self._cached_recipe
         recipe = self._recipes.get(name)
         if recipe is None:
-            logger.debug(f"[RecipeManager] Recipe '{name}' not found — using fallback.")
+            logger.debug(f"Recipe '{name}' not found — using fallback.")
             recipe = self._fallback
         self._cached_name   = name
         self._cached_recipe = recipe

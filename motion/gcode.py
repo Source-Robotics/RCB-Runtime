@@ -39,7 +39,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("exec.planner")  # docs/logging.md "Logger names"
 
 # Words we accept but cannot act on, mapped to why. Parsed, ignored, warned about ONCE.
 IGNORED_WORDS = {"E": "no extruder axis on this arm"}
@@ -121,7 +121,7 @@ def parse(text: str, start_xyz: Sequence[float] = (0.0, 0.0, 0.0), default_blend
 
     def note_ignored(key, why):
         if key not in prog.ignored:
-            logger.warning(f"[G-code] ignoring {key}: {why}")
+            logger.warning(f"G-code: ignoring {key}: {why}")
             prog.ignored[key] = 0
         prog.ignored[key] += 1
 
@@ -227,7 +227,7 @@ def parse(text: str, start_xyz: Sequence[float] = (0.0, 0.0, 0.0), default_blend
 def _finish(prog):
     if prog.ignored:
         logger.warning(
-            "[G-code] this program contained words this arm cannot act on: "
+            "G-code: this program contained words this arm cannot act on: "
             + ", ".join(f"{k} x{n}" for k, n in prog.ignored.items())
             + ". The MOTION will run; nothing is extruded or heated.")
     return prog

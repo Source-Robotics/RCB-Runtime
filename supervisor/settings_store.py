@@ -22,7 +22,7 @@ import tempfile
 from project_paths import SUPERVISOR_SETTINGS
 from supervisor import state
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sup.ui")  # docs/logging.md "Logger names"
 
 
 def load():

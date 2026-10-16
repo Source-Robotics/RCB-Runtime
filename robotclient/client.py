@@ -81,8 +81,10 @@ class GripperResult:
 
 
 class RobotClient:
-    def __init__(self, sync=False):
-        self._conn = Connection()
+    def __init__(self, sync=False, name=None):
+        """name: how the robot shows this client in its activity log and control messages ("dashboard",
+        "pick_place"). Default: "<script> on <host>", e.g. "pick_place.py on lab-pc"."""
+        self._conn = Connection(name=name)
         self._sync = sync
         self._last_queued = None   # most recent queued command's _Pending, for wait_motion_complete()
         # Most recent GRIPPER command's _Pending, tracked separately: queue a
@@ -1199,6 +1201,15 @@ class RobotClient:
         an error instead."""
         self._wait_homed(timeout, "wait_homed")
 
+    def wait_error_reset(self, timeout: float | None = WAIT_STATE_TIMEOUT) -> None:
+        """Wait until no error is latched (after clear_errors(), or someone pressing Clear Errors). 2026-10-15."""
+        self.wait(lambda s: not s.get("err") and not s.get("errors"), timeout, "wait_error_reset")
+
+    def errors(self) -> list[dict]:
+        """The latched errors from the latest status: [{"key", "number", "title", "level", "since"}] (2026-10-15;
+        [] when clean). `key` is "J3:WATCHDOG" style; the number and title are the catalog's (docs/error_codes.md)."""
+        return list(self.status().get("error_details") or [])
+
     # ------------------------------------------------------------------ #
     # Data queries (immediate, never block)
     # ------------------------------------------------------------------ #
@@ -1210,6 +1221,29 @@ class RobotClient:
     def get_pose(self) -> list[float]:
         """TCP pose [x, y, z, rx, ry, rz]."""
         return self._immediate("get_pose")
+
+    def get_health(self) -> dict:
+        """The robot's health summary (2026-10-15): {"level": "OK" | "WARN" | "ERROR" | "STALE", "components":
+        [{"name", "level", "summary", "values"}]} — the control loop, CAN, drives, errors, homing, the executor, the
+        self-collision worker, the processes, disk, memory, CPU temperature, the clock."""
+        return self._immediate("get_health")
+
+    def set_log_level(self, name: str, level: str) -> Any:
+        """Set one logger's level on the robot without a restart (2026-10-15): `name` from docs/logging.md "Logger
+        names" ("rti.can", "exec.planner", ...), `level` DEBUG / INFO / WARNING / ERROR. Applied in RTI and the
+        executor; not persisted (a restart returns to INFO)."""
+        return self._immediate("set_log_level", [str(name), str(level).upper()])
+
+    def capture_telemetry(self, seconds: float = 10.0, name: str = "") -> Any:
+        """Record `seconds` (1-60) of the robot's per-tick channels into a file on the robot
+        (temp_data/captures/<UTC time>_<name>.npz; the dashboard's Recordings tab > Captures shows and downloads it; the
+        activity log says CAPTURE_SAVED when it is done). The loop does no extra work. 2026-10-15."""
+        return self._immediate("capture_telemetry", [float(seconds), str(name)])
+
+    def stop_capture(self) -> Any:
+        """End the running capture now: the robot saves what it has recorded so far (the activity log says
+        CAPTURE_SAVED, "stopped early"; CAPTURE_REFUSED when none runs). 2026-10-16."""
+        return self._immediate("stop_capture")
 
     def get_status(self) -> dict:
         """One-shot status query over TCP: mode, state, homed, error_active, joints."""

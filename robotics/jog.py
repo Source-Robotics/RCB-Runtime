@@ -180,6 +180,7 @@ class JogHandler:
         # formatted on the tick.
         self._activity_logger    = get_rti_activity_logger()
         self._jog_session_active = False
+        self._cmd_id = None              # the jog command's id for JOG_STARTED (set_jog)
         self._limit_msg = [(f"axis={i} direction=-1", f"axis={i} direction=+1") for i in range(joint_num)]
         self._sc_msg = [(f"axis={i} direction=-1 self-collision", f"axis={i} direction=+1 self-collision") for i in range(joint_num)]
 
@@ -205,10 +206,12 @@ class JogHandler:
     # External interface — called from RTI.py ZMQ command handler
     # -------------------------------------------------------------------------
 
-    def set_jog(self, axis: int, direction: int, speed_pct: float):
-        """Jog one joint: `direction` +1 / -1 (0 = stop), speed as a fraction of that joint's velocity limit."""
+    def set_jog(self, axis: int, direction: int, speed_pct: float, cmd_id=None):
+        """Jog one joint: `direction` +1 / -1 (0 = stop), speed as a fraction of that joint's velocity limit.
+        `cmd_id`: the jog command's id, for the activity log's JOG_STARTED / JOG_STOPPED (2026-10-15)."""
+        self._cmd_id = cmd_id
         if direction == 0:
-            self.stop_jog()
+            self.stop_jog(cmd_id)
             return
         vec = self._tmp
         vec[:] = 0.0
@@ -221,14 +224,15 @@ class JogHandler:
         self._jog_axis, self._jog_direction = axis, (1 if direction > 0 else -1)
         self._request(vec, speed_pct, f"axis={axis} direction={self._jog_direction:+d}")
 
-    def set_jog_vector(self, direction, speed_pct: float):
+    def set_jog_vector(self, direction, speed_pct: float, cmd_id=None):
         """Jog several joints at once: `direction` is any joint-space vector (normalised here); the speed is a fraction
         of the fastest speed along it that keeps every moving joint within its own velocity limit. Stops at the
         nearer of the soft limits and the self-collision margin along that ray, exactly like a single-joint jog."""
+        self._cmd_id = cmd_id
         d = np.asarray(direction, dtype=np.float64)[:self.joint_num]
         norm = float(np.linalg.norm(d))
         if norm < 1e-9:
-            self.stop_jog()
+            self.stop_jog(cmd_id)
             return
         for i in range(self.joint_num):
             if self._blocked_dir[i] != 0:
@@ -246,15 +250,15 @@ class JogHandler:
             self._shared_data.rti['jog_speed_pct'][0] = self._jog_speed_pct
         if not self._jog_session_active:
             self._jog_session_active = True
-            log_activity(self._activity_logger, "RTI", "info", "JOG_STARTED",
+            log_activity(self._activity_logger, "RTI", "info", "JOG_STARTED", id=self._cmd_id,
                          message=f"{what} speed_pct={self._jog_speed_pct:.2f}")
 
-    def stop_jog(self):
+    def stop_jog(self, cmd_id=None):
         self._want_on = False
         # The indicator stays (a release does not unblock: pressing the same direction again stays at the limit).
         if self._jog_session_active:
             self._jog_session_active = False
-            log_activity(self._activity_logger, "RTI", "info", "JOG_STOPPED",
+            log_activity(self._activity_logger, "RTI", "info", "JOG_STOPPED", id=cmd_id,
                          message=f"axis={self._jog_axis}")
 
     def _compute_accel(self, accel_time):

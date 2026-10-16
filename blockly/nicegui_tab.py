@@ -10,7 +10,7 @@ Remove: delete the add_blockly_tab lines and the 'Blocks' tab in nicegui_test.py
 """
 from nicegui import run, ui
 
-from blockly import runs
+from blockly import run_records, runs
 from blockly.server import mount
 
 
@@ -25,6 +25,50 @@ def add_blockly_tab(app, tabs, tab_name, height="calc(100vh - 170px)"):
     frame.set_visibility(_tab_name(tabs.value) == tab_name)
     tabs.on_value_change(lambda e: frame.set_visibility(_tab_name(e.value) == tab_name))
     return frame
+
+
+def add_runs_card(tabs, tab_name, fmt_time, limit=20):
+    """The program run history under the editor (blockly/run_records.py, 2026-10-15): the newest `limit` runs —
+    program, start, duration, result, blocks, the error — shown only while the tab `tab_name` is selected, re-read
+    every 5 s then. Call it right after add_blockly_tab. Returns (the expansion, its refresh) for the nets."""
+    columns = [{"name": "program", "label": "Program", "field": "program", "align": "left"},
+               {"name": "started", "label": "Started", "field": "started", "align": "left"},
+               {"name": "duration", "label": "Duration", "field": "duration", "align": "right"},
+               {"name": "result", "label": "Result", "field": "result", "align": "left"},
+               {"name": "blocks", "label": "Blocks", "field": "blocks", "align": "right"},
+               {"name": "error", "label": "Error", "field": "error", "align": "left"}]
+    with ui.expansion("Program runs (the newest 20; every run is a file in logs/block_runs/)", icon="history")             .classes("w-full") as box:
+        table = ui.table(columns=columns, rows=[], row_key="file").classes("w-full").props("dense flat")
+    box.set_visibility(_tab_name(tabs.value) == tab_name)
+    tabs.on_value_change(lambda e: box.set_visibility(_tab_name(e.value) == tab_name))
+    shown = {"rows": None}
+
+    def refresh():
+        if not box.visible:
+            return
+        rows = run_rows(run_records.history(limit), fmt_time)
+        if rows == shown["rows"]:
+            return
+        shown["rows"] = rows
+        table.rows = rows
+        table.update()
+
+    ui.timer(5.0, refresh)
+    refresh()
+    return box, refresh
+
+
+def run_rows(history, fmt_time):
+    """Table rows from run_records.history()."""
+    out = []
+    for h in history:
+        err = h.get("error") or {}
+        out.append({"file": h["file"], "program": h.get("program"),
+                    "started": fmt_time(h["started"]) if h.get("started") else "",
+                    "duration": f"{h['duration_s']:.1f} s" if h.get("duration_s") is not None else "",
+                    "result": h.get("result"), "blocks": h.get("blocks") if h.get("blocks") is not None else "",
+                    "error": (f"{err.get('code')}: {err.get('message')}" if isinstance(err, dict) and err.get("code") else "")})
+    return out
 
 
 def _tab_name(value):

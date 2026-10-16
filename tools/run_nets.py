@@ -26,6 +26,9 @@ RULES IT ENFORCES
      ratchets it (temp_data/coverage/html). A failed net is rerun once: a pass then is reported FLAKY (and logged in
      temp_data/quality/flaky_history.tsv). A full run regenerates docs/test_catalog.md. --audit adds the known-
      vulnerability audit (report only). The policy for new features: docs/testing.md "Testing policy".
+  7. (2026-10-16) Every process it starts is capped at MEM_CAP_MB of address space (RLIMIT_AS, set on the runner and
+     inherited): a net that allocates without bound gets a MemoryError instead of running the Pi out of memory
+     (that day a mutant allocated ~3 GB; the Pi — 4 GB, no swap — stalled RTI 194 s). --mem-cap-mb 0 = no cap.
 
 Exit code 0 only when every net and every check pass. The summary is also written to temp_data/nets/last_run.txt.
 """
@@ -35,6 +38,7 @@ import glob
 import json
 import os
 import re
+import resource
 import shutil
 import socket
 import subprocess
@@ -46,6 +50,7 @@ import quality                                     # tools/quality.py (same fold
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NETS_DIR = os.path.join(ROOT, "dummy_test_scripts")
 OUT_DIR = os.path.join(ROOT, "temp_data", "nets")
+NET_SITE = os.path.join(ROOT, "tools", "net_site")     # its sitecustomize.py points tempfile at the net's folder
 RUFF_BASELINE = os.path.join(ROOT, "temp_data", "ruff_baseline.txt")
 # The runtime source: ONE list for ruff, the static checks and the import map (tools/quality.py) — ruff covered
 # less until 2026-10-13 (not blockly/, sim/, the self-collision worker, six gui_*.py: 0 findings there).
@@ -55,6 +60,8 @@ SOURCE_PKGS = tuple(quality.RUNTIME_PKGS)
 # mentions "FAILED" must not count). Tracebacks in the output are NOT a failure signal: a crash gives a non-zero
 # exit anyway, while several nets print tracebacks on purpose (a handler raising "boom" to test the intake guard)
 # or at exit (CPython's resource_tracker complaining about a segment the net unlinked itself).
+# The address-space cap per process (rule 7). The whole suite passed under 1.5 GB on 2026-10-16.
+MEM_CAP_MB = 1500
 FAIL_MARKERS = re.compile(r"(?m)^\s*(?:(?!0 )\d+ (?:failed|FAILED|FAILURE)|FAILED\b|FAILURES:|\[FAIL\]|FAIL\s{2,}|"
                           r"PLAN ERROR|RESULT: (?!ALL)\S*FAIL)")
 # A CPU-time budget skips itself only under coverage (dummy_test_scripts/_timing.py); in a plain run that line means
@@ -105,7 +112,15 @@ def run_one(path, index, timeout, coverage=False):
     # RCB_LOGS_DIR (project_paths): the test's logs in a folder of its own, never the robot's logs/ (2026-10-13)
     logs = os.path.join(OUT_DIR, "logs", name)
     shutil.rmtree(logs, ignore_errors=True)
-    env = dict(os.environ, RCB_SHM_PREFIX=prefix, PYTHONUNBUFFERED="1", PYTHONPATH=ROOT, RCB_LOGS_DIR=logs)
+    # The net's temporary files (tempfile.mkdtemp & co.) in a folder of its own, deleted when the net passes and kept
+    # until its next run when it fails — they piled up in /tmp, on the SD card, before (2026-10-15). RCB_TMPDIR, read
+    # by tools/net_site/sitecustomize.py (first on PYTHONPATH): python3 here has a file capability, so the C library
+    # drops TMPDIR from its environment at start. TMPDIR is set as well, for whatever else a net runs.
+    tmp = os.path.join(OUT_DIR, "tmp", name)
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    env = dict(os.environ, RCB_SHM_PREFIX=prefix, PYTHONUNBUFFERED="1", PYTHONPATH=os.pathsep.join((NET_SITE, ROOT)),
+               RCB_LOGS_DIR=logs, RCB_TMPDIR=tmp, TMPDIR=tmp)
     cmd = [sys.executable, path]
     if coverage:                                       # measured: lines + branches, its subprocesses too
         cmd = quality.coverage_command(path)
@@ -124,6 +139,8 @@ def run_one(path, index, timeout, coverage=False):
             rc, why = -1, f"TIMEOUT after {timeout:.0f} s"
     dt = time.perf_counter() - t0
     leaked = unlink_prefixed(prefix)
+    if rc == 0:
+        shutil.rmtree(tmp, ignore_errors=True)       # a failed net keeps its temporary files for a look
     out = open(log, errors="replace").read()
     marker = FAIL_MARKERS.search(out)
     if rc == 0 and marker:
@@ -204,6 +221,19 @@ def coverage_map(nets):
     return [m for m in mods if not any(i == m or i.startswith(m + ".") for i in imported)]
 
 
+def apply_memory_cap(mb):
+    """Cap this process's address space at `mb` MB (0 / None: no cap); every child inherits it. Returns the cap in
+    bytes, or None."""
+    if not mb:
+        return None
+    _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    cap = int(mb) * 1024 * 1024
+    if hard != resource.RLIM_INFINITY:
+        cap = min(cap, hard)
+    resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+    return cap
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", help="run only nets whose file name contains this")
@@ -216,6 +246,8 @@ def main():
     ap.add_argument("--no-static", action="store_true", help="skip mypy / bandit / vulture / radon")
     ap.add_argument("--audit", action="store_true", help="also the known-vulnerability audit (internet; report only)")
     ap.add_argument("--no-rerun", action="store_true", help="do not rerun a failed net once (flaky detection)")
+    ap.add_argument("--mem-cap-mb", type=int, default=MEM_CAP_MB,
+                    help=f"address-space cap per process in MB (default {MEM_CAP_MB}; 0 = no cap)")
     ap.add_argument("--update-baselines", action="store_true",
                     help="accept today's ruff / static / coverage state as the baselines (after review only)")
     args = ap.parse_args()
@@ -235,8 +267,10 @@ def main():
               "the CPU and slow RTI's ticks. --allow-enabled overrides.")
         return 3
     os.makedirs(OUT_DIR, exist_ok=True)
+    cap = apply_memory_cap(args.mem_cap_mb)
     print(f"robot: {state or 'no executor answering'} — running {len(nets)} nets serially at nice 19, "
-          f"RCB_SHM_PREFIX set per net, timeout {args.timeout:.0f} s each\n")
+          f"RCB_SHM_PREFIX set per net, timeout {args.timeout:.0f} s each, "
+          f"{f'memory capped at {cap // 1048576} MB per process' if cap else 'NO memory cap'}\n")
     results = []
     t_all = time.perf_counter()
     if args.coverage:

@@ -23,9 +23,11 @@ from __future__ import annotations
 from typing import Any
 
 import logging
+logger = logging.getLogger("kin")  # docs/logging.md "Logger names"
 import math
 
 import numpy as np
+import utility.quiet_imports  # noqa: F401,E402  # first: imports roboticstoolbox without NumPy's 1.x stderr block
 from roboticstoolbox import DHRobot
 
 
@@ -267,12 +269,12 @@ def attach_pinocchio(rtb_robot: Any) -> Any:
         dyn_model, dyn_data = build_pinocchio_dynamics(rtb_robot)
         rtb_robot.pinocchio_gravity = _make_pinocchio_gravity(dyn_model, dyn_data)
     except Exception as exc:
-        logging.getLogger(__name__).warning("[pinocchio] no dynamics model for gravity (%s) — rtb rne stays", exc)
+        logger.warning("Pinocchio: no dynamics model for gravity (%s) — rtb rne stays", exc)
     # Inertia + Coriolis feedforward (2026-10-10): its own gravity-free model and Data. No model -> no feedforward
     # (mode_dispatch._add_dynamics_ff adds nothing), never a fallback to something slower in the tick.
     try:
         rtb_robot.pinocchio_dynamics_ff = make_pinocchio_dynamics_ff(rtb_robot)
     except Exception as exc:
-        logging.getLogger(__name__).warning("[pinocchio] no dynamics model for inertia / Coriolis feedforward (%s)", exc)
+        logger.warning("Pinocchio: no dynamics model for inertia / Coriolis feedforward (%s)", exc)
 
     return rtb_robot

@@ -36,6 +36,10 @@ sys.path.insert(0, ROOT)
 from project_paths import RTI_LOG, TEMP_DATA_DIR                          # noqa: E402
 from utility.code_version import git_commit                               # noqa: E402
 from utility import sim_mode                                              # noqa: E402
+from utility.logger_setup import parse_line                               # noqa: E402
+from utility.housekeeping import prune_folders                            # noqa: E402
+
+KEEP_RUNS = 30
 sys.path.insert(0, os.path.join(ROOT, "api_tests"))
 from _common import START_POSE_DEG                                        # noqa: E402  (the api_tests' one start pose)
 
@@ -180,10 +184,9 @@ def _rti_code_line():
     except OSError:
         return None, None
     for ln in reversed(lines):
-        if "[RTI] code:" in ln:
-            m = re.search(r"\|\s*([0-9.]+)\s*\|.*\[RTI\] code:\s*(.+)$", ln)
-            if m:
-                return float(m.group(1)), m.group(2).strip()
+        rec = parse_line(ln)        # both line formats: "rti.startup | code: ..." and the older "[RTI] code: ..."
+        if rec is not None and rec["name"] in ("rti", "rti.startup") and rec["message"].startswith("code:"):
+            return rec["time"], rec["message"][len("code:"):].strip()
     return None, None
 
 
@@ -298,6 +301,7 @@ def main():
     stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     run_dir = os.path.join(OUT, f"{stamp}_{(sha or 'nogit')[:8]}")
     os.makedirs(run_dir, exist_ok=True)
+    prune_folders(OUT, KEEP_RUNS)        # the newest KEEP_RUNS run folders (2026-10-15); history.tsv stays
     results = []
     aborted = None
     for name, script, extra, moves, mode in tests:

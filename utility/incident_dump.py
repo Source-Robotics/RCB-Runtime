@@ -1,54 +1,53 @@
 #!/usr/bin/env python3
-"""The last two seconds before a hard error, saved to a file (2026-10-03).
+"""The incident dump and telemetry capture FILES (2026-10-03; written by the recorder process since 2026-10-16).
 
-RTI already keeps 500 ticks of every joint / TCP channel in the `Joint_data` deque (utility/data_init.py) for
-the telemetry recipes. When a HARD error latches (E-stop, CAN_LOST, LOOP_CRITICAL, a safety-monitor stop, a motor
-fault, ...) that history is exactly the evidence every "what happened on that tick" question has needed — and it
-was being overwritten 500 ticks later. Industrial controllers commonly attach the same thing (the last state
-records) to a control error. This saves it to
-`temp_data/incidents/<UTC time>_<tick>_<key>.npz` with every channel as a (ticks, n) array.
+An incident dump is every per-tick channel from 5 s before a hard error latched to 2 s after it; a capture is the same
+channels from 5 s before a request to 1-60 s after it. Both are written by recorder.py (utility/trace_recorder.py)
+from RTI's shared-memory trace (utility/trace_ring.py) — RTI itself does no part of it. This module is the file layer
+every user shares: the recorder saves, the dashboard's Recordings tab lists and loads, api_tests/75 loads.
 
-Cost on the real-time thread: a shallow copy of the deque (500 references, a few microseconds) on the one tick
-the error appears, nothing otherwise. The arrays are stacked and written by a worker thread that yields between
-channels, so it never holds the interpreter for more than one channel — and that thread moves itself OFF the
-real-time core to a normal scheduling class first (`_leave_the_rt_core`): started after `setup_realtime_process`
-it inherits SCHED_FIFO 99 on RTI's core, where a same-priority thread is NOT preempted by the loop's wake-up, and
-the zlib compress of one dump is 36-50 ms of pure CPU (measured on the real 0.84 MB dump). On the arm, 2026-10-07,
-the first real hard error (SELF_COLLISION) was followed 80 ms later by a 31 ms tick and a LOOP_CRITICAL on top of
-it — this. Off the RT core the compress costs the loop nothing (the GIL is released inside zlib); the short Python
-bursts between (one channel each, a sleep after) are the only interpreter time it takes.
-At most one dump per `min_interval_s`, the newest `keep` files kept; none with less than `min_history` ticks of
-history (an error at the very start of a run has nothing to show).
+    temp_data/incidents/<UTC time>_<tick>_<key>.npz   the newest INCIDENT_KEEP
+    temp_data/captures/<UTC time>_<name>.npz          the newest CAPTURE_KEEP
 
-    from utility.incident_dump import IncidentDumper
-    dumper = IncidentDumper(TEMP_DATA_DIR / "incidents")
-    dumper.start()                                # after setup_realtime_process, like the log listener
-    ... process_errors_tick(..., on_hard_error=dumper.hook(Joint_data))
+    from utility.incident_dump import load
+    meta, channels = load(path)      # channels["j_p"].shape == (1750, 6): 5 s before + 2 s after, oldest first
 
-    meta, channels = IncidentDumper.load(path)    # channels["j_p"].shape == (500, 6)
+A file: every channel as an array (ticks, n), scalars (ticks,), the mode as strings; `meta` (JSON): time, time_utc,
+tick (the fault's / the last one), keys (the error keys / the capture's name), ticks, channels, kind ("incident" /
+"capture"), and per kind before_ticks / after_ticks / after_s, or seconds / request_tick / gaps.
+
+`_leave_the_rt_core` stays here for robotics/homing_arms.py's worker thread (a thread started by RTI after its
+real-time setup inherits SCHED_FIFO 99 on RTI's core; it moves itself off).
 """
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
-import queue
-import threading
+import re
 import time
 from pathlib import Path
 
 import numpy as np
 
+from config.cpu_cores import GENERAL_CPU_CORES
+
 _META_KEY = "__meta__"
-_log = logging.getLogger(__name__)
-
-
-from config.cpu_cores import GENERAL_CPU_CORES  # noqa: E402
-OTHER_CORES = tuple(GENERAL_CPU_CORES)   # never RTI's core (3) nor the CAN core (2); see the module docstring
+_log = logging.getLogger("proc")  # docs/logging.md "Logger names" (its one line: a worker thread left at RT priority)
+INCIDENT_KEEP = 20
+INCIDENT_MIN_INTERVAL_S = 10.0   # at most one incident file per 10 s (a second fault inside it shows in the first's after-window)
+INCIDENT_MIN_HISTORY = 50        # ticks before the fault; an error at a run's very start has nothing to show (2026-10-05)
+INCIDENT_BEFORE_S = 5.0
+INCIDENT_AFTER_S = 2.0           # the stop and the settle (a held stop rang ~1 s on the arm)
+CAPTURE_MIN_S = 1.0
+CAPTURE_MAX_S = 60.0
+CAPTURE_KEEP = 10
+OTHER_CORES = tuple(GENERAL_CPU_CORES)   # never RTI's core (3) nor the CAN core (2)
 
 
 def _leave_the_rt_core(cores=OTHER_CORES) -> tuple[int, set] | None:
-    """Called by the writer THREAD on itself (pid 0 = the calling thread on Linux): normal scheduling, off RTI's core.
+    """Called by a worker THREAD on itself (pid 0 = the calling thread on Linux): normal scheduling, off RTI's core.
     Returns (policy, affinity) as set, None when the platform cannot."""
     try:
         wanted = set(cores) & os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else set()
@@ -58,117 +57,68 @@ def _leave_the_rt_core(cores=OTHER_CORES) -> tuple[int, set] | None:
         os.sched_setaffinity(0, wanted)
         return os.sched_getscheduler(0), os.sched_getaffinity(0)
     except (AttributeError, OSError) as exc:                   # pragma: no cover - not Linux, or refused
-        logging.getLogger(__name__).warning("[incident] the dump thread stays at the RT priority: %s", exc)
+        _log.warning("the worker thread stays at the RT priority: %s", exc)
         return None
 
 
-class IncidentDumper:
-    def __init__(self, directory, keep: int = 20, min_interval_s: float = 10.0, chunk_sleep_s: float = 0.001,
-                 min_history: int = 50):
-        self.directory = Path(directory)
-        self.keep = int(keep)
-        self.min_interval_s = float(min_interval_s)
-        self.chunk_sleep_s = float(chunk_sleep_s)
-        self._q = queue.SimpleQueue()
-        self._thread = None
-        self._last_request = float("-inf")
-        self.written = []            # paths written this run (newest last) — for tests and the dashboard
-        self.requested = 0
-        self.dropped = 0             # requests refused by the rate limit
-        # An error with less history than this is not saved (2026-10-05): a fault the drivers carried over from the
-        # last RTI latched at TICK 1 of every start — one tick of history, nothing to see — and each such file took
-        # one of the `keep` slots from a real incident.
-        self.min_history = int(min_history)
-        self.too_early = 0           # requests refused for too little history
+def safe_capture_name(name) -> str:
+    """A capture's file name part: letters, digits, '-' and '_', at most 32 characters; "capture" when empty."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", str(name or "")).strip("-")[:32]
+    return cleaned or "capture"
 
-    # ------------------------------------------------------------------ real-time side
-    def request(self, keys, tick, joint_data) -> bool:
-        """Snapshot `joint_data` (a deque of per-tick dicts) for `keys` at `tick`. Returns False when rate-limited or
-        when there is less than `min_history` ticks of history (checked first: it does not use up the rate limit)."""
-        if len(joint_data) < self.min_history:
-            self.too_early += 1
-            _log.info(f"[incident] {', '.join(str(k) for k in keys)} at tick {tick}: not saved — only "
-                      f"{len(joint_data)} tick(s) of history (< {self.min_history})")
-            return False
-        now = time.monotonic()
-        if now - self._last_request < self.min_interval_s:
-            self.dropped += 1
-            return False
-        self._last_request = now
-        self.requested += 1
-        self._q.put((time.time(), int(tick), tuple(str(k) for k in keys), list(joint_data)))
-        return True
 
-    def hook(self, joint_data):
-        """The callable process_errors_tick(on_hard_error=...) wants: (new_hard_keys, tick) -> request()."""
-        def on_hard_error(keys, tick):
-            self.request(keys, tick, joint_data)
-        return on_hard_error
+def save(directory, wall_time, tick, keys, channels, ticks, kind="incident", keep=INCIDENT_KEEP, extra=None) -> Path:
+    """Write one file atomically (a .tmp first, then renamed) and keep the newest `keep` in `directory`."""
+    meta = {"time": wall_time, "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(wall_time)),
+            "tick": int(tick), "keys": [str(k) for k in keys], "ticks": int(ticks), "channels": sorted(channels),
+            "kind": kind}
+    if extra:
+        meta.update(extra)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    safe = str(keys[0]).replace(":", "-").replace("/", "-") if keys else "error"
+    stamp = time.strftime('%Y%m%d_%H%M%S', time.gmtime(wall_time))
+    path = directory / (f"{stamp}_{safe}.npz" if kind == "capture" else f"{stamp}_{int(tick)}_{safe}.npz")
+    tmp = path.with_suffix(".tmp.npz")
+    np.savez_compressed(tmp, **{_META_KEY: np.array(json.dumps(meta))}, **channels)
+    os.replace(tmp, path)
+    prune(directory, keep)
+    return path
 
-    # ------------------------------------------------------------------ worker side
-    def start(self) -> None:
-        if self._thread is None:
-            self._thread = threading.Thread(target=self._run, name="incident-dump", daemon=True)
-            self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
-        """Write whatever is queued, then return (atexit)."""
-        if self._thread is None:
-            return
-        self._q.put(None)
-        self._thread.join(timeout)
-        self._thread = None
+def prune(directory, keep) -> None:
+    """Keep the newest `keep` .npz files in `directory` (by modification time)."""
+    files = sorted(Path(directory).glob("*.npz"), key=lambda p: p.stat().st_mtime)
+    for old in files[:-keep] if keep > 0 else []:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
-    def _run(self) -> None:
-        _leave_the_rt_core()
-        while True:
-            item = self._q.get()
-            if item is None:
-                return
+
+def list_files(incidents_directory, captures_directory=None):
+    """[{path, name, kind, time (epoch, from the file name), size}] of every incident and capture, newest first."""
+    out = []
+    for directory, kind in ((Path(incidents_directory), "incident"),
+                            (Path(captures_directory) if captures_directory else Path(incidents_directory).parent / "captures",
+                             "capture")):
+        if not directory.is_dir():
+            continue
+        for p in directory.glob("*.npz"):
+            if p.name.endswith(".tmp.npz"):
+                continue
             try:
-                self._write(*item)
-            except Exception as exc:                      # a dump must never take anything else down
-                import logging
-                logging.getLogger(__name__).warning("[incident] dump failed: %s", exc)
+                t = calendar.timegm(time.strptime(p.name[:15], "%Y%m%d_%H%M%S"))
+            except ValueError:
+                t = p.stat().st_mtime
+            out.append({"path": str(p), "name": p.name, "kind": kind, "time": float(t), "size": p.stat().st_size})
+    out.sort(key=lambda f: f["time"], reverse=True)
+    return out
 
-    def _write(self, wall_time, tick, keys, snapshot) -> None:
-        if not snapshot:
-            return
-        channels = {}
-        sample = snapshot[0]
-        for name in sample:
-            values = [d.get(name) for d in snapshot]
-            if isinstance(sample[name], np.ndarray):
-                channels[name] = np.stack([np.asarray(v, dtype=np.float64) for v in values])
-            elif isinstance(sample[name], str):
-                channels[name] = np.array([str(v) for v in values])
-            else:
-                channels[name] = np.asarray(values, dtype=np.float64)
-            time.sleep(self.chunk_sleep_s)                # yield: never hold the interpreter for long
-        meta = {"time": wall_time, "time_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(wall_time)),
-                "tick": tick, "keys": list(keys), "ticks": len(snapshot), "channels": sorted(channels)}
-        self.directory.mkdir(parents=True, exist_ok=True)
-        safe = keys[0].replace(":", "-").replace("/", "-") if keys else "error"
-        path = self.directory / f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime(wall_time))}_{tick}_{safe}.npz"
-        tmp = path.with_suffix(".tmp.npz")
-        np.savez_compressed(tmp, **{_META_KEY: np.array(json.dumps(meta))}, **channels)
-        os.replace(tmp, path)
-        self.written.append(path)
-        self._prune()
 
-    def _prune(self) -> None:
-        files = sorted(self.directory.glob("*.npz"), key=lambda p: p.stat().st_mtime)
-        for old in files[:-self.keep] if self.keep > 0 else []:
-            try:
-                old.unlink()
-            except OSError:
-                pass
-
-    # ------------------------------------------------------------------ reading
-    @staticmethod
-    def load(path):
-        """(meta dict, {channel: array}) of one dump."""
-        with np.load(path, allow_pickle=False) as z:
-            meta = json.loads(str(z[_META_KEY]))
-            channels = {k: z[k] for k in z.files if k != _META_KEY}
-        return meta, channels
+def load(path):
+    """(meta dict, {channel: array}) of one file."""
+    with np.load(path, allow_pickle=False) as z:
+        meta = json.loads(str(z[_META_KEY]))
+        channels = {k: z[k] for k in z.files if k != _META_KEY}
+    return meta, channels

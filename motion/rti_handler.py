@@ -58,7 +58,7 @@ try:
 except ImportError:                                  # pragma: no cover - env dependent
     _RUCKIG_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.handler")  # docs/logging.md "Logger names"
 
 # --------------------------------------------------------------------------- #
 # COMMAND LATENCY — why it is one tick, and what the clock mode buys you.
@@ -661,7 +661,7 @@ class RTIModeHandler:
         self.soft_timeout_ceiling = min(max(_ceil, COMMAND_TIMEOUT_S), MAX_COMMAND_TIMEOUT_S)
         # One line at start-up so the policy in force is visible in RTI.log (and so a restart onto
         # the new code can be CONFIRMED with a grep instead of by running the arm).
-        logger.info("[RTI] Watchdog policy: RTI %.0f ms, tighten-only; SOFT_RTI position-only, widenable "
+        logger.info("Watchdog policy: RTI %.0f ms, tighten-only; SOFT_RTI position-only, widenable "
                     "up to %.0f ms (operator ceiling <safety><max_soft_rti_timeout>)",
                     COMMAND_TIMEOUT_S * 1e3, self.soft_timeout_ceiling * 1e3)
         self._soft_rate_hz = None         # the PC's declared command rate, SOFT_RTI only
@@ -760,7 +760,7 @@ class RTIModeHandler:
         if not _RUCKIG_AVAILABLE:
             self._rk_unavailable = ("the ruckig package is not importable (it is a pinned "
                                     "requirement: `pip install -r requirements.txt`)")
-            logger.error("[RTI] %s — RTI mode cannot claim control with the rate limiter "
+            logger.error("%s — RTI mode cannot claim control with the rate limiter "
                          "enabled.", self._rk_unavailable)
         elif not (np.all(np.isfinite(self.vel_limit)) and
                   np.all(np.isfinite(self.accel_limit)) and
@@ -770,7 +770,7 @@ class RTIModeHandler:
             # to paper over with a made-up number.
             self._rk_unavailable = ("velocity/acceleration/jerk limits are not all finite "
                                     "in the robot XML")
-            logger.error("[RTI] %s — RTI mode cannot claim control with the rate limiter "
+            logger.error("%s — RTI mode cannot claim control with the rate limiter "
                          "enabled. Fix the XML.", self._rk_unavailable)
         else:
             self._rk = Ruckig(joint_num, delta_t)
@@ -839,7 +839,7 @@ class RTIModeHandler:
         if self.sub_state is None:
             # Mode entered without a TCP handshake (e.g. operator set_mode:RTI).
             # Legal: we stream nothing and hold until a PC connects.
-            logger.info("[RTI] Mode entered with no PC paired — holding until rti_connect")
+            logger.info("Mode entered with no PC paired — holding until rti_connect")
         self._publish(ctx)
 
     def exit(self, ctx):
@@ -849,7 +849,7 @@ class RTIModeHandler:
         through rti_claim again, so a stale claim cannot silently re-arm timing rules.
         """
         if self.sub_state in ('control_active', 'stopping_clean', 'stopping_error'):
-            logger.info("[RTI] Left RTI mode while control was claimed — claim dropped")
+            logger.info("Left RTI mode while control was claimed — claim dropped")
             self.sub_state = 'connected'
         self.stopping_counter = 0
         self._publish(ctx)
@@ -866,7 +866,7 @@ class RTIModeHandler:
         self.seq_rx_gaps = 0
         self.last_cmd_tick = current_tick
         self._reset_bandwidth()   # a new session's traffic, not the previous one's
-        logger.info("[RTI] Paired with %s:%s — streaming state", pc_addr[0], pc_addr[1])
+        logger.info("Paired with %s:%s — streaming state", pc_addr[0], pc_addr[1])
 
     def flush_state(self, ctx):
         """Option B (defer_state): send the tick's state packet now — RTI calls it after the CAN commands left and the
@@ -915,7 +915,7 @@ class RTIModeHandler:
         """
         ok, why = self.can_claim()
         if not ok:
-            logger.error("[RTI] rti_claim REFUSED — %s. Fix the install or the robot XML, "
+            logger.error("rti_claim REFUSED — %s. Fix the install or the robot XML, "
                          "or stream with the rate limiter explicitly disabled "
                          "(rti_set_rate_limiter(False)) and accept unfiltered commands.", why)
             return False
@@ -976,7 +976,7 @@ class RTIModeHandler:
         if self._lp_bank is not None:
             self.set_lowpass_filter(self._lp_cutoff_hz)
 
-        logger.info("[RTI] Control claimed — timeout %d ticks, rate limiter %s, start-pose check %s",
+        logger.info("Control claimed — timeout %d ticks, rate limiter %s, start-pose check %s",
                     self.timeout_ticks,
                     "ON" if self.rate_limit_enabled else "OFF",
                     "ON" if self.start_pose_check_enabled else "OFF")
@@ -987,7 +987,7 @@ class RTIModeHandler:
         if self.sub_state != 'control_active':
             return False
         self._begin_stop('stopping_clean')
-        logger.info("[RTI] Clean release requested over TCP")
+        logger.info("Clean release requested over TCP")
         return True
 
     def disconnect(self):
@@ -995,7 +995,7 @@ class RTIModeHandler:
         self.sub_state = None
         self.pc_addr = None
         self.stopping_counter = 0
-        logger.info("[RTI] Unpaired")
+        logger.info("Unpaired")
 
     # ------------------------------------------------------------------ #
     # Per-tick step
@@ -1052,7 +1052,7 @@ class RTIModeHandler:
         if got:
             if self.last_cmd_type == CMD_STOP:
                 self._begin_stop('stopping_clean')
-                logger.info("[RTI] Motion finished by PC")
+                logger.info("Motion finished by PC")
                 return self._step_stopping(ctx)
 
             # Validate the FIRST command of this claim before it can reach a motor.
@@ -1074,7 +1074,7 @@ class RTIModeHandler:
         if not got and (ctx.current_tick - self.last_cmd_tick) > self.timeout_ticks:
             self._begin_stop('stopping_error', link_lost=True)
             logger.warning(
-                "[RTI] No command for %d ticks (limit %d) — braking to rest, then latching RTI_LINK_LOST",
+                "No command for %d ticks (limit %d) — braking to rest, then latching RTI_LINK_LOST",
                 ctx.current_tick - self.last_cmd_tick, self.timeout_ticks)
             return self._step_stopping(ctx)
 
@@ -1097,9 +1097,9 @@ class RTIModeHandler:
             was = self.sub_state
             self.sub_state = 'connected'
             if was == 'stopping_clean':
-                logger.info("[RTI] Clean stop complete — back to connected")
+                logger.info("Clean stop complete — back to connected")
             else:
-                logger.warning("[RTI] Error stop complete — back to connected, error latched")
+                logger.warning("Error stop complete — back to connected, error latched")
         return self._hold(ctx)
 
     # ------------------------------------------------------------------ #
@@ -1833,7 +1833,7 @@ class RTIModeHandler:
             # the f-string and the log call are fine here.
             self._rk_errors += 1
             if self._rk_errors == 1:
-                logger.error("[RTI] Ruckig rejected a setpoint (non-finite command?) — "
+                logger.error("Ruckig rejected a setpoint (non-finite command?) — "
                              "holding position. Further occurrences are counted, not logged.")
             return self._rl_q
 
@@ -1967,7 +1967,7 @@ class RTIModeHandler:
         RTI_NO_SEND_TIME (once: the stop has begun, later packets are not read)."""
         if self.sub_state != 'control_active':
             return
-        logger.error("[RTI] Hard-RTI position command without the PC's send time (a 101-byte packet, or one not finite) — refused, "
+        logger.error("Hard-RTI position command without the PC's send time (a 101-byte packet, or one not finite) — refused, "
                      "braking to rest. Hard RTI follows the PC's own timing: keep send times on (RTIClient's "
                      "default), or use SOFT_RTI (rti_connect with a rate) for a sender without them.")
         self._begin_stop('stopping_error', errors=("RTI_NO_SEND_TIME",))
@@ -1995,7 +1995,7 @@ class RTIModeHandler:
                 why.append(f"J{j + 1} jerk {jerk[j]:.0f} rad/s^3 > {self.jerk_limit[j]:.0f}")
         if not keys:                                       # the masks said so; name the first joint generically
             keys.append("J1:RTI_POSITION_LIMIT" if bad_pos else "J1:RTI_VELOCITY_LIMIT")
-        logger.error("[RTI] Command refused (%s) — braking to rest: %s", ", ".join(keys), "; ".join(why))
+        logger.error("Command refused (%s) — braking to rest: %s", ", ".join(keys), "; ".join(why))
         self._begin_stop('stopping_error', errors=tuple(keys))
         return True
 
@@ -2189,7 +2189,7 @@ class RTIModeHandler:
         except Exception:
             self._rk_errors += 1
             if self._rk_errors == 1:
-                logger.error("[RTI] Ruckig rejected a setpoint (non-finite command?) — "
+                logger.error("Ruckig rejected a setpoint (non-finite command?) — "
                              "holding position. Further occurrences are counted, not logged.")
             return self._rl_q
         out = self._rl_out
@@ -2415,7 +2415,7 @@ class RTIModeHandler:
             worst = int(np.argmax(self._rl_tmp_v))
             if self._rl_tmp_v[worst] > self.start_pose_tol_rad:
                 logger.error(
-                    "[RTI] START POSE REJECTED — joint %d commanded %.4f rad but arm is at "
+                    "START POSE REJECTED — joint %d commanded %.4f rad but arm is at "
                     "%.4f rad (%.4f off, tolerance %.4f). Refusing control; send the CURRENT "
                     "pose as your first setpoint.",
                     worst, self._payload[worst], measured[worst],
@@ -2429,7 +2429,7 @@ class RTIModeHandler:
             if bad.any():
                 worst = int(np.argmax(np.abs(self._payload)))
                 logger.error(
-                    "[RTI] START VELOCITY REJECTED — joint %d commanded %.4f rad/s as its "
+                    "START VELOCITY REJECTED — joint %d commanded %.4f rad/s as its "
                     "FIRST setpoint (limit %.4f). The arm is at rest; ramp up from zero.",
                     worst, self._payload[worst], budget[worst])
                 return False
@@ -2441,7 +2441,7 @@ class RTIModeHandler:
             if bad.any():
                 worst = int(np.argmax(np.abs(self._payload)))
                 logger.error(
-                    "[RTI] START TORQUE REJECTED — joint %d commanded %.4f Nm as its FIRST "
+                    "START TORQUE REJECTED — joint %d commanded %.4f Nm as its FIRST "
                     "setpoint (limit %.4f). Ramp up from zero.",
                     worst, self._payload[worst], budget[worst])
                 return False
@@ -2452,12 +2452,12 @@ class RTIModeHandler:
     def set_rate_limiter(self, enabled):
         """Runtime toggle (plan §11c). OFF streams the PC's commands through untouched."""
         self.rate_limit_enabled = bool(enabled)
-        logger.warning("[RTI] Rate limiter %s", "ENABLED" if enabled else "DISABLED")
+        (logger.info if enabled else logger.warning)("Rate limiter %s", "ENABLED" if enabled else "DISABLED")
 
     def set_start_pose_check(self, enabled):
         """Runtime toggle. OFF means a bad first setpoint reaches the motors."""
         self.start_pose_check_enabled = bool(enabled)
-        logger.warning("[RTI] Start-pose check %s", "ENABLED" if enabled else "DISABLED")
+        (logger.info if enabled else logger.warning)("Start-pose check %s", "ENABLED" if enabled else "DISABLED")
 
     def set_gravity_comp(self, enabled):
         """RTI-scoped gravity-compensation toggle (default ON).
@@ -2468,7 +2468,7 @@ class RTIModeHandler:
         disconnects; the robot-wide flag still wins over this one if the operator has it off.
         """
         self.gravity_comp_enabled = bool(enabled)
-        logger.warning("[RTI] Gravity compensation %s", "ENABLED" if enabled else "DISABLED")
+        logger.info("Gravity compensation %s", "ENABLED" if enabled else "DISABLED")
 
     def set_dynamics_ff_source(self, name):
         """Inertia / Coriolis feedforward source for RTI / SOFT_RTI position streams: "stream" (the stream's own
@@ -2476,12 +2476,12 @@ class RTIModeHandler:
         inertia / Coriolis switches still apply on top. An unknown name is refused and leaves the source unchanged."""
         key = str(name).strip().lower()
         if key not in DYNAMICS_FF_SOURCES:
-            logger.warning("[RTI] rti_set_dynamics_ff refused: %r — known: %s; source stays %r",
+            logger.warning("rti_set_dynamics_ff refused: %r — known: %s; source stays %r",
                            name, ", ".join(DYNAMICS_FF_SOURCES), self.dynamics_ff_source)
             return False
         self.dynamics_ff_source = key
         self._reset_stream_acceleration(self._trk_cmd_tick)
-        logger.warning("[RTI] Dynamics feedforward source: %s", key.upper())
+        logger.info("Dynamics feedforward source: %s", key.upper())
         return True
 
     def _reset_stream_acceleration(self, current_tick):
@@ -2554,7 +2554,7 @@ class RTIModeHandler:
             self.set_pace(0.0)
             self.set_min_duration(0.0)
             self._state_every = 1     # hard RTI closes the loop per tick; it needs every one
-            logger.warning("[RTI] Contract: HARD real-time. One setpoint per %.0f ms tick; "
+            logger.info("Contract: HARD real-time. One setpoint per %.0f ms tick; "
                            "ripple is 0%% here and always was.", self.delta_t * 1e3)
             return
 
@@ -2562,12 +2562,12 @@ class RTIModeHandler:
             try:
                 hz = float(rate_hz)
             except (TypeError, ValueError):
-                logger.warning("[RTI] SOFT_RTI: rate is not a number: %r — timeout left "
+                logger.warning("SOFT_RTI: rate is not a number: %r — timeout left "
                                "unchanged", rate_hz)
                 hz = None
             else:
                 if not np.isfinite(hz) or hz <= 0.0:
-                    logger.warning("[RTI] SOFT_RTI: rate %r is not a positive finite Hz — "
+                    logger.warning("SOFT_RTI: rate %r is not a positive finite Hz — "
                                    "timeout left unchanged", rate_hz)
                     hz = None
         else:
@@ -2583,7 +2583,7 @@ class RTIModeHandler:
         if hz is not None:
             self.set_command_timeout(3.0 / hz)
         self.set_servo_generator(SERVO_ADVANCING)
-        logger.warning("[RTI] Contract: SOFT real-time. The ROBOT fills in between your "
+        logger.info("Contract: SOFT real-time. The ROBOT fills in between your "
                        "targets. %s Prefer a rate that divides into %.0f Hz (50, 25, 10) — "
                        "a non-integer ratio corrupts every velocity estimate taken from "
                        "the stream.",
@@ -2605,7 +2605,7 @@ class RTIModeHandler:
         if self._rk is None or self._rk_in.synchronization == mode:
             return
         self._rk_in.synchronization = mode
-        logger.warning("[RTI] Ruckig synchronization -> %s. %s",
+        logger.info("Ruckig synchronization -> %s. %s",
                        "TIME" if mode == Synchronization.Time else "NONE",
                        "Joints now share one trajectory duration (coordinated motion)."
                        if mode == Synchronization.Time else
@@ -2646,33 +2646,33 @@ class RTIModeHandler:
         try:
             requested = float(multiplier)
         except (TypeError, ValueError):
-            logger.warning("[RTI] Minimum duration refused: not a number: %r", multiplier)
+            logger.warning("Minimum duration refused: not a number: %r", multiplier)
             return
         if not np.isfinite(requested) or requested < 0.0:
-            logger.warning("[RTI] Minimum duration refused: %r is not a non-negative finite "
+            logger.warning("Minimum duration refused: %r is not a non-negative finite "
                            "multiple", multiplier)
             return
         if requested == 0.0:
             self.min_duration_mult = 0.0
             self._set_ruckig_sync(Synchronization.No)
-            logger.warning("[RTI] Duration pacing DISABLED (per-joint independence restored)")
+            logger.info("Duration pacing DISABLED (per-joint independence restored)")
             return
 
         value = min(max(requested, MIN_DURATION_MULT_MIN), MIN_DURATION_MULT_MAX)
         if value != requested:
-            logger.warning("[RTI] Duration multiple %.2f outside [%.1f, %.1f] — clamped to "
+            logger.warning("Duration multiple %.2f outside [%.1f, %.1f] — clamped to "
                            "%.2f", requested, MIN_DURATION_MULT_MIN, MIN_DURATION_MULT_MAX,
                            value)
         self.min_duration_mult = value
         self._set_ruckig_sync(Synchronization.Time)
         if value < MIN_DURATION_MULT_SUGGESTED:
-            logger.warning("[RTI] Duration pacing %.2fx — at or near 1x the plan ends as the "
+            logger.warning("Duration pacing %.2fx — at or near 1x the plan ends as the "
                            "next command lands, so its deceleration still runs and the "
                            "velocity still returns to zero. %.1fx or above is where the "
                            "motion actually becomes continuous.",
                            value, MIN_DURATION_MULT_SUGGESTED)
         else:
-            logger.warning("[RTI] Duration pacing %.2fx the measured command interval", value)
+            logger.info("Duration pacing %.2fx the measured command interval", value)
 
     def set_state_rate(self, hz):
         """How often to unicast the recipe payload to the PC. 0 = every tick (the default).
@@ -2699,30 +2699,30 @@ class RTIModeHandler:
         # and in hard RTI the PC closes the loop every tick, so a reduced state rate silently
         # breaks the one guarantee that contract makes. Same reasoning as refusing TCP there.
         if not self.soft_mode:
-            logger.warning("[RTI] rti_set_state_rate is refused in hard RTI: you close the "
+            logger.warning("rti_set_state_rate is refused in hard RTI: you close the "
                            "loop every tick, so you need state every tick. Reconnect with "
                            "a rate_hz for SOFT_RTI if you want to throttle it.")
             return
         try:
             v = float(hz)
         except (TypeError, ValueError):
-            logger.warning("[RTI] state rate: not a number: %r", hz)
+            logger.warning("state rate: not a number: %r", hz)
             return
         if not np.isfinite(v) or v <= 0.0:
             self._state_every = 1
-            logger.warning("[RTI] State rate: every tick (%.0f Hz)", 1.0 / self.delta_t)
+            logger.info("State rate: every tick (%.0f Hz)", 1.0 / self.delta_t)
             return
         loop_hz = 1.0 / self.delta_t
         clamped = min(max(v, STATE_RATE_MIN_HZ), loop_hz)
         if clamped != v:
-            logger.warning("[RTI] State rate %.1f Hz outside [%.0f, %.0f] — clamped to %.1f. "
+            logger.warning("State rate %.1f Hz outside [%.0f, %.0f] — clamped to %.1f. "
                            "The floor exists because the state stream is the PC's only way "
                            "to notice the robot has left RTI mode.",
                            v, STATE_RATE_MIN_HZ, loop_hz, clamped)
         # A whole number of ticks, so the spacing is exact rather than drifting — the same
         # reason the command rate wants an integer ratio (servo_mode_options.md 15.1).
         self._state_every = max(1, int(round(loop_hz / clamped)))
-        logger.warning("[RTI] State rate -> every %d ticks (%.1f Hz), was every tick",
+        logger.info("State rate -> every %d ticks (%.1f Hz), was every tick",
                        self._state_every, loop_hz / self._state_every)
 
     def set_pace(self, factor):
@@ -2751,23 +2751,23 @@ class RTIModeHandler:
         try:
             requested = float(factor)
         except (TypeError, ValueError):
-            logger.warning("[RTI] Velocity pacing refused: not a number: %r", factor)
+            logger.warning("Velocity pacing refused: not a number: %r", factor)
             return
         if not np.isfinite(requested) or requested < 0.0:
-            logger.warning("[RTI] Velocity pacing refused: %r is not a non-negative finite "
+            logger.warning("Velocity pacing refused: %r is not a non-negative finite "
                            "factor", factor)
             return
         if requested == 0.0:
             self.pace_factor = 0.0
-            logger.warning("[RTI] Auto velocity pacing DISABLED")
+            logger.info("Auto velocity pacing DISABLED")
             return
         value = min(requested, PACE_FACTOR_MAX)
         if value != requested:
-            logger.warning("[RTI] Pacing factor %.2f above the %.1f ceiling — clamped. A "
+            logger.warning("Pacing factor %.2f above the %.1f ceiling — clamped. A "
                            "factor that large never binds anyway.", requested,
                            PACE_FACTOR_MAX)
         self.pace_factor = value
-        logger.warning("[RTI] Auto velocity pacing at %.2fx the measured target speed "
+        logger.info("Auto velocity pacing at %.2fx the measured target speed "
                        "(floor %.3f rad/s)", value, PACE_FLOOR_RAD_S)
 
     def set_servo_generator(self, name, gain=None, lookahead=None, self_lookahead=None):
@@ -2796,15 +2796,15 @@ class RTIModeHandler:
         """
         key = str(name).strip().lower()
         if key not in SERVO_GENERATORS:
-            logger.warning("[RTI] Servo generator refused: %r is not one of %s",
+            logger.warning("Servo generator refused: %r is not one of %s",
                            name, ", ".join(SERVO_GENERATORS))
             return
         if key == SERVO_PASSTHROUGH and self.soft_mode:
-            logger.warning("[RTI] Servo generator 'passthrough' refused in SOFT_RTI: it replays a target EVERY tick "
+            logger.warning("Servo generator 'passthrough' refused in SOFT_RTI: it replays a target EVERY tick "
                            "(hard RTI); sparse targets need a generator that fills in between them.")
             return
         if key == SERVO_TRACKER and self.rate_limit_enabled is False:
-            logger.warning("[RTI] Servo generator 'tracker' selected while the rate limiter "
+            logger.warning("Servo generator 'tracker' selected while the rate limiter "
                            "is OFF — the limiter-off path streams commands through "
                            "unshaped, so NO generator runs at all. Re-enable the rate "
                            "limiter for the tracker to have any effect.")
@@ -2813,17 +2813,17 @@ class RTIModeHandler:
             try:
                 g = float(gain)
             except (TypeError, ValueError):
-                logger.warning("[RTI] Servo generator: gain is not a number: %r", gain)
+                logger.warning("Servo generator: gain is not a number: %r", gain)
                 return
             if not np.isfinite(g):
-                logger.warning("[RTI] Servo generator: gain %r is not finite", gain)
+                logger.warning("Servo generator: gain %r is not finite", gain)
                 return
             clamped = min(max(g, TRACKER_GAIN_MIN), TRACKER_GAIN_MAX)
             if clamped != g:
-                logger.warning("[RTI] Tracker gain %.2f outside [%.1f, %.1f] — clamped to "
+                logger.warning("Tracker gain %.2f outside [%.1f, %.1f] — clamped to "
                                "%.2f", g, TRACKER_GAIN_MIN, TRACKER_GAIN_MAX, clamped)
             if clamped > TRACKER_GAIN_OVERSHOOT_WARN:
-                logger.warning("[RTI] Tracker gain %.1f is above %.0f — on a large STEP the "
+                logger.warning("Tracker gain %.1f is above %.0f — on a large STEP the "
                                "law saturates on acceleration and overshoots (measured 22%% "
                                "at gain 25, 46%% at gain 40 for a 0.5 rad step). Fine for a "
                                "smooth stream; use 'ruckig' for point-to-point.",
@@ -2837,11 +2837,11 @@ class RTIModeHandler:
             try:
                 la = float(lookahead)
             except (TypeError, ValueError):
-                logger.warning("[RTI] Servo generator: lookahead is not a number: %r",
+                logger.warning("Servo generator: lookahead is not a number: %r",
                                lookahead)
                 return
             if not np.isfinite(la):
-                logger.warning("[RTI] Servo generator: lookahead %r is not finite", lookahead)
+                logger.warning("Servo generator: lookahead %r is not finite", lookahead)
                 return
             self.tracker_lookahead = min(max(la, 0.0), TRACKER_LOOKAHEAD_MAX)
 
@@ -2849,11 +2849,11 @@ class RTIModeHandler:
             try:
                 sl = float(self_lookahead)
             except (TypeError, ValueError):
-                logger.warning("[RTI] Servo generator: self_lookahead is not a number: %r",
+                logger.warning("Servo generator: self_lookahead is not a number: %r",
                                self_lookahead)
                 return
             if not np.isfinite(sl):
-                logger.warning("[RTI] Servo generator: self_lookahead %r is not finite",
+                logger.warning("Servo generator: self_lookahead %r is not finite",
                                self_lookahead)
                 return
             self.tracker_self_lookahead = min(max(sl, 0.0), TRACKER_LOOKAHEAD_MAX)
@@ -2862,18 +2862,18 @@ class RTIModeHandler:
         self.servo_generator = key
         self._pt_reset(self.last_cmd_tick)
         if key == SERVO_TRACKER:
-            logger.warning("[RTI] Servo generator -> TRACKER (gain %.2f rad/s, lookahead "
+            logger.info("Servo generator -> TRACKER (gain %.2f rad/s, lookahead "
                            "%.4f s). A servo law, not a planner: prefer 'ruckig' for "
                            "point-to-point moves.",
                            self.tracker_gain, self.tracker_lookahead)
         elif key == SERVO_ADVANCING:
-            logger.warning("[RTI] Servo generator -> RUCKIG_ADVANCING (planner aimed at the "
+            logger.info("Servo generator -> RUCKIG_ADVANCING (planner aimed at the "
                            "moving target; exact arrival kept, ripple removed)")
         elif key == SERVO_PASSTHROUGH:
-            logger.warning("[RTI] Servo generator -> PASSTHROUGH (hard RTI's default: stamped targets replayed "
+            logger.info("Servo generator -> PASSTHROUGH (hard RTI's default: stamped targets replayed "
                            "exactly, ~1 tick; a position without a send time is refused)")
         else:
-            logger.warning("[RTI] Servo generator -> RUCKIG (plans to stop at every target)")
+            logger.info("Servo generator -> RUCKIG (plans to stop at every target)")
 
     def timeout_ceiling(self):
         """The most the watchdog may be set to RIGHT NOW, in seconds.
@@ -2917,10 +2917,10 @@ class RTIModeHandler:
         try:
             requested = float(seconds)
         except (TypeError, ValueError):
-            logger.warning("[RTI] Command timeout refused: not a number: %r", seconds)
+            logger.warning("Command timeout refused: not a number: %r", seconds)
             return None
         if not np.isfinite(requested):
-            logger.warning("[RTI] Command timeout refused: %r is not finite", seconds)
+            logger.warning("Command timeout refused: %r is not finite", seconds)
             return None
 
         floor = 2.0 * self.delta_t
@@ -2929,7 +2929,7 @@ class RTIModeHandler:
         if value != requested:
             if requested > ceiling:
                 logger.warning(
-                    "[RTI] Command timeout %.4f s exceeds the %s limit of %.3f s — clamped to %.4f s. %s",
+                    "Command timeout %.4f s exceeds the %s limit of %.3f s — clamped to %.4f s. %s",
                     requested, "SOFT_RTI operator" if self.soft_mode else "RTI",
                     ceiling,  value,
                     "(Widen <safety><max_soft_rti_timeout> in the robot XML to allow more.)"
@@ -2937,14 +2937,14 @@ class RTIModeHandler:
                     "(Hard RTI's watchdog can only be tightened: a stale velocity/torque command "
                     "keeps driving for the whole window.)")
             else:
-                logger.warning("[RTI] Command timeout %.4f s is below the floor of %.4f s — "
+                logger.warning("Command timeout %.4f s is below the floor of %.4f s — "
                                "clamped to %.4f s", requested, floor, value)
 
         self.timeout_ticks = max(1, int(round(value / self.delta_t)))
         # Kept derived, as in __init__: a fixed warn threshold would silently become
         # "warn exactly when we stop" the moment the timeout is shortened here.
         self.miss_warn_ticks = max(2, self.timeout_ticks // 2)
-        logger.warning("[RTI] Command timeout %.4f s (%d ticks) — supports a PC rate down "
+        logger.info("Command timeout %.4f s (%d ticks) — supports a PC rate down "
                        "to ~%.1f Hz", value, self.timeout_ticks, 1.0 / value)
         return value
 
@@ -2980,21 +2980,21 @@ class RTIModeHandler:
         try:
             requested = float(fraction)
         except (TypeError, ValueError):
-            logger.warning("[RTI] Velocity scale refused: not a number: %r", fraction)
+            logger.warning("Velocity scale refused: not a number: %r", fraction)
             return
         if not np.isfinite(requested) or requested <= 0.0:
-            logger.warning("[RTI] Velocity scale refused: %r is not a positive finite "
+            logger.warning("Velocity scale refused: %r is not a positive finite "
                            "fraction", fraction)
             return
 
         if requested > 1.0:
-            logger.warning("[RTI] Velocity scale %.3f would RAISE the RTI velocity limit "
+            logger.warning("Velocity scale %.3f would RAISE the RTI velocity limit "
                            "above the robot XML value — clamped to 1.0. Raise "
                            "<rti_limits><velocity> in the robot XML if you need more.",
                            requested)
             value = 1.0
         elif requested < MIN_VEL_SCALE:
-            logger.warning("[RTI] Velocity scale %.4f is below the %.2f floor — clamped. "
+            logger.warning("Velocity scale %.4f is below the %.2f floor — clamped. "
                            "Use a stop, not a scale, to hold the arm still.",
                            requested, MIN_VEL_SCALE)
             value = MIN_VEL_SCALE
@@ -3017,7 +3017,7 @@ class RTIModeHandler:
             # cap is recomputed before _rk.update() on every tick it applies to.
             self._tcp_cap_applied = False
 
-        logger.warning("[RTI] RTI velocity scale %.3f — max %.3f rad/s (XML %.3f rad/s)",
+        logger.info("RTI velocity scale %.3f — max %.3f rad/s (XML %.3f rad/s)",
                        value, float(np.max(self.vel_limit)),
                        float(np.max(self._vel_limit_base)))
 
@@ -3031,7 +3031,7 @@ class RTIModeHandler:
         cap to scale. That asymmetry is inherent, not an oversight.
         """
         self.tcp_vel_limit = max(0.0, float(mps))
-        logger.warning("[RTI] TCP velocity limit %s",
+        logger.info("TCP velocity limit %s",
                        f"{self.tcp_vel_limit:.3f} m/s" if self.tcp_vel_limit > 0
                        else "DISABLED")
 
@@ -3051,7 +3051,7 @@ class RTIModeHandler:
         if robot is None:
             if not self._tcp_warned:
                 self._tcp_warned = True
-                logger.error("[RTI] TCP velocity limit is set but no robot model is "
+                logger.error("TCP velocity limit is set but no robot model is "
                              "available — the cap is INERT. ctx.robot is None.")
             return None
         try:
@@ -3064,7 +3064,7 @@ class RTIModeHandler:
         except Exception:
             if not self._tcp_warned:
                 self._tcp_warned = True
-                logger.exception("[RTI] TCP velocity limit: Jacobian computation failed — "
+                logger.exception("TCP velocity limit: Jacobian computation failed — "
                                  "the cap is INERT until this is fixed.")
             return None
 
@@ -3079,10 +3079,10 @@ class RTIModeHandler:
         if cutoff <= 0.0:
             self._lp_bank = None
             self._lp_cutoff_hz = 0.0
-            logger.warning("[RTI] Command low-pass DISABLED")
+            logger.info("Command low-pass DISABLED")
             return
         if cutoff >= nyquist:
-            logger.warning("[RTI] Low-pass cutoff %.1f Hz is at/above Nyquist (%.1f Hz) — "
+            logger.warning("Low-pass cutoff %.1f Hz is at/above Nyquist (%.1f Hz) — "
                            "disabling instead of pretending to filter", cutoff, nyquist)
             self._lp_bank = None
             self._lp_cutoff_hz = 0.0
@@ -3097,7 +3097,7 @@ class RTIModeHandler:
         self._lp_bank = create_filter_bank({"kind": "butter2", "tau": tau}, self.joint_num,
                                            self.delta_t)
         self._lp_cutoff_hz = cutoff
-        logger.warning("[RTI] Command low-pass ENABLED at %.1f Hz (tau %.4f s)", cutoff, tau)
+        logger.info("Command low-pass ENABLED at %.1f Hz (tau %.4f s)", cutoff, tau)
 
     def _apply_lowpass(self, x):
         """Filter an incoming command vector in place-ish. Returns the array to use."""
@@ -3128,7 +3128,7 @@ class RTIModeHandler:
             self._soft_refused += 1
             if self._soft_refused == 1:               # once per session — never per tick
                 logger.warning(
-                    "[RTI] SOFT_RTI accepts position targets only; refusing a %s packet. "
+                    "SOFT_RTI accepts position targets only; refusing a %s packet. "
                     "Velocity/torque streaming needs hard RTI (rti_connect without a rate), "
                     "whose 40 ms watchdog is what makes a stale command safe.",
                     "velocity" if cmd_type == CMD_JOINT_VELOCITY else
@@ -3195,7 +3195,7 @@ class RTIModeHandler:
                 self.worst_consecutive_misses = self.consecutive_misses
             if self.consecutive_misses >= self.miss_warn_ticks and not self._miss_warned:
                 logger.warning(
-                    "[RTI] %d consecutive ticks with no command (%.0f ms) — link stalling; "
+                    "%d consecutive ticks with no command (%.0f ms) — link stalling; "
                     "%d more and control stops",
                     self.consecutive_misses, self.consecutive_misses * self.delta_t * 1e3,
                     self.timeout_ticks - self.consecutive_misses)
@@ -3217,12 +3217,12 @@ class RTIModeHandler:
 
         # Latch the warning level so a bad link logs twice, not 250x/second.
         if self.success_rate < self.success_bad and self._warned_at < 2:
-            logger.warning("[RTI] Poor packet success rate: %.1f%% over the last %d ticks "
+            logger.warning("Poor packet success rate: %.1f%% over the last %d ticks "
                            "— control unreliable",
                            self.success_rate * 100.0, self.success_window_ticks)
             self._warned_at = 2
         elif self.success_rate < self.success_warn and self._warned_at < 1:
-            logger.warning("[RTI] Some packets lost: %.1f%% over the last %d ticks "
+            logger.warning("Some packets lost: %.1f%% over the last %d ticks "
                            "— check network",
                            self.success_rate * 100.0, self.success_window_ticks)
             self._warned_at = 1
@@ -3293,4 +3293,4 @@ class RTIModeHandler:
         except OSError as exc:
             # Transient send failure (unreachable host, buffer full). Never kill the
             # RT loop over it; the PC-side timeout is the real backstop.
-            logger.warning("[RTI] State send failed: %s", exc)
+            logger.warning("State send failed: %s", exc)

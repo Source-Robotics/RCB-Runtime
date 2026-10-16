@@ -14,12 +14,32 @@ class RobotTimeout(RobotError):
 
 
 class CommandRejected(RobotError):
-    """The robot rejected or failed a command (status == 'error')."""
+    """The robot rejected or failed a command (status == 'error').
 
-    def __init__(self, code, message):
+    `code` and `message` as before; since 2026-10-15 also the catalog's `number`, `title` and `fix` when the robot
+    sent them (docs/error_codes.md): `str(exc)` reads "[6003 BAD_ARGS] Invalid arguments: <message> Fix: ...".
+    """
+
+    def __init__(self, code, message, number=None, title=None, fix=None):
         self.code = code
         self.message = message
-        super().__init__(f"[{code}] {message}")
+        self.number = number
+        self.title = title
+        self.fix = fix
+        super().__init__(format_error(code, message, number, title, fix))
+
+
+def format_error(code, message, number=None, title=None, fix=None):
+    """One line for a person: "[6003 BAD_ARGS] Invalid arguments: the message. Fix: ...". Without the catalog
+    fields (an older robot): "[BAD_ARGS] the message"."""
+    head = f"[{number} {code}]" if number is not None else f"[{code}]"
+    body = str(message or "")
+    if title and title.lower() not in body.lower():
+        body = f"{title}: {body}" if body else title
+    text = f"{head} {body}".rstrip()
+    if fix:
+        text += (" " if text.endswith((".", "!", "?")) else ". ") + f"Fix: {fix}"
+    return text
 
 
 class MotionFailed(RobotError):
@@ -30,13 +50,15 @@ class MotionFailed(RobotError):
     after the "queued" ack, so the caller has already moved on — they surface at
     the next wait_idle().
 
-    `failures` is a list of {"id", "code", "message"} dicts, in arrival order.
+    `failures` is a list of {"id", "code", "message"} dicts, in arrival order — with "number", "title" and "fix"
+    when the robot sent them (2026-10-15).
     """
 
     def __init__(self, failures):
         self.failures = list(failures)
         n = len(self.failures)
-        detail = "; ".join(f"{f['id']}: [{f['code']}] {f['message']}" for f in self.failures)
+        detail = "; ".join(f"{f['id']}: " + format_error(f.get("code"), f.get("message"), f.get("number"),
+                                                        f.get("title"), f.get("fix")) for f in self.failures)
         noun = "command" if n == 1 else "commands"
         super().__init__(f"{n} queued motion {noun} failed — {detail}")
 

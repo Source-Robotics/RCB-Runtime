@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+logger = logging.getLogger("sc")  # docs/logging.md "Logger names"
 import math
 import os
 
@@ -70,7 +71,7 @@ def load_geometry(robots_dir, grippers_dir, robot_cfg: dict) -> tuple[dict, dict
     gf = robot_cfg.get("gripper_collision", {}).get("file")
     tool_geo = json.load(open(os.path.join(grippers_dir, gf))) if gf else None
     if tool_geo is None:
-        logging.warning(f"[SELF-COLLISION] the gripper XML ({robot_cfg.get('gripper_name', '?')}) names no <collision file=...>: "
+        logger.warning(f"the gripper XML ({robot_cfg.get('gripper_name', '?')}) names no <collision file=...>: "
                         f"the TOOL is not checked against the arm — only the arm's own links are")
     return robot_geo, tool_geo
 
@@ -193,7 +194,7 @@ class SelfCollisionModel:
         # now would keep reading "collision". So the pairs flagged last time are cleared before every call (few), and
         # the results are scanned only when the callback saw any collision (rare) — the common tick reads one flag.
         self._last_hit_idx = {which: [] for which in self.margins}
-        logging.info(f"[SELF-COLLISION] {self.geom.ngeoms} convex pieces ({'with' if tool_geo else 'without'} the tool), "
+        logger.info(f"{self.geom.ngeoms} convex pieces ({'with' if tool_geo else 'without'} the tool), "
                      f"{self.n_pairs} piece pairs over {len(set(self.pair_frames))} link pairs; margins planner "
                      f"{1e3 * pm:g} mm / jog {1e3 * min(pm, max(mm, jm)):g} mm / monitor {1e3 * mm:g} mm"
                      + (f"; jaws MEASURED ({len(jaw_list)}, stroke {1e3 * self.jaw_strokes.max():.1f} mm, band {1e3 * self.jaw_band_m:g} mm)"

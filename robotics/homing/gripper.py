@@ -3,6 +3,7 @@
 # (dummy_test_scripts/test_homing_golden.py) proves the behaviour unchanged.
 
 import logging
+logger = logging.getLogger("rti.homing")  # docs/logging.md "Logger names"
 
 from robotics.homing.status import STATUS_DONE, STATUS_FAILED, STATUS_RUNNING
 
@@ -88,10 +89,10 @@ class GripperHomingState:
         if not self._sent_cmd:
             if hasattr(motor, 'Send_gripper_calibrate'):
                 motor.Send_gripper_calibrate()
-                logging.info(f"[Homing] {self._label} firmware calibrate sent")
+                logger.info(f"{self._label} firmware calibrate sent")
             else:
-                logging.error(
-                    f"[Homing] {self._label} motor object has no "
+                logger.error(
+                    f"{self._label} motor object has no "
                     f"Send_gripper_calibrate method"
                 )
                 self.fail_reason = "its driver object cannot send a firmware calibration"
@@ -108,8 +109,8 @@ class GripperHomingState:
         if self._tick_count >= self._min_wait_ticks:
             calibrated = getattr(motor, 'gripper_calibrated', None)
             if calibrated is not None and int(calibrated) == 1:
-                logging.info(
-                    f"[Homing] {self._label} firmware calibration done "
+                logger.info(
+                    f"{self._label} firmware calibration done "
                     f"(tick={self._tick_count})"
                 )
                 shared_data.rti["homing_status"][self.j] = STATUS_DONE
@@ -122,8 +123,8 @@ class GripperHomingState:
         if self._tick_count > self._timeout_ticks:
             self.fail_reason = (f"its firmware calibration did not finish within {self.timeout_s:.1f} s — check that the "
                                 f"jaws can move freely and the gripper is powered")
-            logging.error(
-                f"[Homing] {self._label} firmware calibration timed out "
+            logger.error(
+                f"{self._label} firmware calibration timed out "
                 f"({self.timeout_s:.1f} s)"
             )
             shared_data.rti["homing_status"][self.j] = STATUS_FAILED

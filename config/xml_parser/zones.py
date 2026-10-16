@@ -8,6 +8,7 @@ Split out of the single-file config/xml_parser.py on 2026-10-03 (refactor Phase 
 from __future__ import annotations
 
 import logging
+logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -112,17 +113,17 @@ def _parse_haptic_walls(elem: ET.Element | None) -> dict:
         try:
             val = int(text) if isinstance(default, int) else float(text)
         except ValueError:
-            logging.warning("[system.xml] <haptic_walls><%s> is not a number (%r) — using %s", key, text, default)
+            logger.warning("system.xml <haptic_walls><%s> is not a number (%r) — using %s", key, text, default)
             continue
         lo, hi = _HAPTIC_BOUNDS[key]
         if not (lo <= val <= hi):
-            logging.warning("[system.xml] <haptic_walls><%s> = %s is outside [%s, %s] — using %s", key, val, lo, hi, default)
+            logger.warning("system.xml <haptic_walls><%s> = %s is outside [%s, %s] — using %s", key, val, lo, hi, default)
             continue
         out[key] = val
     k, d, tau = out["stiffness"], out["damping"], out["velocity_tau"]
     win = haptic_damping_window(k, tau)
     if win is None or not (win[0] <= d <= win[1]):
-        logging.warning("[system.xml] <haptic_walls> stiffness %s N/m, damping %s N.s/m, filter %.0f ms is outside the "
+        logger.warning("system.xml <haptic_walls> stiffness %s N/m, damping %s N.s/m, filter %.0f ms is outside the "
                         "region simulated stable (%s) — using %s / %s / %s ms", k, d, 1000 * tau,
                         "no stable damping at that stiffness/filter" if win is None else f"damping {win[0]:g}-{win[1]:g}",
                         _HAPTIC_FALLBACK["stiffness"], _HAPTIC_FALLBACK["damping"], 1000 * _HAPTIC_FALLBACK["velocity_tau"])

@@ -31,7 +31,7 @@ from pathlib import Path
 
 from utility.signal_filters import FILTER_KINDS, create_filter_bank
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("filters")  # docs/logging.md "Logger names"
 
 # Signals grouped by channel count: per-joint (joint_num), the 6-DOF Cartesian signals, and
 # the single-channel gripper.
@@ -166,9 +166,9 @@ def load_filter_banks(path: str | Path, joint_num: int, dt: float) -> tuple[dict
             banks = build_filter_banks(config, joint_num, dt)
             return banks, str(path)
         except (ET.ParseError, ValueError, OSError) as e:
-            logger.error(f"[filters] '{path}' invalid ({e}) — falling back to default filters")
+            logger.error(f"'{path}' invalid ({e}) — falling back to default filters")
     else:
-        logger.info("[filters] no filter config file — using default filters")
+        logger.info("no filter config file — using default filters")
     banks = build_filter_banks(
         {s: [dict(default_filter_config()[s])] * _channels(s, joint_num)
          for s in ALL_SIGNALS},

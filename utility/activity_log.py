@@ -10,7 +10,7 @@ Description:
     routine events (jog start/stop, mode changes, limits). See
     TODO/activity_log_design.md for the full design and rationale.
 
-    This module owns the entry shape, the code->{cause, fix} catalog, and the
+    This module owns the entry shape (the catalog itself is utility/error_catalog.py), and the
     two dedicated loggers (activity_rti / activity_exec). It does not decide
     *when* to log — emission call sites live in RTI.py, error_checks.py,
     command_executor.py, and motion/trajectory_planner.py.
@@ -23,115 +23,84 @@ Dependencies: json, logging, os, time
 import json
 import logging
 import os
+import threading
 import time
+from collections import OrderedDict
 from logging.handlers import QueueHandler, RotatingFileHandler
 
-from project_paths import ACTIVITY_RTI_LOG, ACTIVITY_EXEC_LOG
-from utility.error_catalog import ERROR_DESCRIPTIONS
+from project_paths import ACTIVITY_RTI_LOG, ACTIVITY_EXEC_LOG, ACTIVITY_REC_LOG
+from utility.error_catalog import CATALOG as _CATALOG, entry as _catalog_entry
 
 
 # ---------------------------------------------------------------------------
-# Catalog — code -> {"cause": str|None, "fix": str|None}.
-#
-# RTI hardware-fault codes already live in error_catalog.ERROR_DESCRIPTIONS
-# (that's the existing source of truth for those); this dict covers
-# everything else — EXEC's command lifecycle/rejection/planner codes and
-# RTI's routine (non-fault) events. get_catalog_entry() checks both.
+# The catalog — code -> {number, title, cause, effect, fix}: ONE dict for every code since 2026-10-15
+# (utility/error_catalog.CATALOG; until then the RTI fault keys and the rest lived in two dicts).
 # ---------------------------------------------------------------------------
-_FALLBACK = {"cause": None, "fix": "not yet documented — check logs/high_level.log for detail."}
-
-CATALOG = {
-    # EXEC — command lifecycle (info; nothing to explain)
-    "CMD_QUEUED":    {"cause": None, "fix": None},
-    "CMD_STARTED":   {"cause": None, "fix": None},
-    "CMD_COMPLETED": {"cause": None, "fix": None},
-    "CMD_EXECUTED":  {"cause": None, "fix": None},
-
-    # EXEC — rejection codes (warning) — reused verbatim from the reply's own "code" field
-    "BAD_ARGS":      {"cause": "command arguments failed validation.", "fix": "check the command's argument count/types and retry."},
-    "QUEUE_FULL":    {"cause": "the motion queue is full.", "fix": "wait for queued commands to complete, or clear the queue, then retry."},
-    "BAD_PIN":       {"cause": "referenced an invalid/out-of-range digital IO pin.", "fix": "check the pin number against the robot's IO configuration."},
-    "UNKNOWN_CMD":   {"cause": "command name is not recognized.", "fix": "check spelling/casing against the command reference."},
-    "BAD_JSON":      {"cause": "message was not valid JSON.", "fix": "check the client's wire-protocol encoding."},
-    "FORBIDDEN":     {"cause": "command is not allowed in the current mode/state.", "fix": "check the robot's current mode before sending this command."},
-    "BAD_OPTIONS":   {"cause": "per-command motion options failed validation.", "fix": "check profile/speed/blend/completion_policy values against allowed ranges."},
-    "BAD_PROFILE":   {"cause": "requested trajectory profile is not recognized.", "fix": "check the profile name against the supported list."},
-    "BAD_IK_SOLVER": {"cause": "requested IK solver is not recognized.", "fix": "check the solver name against the supported list."},
-    "BAD_POLICY":    {"cause": "requested completion policy is not recognized.", "fix": "use one of: commanded, settled, strict."},
-    "UNHANDLED":     {"cause": "an unexpected exception occurred while handling the command.", "fix": "check logs/high_level.log for the full traceback."},
-    "REJECTED":      {"cause": None, "fix": None},
-
-    # EXEC — planner/motion failures (error)
-    "IK_TARGET_UNREACHABLE": {"cause": "requested pose is outside the arm's reachable workspace.", "fix": "check the target pose against the robot's reach/joint limits."},
-    "IK_PARTIAL_PATH":       {"cause": "IK solver could only satisfy part of the requested Cartesian path.", "fix": "shorten the path or move the target closer to a reachable region."},
-    "IK_MARGIN_VIOLATION":   {"cause": "solved path passed too close to a joint or singularity margin.", "fix": "adjust the target pose or relax the margin, if appropriate."},
-    "IK_POSE_ERROR":         {"cause": "solved joint configuration does not reproduce the requested pose within tolerance.", "fix": "check for a nearby singularity or an unreachable orientation."},
-    "PLAN_FAIL":              {"cause": "trajectory planning failed.", "fix": "check logs/high_level.log for the underlying planner error."},
-    "GRIPPER_TIMEOUT":        {"cause": "gripper did not respond in time.", "fix": "check gripper CAN wiring/power."},
-    "SEND_TIMEOUT":           {"cause": "command reply was not sent in time.", "fix": "check the client connection."},
-    "SUPERSEDED":             {"cause": None, "fix": None},
-    "TOPPRA_UNAVAILABLE":     {"cause": "TOPPRA profile was requested but the toppra package is not importable.", "fix": "install toppra, or select a different profile (trapezoid/quintic/s_curve)."},
-    "TOPPRA_INFEASIBLE":      {"cause": "TOPPRA could not compute a valid time-parameterization for this path.", "fix": "check the requested speed/accel limits, or select a different profile."},
-
-    # EXEC — a stop RTI did not confirm (2026-10-14): command_executor fell back to the old stop, IDLE
-    "STOP_FALLBACK":          {"cause": "RTI did not confirm the controlled stop within 1.5 s — RTI runs code from before "
-                                        "2026-10-14 (restart only the GUI / executor?), or the planner's stop fence was lost "
-                                        "(RTI not draining the trajectory socket).",
-                               "fix": "the robot went to IDLE instead (the arm braked first if RTI started the stop). "
-                                      "Restart the service so RTI and the executor run the same code; if it recurs, "
-                                      "check logs/RTI.log for the [EXEC] stop line and logs/high_level.log."},
-
-    # EXEC — warning (not a failure, planning still succeeds)
-    "IK_SINGULARITY_WARNING": {"cause": "planned path passes near a kinematic singularity.", "fix": "check the singularity metrics; consider an alternate path if this recurs."},
-
-    # RTI — routine events (info; nothing to explain)
-    "MODE_CHANGE":         {"cause": None, "fix": None},
-    "JOG_STARTED":         {"cause": None, "fix": None},
-    "JOG_STOPPED":         {"cause": None, "fix": None},
-    "LIMIT_CLEARED":       {"cause": None, "fix": None},
-    "COMPENSATION_CHANGED": {"cause": None, "fix": None},
-
-    # RTI — routine warning
-    "LIMIT_REACHED": {"cause": "jog motion blocked by a joint/workspace limit.", "fix": "jog away from the limit to clear it."},
-}
+CATALOG = _CATALOG
+_FALLBACK = {"number": None, "title": None, "cause": None, "effect": None,
+             "fix": "Not catalogued yet: check the logs in the Logs tab for the detail."}
 
 
 def get_catalog_entry(code: str) -> dict:
-    """Look up {cause, fix} for a code.
+    """{number, title, cause, effect, fix} of a code; the not-yet-catalogued fallback for an unknown one
+    (dummy_test_scripts/test_error_catalog.py keeps every emitted code catalogued)."""
+    return _catalog_entry(code) or _FALLBACK
 
-    RTI hardware-fault codes (short_keys from error_catalog.ERROR_DESCRIPTIONS)
-    take priority since that's their existing source of truth; falls back to
-    this module's CATALOG, then to the generic not-yet-documented fallback.
 
-    (The catalog is a leaf module since 2026-10-03, so this import is at module level — the former
-    in-function import worked around the error_checks <-> activity_log cycle.)
+# ---------------------------------------------------------------------------
+# Who asked: the ORIGIN of a command's entries (2026-10-15). The executor learns each client's name (the
+# robotclient sends it with every message — "dashboard", "pick_place.py on lab-pc") and records origin per command
+# id here; RTI records the origin that comes with each forwarded command. Every entry of that id — queued, started,
+# completed, the mode change it caused — then carries it. A process remembers the last ORIGINS_KEPT ids.
+# ---------------------------------------------------------------------------
+ORIGINS_KEPT = 2000
+_origins: OrderedDict[str, str] = OrderedDict()
+_origins_lock = threading.Lock()
+
+
+def note_origin(cid, origin):
+    """Remember who sent command `cid` (None / empty: nothing to remember)."""
+    if not cid or not origin:
+        return
+    with _origins_lock:
+        _origins[cid] = origin
+        _origins.move_to_end(cid)
+        while len(_origins) > ORIGINS_KEPT:
+            _origins.popitem(last=False)
+
+
+def origin_of(cid):
+    """The origin recorded for command `cid`, or None."""
+    if not cid:
+        return None
+    with _origins_lock:
+        return _origins.get(cid)
+
+
+def format_entry(source, level, code, id=None, command=None, message=None, context=None, origin=None):
+    """Build one activity-log entry dict — the entry shape from the design doc, extended 2026-10-15.
+
+    number / title: the catalog's, for every code. cause / effect / fix: only for warning / error (an info entry has
+    nothing to explain). origin: who asked — given, else what was recorded for `id`, else null (the robot or the
+    executor itself). `context` is only populated for CMD_STARTED (the resolved MotionOptions for that command).
     """
-    if code in ERROR_DESCRIPTIONS:
-        return ERROR_DESCRIPTIONS[code]
-    return CATALOG.get(code, _FALLBACK)
-
-
-def format_entry(source, level, code, id=None, command=None, message=None, context=None):
-    """Build one activity-log entry dict — the entry shape from the design doc.
-
-    cause/fix are only populated for warning/error levels; info entries have
-    nothing to explain and stay null. `context` is only populated for
-    CMD_STARTED (the resolved MotionOptions for that command) — see
-    TODO/activity_log_design.md's context-field discussion.
-    """
-    cause = fix = None
+    cat = get_catalog_entry(code)
+    cause = effect = fix = None
     if level in ("warning", "error"):
-        entry = get_catalog_entry(code)
-        cause, fix = entry.get("cause"), entry.get("fix")
+        cause, effect, fix = cat.get("cause"), cat.get("effect"), cat.get("fix")
     return {
         "timestamp": time.time(),
         "source": source,
+        "origin": origin or origin_of(id),
         "level": level,
+        "number": cat.get("number"),
         "code": code,
+        "title": cat.get("title"),
         "id": id,
         "command": command,
         "message": message,
         "cause": cause,
+        "effect": effect,
         "fix": fix,
         "context": context,
     }
@@ -171,7 +140,8 @@ def _queue_logger(name: str, logger: logging.Logger) -> None:
         h.addFilter(_only_logger(name))
         _LISTENER.handlers = (*_LISTENER.handlers, h)
     if not any(isinstance(h, QueueHandler) for h in logger.handlers):
-        logger.addHandler(QueueHandler(_QUEUE))
+        from utility.logger_setup import BoundedQueueHandler   # the same cap as the root's (2026-10-15)
+        logger.addHandler(BoundedQueueHandler(_QUEUE))
 
 
 def route_through_queue(q, listener) -> None:
@@ -212,15 +182,21 @@ def get_rti_activity_logger(log_file: str = str(ACTIVITY_RTI_LOG)) -> logging.Lo
     return _get_activity_logger("activity_rti", log_file, max_bytes=2_000_000)
 
 
+def get_rec_activity_logger(log_file: str = str(ACTIVITY_REC_LOG)) -> logging.Logger:
+    """The recorder's activity logger (recorder.py, 2026-10-16): its captures — a handful of entries a day."""
+    return _get_activity_logger("activity_rec", log_file, max_bytes=2_000_000)
+
+
 def get_exec_activity_logger(log_file: str = str(ACTIVITY_EXEC_LOG)) -> logging.Logger:
     """EXEC's activity logger. Volume scales with command throughput, which
     has no natural ceiling, so this file gets a larger rotation size."""
     return _get_activity_logger("activity_exec", log_file, max_bytes=20_000_000)
 
 
-def log_activity(logger: logging.Logger, source, level, code, id=None, command=None, message=None, context=None):
+def log_activity(logger: logging.Logger, source, level, code, id=None, command=None, message=None, context=None,
+                 origin=None):
     """Format one entry and write it as a single JSON line."""
-    entry = format_entry(source, level, code, id=id, command=command, message=message, context=context)
+    entry = format_entry(source, level, code, id=id, command=command, message=message, context=context, origin=origin)
     line = json.dumps(entry)
     getattr(logger, level)(line)
     return entry

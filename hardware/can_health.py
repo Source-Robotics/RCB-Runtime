@@ -25,7 +25,7 @@ happened. This module reads them so the fault leaves evidence.
 import logging
 import subprocess
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sup.can_link")  # docs/logging.md "Logger names"
 
 # Header emitted by `ip -details -statistics link show`, in order. The value line
 # that follows carries these six counters first, then unrelated queue fields.

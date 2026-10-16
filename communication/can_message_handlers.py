@@ -28,7 +28,8 @@ from utility.data_init import (
     process_motor_kt
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rti.can")  # docs/logging.md "Logger names"
+log_startup = logging.getLogger("rti.startup")  # docs/logging.md "Logger names"
 
 # Safety bound on how many CAN frames one tick may drain. NOT a target: the RX loop exits on
 # the first empty read, which in steady state is after ~8 frames (6 joints + gripper + 1
@@ -148,7 +149,7 @@ def handle_motor_reconnect(
             reload_pending[i] = True
             if tick - reload_last_tick[i] < cooldown_ticks:
                 name = f"Motor J{i + 1}" if i < joint_num else "Gripper"
-                logger.warning(f"[RTI] {name} went stale and recovered again within "
+                logger.warning(f"{name} went stale and recovered again within "
                                f"{cooldown_ticks} ticks of its last config reload — next reload deferred "
                                f"(many nodes at once = a host-side CAN stall, e.g. memory starvation)")
         prev_old_data_warning[i] = _cur_warn
@@ -172,7 +173,6 @@ def handle_motor_reconnect(
 def _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_velocity_limit, motor_Ilim,
                   motor_KPP, motor_KP, motor_KD, motor_KPIQ, motor_KIIQ, motor_KPV, motor_KIV, motor_voltage_limit):
     """Re-send one joint's config after it recovered (handle_motor_reconnect's storm guard decides when)."""
-    logger.info(f"[RTI] Motor J{i+1} reconnected — reloading config.")
     load_motor_configs(Motor,
                        joint_num=joint_num,
                        watchdog_rate=motor_watchdog_rate,
@@ -194,14 +194,13 @@ def _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_v
         Ilim=motor_Ilim, velocity_limit=motor_velocity_limit,
         voltage_limit=motor_voltage_limit,
     )
-    logger.info(f"[RTI] Motor J{i+1} config reload done.")
+    logger.info(f"Motor J{i+1} reconnected — config reloaded")   # one line per reload (was two, 2026-10-15)
 
 
 def _reload_gripper(shared_data, Motor, joint_num, gripper_watchdog_rate, gripper_velocity_limit, gripper_Ilim,
                     gripper_voltage_limit, gripper_KP, gripper_KD, gripper_KPIQ, gripper_KIIQ, gripper_KPV,
                     gripper_KIV, gripper_KPP):
     """Re-send the gripper's config after it recovered (handle_motor_reconnect's storm guard decides when)."""
-    logger.info("[RTI] Gripper reconnected — reloading config.")
     load_gripper_configs(Motor,
                          joint_num=joint_num,
                          watchdog_rate=gripper_watchdog_rate,
@@ -222,7 +221,7 @@ def _reload_gripper(shared_data, Motor, joint_num, gripper_watchdog_rate, grippe
         Ilim=gripper_Ilim, velocity_limit=gripper_velocity_limit,
         voltage_limit=gripper_voltage_limit,
     )
-    logger.info("[RTI] Gripper config reload done.")
+    logger.info("Gripper reconnected — config reloaded")   # one line per reload (was two, 2026-10-15)
 
 
 def send_motor_commands(motors, joint_num, positions=None, speeds=None, currents=None, hall_joint=-1):
@@ -984,7 +983,7 @@ def _drain_pending_can_messages(communication, max_messages=64):
             break
         drained += 1
     if drained:
-        logger.info(f"[Startup][Kt] Drained {drained} stale CAN frame(s)")
+        log_startup.info(f"Kt: Drained {drained} stale CAN frame(s)")
 
 
 def _read_kt_for_node(motors, communication, node_id, timeout_s, retries):
@@ -992,8 +991,8 @@ def _read_kt_for_node(motors, communication, node_id, timeout_s, retries):
     for attempt in range(1, retries + 1):
         _drain_pending_can_messages(communication)
         motors[node_id].Send_Respond_Kt()
-        logger.info(
-            f"[Startup][Kt] Requested node {node_id} Kt "
+        log_startup.info(
+            f"Kt: Requested node {node_id} Kt "
             f"(attempt {attempt}/{retries})"
         )
 
@@ -1011,8 +1010,8 @@ def _read_kt_for_node(motors, communication, node_id, timeout_s, retries):
             error_bit = msg_ID[2]
 
             if command_id == _KT_RESPOND_CMD_ID:
-                logger.info(
-                    f"[Startup][Kt] RX id=0x{message.arbitration_id:03X} "
+                log_startup.info(
+                    f"Kt: RX id=0x{message.arbitration_id:03X} "
                     f"node={rx_node_id} cmd={command_id} err={error_bit} "
                     f"dlc={message.dlc} data=[{_format_can_data(message)}]"
                 )
@@ -1023,8 +1022,8 @@ def _read_kt_for_node(motors, communication, node_id, timeout_s, retries):
             motors[rx_node_id].UnpackData(message, msg_ID)
             kt_can = motors[rx_node_id].Kt
             if kt_can is None or kt_can <= 0:
-                logger.warning(
-                    f"[Startup][Kt] Node {node_id} returned invalid Kt={kt_can}; "
+                log_startup.warning(
+                    f"Kt: Node {node_id} returned invalid Kt={kt_can}; "
                     "keeping fallback value"
                 )
                 continue
@@ -1078,8 +1077,8 @@ def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
             break
 
         if fetch_round > 1:
-            logger.info(
-                f"[Startup][Kt] Retrying missing node(s) {pending_nodes} "
+            log_startup.info(
+                f"Kt: Retrying missing node(s) {pending_nodes} "
                 f"after {settle_s:.3f}s settle delay "
                 f"(round {fetch_round}/{rounds})"
             )
@@ -1096,16 +1095,16 @@ def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
         pending_nodes = still_missing
 
     if pending_nodes:
-        logger.warning(
-            f"[Startup][Kt] No CAN Kt response from node(s) {pending_nodes}; "
+        log_startup.warning(
+            f"Kt: No CAN Kt response from node(s) {pending_nodes}; "
             "using XML fallback for those joints"
         )
 
     if gripper_idx is not None:
         for fetch_round in range(1, rounds + 1):
             if fetch_round > 1:
-                logger.info(
-                    f"[Startup][Kt] Retrying gripper node {gripper_idx} "
+                log_startup.info(
+                    f"Kt: Retrying gripper node {gripper_idx} "
                     f"after {settle_s:.3f}s settle delay "
                     f"(round {fetch_round}/{rounds})"
                 )
