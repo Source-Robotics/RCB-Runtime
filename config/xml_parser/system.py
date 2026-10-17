@@ -238,11 +238,16 @@ def _parse_maintenance_defaults(elem: ET.Element | None) -> dict:
 
 
 # Friction compensation POLICY (utility/friction_comp.py; TODO/friction_compensation_plan.md) — robot-independent.
-# The measured friction and gravity error per joint are the ARM's: <friction_sliding_nm> / <gravity_error_nm>
-# (and the breakaway <friction_static_nm>) in the robot XML. The operator switch (dashboard / set_friction_comp) starts OFF at every RTI start.
+# The measured friction and gravity error per joint are the ARM's: <friction_coulomb_nm> (+ <friction_load_per_nm>;
+# the older <friction_sliding_nm> when missing) / <gravity_error_nm> (and the breakaway <friction_static_nm>) in the
+# robot XML, api_tests/77. The operator switch (dashboard / set_friction_comp) starts OFF at every RTI start.
 _FRICTION_COMP_FALLBACK = {
     "fraction":       0.5,     # of (sliding friction - gravity error) given back: below friction -> still passive
-    "sliding_ratio":  0.7,     # a joint with no <friction_sliding_nm>: sliding friction = this x its breakaway
+    "sliding_ratio":  0.7,     # a joint with no measured sliding friction: sliding friction = this x its breakaway
+    # the share of the friction MODEL (the typical friction, api_tests/77) freedrive relies on: the friction measured
+    # went down to 0.69x the model (J4 at 0 deg; J6 0.84, J5 0.88, J3 0.90, J1 / J2 0.93) — with 0.7 a joint released
+    # while moving still stops wherever its real friction is at least 0.7x the model, at its worst gravity error
+    "model_share":    0.7,
     "band_dps":       2.0,     # deg/s: full compensation beyond this speed, 0 at rest (never breaks a joint loose)
     "fade_start_dps": 20.0,    # deg/s: fading out above this — friction matters most for SLOW motion (fine
     "fade_end_dps":   40.0,    # positioning, stick-slip); gone at this: caps how fast a joint could glide with help
@@ -252,6 +257,7 @@ _FRICTION_COMP_FALLBACK = {
 _FRICTION_COMP_BOUNDS = {
     "fraction":       (0.0, 0.9),
     "sliding_ratio":  (0.3, 1.0),
+    "model_share":    (0.3, 1.0),
     "band_dps":       (0.5, 30.0),
     "fade_start_dps": (5.0, 360.0),
     "fade_end_dps":   (10.0, 720.0),
@@ -261,9 +267,12 @@ _FRICTION_COMP_BOUNDS = {
 def _parse_dynamics_feedforward(elem: ET.Element | None) -> dict:
     """<dynamics_feedforward><inertia>1</inertia><coriolis>1</coriolis></dynamics_feedforward> — the START state of the two
     switches (2026-10-10, user: both ON by default; the dashboard / set_inertia_comp / set_coriolis_comp still switch
-    them at runtime). Missing block, missing key or a value that is not 0/1 -> ON (with a warning for the bad value)."""
-    out = {"inertia": True, "coriolis": True}
+    them at runtime). Missing block, missing key or a value that is not 0/1 -> ON (with a warning for the bad value).
+    <friction> (2026-10-17): the friction feedforward's start state — OFF when missing or not 0/1 (not yet measured on
+    the arm with api_tests/66); <friction_fraction>: the share of the friction model it gives back, [0, 1], default 1."""
+    out: dict[str, bool | float] = {"inertia": True, "coriolis": True}
     if elem is None:
+        out.update(friction=False, friction_fraction=1.0)
         return out
     for key in out:
         text = (elem.findtext(key) or "").strip().lower()
@@ -275,6 +284,21 @@ def _parse_dynamics_feedforward(elem: ET.Element | None) -> dict:
             out[key] = False
         else:
             logger.warning("system.xml <dynamics_feedforward><%s> is not 0/1 (%r) — ON", key, text)
+    text = (elem.findtext("friction") or "").strip().lower()
+    out["friction"] = text in ("1", "true", "on", "yes")
+    if text and text not in ("1", "true", "on", "yes", "0", "false", "off", "no"):
+        logger.warning("system.xml <dynamics_feedforward><friction> is not 0/1 (%r) — OFF", text)
+    text = (elem.findtext("friction_fraction") or "").strip()
+    out["friction_fraction"] = 1.0
+    if text:
+        try:
+            val = float(text)
+        except ValueError:
+            val = None
+        if val is None or not 0.0 <= val <= 1.0:
+            logger.warning("system.xml <dynamics_feedforward><friction_fraction> %r is not in [0, 1] — using 1", text)
+        else:
+            out["friction_fraction"] = val
     return out
 
 
@@ -339,6 +363,12 @@ _SAFETY_MONITOR_FALLBACK = {
     "hold_oscillation_hz":         25.0,
     "hold_oscillation_sustain_s":  1.5,
     "hold_still_dps":              0.5,
+    # Collision detection (2026-10-16): the external torque estimate (momentum observer) minus the baseline taken at rest
+    # before each move, against the robot XML's per-joint <contact_torque_nm> / <collision_torque_nm>; EXEC / JOG / RTI /
+    # SOFT_RTI only. Shipped warn (user: warn-only first, then the normal safety stop); a PC program can switch it.
+    "collision":            "warn",
+    "collision_sustain_s":  0.012,
+    "collision_settle_s":   0.5,
 }
 
 
@@ -359,6 +389,8 @@ _SAFETY_MONITOR_BOUNDS = {
     # under 0.5 s the kick a hold gives as it engages (0.25-0.5 s measured) would warn
     "hold_oscillation_sustain_s":  (0.5, 10.0),
     "hold_still_dps":       (0.05, 5.0),
+    "collision_sustain_s":  (0.001, 0.1),    # the observer already averages over 20 ms; past 0.1 s a collision pushes on
+    "collision_settle_s":   (0.0, 5.0),      # how long after a move the check still runs (the arm settling)
 }
 
 

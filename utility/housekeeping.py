@@ -24,7 +24,9 @@ import shutil
 # The folders of temp_data the api_tests measurement scripts write their runs into (recordings, re-creatable by
 # running the test again). Nothing else is ever deleted by enforce_budget.
 RECORDING_DIRS = ("tracking", "can_gaps", "rti_ff", "exec_brake", "wall_delay", "resonance", "haptic_wall",
-                  "hold_noise", "idle_release", "virtual_box", "friction", "j6_sampling", "monitor_baseline")
+                  "hold_noise", "idle_release", "virtual_box", "friction", "j6_sampling", "monitor_baseline",
+                  "external_torque",       # api_tests/76: the external torque's capture copies (2026-10-16)
+                  "friction_id")           # api_tests/77: friction identification runs (2026-10-16)
 # temp_data folders a script writes that are NOT recordings: kept whole (reference data, their own limits, caches).
 KEPT_DIRS = {"calibration": "the arms' calibration-screw readings (api_tests/65): reference data",
              "self_collision": "the geometry tool's fits and reports: reference data",

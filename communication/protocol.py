@@ -152,7 +152,9 @@ COMMAND_RULES = {
     "friction_comp":    (IMMEDIATE, None, None, False),   # freedrive friction compensation switch (OWNED)
     "inertia_comp":     (IMMEDIATE, None, None, False),   # inertia feedforward switch (OWNED, 2026-10-10)
     "coriolis_comp":    (IMMEDIATE, None, None, False),   # Coriolis feedforward switch (OWNED, 2026-10-10)
+    "friction_ff":      (IMMEDIATE, None, None, False),   # friction feedforward switch (OWNED, 2026-10-17)
     "can_read_first":   (IMMEDIATE, None, None, False),   # RTI reads CAN first, sends early (option B; OWNED, 2026-10-12)
+    "collision_detection": (IMMEDIATE, None, None, False),  # off | warn | stop until RTI restarts (OWNED, 2026-10-16)
     # The Hall sensor check (robotics/hall_check.py, 2026-10-13): the Hall-sensor joint limp, its pin shown live. IDLE
     # only, enabled or not, homed or not (OWNED); RTI stops it itself before any mode change.
     "hall_check":       (IMMEDIATE, ["IDLE"], None, False),

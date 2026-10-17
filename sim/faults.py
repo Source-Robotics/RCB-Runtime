@@ -95,14 +95,22 @@ class Context:
             pass
         return out
 
+    @staticmethod
+    def names_joint(entry, joint):
+        """The entry is about this joint (1-based): its message is "joint <n>", or "joint <n>: <the values>" — RTI puts
+        a fault's measured values after the colon (utility/fault_details.py, 2026-10-15: "joint 1: 38 C"). Its clear
+        ("joint <n>: cleared") is not the event."""
+        msg, head = entry.get("message") or "", f"joint {joint}"
+        return msg == head or (msg.startswith(head + ": ") and msg != head + ": cleared")
+
     def has(self, mark, code, joint=None):
-        """An activity entry with this code since `mark` — for a joint, its message is "joint <n>" (1-based)."""
-        return any(e.get("code") == code and (joint is None or e.get("message") == f"joint {joint}")
+        """An activity entry with this code since `mark` — for a joint, one that names it (names_joint)."""
+        return any(e.get("code") == code and (joint is None or self.names_joint(e, joint))
                    for e in self.activity_since(mark))
 
     def joint_errors(self, mark, joint):
         return [e.get("code") for e in self.activity_since(mark)
-                if e.get("level") == "error" and e.get("message") == f"joint {joint}"]
+                if e.get("level") == "error" and self.names_joint(e, joint)]
 
     def ready(self, robot, home=False):
         """Errors cleared, ENABLED (and homed when asked) — the state every motion scenario starts from."""

@@ -174,11 +174,24 @@
     <dynamics_feedforward>
         <inertia>1</inertia>
         <coriolis>1</coriolis>
+        <!-- Friction feedforward (2026-10-17, utility/friction_model.py): the robot XML's measured friction model
+             (<friction_coulomb_nm> / <friction_viscous_nm_s> / <friction_load_per_nm>, api_tests/77) on the COMMANDED
+             speed, in EXEC / JOG / RTI-SOFT_RTI position and velocity commands — no feedback, so it cannot run away;
+             the drive's own loop corrects whatever is left. OFF at start until api_tests/66 has measured it on the arm
+             (the inertia feedforward's path); robot.set_friction_ff() / the dashboard switch it at runtime.
+             friction_fraction: the share of the model it gives back, 0-1. -->
+        <friction>0</friction>
+        <friction_fraction>1.0</friction_fraction>
     </dynamics_feedforward>
     <friction_comp>
         <fraction>0.5</fraction>
-        <sliding_ratio>0.7</sliding_ratio>   <!-- a joint with no <friction_sliding_nm>: sliding = this x its breakaway
-                                                  (1.0 trusts the breakaway: J5 could then glide, simulated ~28 deg/s) -->
+        <sliding_ratio>0.7</sliding_ratio>   <!-- a joint with no measured sliding friction: sliding = this x its
+                                                  breakaway (1.0 trusts the breakaway: J5 could then glide, simulated ~28 deg/s) -->
+        <model_share>0.7</model_share>       <!-- the share of the robot XML's friction model (the TYPICAL friction,
+                                                  api_tests/77) freedrive relies on: measured friction went down to 0.69x
+                                                  it (J4 at 0 deg, 2026-10-17); a joint released while moving still stops
+                                                  where its friction is at least this x the model, at its worst gravity
+                                                  error. c = fraction x max(0, this x friction - gravity error) -->
         <band_dps>2</band_dps>
         <fade_start_dps>20</fade_start_dps>
         <fade_end_dps>40</fade_end_dps>
@@ -254,6 +267,16 @@
         <hold_oscillation_hz>25</hold_oscillation_hz>
         <hold_oscillation_sustain_s>1.5</hold_oscillation_sustain_s>
         <hold_still_dps>0.5</hold_still_dps>
+        <!-- CONTACT_WARNING / COLLISION (2026-10-16): the external joint torque the momentum observer estimates, minus a
+             baseline taken AT REST before each move, against the robot XML's per-joint <contact_torque_nm> (a live
+             warning) and <collision_torque_nm> (this mode: off | warn | stop — stop = the normal safety stop: a latched
+             error, the robot holds, Clear Errors to go on). Only in EXEC, JOG, RTI and SOFT_RTI, while a joint is
+             commanded faster than hold_still_dps and collision_settle_s after; never in freedrive or homing.
+             warn until normal use shows no false warnings (user, 2026-10-16). A PC program that pushes on purpose
+             switches it: robot.set_collision_detection("off" | "warn" | "stop"), until RTI restarts. -->
+        <collision>warn</collision>
+        <collision_sustain_s>0.012</collision_sustain_s>
+        <collision_settle_s>0.5</collision_settle_s>
     </safety_monitor>
 
     <self_collision>

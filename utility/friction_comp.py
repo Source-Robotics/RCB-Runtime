@@ -16,11 +16,18 @@ THE LAW, per joint j, every freedrive tick:
     fade     1 below fade_start (20 deg/s), linearly 0 at fade_end (40): friction matters most for SLOW motion —
              fine positioning, stick-slip; fast hand motion is dominated by inertia — and it bounds how fast a
              joint could glide on its own (below).
-    c_j      Nm = fraction x max(0, sliding_j - gravity_error_j), from the robot XML (<friction_sliding_nm>: the
-             SLIDING friction measured at a steady speed — the lowest over the angles tested; <gravity_error_nm>: the
-             largest gravity-model error measured while sliding; both from api_tests/54) and the <friction_comp>
-             policy (fraction 0.5). A joint with no sliding measurement falls back to sliding_ratio (0.7) x its
-             breakaway friction <friction_static_nm>.
+    c_j      Nm = fraction x max(0, share x (sliding_j + load_j x |g_j|) - gravity_error_j), from the robot XML
+             (<friction_coulomb_nm>: the SLIDING friction at a steady speed, api_tests/77 — the old
+             <friction_sliding_nm> when it is missing; <friction_load_per_nm>: how much it grows with the joint's
+             gravity torque g_j, J2 only on PAR6; <gravity_error_nm>: the largest gravity-model error measured while
+             sliding) and the <friction_comp> policy (fraction 0.5). A joint with no sliding measurement falls back to
+             sliding_ratio (0.7) x its breakaway friction <friction_static_nm>. The same model as the friction
+             feedforward and the external-torque estimate (utility/friction_model.py, 2026-10-17); here only its
+             Coulomb + load part — the viscous part grows with speed, where the fade already takes it all back.
+             share: <model_share> (0.7) — the model is the TYPICAL friction (api_tests/77), and the friction measured
+             went down to 0.69x it (J4 at 0 deg); freedrive relies only on what is there at the lowest. On PAR6
+             2026-10-17: J1 0.040, J2 0 (unloaded) .. 0.10 (7.4 Nm of gravity), J4 0.047 Nm; J3 / J5 / J6 0 — their
+             gravity-model error is as large as their friction.
 
 WHY THAT c_j: while the compensation is less than the joint's real friction, the net friction (real - compensation)
 still opposes motion — the arm still loses energy, it just loses less; it cannot run away. The one way it can glide
@@ -33,8 +40,10 @@ motors, so the ramp's 0.08 deg onset includes give in the gearing, and the push 
 decides which) moves early — which the ramp also read as J4's ±0.13 Nm "gravity error" (sliding: ±0.03). Now:
 J4 0.068, J5 0.024, J6 0.027 Nm. Any glide is capped near fade_start: above it the joint's full friction comes back.
 
-NOT IN THE OTHER MODES (yet): JOG / EXEC / RTI hold a position through the drives' own loop; there a feed-forward
-from the COMMANDED speed (not the measured one) would cut tracking error — planned, TODO/friction_compensation_plan.md.
+THE OTHER MODES: JOG / EXEC / RTI follow a commanded motion through the drives' own loop; there the friction
+feedforward on the COMMANDED speed (utility/mode_dispatch._add_friction_ff, 2026-10-17, its own switch) gives back the
+whole model — no feedback, so it cannot run away. Same model (utility/friction_model.py), different rule: here a
+fraction of the margin above the gravity error, because here the MEASURED speed drives it.
 HOMING never: it finds the endstops by the current a stall draws.
 
 HOT PATH: step() is a scalar loop into a preallocated buffer; no allocation.
@@ -53,16 +62,16 @@ def _num(x):
 
 
 def comp_amounts(friction_static: Sequence[float], gravity_error: Sequence[float], fraction: float, sliding_ratio: float = 0.7,
-                 friction_sliding: Sequence[float] | None = None) -> list[float]:
-    """Per-joint compensation (Nm): fraction x max(0, sliding friction - gravity error). The sliding friction is the
-    MEASURED one (friction_sliding, api_tests/54 at a steady speed) where it is > 0, else sliding_ratio x the
-    breakaway friction. Unmeasured (both 0) -> 0."""
+                 friction_sliding: Sequence[float] | None = None, model_share: float = 1.0) -> list[float]:
+    """Per-joint compensation (Nm): fraction x max(0, sliding friction - gravity error). The sliding friction is
+    model_share x the MEASURED one (friction_sliding: the model's Coulomb part, api_tests/77) where it is > 0, else
+    sliding_ratio x the breakaway friction. Unmeasured (both 0) -> 0."""
     if friction_sliding is None:
         friction_sliding = [0.0] * len(friction_static)
     out = []
     for f, e, fsl in zip(friction_static, gravity_error, friction_sliding):
         f, e, fsl = _num(f), _num(e), _num(fsl)
-        slide = fsl if fsl > 0.0 else sliding_ratio * f
+        slide = model_share * fsl if fsl > 0.0 else sliding_ratio * f
         out.append(fraction * max(0.0, slide - abs(e)) if slide > 0.0 else 0.0)
     return out
 
@@ -70,32 +79,54 @@ def comp_amounts(friction_static: Sequence[float], gravity_error: Sequence[float
 class FrictionComp:
     """Built once before the RT loop (RTI.py); IDLE's freedrive calls step() while the operator switch is on."""
 
-    def __init__(self, joint_num, friction_static, gravity_error, policy, friction_sliding=None):
+    def __init__(self, joint_num, friction_static, gravity_error, policy, friction_sliding=None, friction_load=None):
         self.n = int(joint_num)
         self._fs = [float(x) for x in friction_static][:self.n]
         self._ge = [float(x) for x in gravity_error][:self.n]
         self._fsl = [float(x) for x in (friction_sliding if friction_sliding is not None else [0.0] * self.n)][:self.n]
+        # Nm of friction per Nm of gravity torque (<friction_load_per_nm>, 2026-10-17); 0 = no load term
+        self._load = [_num(x) for x in (list(friction_load or []) + [0.0] * self.n)[:self.n]]
         self.tau = np.zeros(self.n)
         self.c = [0.0] * self.n
+        self._slide = [0.0] * self.n          # the sliding friction used (measured, or the breakaway fallback), Nm
         self.set_policy(policy)
 
     def set_policy(self, policy):
         self.fraction = float(policy.get("fraction", 0.5))
         self.sliding_ratio = float(policy.get("sliding_ratio", 0.7))
+        self.model_share = float(policy.get("model_share", 0.7))
         self.v_band = math.radians(float(policy.get("band_dps", 2.0)))
         self.f0 = math.radians(float(policy.get("fade_start_dps", 20.0)))
         self.f1 = math.radians(float(policy.get("fade_end_dps", 40.0)))
-        self.c[:] = comp_amounts(self._fs, self._ge, self.fraction, self.sliding_ratio, self._fsl)
+        self.c[:] = comp_amounts(self._fs, self._ge, self.fraction, self.sliding_ratio, self._fsl, self.model_share)
+        for j in range(self.n):
+            fsl = _num(self._fsl[j]) if j < len(self._fsl) else 0.0
+            fs = _num(self._fs[j]) if j < len(self._fs) else 0.0
+            self._slide[j] = self.model_share * fsl if fsl > 0.0 else self.sliding_ratio * fs
 
     @property
     def active(self):
-        return any(c > 0.0 for c in self.c)
+        return any(c > 0.0 for c in self.c) or any(
+            ld > 0.0 and sl > 0.0 for ld, sl in zip(self._load, self._slide))
 
-    def step(self, v):
-        """Compensation torque (Nm) for the filtered joint speeds `v` (rad/s), in self.tau."""
+    def amount(self, j, g=None):
+        """Joint j's compensation at full speed (Nm): c_j, with the load term at gravity torque g (Nm) when given."""
+        ld = self._load[j]
+        if g is None or ld <= 0.0 or self._slide[j] <= 0.0:
+            return self.c[j]
+        gj = float(g)
+        if gj != gj:                          # NaN: no load term this tick
+            return self.c[j]
+        e = _num(self._ge[j]) if j < len(self._ge) else 0.0
+        c = self._slide[j] + self.model_share * ld * (gj if gj >= 0.0 else -gj) - (e if e >= 0.0 else -e)
+        return self.fraction * c if c > 0.0 else 0.0
+
+    def step(self, v, g=None):
+        """Compensation torque (Nm) for the filtered joint speeds `v` (rad/s), in self.tau; `g` the gravity model's
+        joint torques (Nm) for the load term (None: Coulomb only)."""
         tau, band, f0, f1 = self.tau, self.v_band, self.f0, self.f1
         for j in range(self.n):
-            c = self.c[j]
+            c = self.c[j] if g is None else self.amount(j, g[j])
             if c <= 0.0:
                 tau[j] = 0.0
                 continue

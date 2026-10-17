@@ -1670,6 +1670,10 @@ IMMEDIATE_HANDLERS = {
     "can_read_first":   _forward_fmt("can_read_first", "can_read_first", 1, (_arg_switch,)),   # TODO/can_tx_timing_plan.md option B
     "hall_check":       _forward_fmt("hall_check", "hall_check", 1, (_arg_switch,)),   # robotics/hall_check.py (IDLE only: COMMAND_RULES)
     "coriolis_comp":    _forward_fmt("coriolis_comp", "coriolis_comp", 1, (_arg_switch,)),
+    "friction_ff":      _forward_fmt("friction_ff", "friction_ff", 1, (_arg_switch,)),   # utility/friction_model.py
+    # collision detection's reaction (utility/safety_monitor.py; until RTI restarts — a PC program that pushes on purpose)
+    "collision_detection": _forward_fmt("collision_detection", "collision_detection", 1,
+                                        (_arg_one_of("off", "warn", "stop"),)),
     "set_pid_gains":    _handle_set_pid_gains,
     # --- RTI mode handshake (TODO/RTI_mode_plan.md §4d). The UDP setpoint stream
     # bypasses this process entirely and goes straight to RTI's socket; only the
@@ -1815,6 +1819,11 @@ def current_status():
         # Inertia / Coriolis feedforward on the commanded motion (start state: system.xml <dynamics_feedforward>, ON).
         "inertia_comp": bool(shared_data.rti["inertia_comp_enabled"][0] > 0.5),
         "coriolis_comp": bool(shared_data.rti["coriolis_comp_enabled"][0] > 0.5),
+        # Friction feedforward on the commanded speed (start state: system.xml <dynamics_feedforward><friction>, OFF).
+        "friction_ff": bool(shared_data.rti["friction_ff_enabled"][0] > 0.5),
+        # Collision detection's reaction in force: "off" | "warn" | "stop" (system.xml <safety_monitor><collision> at
+        # RTI's start; set_collision_detection changes it until RTI restarts; "off" also when nothing can be checked).
+        "collision_detection": ("off", "warn", "stop")[min(2, max(0, int(shared_data.rti["collision_mode"][0])))],
         # RTI's CAN tick order: True = read first, send early (option B; start state system.xml <can_read_first>, ON),
         # False = the old order — also while homing, which always uses it (set_can_read_first switches it).
         "can_read_first": bool(shared_data.rti["can_read_first"][0] > 0.5),

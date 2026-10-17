@@ -291,6 +291,48 @@ def _nonneg(values: Iterable[float | None], tag: str, hi: float) -> list[float]:
     return out
 
 
+FRICTION_NM_MAX = 5.0            # Nm (and Nm.s/rad): a friction value above this is a typo
+FRICTION_LOAD_MAX = 1.0          # Nm of friction per Nm of gravity: above this is a typo
+
+
+def _friction_coulomb(coulomb: Iterable[float | None], sliding: Iterable[float | None]) -> list[float]:
+    """<friction_coulomb_nm> per joint (utility/friction_model.py, measured by api_tests/77, 2026-10-17); a joint without
+    it falls back to the older <friction_sliding_nm> (api_tests/54's lowest sliding friction) — a robot XML from before
+    keeps its value; outside [0, FRICTION_NM_MAX] -> 0 with a warning."""
+    c = list(coulomb)
+    s = _nonneg(sliding, "friction_sliding_nm", 1.0)
+    out = []
+    for i, v in enumerate(c):
+        v = float(v) if v is not None else float("nan")
+        if not math.isfinite(v):
+            out.append(s[i] if i < len(s) else 0.0)
+        elif 0.0 <= v <= FRICTION_NM_MAX:
+            out.append(v)
+        else:
+            logger.warning("robot XML joint %d <friction_coulomb_nm> = %s is outside [0, %s] — using 0", i, v,
+                           FRICTION_NM_MAX)
+            out.append(0.0)
+    return out
+
+
+COLLISION_NM_MAX = 50.0          # Nm: a contact / collision threshold above this is a typo
+
+
+def _collision_nm(contact: Iterable[float | None], collision: Iterable[float | None]) -> tuple[list[float], list[float]]:
+    """<contact_torque_nm> / <collision_torque_nm> per joint (the safety monitor's thresholds on the external torque
+    estimate minus its baseline, Nm; measured by api_tests/76_external_torque.py): missing / 0 -> that threshold
+    unchecked, outside [0, COLLISION_NM_MAX] -> 0 with a warning; a contact threshold above the joint's collision
+    threshold is lowered to it, with a warning (the stricter number wins)."""
+    cn = _nonneg(contact, "contact_torque_nm", COLLISION_NM_MAX)
+    co = _nonneg(collision, "collision_torque_nm", COLLISION_NM_MAX)
+    for i in range(min(len(cn), len(co))):
+        if co[i] > 0.0 and cn[i] > co[i]:
+            logger.warning("robot XML joint %d <contact_torque_nm> %s is above its <collision_torque_nm> %s — using %s",
+                            i, cn[i], co[i], co[i])
+            cn[i] = co[i]
+    return cn, co
+
+
 def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None = None,
                            active_gripper: str | None = None) -> dict:
     """
@@ -330,6 +372,9 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
             return default
         text = gripper_elem.findtext(tag, default="").strip()
         return text.lower() if text else default
+
+    _collision_cn, _collision_co = _collision_nm(get_all_values(joints, 'contact_torque_nm'),
+                                                 get_all_values(joints, 'collision_torque_nm'))
 
     cfg = {
         # ---- metadata ----
@@ -400,11 +445,22 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         # Safety monitor HOLD_OSCILLATION_WARNING threshold per joint, mA (fast motor-current ripple while
         # commanded still). Missing -> HOLD_OSC_DEFAULT_MA, 0 = that joint unchecked.
         'hold_oscillation_ma':    _hold_osc_ma(get_all_values(joints, 'hold_oscillation_ma')),
+        # Safety monitor CONTACT_WARNING / COLLISION thresholds per joint, Nm (2026-10-16). Missing / 0 = unchecked.
+        'contact_torque_nm':      _collision_cn,
+        'collision_torque_nm':    _collision_co,
         'freedrive_walls':        get_freedrive_walls(joints),
         # Friction compensation (utility/friction_comp.py): MEASURED per joint by api_tests/54 — the breakaway
         # friction and the largest gravity-model error, Nm. Missing / 0 = not measured -> no compensation.
         'friction_static_nm':     _nonneg(get_all_values(joints, 'friction_static_nm'), 'friction_static_nm', 1.0),
         'friction_sliding_nm':    _nonneg(get_all_values(joints, 'friction_sliding_nm'), 'friction_sliding_nm', 1.0),
+        # THE friction model (utility/friction_model.py, 2026-10-17; api_tests/77 measures, `--apply` writes): Coulomb
+        # (falls back to <friction_sliding_nm>), the speed term, the load term. Missing speed / load = 0.
+        'friction_coulomb_nm':    _friction_coulomb(get_all_values(joints, 'friction_coulomb_nm'),
+                                                    get_all_values(joints, 'friction_sliding_nm')),
+        'friction_viscous_nm_s':  _nonneg(get_all_values(joints, 'friction_viscous_nm_s'), 'friction_viscous_nm_s',
+                                          FRICTION_NM_MAX),
+        'friction_load_per_nm':   _nonneg(get_all_values(joints, 'friction_load_per_nm'), 'friction_load_per_nm',
+                                          FRICTION_LOAD_MAX),
         'gravity_error_nm':       _nonneg(get_all_values(joints, 'gravity_error_nm'), 'gravity_error_nm', 1.0),
         'homing_release_current_ma': get_all_values(joints, 'homing_release_current_ma'),
         'homing_release_duration_s': get_all_values(joints, 'homing_release_duration_s'),

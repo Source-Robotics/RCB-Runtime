@@ -86,6 +86,8 @@
             <software_joint_limit_positive>2.8647335</software_joint_limit_positive> <!-- Soft Joint limits in radians. These limits are imoposed on software to never actually touch the mechanical limits-->
             <tracking_limit_deg>5.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked. PROVISIONAL 5 deg (2026-10-01, the check runs warn-only): not measured yet — measure like J4-J6 (api_tests/46) and set ~2x the peak. -->
             <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
+            <contact_torque_nm>0.60</contact_torque_nm> <!-- safety monitor CONTACT_WARNING: the external torque estimate (momentum observer) minus the baseline taken at rest before the move, Nm; 0 = unchecked. 2x the moving p99 measured by api_tests/76 (2026-10-17: clean windows — this joint moving, the others still — with the friction model of api_tests/77 live; 2026-10-16 before). Re-measure after a model / friction / gain change. -->
+            <collision_torque_nm>0.90</collision_torque_nm> <!-- safety monitor COLLISION (system.xml <collision>: warn | stop): the same, the larger of 2x the moving max and 1.5x contact (api_tests/76, 2026-10-17); 0 = unchecked. -->
             <encoder>14</encoder> <!-- Encoder resolution in bits.-->
             <sector_home_master_position>3969 </sector_home_master_position> <!-- Encoder ticks the robot is at bootup at MASTER POSITIONS-->
             <sector_home_offset>1.570796327 </sector_home_offset> <!-- Joint level position from master position to the one defined in kinematics chain-->
@@ -108,8 +110,10 @@
             <dir>0</dir> <!-- is positive rotation of the joint matched to the one in kinematic definiton of the robot 0 yes 1 no -->
             <joint_type>revolute</joint_type> <!-- Type of the joint. Options: revolute, prismatic, continuous_revolute -->
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured yet; api_tests/54, 2026-10-02). 0 = not measured: no friction compensation -->
-            <friction_sliding_nm>0.177</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest at any angle and speed tested (2026-10-02: 0.177-0.218 Nm at 82 / 112 / 142 deg, + 0.09-0.14 Nm.s/rad x speed; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
-            <gravity_error_nm>0.035</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this); J1 carries no gravity: this is direction asymmetry -->
+            <friction_coulomb_nm>0.190</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.177 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
+            <friction_viscous_nm_s>0.051</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
+            <friction_load_per_nm>0.000</friction_load_per_nm> <!-- Nm of friction per Nm of the gravity model's torque on the joint (api_tests/77; 0 = no load effect worth a term) -->
+            <gravity_error_nm>0.053</gravity_error_nm> <!-- Nm, the largest gravity-model error measured while sliding, any pose and speed (api_tests/77, applied 2026-10-17). Freedrive friction compensation gives back 0.5 x (sliding friction - this) -->
             <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
         </joint>
         <joint id="1">
@@ -152,6 +156,8 @@
             <software_joint_limit_positive>-0.1122665</software_joint_limit_positive>
             <tracking_limit_deg>5.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked. PROVISIONAL 5 deg (2026-10-01, the check runs warn-only): not measured yet — measure like J4-J6 (api_tests/46) and set ~2x the peak. -->
             <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
+            <contact_torque_nm>2.82</contact_torque_nm> <!-- safety monitor CONTACT_WARNING: the external torque estimate (momentum observer) minus the baseline taken at rest before the move, Nm; 0 = unchecked. 2x the moving p99 measured by api_tests/76 (2026-10-17: clean windows — this joint moving, the others still — with the friction model of api_tests/77 live; 2026-10-16 before). Re-measure after a model / friction / gain change. -->
+            <collision_torque_nm>4.24</collision_torque_nm> <!-- safety monitor COLLISION (system.xml <collision>: warn | stop): the same, the larger of 2x the moving max and 1.5x contact (api_tests/76, 2026-10-17); 0 = unchecked. -->
             <encoder>14</encoder>
             <sector_home_master_position>5707 </sector_home_master_position>
             <sector_home_offset>-2.516096327 </sector_home_offset>
@@ -174,8 +180,10 @@
             <dir>0</dir>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
-            <friction_sliding_nm>0</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest at any angle and speed tested (MEASURED 0.561 + 0.92 Nm.s/rad x speed at -112 deg, 2026-10-02 — but only where the model's gravity on J2 is 0.5 Nm of up to 7.4: its gravity error there (0.072) says nothing about loaded poses. Left at 0 = NOT compensated until 54 is run where J2 carries several Nm; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
-            <gravity_error_nm>0</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this); J2: 0.072 measured at 0.5 Nm of gravity only -->
+            <friction_coulomb_nm>0.578</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 26 slides at 4 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
+            <friction_viscous_nm_s>0.625</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
+            <friction_load_per_nm>0.041</friction_load_per_nm> <!-- Nm of friction per Nm of the gravity model's torque on the joint (api_tests/77; 0 = no load effect worth a term) -->
+            <gravity_error_nm>0.415</gravity_error_nm> <!-- Nm, the largest gravity-model error measured while sliding, any pose and speed (api_tests/77, applied 2026-10-17). Freedrive friction compensation gives back 0.5 x (sliding friction - this) -->
             <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
@@ -219,6 +227,8 @@
             <software_joint_limit_positive>6.5627335</software_joint_limit_positive>
             <tracking_limit_deg>5.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked. PROVISIONAL 5 deg (2026-10-01, the check runs warn-only): not measured yet — measure like J4-J6 (api_tests/46) and set ~2x the peak. -->
             <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. MEASURED on J3 (api_tests/59, 2026-10-06): buzzing ~230 mA, quiet <= 25 mA once settled. -->
+            <contact_torque_nm>1.49</contact_torque_nm> <!-- safety monitor CONTACT_WARNING: the external torque estimate (momentum observer) minus the baseline taken at rest before the move, Nm; 0 = unchecked. 2x the moving p99 measured by api_tests/76 (2026-10-17: clean windows — this joint moving, the others still — with the friction model of api_tests/77 live; 2026-10-16 before). Re-measure after a model / friction / gain change. -->
+            <collision_torque_nm>2.23</collision_torque_nm> <!-- safety monitor COLLISION (system.xml <collision>: warn | stop): the same, the larger of 2x the moving max and 1.5x contact (api_tests/76, 2026-10-17); 0 = unchecked. -->
             <encoder>14</encoder>
             <sector_home_master_position>2838 </sector_home_master_position>
             <sector_home_offset>1.913322625 </sector_home_offset>
@@ -241,8 +251,10 @@
             <dir>1</dir>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
-            <friction_sliding_nm>0.369</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest at any angle and speed tested (2026-10-02: 0.37-0.47 Nm at 129 / 144 / 159 deg — LESS at 15 than at 5 deg/s; model gravity there 2.2-2.5 Nm of at most 2.7; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
-            <gravity_error_nm>0.124</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this) -->
+            <friction_coulomb_nm>0.541</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 18 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough; poses left out (over 1.5x the others): +354.0 deg). Was <friction_sliding_nm>0.369 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
+            <friction_viscous_nm_s>0.227</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
+            <friction_load_per_nm>0.000</friction_load_per_nm> <!-- Nm of friction per Nm of the gravity model's torque on the joint (api_tests/77; 0 = no load effect worth a term) -->
+            <gravity_error_nm>0.489</gravity_error_nm> <!-- Nm, the largest gravity-model error measured while sliding, any pose and speed (api_tests/77, applied 2026-10-17). Freedrive friction compensation gives back 0.5 x (sliding friction - this) -->
             <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
@@ -286,6 +298,8 @@
             <software_joint_limit_positive>2.5547335</software_joint_limit_positive>
             <tracking_limit_deg>3.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked (2x the 1.39 deg measured at 100% EXEC, api_tests/46 2026-09-30). Re-measure after changing speeds. -->
             <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
+            <contact_torque_nm>0.49</contact_torque_nm> <!-- safety monitor CONTACT_WARNING: the external torque estimate (momentum observer) minus the baseline taken at rest before the move, Nm; 0 = unchecked. 2x the moving p99 measured by api_tests/76 (2026-10-17: clean windows — this joint moving, the others still — with the friction model of api_tests/77 live; 2026-10-16 before). Re-measure after a model / friction / gain change. -->
+            <collision_torque_nm>0.74</collision_torque_nm> <!-- safety monitor COLLISION (system.xml <collision>: warn | stop): the same, the larger of 2x the moving max and 1.5x contact (api_tests/76, 2026-10-17); 0 = unchecked. -->
             <encoder>14</encoder>
             <sector_home_master_position>6683 </sector_home_master_position>
             <sector_home_offset>0 </sector_home_offset>
@@ -308,8 +322,10 @@
             <dir>1</dir>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.13</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.26; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
-            <friction_sliding_nm>0.163</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest over the angles tested (2026-10-02: 0.163 / 0.225 / 0.201 Nm at 11 / -19 / 41 deg, + 0.02-0.13 Nm.s/rad x speed; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
-            <gravity_error_nm>0.031</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this) -->
+            <friction_coulomb_nm>0.190</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.163 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
+            <friction_viscous_nm_s>0.086</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
+            <friction_load_per_nm>0.000</friction_load_per_nm> <!-- Nm of friction per Nm of the gravity model's torque on the joint (api_tests/77; 0 = no load effect worth a term) -->
+            <gravity_error_nm>0.039</gravity_error_nm> <!-- Nm, the largest gravity-model error measured while sliding, any pose and speed (api_tests/77, applied 2026-10-17). Freedrive friction compensation gives back 0.5 x (sliding friction - this) -->
             <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
@@ -353,6 +369,8 @@
             <software_joint_limit_positive>1.6</software_joint_limit_positive>
             <tracking_limit_deg>2.5</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked (2x the 1.09 deg measured). Re-measure after changing speeds. -->
             <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
+            <contact_torque_nm>0.30</contact_torque_nm> <!-- safety monitor CONTACT_WARNING: the external torque estimate (momentum observer) minus the baseline taken at rest before the move, Nm; 0 = unchecked. 2x the moving p99 measured by api_tests/76 (2026-10-17: clean windows — this joint moving, the others still — with the friction model of api_tests/77 live; 2026-10-16 before). Re-measure after a model / friction / gain change. -->
+            <collision_torque_nm>0.44</collision_torque_nm> <!-- safety monitor COLLISION (system.xml <collision>: warn | stop): the same, the larger of 2x the moving max and 1.5x contact (api_tests/76, 2026-10-17); 0 = unchecked. -->
             <encoder>14</encoder>
             <sector_home_master_position>15658 </sector_home_master_position>
             <sector_home_offset>0 </sector_home_offset>
@@ -375,8 +393,10 @@
             <dir>1</dir>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.06</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.05-0.12; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
-            <friction_sliding_nm>0.080</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest over the angles tested (2026-10-02: 0.080 / 0.099 Nm at -62 / -33 deg, + 0.06-0.07 Nm.s/rad x speed; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
-            <gravity_error_nm>0.039</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this) -->
+            <friction_coulomb_nm>0.093</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.080 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
+            <friction_viscous_nm_s>0.064</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
+            <friction_load_per_nm>0.000</friction_load_per_nm> <!-- Nm of friction per Nm of the gravity model's torque on the joint (api_tests/77; 0 = no load effect worth a term) -->
+            <gravity_error_nm>0.109</gravity_error_nm> <!-- Nm, the largest gravity-model error measured while sliding, any pose and speed (api_tests/77, applied 2026-10-17). Freedrive friction compensation gives back 0.5 x (sliding friction - this) -->
             <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>
@@ -426,6 +446,8 @@
             <software_joint_limit_positive>7.14</software_joint_limit_positive>
             <tracking_limit_deg>2.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked (2x the 0.87 deg measured). Re-measure after changing speeds. -->
             <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
+            <contact_torque_nm>0.34</contact_torque_nm> <!-- safety monitor CONTACT_WARNING: the external torque estimate (momentum observer) minus the baseline taken at rest before the move, Nm; 0 = unchecked. 2x the moving p99 measured by api_tests/76 (2026-10-17: clean windows — this joint moving, the others still — with the friction model of api_tests/77 live; 2026-10-16 before). Re-measure after a model / friction / gain change. -->
+            <collision_torque_nm>0.51</collision_torque_nm> <!-- safety monitor COLLISION (system.xml <collision>: warn | stop): the same, the larger of 2x the moving max and 1.5x contact (api_tests/76, 2026-10-17); 0 = unchecked. -->
             <encoder>14</encoder>
             <sector_home_master_position>3956 </sector_home_master_position>
             <sector_home_offset>0 </sector_home_offset>
@@ -448,8 +470,10 @@
             <dir>1</dir>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.111</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.19; informational once friction_sliding_nm is set; 2026-10-02) -->
-            <friction_sliding_nm>0.070</friction_sliding_nm> <!-- Nm, SLIDING friction at a steady speed, the lowest over the angles tested (2026-10-02: 0.078 / 0.070 / 0.076 Nm at 146 / 116 / 176 deg, + 0.02-0.06 Nm.s/rad x speed; api_tests/54). 0 = not measured: 0.7 x breakaway (none if that is 0 too) -->
-            <gravity_error_nm>0.019</gravity_error_nm> <!-- Nm, the largest gravity-model error measured WHILE SLIDING, any angle and speed (api_tests/54). Friction compensation gives back 0.5 x (sliding friction - this) -->
+            <friction_coulomb_nm>0.109</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.070 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
+            <friction_viscous_nm_s>0.025</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
+            <friction_load_per_nm>0.000</friction_load_per_nm> <!-- Nm of friction per Nm of the gravity model's torque on the joint (api_tests/77; 0 = no load effect worth a term) -->
+            <gravity_error_nm>0.105</gravity_error_nm> <!-- Nm, the largest gravity-model error measured while sliding, any pose and speed (api_tests/77, applied 2026-10-17). Freedrive friction compensation gives back 0.5 x (sliding friction - this) -->
             <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
         </joint>

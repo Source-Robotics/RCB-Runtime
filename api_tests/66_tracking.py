@@ -5,7 +5,9 @@ TODO/dynamics_feedforward_plan.md. The same EXEC moves are run with each SET in 
 per joint and speed. Three kinds of set:
   gains          "new" (the XML values) / "old" (the tune before 2026-10-09, read from the "Was: KPP ..." comments in
                  robots/PAR6.xml) — inertia / Coriolis feedforward OFF                                  (step T2)
-  feedforward    "off" / "inertia" / "coriolis" / "inertia+coriolis" — the XML gains, the two switches as named (F1)
+  feedforward    "off" / "inertia" / "coriolis" / "inertia+coriolis" — the XML gains, the two switches as named (F1);
+                 "friction" / "inertia+coriolis+friction" — with the friction feedforward (utility/friction_model.py,
+                 2026-10-17; every other set runs with it OFF, as shipped)
   profile        "trapezoid" (the EXEC default until 2026-10-11) / "ruckig" (jerk-limited, the full
                  <exec_limits><jerk> budget) / "s_curve" / "quintic" / "toppra" — the shipped setup (XML gains,
                  inertia + Coriolis feedforward ON), each move planned with that profile (F4, 2026-10-10: J1 rings
@@ -53,6 +55,7 @@ the XML's), and the XML gains are ALWAYS put back at the end, whatever happens. 
     python3 api_tests/66_tracking.py --go                       # new, old, new (the 2nd new = repeatability)
     python3 api_tests/66_tracking.py --go --sets new --joints 4,5,6 --speeds 30,60
     python3 api_tests/66_tracking.py --go --sets off,inertia,inertia+coriolis,off      # the feedforward A/B
+    python3 api_tests/66_tracking.py --go --sets inertia+coriolis,inertia+coriolis+friction,inertia+coriolis  # friction
     python3 api_tests/66_tracking.py --go --sets trapezoid,ruckig,trapezoid           # the profile A/B
     python3 api_tests/66_tracking.py --go --sets ruckig,ruckig_rf,ruckig         # option B A/B (read first, send early)
     python3 api_tests/66_tracking.py --compare temp_data/tracking/A.json temp_data/tracking/B.json
@@ -90,7 +93,10 @@ MOVING = 1e-3                     # rad/s — a commanded speed above this is "m
 ACC_FRACTION = 0.1                # |commanded accel| above this x the move's peak counts as accelerating / decelerating
 SETTLE_DEG = 0.05
 FINAL_S = 0.1
-COMP_SETS = {"off": (False, False), "inertia": (True, False), "coriolis": (False, True), "inertia+coriolis": (True, True)}
+# (inertia, Coriolis, friction) feedforward
+COMP_SETS = {"off": (False, False, False), "inertia": (True, False, False), "coriolis": (False, True, False),
+             "inertia+coriolis": (True, True, False), "friction": (False, False, True),
+             "inertia+coriolis+friction": (True, True, True)}
 PROFILE_SETS = ("trapezoid", "ruckig", "s_curve", "quintic", "toppra")     # motion/exec_commands.SUPPORTED_PROFILES
 POST_S = 0.3                                    # the window after the stop that 'post' measures (J1 rings ~0.3 s)
 START_S = 0.04                                  # "from rest": the first 40 ms of a move
@@ -119,9 +125,10 @@ def apply_gains(robot, gains):
     time.sleep(0.3)                                       # RTI reloads each joint's config on its tick
 
 
-def set_comp(robot, inertia, coriolis):
+def set_comp(robot, inertia, coriolis, friction=False):
     robot.set_inertia_comp(bool(inertia))
     robot.set_coriolis_comp(bool(coriolis))
+    robot.set_friction_ff(bool(friction))
     time.sleep(0.1)
 
 
@@ -131,10 +138,10 @@ def apply_set(robot, name, gain_sets):
     put back)."""
     if name in gain_sets:
         apply_gains(robot, gain_sets[name])
-        set_comp(robot, False, False)
+        set_comp(robot, False, False, False)
         return name != "new"
     apply_gains(robot, gain_sets["new"])
-    set_comp(robot, *(COMP_SETS[name] if name in COMP_SETS else (True, True)))
+    set_comp(robot, *(COMP_SETS[name] if name in COMP_SETS else (True, True, False)))
     return False
 
 
@@ -424,7 +431,7 @@ def selftest():
 
     class FakeRobot:
         def __init__(self):
-            self.gains, self.comp = {}, [None, None]
+            self.gains, self.comp = {}, [None, None, None]
 
         def set_pid_gains(self, j, **g):
             self.gains[j] = g
@@ -434,16 +441,23 @@ def selftest():
 
         def set_coriolis_comp(self, on):
             self.comp[1] = on
+
+        def set_friction_ff(self, on):
+            self.comp[2] = on
     fake_sets = {"new": [{"KPP": 1.0 + j} for j in range(6)], "old": [{"KPP": 9.0} for _ in range(6)]}
     seen = {}
-    for nm in ("ruckig", "trapezoid", "off", "old"):
+    for nm in ("ruckig", "trapezoid", "off", "old", "inertia+coriolis+friction", "friction"):
         fr = FakeRobot()
         back = apply_set(fr, nm, fake_sets)
         seen[nm] = (back, [fr.gains[j] for j in range(6)] == fake_sets["new"], tuple(fr.comp))
-    chk("profile sets: the XML gains, both feedforward switches ON, nothing to put back",
-        seen["ruckig"] == (False, True, (True, True)) and seen["trapezoid"] == (False, True, (True, True)), seen)
-    chk("...the other sets unchanged: 'off' = XML gains + both off; 'old' = other gains (to put back) + both off",
-        seen["off"] == (False, True, (False, False)) and seen["old"] == (True, False, (False, False)), seen)
+    chk("profile sets: the XML gains, inertia + Coriolis feedforward ON, friction OFF (as shipped), nothing to put back",
+        seen["ruckig"] == (False, True, (True, True, False)) and seen["trapezoid"] == (False, True, (True, True, False)),
+        seen)
+    chk("...the other sets unchanged: 'off' = XML gains + all off; 'old' = other gains (to put back) + all off",
+        seen["off"] == (False, True, (False, False, False)) and seen["old"] == (True, False, (False, False, False)), seen)
+    chk("...the friction sets: the XML gains, the friction feedforward ON (with inertia + Coriolis, or alone)",
+        seen["inertia+coriolis+friction"] == (False, True, (True, True, True))
+        and seen["friction"] == (False, True, (False, False, True)), seen)
     # the gain tables come out of the real robot XML
     try:
         g = read_gain_sets(os.path.join(_ROOT, "robots", "PAR6.xml"))
@@ -532,10 +546,9 @@ def run_session(args, cfg, gain_sets, set_order):
     robot = RobotClient(sync=False)
     robot.connect(args.host, args.port)
     capture, prev_recipe, claimed, gains_changed = None, None, False, False
-    comp_used = any(split_rf(n)[0] in COMP_SETS or split_rf(n)[0] in PROFILE_SETS for n in set_order)
     rf_used = any(split_rf(n)[1] for n in set_order)
     rf_start = None                                   # RTI's tick order at the start, put back at the end
-    comp0, applied = (False, False), False
+    comp0, applied = (False, False, False), False
     records, ok = [], True
     names = label_sets(set_order)
     try:
@@ -560,9 +573,9 @@ def run_session(args, cfg, gain_sets, set_order):
             if nm in PROFILE_SETS:
                 print(f"  {nm:16s} XML gains, inertia + Coriolis feedforward ON, every move planned with profile='{nm}'")
             elif nm in COMP_SETS:
-                i_on, c_on = COMP_SETS[nm]
+                i_on, c_on, f_on = COMP_SETS[nm]
                 print(f"  {nm:16s} XML gains, inertia feedforward {'ON' if i_on else 'off'}, Coriolis {'ON' if c_on else 'off'}, "
-                      f"profile='trapezoid'")
+                      f"friction {'ON' if f_on else 'off'}, profile='trapezoid'")
             else:
                 print(f"  {nm:16s} " + "  ".join(f"J{j + 1} " + "/".join(f"{gain_sets[nm][j][k]:g}" for k in GAIN_KEYS)
                                                 for j in range(6)) + f"   ({'/'.join(GAIN_KEYS)}), feedforward off, profile='trapezoid'")
@@ -577,10 +590,12 @@ def run_session(args, cfg, gain_sets, set_order):
         if not args.go:
             print("DRY RUN: re-run with --go to execute. Nothing moved.")
             return 0, None
-        if comp_used and "inertia_comp" not in st:
-            print("The executor does not know the inertia / Coriolis switches yet — restart the service first. Nothing moved.")
+        if "friction_ff" not in st:
+            print("The executor does not know the friction feedforward switch yet (2026-10-17) — restart the service "
+                  "first. Nothing moved.")
             return 2, None
-        comp0 = (bool(st.get("inertia_comp", False)), bool(st.get("coriolis_comp", False)))
+        comp0 = (bool(st.get("inertia_comp", False)), bool(st.get("coriolis_comp", False)),
+                 bool(st.get("friction_ff", False)))
         if st.get("state") != "ENABLED" or st.get("homed") is not True or st.get("mode") not in ("IDLE", "EXEC"):
             print(f"Robot must be ENABLED + homed, in IDLE or EXEC (got mode={st.get('mode')} "
                   f"state={st.get('state')} homed={st.get('homed')}). Nothing moved.")
@@ -642,14 +657,14 @@ def run_session(args, cfg, gain_sets, set_order):
             except Exception as exc:
                 print(f"!!! COULD NOT RESTORE THE XML GAINS ({exc}) — re-apply them from the dashboard's Tune Joint, "
                       f"or restart the service, before using the arm.")
-        if applied and (comp_used or gains_changed):
+        if applied:                                   # every set sets the three switches (a gain set: all off)
             try:
                 set_comp(robot, *comp0)
-                print(f"Inertia / Coriolis feedforward back to how they were: {'ON' if comp0[0] else 'off'} / "
-                      f"{'ON' if comp0[1] else 'off'}.")
+                print(f"Inertia / Coriolis / friction feedforward back to how they were: {'ON' if comp0[0] else 'off'} / "
+                      f"{'ON' if comp0[1] else 'off'} / {'ON' if comp0[2] else 'off'}.")
             except Exception as exc:
                 print(f"!!! COULD NOT RESTORE THE FEEDFORWARD SWITCHES ({exc}) — check the dashboard's Inertia / Coriolis "
-                      f"buttons (or restart the service: both start as system.xml <dynamics_feedforward> says, ON as shipped).")
+                      f"/ Friction FF buttons (or restart the service: they start as system.xml <dynamics_feedforward> says).")
         if capture is not None:
             capture.stop()
         try:

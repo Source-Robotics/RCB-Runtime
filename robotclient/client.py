@@ -353,12 +353,33 @@ class RobotClient:
         <dynamics_feedforward> says (ON as shipped); status() reports "coriolis_comp"."""
         return self._immediate("coriolis_comp", [1 if enabled else 0])
 
+    def set_friction_ff(self, enabled: bool) -> Any:
+        """Robot-wide FRICTION feedforward (2026-10-17): the torque each joint's friction takes at the COMMANDED speed
+        (the robot XML's friction model — Coulomb + load x |gravity torque| rounded through zero speed + viscous x
+        speed, measured by api_tests/77_friction_id.py), added to the current the drives get in EXEC, JOG and RTI /
+        SOFT_RTI position and velocity commands. Nothing at a commanded speed of zero (a hold), in freedrive (see
+        set_friction_comp), homing or RTI torque commands. Starts as system.xml <dynamics_feedforward><friction> says
+        (OFF as shipped); status() reports "friction_ff". Measuring friction (api_tests 54 / 77) needs it OFF."""
+        return self._immediate("friction_ff", [1 if enabled else 0])
+
     def set_friction_comp(self, enabled: bool) -> Any:
         """Friction compensation in FREEDRIVE (IDLE with gravity comp ON): a push in the direction each joint is
         already moving — a fraction of its measured friction minus its measured gravity-model error (robot XML
-        <friction_static_nm> / <gravity_error_nm>, policy <friction_comp> in system.xml). Zero at rest, so a released
-        arm is still held by its static friction. OFF at every RTI start. status() reports "friction_comp"."""
+        <friction_coulomb_nm> + <friction_load_per_nm> x |gravity torque| / <gravity_error_nm>, policy <friction_comp>
+        in system.xml). Zero at rest, so a released arm is still held by its static friction. OFF at every RTI start.
+        status() reports "friction_comp"."""
         return self._immediate("friction_comp", [1 if enabled else 0])
+
+    def set_collision_detection(self, mode: str) -> Any:
+        """Collision detection's reaction: "off", "warn" or "stop" — until RTI restarts, then system.xml
+        <safety_monitor><collision> again ("warn" as shipped). The safety monitor compares the external torque on each
+        joint while the robot moves it (EXEC, JOG, RTI, SOFT_RTI) with the torque it had at rest before the move:
+        above the robot XML's <contact_torque_nm> a live CONTACT_WARNING, above <collision_torque_nm> a
+        COLLISION_WARNING ("warn") or the COLLISION error ("stop": the robot stops and holds until errors are
+        cleared). A program that presses on things ON PURPOSE switches it to "off" (or "warn") first and back after.
+        Declare a held part with set_payload — an undeclared one reads as external torque. status() reports
+        "collision_detection"."""
+        return self._immediate("collision_detection", [str(mode).strip().lower()])
 
     def set_payload(self, mass_kg: float, com_m: Sequence[float] = (0.0, 0.0, 0.0)) -> Any:
         """Declare the part the gripper holds: mass [kg] and its centre of mass [m] in the TOOL frame (the

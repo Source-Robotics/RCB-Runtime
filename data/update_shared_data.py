@@ -25,6 +25,8 @@ acceleration/jerk finite differences depend on. Append earlier and both silently
 """
 
 # robot/data_sync.py
+import time
+
 import numpy as np
 from robotics.dynamics import motor_current_to_joint_torque, torque_to_motor_current, estimate_external_force_tcp
 from robotics.dynamics import gravity_torque_rt
@@ -60,6 +62,8 @@ def update_joint_and_tcp_data(
     motor_signs,
     robot,
     jacobian_out=None,
+    observer=None,
+    period_s=None,
 ):
     """
     Update joint-level and TCP-level shared memory.
@@ -93,13 +97,16 @@ def update_joint_and_tcp_data(
         delta_t:              RTI loop period (s)
         gear_ratio, gear_efficiency, motor_kt, motor_signs: drive-train constants
         robot:                robot model (PAR6, INDIGO, etc.)
+        observer, period_s:   the external torque's momentum observer and this tick's measured period (s) —
+                              see update_joint_rest; None = the static estimate (measured - gravity)
     """
     update_joint_state(shared_data=shared_data, Joint=Joint, filter_banks=filter_banks, joint_num=joint_num,
                        gear_ratio=gear_ratio, gear_efficiency=gear_efficiency, motor_kt=motor_kt,
                        motor_signs=motor_signs, robot=robot)
     update_joint_rest(shared_data=shared_data, Joint_data=Joint_data, filter_banks=filter_banks,
                       joint_num=joint_num, delta_t=delta_t, gear_ratio=gear_ratio, gear_efficiency=gear_efficiency,
-                      motor_kt=motor_kt, motor_signs=motor_signs, robot=robot, jacobian_out=jacobian_out)
+                      motor_kt=motor_kt, motor_signs=motor_signs, robot=robot, jacobian_out=jacobian_out,
+                      observer=observer, period_s=period_s)
 
 
 def update_joint_state(*, shared_data, Joint, filter_banks, joint_num, gear_ratio, gear_efficiency, motor_kt,
@@ -148,10 +155,15 @@ def update_tcp_pose(*, shared_data, robot, jacobian_out=None):
 
 
 def update_joint_rest(*, shared_data, Joint_data, filter_banks, joint_num, delta_t, gear_ratio, gear_efficiency,
-                      motor_kt, motor_signs, robot, jacobian_out=None):
+                      motor_kt, motor_signs, robot, jacobian_out=None, observer=None, period_s=None):
     """Everything update_joint_state() leaves out (2026-10-12): acceleration and jerk (raw + filtered), torque (raw +
     filtered), the kinematics (pose, Jacobian, TCP speed / acceleration, quaternion, diagnostics), the external torque
-    and force. Must run AFTER update_joint_state() on the same tick and BEFORE this tick's Joint_data append."""
+    and force. Must run AFTER update_joint_state() on the same tick and BEFORE this tick's Joint_data append.
+
+    observer (2026-10-16): a utility.momentum_observer.MomentumObserver — the external torque WHILE MOVING (the
+    momentum observer on robot.pinocchio_momentum's model terms; dt = `period_s` when given (the nets), else the time
+    since its previous estimate, measured here). None, no model, or a tick it cannot estimate (a lost drive, a gap): the static estimate,
+    the measured (filtered) torque minus gravity — right only at rest, the estimate before 2026-10-16."""
     js = shared_data.joint['joint_speed']
     jsf = shared_data.joint['joint_speed_filtered']
 
@@ -237,12 +249,22 @@ def update_joint_rest(*, shared_data, Joint_data, filter_banks, joint_num, delta
     shared_data.tcp['jacobian_manipulability'][0] = kin['manipulability']
 
     # --- External torque and force estimation ---
-    # Uses FILTERED torque: raw motor current is noisy, and torque_external / force_external
-    # feed collision/interaction estimates where that noise matters most. (This is the former
-    # "consider low-pass filtering torque_external" TODO — now done via the torque filter bank.)
-    # The gravity torque is update_joint_state()'s, read back from shared memory (the same values).
-    shared_data.tcp['torque_external'][:] = (shared_data.joint['joint_torque_filtered'][:]
-                                             - shared_data.joint['joint_gravity_torque'][:])
+    # The momentum observer (2026-10-16, utility/momentum_observer.py): the measured torque minus what moving the arm
+    # itself takes (gravity, inertia, Coriolis, friction), valid while it moves; its own low-pass (the observer gain).
+    # Without one, or on a tick it cannot estimate: the static estimate — the FILTERED torque (raw motor current is
+    # noisy) minus gravity (update_joint_state()'s, read back from shared memory), right only at rest.
+    if observer is not None and observer.step(
+            shared_data.joint['joint_position'], jsf, shared_data.joint['joint_torque'],
+            period_s if period_s is not None else observer.elapsed(time.perf_counter()),
+            getattr(robot, "pinocchio_momentum", None),
+            gravity=shared_data.joint['joint_gravity_torque']):          # the friction model's load term (2026-10-17)
+        # Published as measured - model (the sign torque_external always had: the torque the joints exert against
+        # the outside, e.g. +Tt for a lever pressing a table with Tt, CLAUDE.md §17.2); the observer's r is the torque
+        # the outside exerts on the joints — the opposite sign.
+        np.negative(observer.r, out=shared_data.tcp['torque_external'])
+    else:
+        shared_data.tcp['torque_external'][:] = (shared_data.joint['joint_torque_filtered'][:]
+                                                 - shared_data.joint['joint_gravity_torque'][:])
     f_ext_world = estimate_external_force_tcp(shared_data.tcp['torque_external'], J)
     shared_data.tcp['force_external'][:] = f_ext_world
 

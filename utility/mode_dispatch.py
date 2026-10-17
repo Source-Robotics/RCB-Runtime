@@ -342,7 +342,7 @@ def handle_idle(ctx: TickContext) -> tuple[TickResult, ControlOutput]:
         fc = getattr(ctx, "friction_comp", None)
         if fc is not None and ctx.shared_data.rti['friction_comp_enabled'][0] > 0.5:
             n = ctx.joint_num
-            comp = fc.step(ctx.shared_data.joint['joint_speed_filtered'])
+            comp = fc.step(ctx.shared_data.joint['joint_speed_filtered'], gravity)
             np.add(base[:n], comp[:n], out=_idle_trq_buf[:n])
             ctx.shared_data.joint['joint_friction_comp_torque'][:n] = comp[:n]
             _output_idle_gravity.trq_nm = _idle_trq_buf
@@ -526,6 +526,50 @@ def _add_dynamics_ff(ctx, output):
     output.trq_nm = total
 
 
+_fric_buf: dict = {}            # n -> the friction feedforward's own torque buffer: built on first use, reused
+
+
+def _fric_buffer(n):
+    buf = _fric_buf.get(n)
+    if buf is None:
+        buf = _fric_buf[n] = np.zeros(n, dtype=np.float64)
+    return buf
+
+
+def _add_friction_ff(ctx, output):
+    """Add the friction feedforward (THE friction model, utility/friction_model.py, 2026-10-17) to the tick's commanded
+    torque, behind rti['friction_ff_enabled'] (start state system.xml <dynamics_feedforward><friction>, OFF as shipped),
+    and publish it in joint_friction_comp_torque (Nm; dispatch_step clears it every tick).
+
+    On the COMMANDED speed (output.vel_rad): EXEC, JOG and RTI / SOFT_RTI position and velocity commands — no feedback, so
+    it cannot run away; the drive's own loop corrects what is left. Nothing without a commanded speed (freedrive — its
+    own compensation in handle_idle —, RTI torque commands, homing) and nothing at zero commanded speed (holds, the
+    velocity-hold outputs: the model is zero there, and the shared constant outputs are never touched). The load term
+    uses the gravity model's torque at the measured pose. ff_fraction: the share given back. A non-finite result adds
+    nothing."""
+    v = output.vel_rad
+    if v is None:
+        return
+    fm = getattr(ctx, 'friction_model', None)
+    if fm is None or ctx.shared_data.rti['friction_ff_enabled'][0] <= 0.5:
+        return
+    n = ctx.joint_num
+    buf = _fric_buffer(n)
+    if output.trq_nm is buf:              # a handler that did not refresh its torque: never add friction twice
+        return
+    tau = fm.torque(v, ctx.shared_data.joint['joint_gravity_torque'][:n], fraction=fm.ff_fraction)
+    check = float(np.dot(tau, tau))       # 0 only when every joint's is 0; NaN / inf carry through (no temporary)
+    if check == 0.0 or check != check or check == float('inf'):
+        return
+    if output.trq_nm is None:
+        buf.fill(0.0)
+    else:
+        np.copyto(buf, output.trq_nm)
+    np.add(buf, tau, out=buf)
+    ctx.shared_data.joint['joint_friction_comp_torque'][:n] = tau
+    output.trq_nm = buf
+
+
 def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
     """Run one tick of the active mode handler.
 
@@ -539,8 +583,8 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
     if handler is None:
         handler = handle_idle
     step_fn = handler.step if hasattr(handler, 'step') else handler
-    # The friction compensation applied this tick: 0 unless freedrive (handle_idle) sets it — every mode, so a
-    # value from the last freedrive tick never lingers.
+    # The friction compensation applied this tick: 0 unless freedrive (handle_idle) or the friction feedforward
+    # (_add_friction_ff) sets it — every mode, so a value from an earlier tick never lingers.
     ctx.shared_data.joint['joint_friction_comp_torque'].fill(0.0)
     ctx.shared_data.joint['joint_inertia_torque'].fill(0.0)
     ctx.shared_data.joint['joint_coriolis_torque'].fill(0.0)
@@ -555,6 +599,7 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
             return result
 
         _add_dynamics_ff(ctx, output)
+        _add_friction_ff(ctx, output)
         _commit_joint_state(ctx, output)
         _fk_commanded(ctx)
         _commit_tcp_target(ctx, output)
@@ -575,6 +620,7 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
         return result
 
     _add_dynamics_ff(ctx, output)
+    _add_friction_ff(ctx, output)
     t1b = time.perf_counter_ns()
     samples.append(("dynamics_ff", t1b - t1))
     _commit_joint_state(ctx, output)

@@ -106,7 +106,7 @@ def run(robot):
     print("\n1. compensation switches (status() reports each)")
     for key, setter in (("gravity_comp", robot.set_gravity_comp), ("inertia_comp", robot.set_inertia_comp),
                         ("coriolis_comp", robot.set_coriolis_comp), ("friction_comp", robot.set_friction_comp),
-                        ("can_read_first", robot.set_can_read_first)):
+                        ("friction_ff", robot.set_friction_ff), ("can_read_first", robot.set_can_read_first)):
         was = bool(s0.get(key))
         setter(not was)
         settle()
@@ -235,7 +235,7 @@ def run(robot):
     check("RTI ticking, no error, no CRITICAL line in RTI.log since the start", ticking() and s1.get("err") == 0
           and not criticals_since(log0), (s1.get("errors"), criticals_since(log0)[:2]))
     check("every switch as it was", all(bool(s1.get(k)) == bool(s0.get(k)) for k in
-          ("gravity_comp", "inertia_comp", "coriolis_comp", "friction_comp", "can_read_first")))
+          ("gravity_comp", "inertia_comp", "coriolis_comp", "friction_comp", "friction_ff", "can_read_first")))
 
 
 def main():

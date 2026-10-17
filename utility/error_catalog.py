@@ -19,7 +19,7 @@ ERROR_DESCRIPTIONS is the old name (utility/error_checks.py and nets use it): th
 """
 
 GROUPS = {
-    1: "Safety: E-stop, limits, walls, speed, zones, self-collision",
+    1: "Safety: E-stop, limits, walls, speed, zones, self-collision, collisions",
     2: "Drives, motors and the gripper",
     3: "CAN and communication",
     4: "Homing",
@@ -156,6 +156,26 @@ CATALOG = {
                                "are not being watched.",
                                "Warning only: the robot keeps running without its self-collision check.",
                                "Check the self-collision log in the Logs tab. The worker restarts with the service."),
+    "COLLISION": _e(1501, "Collision detected",
+                    "While the robot moved the joint, the external torque on it rose above its collision threshold "
+                    "(robot XML <collision_torque_nm>) compared with the torque it had at rest before the move: the "
+                    "arm hit something, or carries a load it was not told about.",
+                    _HARD,
+                    "Check what the arm hit and clear the way. Declare a held part with set_payload. Clear errors, "
+                    "then continue. A program that pushes on purpose switches the check off with "
+                    "set_collision_detection."),
+    "COLLISION_WARNING": _e(1502, "Collision detected",
+                            "While the robot moved the joint, the external torque on it rose above its collision "
+                            "threshold compared with the torque it had at rest before the move. The check runs in "
+                            "warn-only mode.", _WARN,
+                            "If nothing was hit, raise <collision_torque_nm> for the joint or re-measure it with "
+                            "api_tests/76 before the check is set to stop. RTI.log has the peak."),
+    "CONTACT_WARNING": _e(1503, "Contact detected",
+                          "While the robot moved the joint, the external torque on it rose above its contact "
+                          "threshold (robot XML <contact_torque_nm>) compared with the torque it had at rest before "
+                          "the move.", _WARN,
+                          "None needed if the contact was expected. If nothing touched the arm, raise "
+                          "<contact_torque_nm> for the joint or re-measure it with api_tests/76."),
 
     # ---------------------------------------------------------------- 2xxx drives, motors, gripper
     "TEMPERATURE": _drive(2101, "the joint's motor", "Motor overheating",
@@ -518,6 +538,7 @@ CATALOG = {
     "BLEND_SPLICE_REJECTED": _info(9017, "Blend into the running move skipped"),
     "CAPTURE_STARTED": _info(9018, "Telemetry capture started"),
     "CAPTURE_SAVED": _info(9019, "Telemetry capture saved"),
+    "COLLISION_DETECTION_CHANGED": _info(9020, "Collision detection changed"),
 }
 
 ERROR_DESCRIPTIONS = CATALOG          # the old name (utility/error_checks.py, nets)

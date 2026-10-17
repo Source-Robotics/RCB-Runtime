@@ -614,8 +614,11 @@ def main():
     _dff = _sys.get("dynamics_feedforward", {"inertia": True, "coriolis": True})
     shared_data.rti["inertia_comp_enabled"][0]      = 1.0 if _dff.get("inertia", True) else 0.0
     shared_data.rti["coriolis_comp_enabled"][0]     = 1.0 if _dff.get("coriolis", True) else 0.0
+    # friction feedforward (utility/mode_dispatch.py _add_friction_ff, 2026-10-17): OFF unless system.xml says <friction>1
+    shared_data.rti["friction_ff_enabled"][0]       = 1.0 if _dff.get("friction", False) else 0.0
     log_dynamics.info(f"dynamics feedforward at start: inertia {'ON' if _dff.get('inertia', True) else 'off'}, "
-                f"Coriolis {'ON' if _dff.get('coriolis', True) else 'off'} (system.xml <dynamics_feedforward>)")
+                f"Coriolis {'ON' if _dff.get('coriolis', True) else 'off'}, friction "
+                f"{'ON' if _dff.get('friction', False) else 'off'} (system.xml <dynamics_feedforward>)")
 
     # ==========================================================================
     # Data queue. Allows us to save previous x points of data for safety, filtering, 
@@ -1090,6 +1093,16 @@ def main():
                 log_safety.warning(f"J{w['joint'] + 1} freedrive wall: {w['note']}")
 
 
+    # The external torque WHILE MOVING (2026-10-16, utility/momentum_observer.py): a momentum observer on the dynamics
+    # model, minus the measured sliding friction; written to tcp['torque_external'] (and the TCP force from it) each
+    # tick after the send. Without the model's terms: the static estimate (measured - gravity), as before.
+    from utility.momentum_observer import MomentumObserver
+    ext_observer = MomentumObserver(joint_num, friction_coulomb=cfg['friction_coulomb_nm'],
+                                    friction_viscous=cfg['friction_viscous_nm_s'], friction_load=cfg['friction_load_per_nm'])
+    log_dynamics.info(f"external torque: momentum observer, gain {ext_observer.gain:g}/s, friction "
+                      + ext_observer.model.describe() + " Nm"
+                      + ("" if getattr(robot, "pinocchio_momentum", None) is not None
+                         else " — NO dynamics model: the static estimate (measured - gravity, right only at rest)"))
     st._wall_haptic = _zone_setup['haptic']
     st._joint_walls = _resolve_walls(st._wall_haptic)
     safety_monitor = SafetyMonitor(
@@ -1119,7 +1132,15 @@ def main():
             "pair_b": shared_data.rti["sc_pair_b"], "gap": shared_data.rti["sc_min_gap"],
             "pair_gaps": shared_data.rti["sc_pair_gaps"]},
         sc_policy=_sys['self_collision'],
+        # collision detection (2026-10-16): the observer's estimate against the robot XML's thresholds; the observer
+        # itself so the check waits while it (re)starts
+        t_ext=shared_data.tcp['torque_external'][:joint_num],
+        contact_nm=cfg['contact_torque_nm'], collision_nm=cfg['collision_torque_nm'], ext_observer=ext_observer,
     )
+    _COLLISION_MODE_CODE = {"off": 0.0, "warn": 1.0, "stop": 2.0}
+    _COLLISION_MODE_NAME = {0: "off", 1: "warn", 2: "stop"}
+    shared_data.rti['collision_mode'][0] = _COLLISION_MODE_CODE[
+        safety_monitor.collision_mode if safety_monitor.check_collision else "off"]
 
     # Haptic zone walls for IDLE gravity-comp freedrive (utility/haptic_walls.py). The TCP Jacobian is not in
     # shared memory, so RTI keeps its own buffer, refreshed every tick by the measurement (with option B: in IDLE by
@@ -1136,7 +1157,14 @@ def main():
     # (robot XML) and the <friction_comp> policy; only acts while the operator switch is ON.
     from utility.friction_comp import FrictionComp
     ctx.friction_comp = FrictionComp(joint_num, cfg['friction_static_nm'], cfg['gravity_error_nm'],
-                                     _sys['friction_comp'], friction_sliding=cfg['friction_sliding_nm'])
+                                     _sys['friction_comp'], friction_sliding=cfg['friction_coulomb_nm'],
+                                     friction_load=cfg['friction_load_per_nm'])
+    # THE friction model (utility/friction_model.py, 2026-10-17): the friction feedforward on the commanded speed
+    # (utility/mode_dispatch._add_friction_ff, behind rti['friction_ff_enabled']) reads it from ctx.
+    from utility.friction_model import FrictionModel
+    ctx.friction_model = FrictionModel.from_config(cfg, joint_num, ff_fraction=_dff.get("friction_fraction", 1.0))
+    log_dynamics.info("friction model (robot XML, api_tests/77): " + ctx.friction_model.describe()
+                      + f" Nm; feedforward gives back {ctx.friction_model.ff_fraction:g} of it")
     log_dynamics.info("friction compensation (freedrive, switch OFF at start): " + ", ".join(
         f"J{j + 1} {c:.3f} Nm" for j, c in enumerate(ctx.friction_comp.c)) +
         f" (fraction {ctx.friction_comp.fraction:g} of friction - gravity error; full beyond "
@@ -1289,6 +1317,25 @@ def main():
             log_dynamics.info(f"friction compensation {'ON' if new_val else 'OFF'} (freedrive)")
 
 
+    def _handle_collision_detection(cmd_msg, cmd_dict):
+        """collision_detection:<off|warn|stop> — collision detection's reaction until RTI restarts (2026-10-16): a PC
+        program that pushes on purpose switches it off, and back. Start state: system.xml <safety_monitor><collision>.
+        A switch to a weaker reaction is a WARNING in RTI.log (a protection switched off)."""
+        parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
+        if len(parts) != 2 or parts[1].strip() not in _COLLISION_MODE_CODE:
+            log_safety.warning(f"collision_detection: {cmd_msg!r} is not off | warn | stop — ignored")
+            return
+        old = _COLLISION_MODE_NAME[int(shared_data.rti['collision_mode'][0])]
+        new = safety_monitor.set_collision_mode(parts[1].strip())
+        shared_data.rti['collision_mode'][0] = _COLLISION_MODE_CODE[new]
+        if new != old:
+            log_activity(_rti_activity_logger, "RTI", "info", "COLLISION_DETECTION_CHANGED", id=st.command_id,
+                         message=f"collision detection: {old} -> {new}")
+        (log_safety.warning if _COLLISION_MODE_CODE[new] < _COLLISION_MODE_CODE[old] else log_safety.info)(
+            f"collision detection {old} -> {new}" + ("" if new == parts[1].strip()
+                                                     else " (no thresholds or no estimate: nothing to check)"))
+
+
     def _dynamics_switch(cmd_msg, key, label):
         """inertia_comp:1|0 / coriolis_comp:1|0 — the operator switches of the inertia and Coriolis feedforward on the
         commanded motion (EXEC, JOG, RTI / SOFT_RTI position and velocity commands; utility/mode_dispatch.py)."""
@@ -1305,6 +1352,10 @@ def main():
 
     def _handle_inertia_comp(cmd_msg, cmd_dict):
         _dynamics_switch(cmd_msg, 'inertia_comp_enabled', "inertia")
+
+    def _handle_friction_ff(cmd_msg, cmd_dict):
+        """friction_ff:1|0 — the friction feedforward on the commanded speed (2026-10-17, utility/friction_model.py)."""
+        _dynamics_switch(cmd_msg, 'friction_ff_enabled', "friction")
 
     def _handle_can_read_first(cmd_msg, cmd_dict):
         """can_read_first:1|0 — TODO/can_tx_timing_plan.md option B (2026-10-12; its start state is system.xml
@@ -1986,7 +2037,9 @@ def main():
         "clear_errors":      _handle_clear_errors,
         "gravity_comp":      _handle_gravity_comp,
         "friction_comp":     _handle_friction_comp,
+        "collision_detection": _handle_collision_detection,
         "inertia_comp":      _handle_inertia_comp,
+        "friction_ff":       _handle_friction_ff,
         "can_read_first":    _handle_can_read_first,
         "hall_check":        _handle_hall_check,
         "coriolis_comp":     _handle_coriolis_comp,
@@ -2220,6 +2273,7 @@ def main():
             motor_signs=motor_signs,
             robot=robot,
             jacobian_out=tcp_jacobian,
+            observer=ext_observer,
         )
         _profile_last = _profile_mark(_profile_last, "joint_tcp_shared")
         _history_entry()
@@ -2244,7 +2298,8 @@ def main():
         nonlocal _profile_last
         update_joint_rest(shared_data=shared_data, Joint_data=Joint_data, filter_banks=st.filter_banks,
                           joint_num=joint_num, delta_t=delta_t, gear_ratio=gear_ratio, gear_efficiency=gear_efficiency,
-                          motor_kt=motor_kt, motor_signs=motor_signs, robot=robot, jacobian_out=tcp_jacobian)
+                          motor_kt=motor_kt, motor_signs=motor_signs, robot=robot, jacobian_out=tcp_jacobian,
+                          observer=ext_observer)
         _profile_last = _profile_mark(_profile_last, "joint_tcp_shared")
         _history_entry()
 

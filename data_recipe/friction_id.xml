@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Recipe: friction_id
+    What api_tests/77_friction_id.py reads, one packet per RTI tick, while the drive's own speed loop slides one joint
+    back and forth: the position and RAW speed (is it really sliding?), the measured joint torque and the torque RTI
+    commanded (the model's gravity) — their difference at a steady speed is friction + the gravity model's error — and
+    the motor temperatures (friction changes as a gearbox warms). The same fields as haptic_wall (54's recipe) + m_temp.
+-->
+<recipe name="friction_id">
+    <field tag="j_p"     precision="5"/>
+    <field tag="j_s"     precision="4"/>
+    <field tag="j_t"     precision="4"/>
+    <field tag="j_tc"    precision="4"/>
+    <field tag="m_temp"  precision="1"/>
+    <field tag="tick"/>
+    <field tag="mode"/>
+</recipe>

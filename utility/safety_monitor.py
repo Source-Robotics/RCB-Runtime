@@ -82,6 +82,20 @@ WHAT IT CHECKS (per-joint keys are "J1:KEY".."J6:KEY", the joint's 1-based numbe
                   the margin on the first fresh tick of an active period (the arm pushed there in freedrive) does
                   not trip; only that pair getting SC_ESCAPE_TOL_M (2 mm) closer than then, or ANOTHER pair coming
                   within the margin, does — read per pair from rti['sc_pair_gaps']. Every passive period re-takes it.
+  CONTACT_WARNING / COLLISION  (2026-10-16) the external joint torque the momentum observer estimates
+                  (tcp['torque_external'], utility/momentum_observer.py) minus a BASELINE taken at rest before each move
+                  — the model's own error at that pose and the stiction the joint settled with — above the joint's
+                  robot-XML <contact_torque_nm> (a live J{i}:CONTACT_WARNING, always a warning) or <collision_torque_nm>
+                  (<safety_monitor><collision>: warn -> a live J{i}:COLLISION_WARNING; stop -> the error J{i}:COLLISION,
+                  the normal safety stop). Only in EXEC, JOG, RTI and SOFT_RTI (user decision; never in freedrive,
+                  hand guiding or homing), only while the arm is commanded to move and for <collision_settle_s> after
+                  (a joint commanded faster than <hold_still_dps>): at rest the baseline follows the estimate (an EMA
+                  of COLLISION_BASELINE_TAU_S), so whatever the arm rests with is not a contact. Sustain
+                  <collision_sustain_s>; nothing for OBSERVER_SETTLE_S after the observer (re)starts. A warning clears
+                  once the joint is under half its contact threshold, or at rest; RTI.log gets the peak. A PC program
+                  that pushes on purpose switches it with the collision_detection command (off | warn | stop, until
+                  RTI restarts). The thresholds are the measured model error (api_tests/76_external_torque.py): an
+                  undeclared payload (set_payload) reads as external torque too.
   ZONE_VIOLATION  (key "Z_<zone>:ZONE_VIOLATION") the measured TCP or a tool sphere past a STOP-zone's
                   surface + <zone_tolerance> (utility/zones.py; the zone's margin is the planner's, not
                   counted here). Edge-triggered like OUT_OF_RANGE, but it fires AGAIN if the robot is
@@ -135,11 +149,19 @@ SC_STALE_S = 0.5                # the worker's heartbeat unchanged this long -> 
 SC_ESCAPE_TOL_M = 0.002         # escape rule: a pair in contact at the start of an active period may get this much closer
 SC_PAIRS = 49                   # rti['sc_pair_gaps'] = 7 x 7 frames, index a * 7 + b
 HOLD_OSC_EMA_S = 0.1            # s: the averaging of the high-passed current's square (the level's time constant)
+CONTACT_WARNING = "CONTACT_WARNING"
+COLLISION = "COLLISION"
+COLLISION_WARNING = "COLLISION_WARNING"
+COLLISION_BASELINE_TAU_S = 0.1  # s: at rest the baseline follows the external torque estimate with this time constant
+OBSERVER_SETTLE_S = 0.1         # s: no collision check this long after the observer (re)starts (5 of its time constants)
 MONITOR_KEYS = frozenset({OUT_OF_RANGE, BEYOND_ENDSTOP, OVERSPEED, TRACKING, TCP_OVERSPEED, ZONE_VIOLATION,
-                          HARD_LIMIT, JOINT_WALL, SELF_COLLISION})
+                          HARD_LIMIT, JOINT_WALL, SELF_COLLISION, COLLISION})
 
 EXEMPT_MODES = frozenset({RobotMode.HOMING, RobotMode.FLASHING, RobotMode.BOOTING, RobotMode.SAFETY_STOP})
 TRACKING_MODES = frozenset({RobotMode.EXEC})
+# Collision detection runs where the ROBOT drives the arm (user decision 2026-10-16) — not in freedrive / hand guiding /
+# impedance, where a hand or a contact is the point.
+COLLISION_MODES = frozenset({RobotMode.EXEC, RobotMode.JOG, RobotMode.RTI, RobotMode.SOFT_RTI})
 # The robot commands NO motion in these: IDLE holds gravity torque (freedrive) or zero velocity, ACTIVE_ERROR
 # holds zero velocity. A soft limit passed here was passed by a hand — warn, do not stop (2026-10-01).
 PASSIVE_MODES = frozenset({RobotMode.IDLE, RobotMode.ACTIVE_ERROR})
@@ -174,7 +196,8 @@ class SafetyMonitor:
                  soft_lo, soft_hi, hard_lo, hard_hi, has_endstop, vel_ceiling,
                  tolerance_rad, endstop_tolerance_rad, tracking_limit_rad, tcp_limit, policy,
                  tcp_pose=None, zones=(), tool_spheres=(), haptic=None, joint_walls=None,
-                 i_meas=None, v_cmd=None, hold_osc_ma=None, sc=None, sc_policy=None):
+                 i_meas=None, v_cmd=None, hold_osc_ma=None, sc=None, sc_policy=None,
+                 t_ext=None, contact_nm=None, collision_nm=None, ext_observer=None):
         n = int(joint_num)
         self.n = n
         # Fixed VIEWS of the live shared-memory arrays: reading them allocates nothing.
@@ -304,6 +327,37 @@ class SafetyMonitor:
         self._ho_counting = False                                              # some counter may be non-zero
         self._ho_fresh = True                                                  # restart the filter on the next tick
         self._k_how = [joint_key(i, HOLD_OSCILLATION_WARNING) for i in range(n)]
+        # CONTACT_WARNING / COLLISION(_WARNING): a fixed view of the external torque estimate (tcp['torque_external'],
+        # joints only), the per-joint thresholds (robot XML, Nm; 0 / NaN = that threshold unchecked) and the observer
+        # (its `running` / `resets`: no check while it starts again). The commanded speeds (v_cmd) say "moving".
+        self._te, self._obs = t_ext, ext_observer
+        def _threshold(a):
+            a = f(a) if a is not None else np.zeros(n)
+            return np.where(np.isfinite(a) & (a > 0), a, np.inf)
+        self._cn_thr, self._co_thr = _threshold(contact_nm), _threshold(collision_nm)
+        self._cl_lo = np.minimum(self._cn_thr, self._co_thr)                   # the lower of the two: the early out
+        self._cl_clear = 0.5 * self._cl_lo                                      # a warning clears under this
+        self._cl_possible = t_ext is not None and v_cmd is not None and bool(np.isfinite(self._cl_lo).any())
+        self.collision_mode = check_mode(policy.get("collision", "off"))
+        self.check_collision = self._cl_possible and self.collision_mode != "off"
+        self._cl_n = sustain_ticks(policy.get("collision_sustain_s", 0.012), dt)
+        self._cl_settle_n = sustain_ticks(policy.get("collision_settle_s", 0.5), dt)
+        self._cl_hold_n = sustain_ticks(OBSERVER_SETTLE_S, dt)
+        self._cl_k = min(1.0, float(dt) / COLLISION_BASELINE_TAU_S)              # the baseline's EMA at rest
+        self._cl_base, self._cl_d = z(np.float64), z(np.float64)
+        self._cl_pk = z(np.float64)                                             # a live excursion's peak, Nm
+        self._cl_cc, self._cl_oc = z(np.int64), z(np.int64)                     # ticks over contact / collision
+        self._cl_b1, self._cl_b2, self._cl_b3 = z(bool), z(bool), z(bool)
+        self._cl_live_c, self._cl_live_w = z(bool), z(bool)                     # CONTACT_ / COLLISION_WARNING live
+        self._cl_armed = np.ones(n, dtype=bool)                                 # COLLISION fires once per excursion
+        self._cl_any = self._cl_counting = False
+        self._cl_fresh = True                                                   # take the baseline on the next tick
+        self._cl_since = self._cl_settle_n                                      # ticks since the arm was commanded to move
+        self._cl_hold = 0                                                       # ticks left without a check
+        self._cl_resets = ext_observer.resets if ext_observer is not None else 0
+        self._k_ct = [joint_key(i, CONTACT_WARNING) for i in range(n)]
+        self._k_cl = [joint_key(i, COLLISION) for i in range(n)]
+        self._k_clw = [joint_key(i, COLLISION_WARNING) for i in range(n)]
         # SELF_COLLISION from the worker's shared-memory fields: sc = {"hit", "heartbeat", "pair_a", "pair_b", "gap"} views.
         self._sc = sc
         self.sc_mode = check_mode((sc_policy or {}).get("reaction", "off")) if (sc_policy or {}).get("enabled", 0) else "off"
@@ -409,6 +463,16 @@ class SafetyMonitor:
                 parts.append(f"J{i + 1} hard limit (stop)")
         return ", ".join(parts) or "none"
 
+    def _collision_text(self):
+        if not self._cl_possible:
+            return "off (no thresholds in the robot XML)" if self._te is not None else "off (no external torque)"
+        if not self.check_collision:
+            return "off"
+        lim = ", ".join(f"J{i + 1} " + "/".join(f"{v:.2f}" if np.isfinite(v) else "-" for v in (c, o))
+                        for i, (c, o) in enumerate(zip(self._cn_thr, self._co_thr)))
+        return (f"{self.collision_mode} (contact/collision {lim} Nm over the baseline taken at rest; EXEC/JOG/RTI/"
+                f"SOFT_RTI while commanded to move + {self._cl_settle_n} ticks, sustain {self._cl_n} ticks)")
+
     def _hold_osc_text(self):
         if not self.check_hold_osc:
             return "off"
@@ -431,6 +495,7 @@ class SafetyMonitor:
             f"tracking {self.tracking_mode if self.check_tracking else 'off'}, "
             f"TCP speed {self.tcp_mode if self.check_tcp else 'off'}, hold oscillation {self._hold_osc_text()}, "
             f"self-collision {self.sc_mode if self.check_self_collision else 'off'} (from the worker), "
+            f"collision {self._collision_text()}, "
             f"zones {self.check_zones} ({len(self._zones)} enabled, "
             f"{len(self._spheres)} robot sphere(s), tolerance {1000 * self._z_tol:.1f} mm); "
             f"tolerance {np.degrees(self.tol):.2f} deg (endstops {np.degrees(self.end_tol):.2f} deg), position sustain "
@@ -468,6 +533,7 @@ class SafetyMonitor:
         self._ho_fresh = True
         self._sc_c, self._sc_armed, self._sc_live, self._sc_stale = 0, True, False, False
         self._sc_rebase = True
+        self._collision_reset()
         if self.warnings:
             self.warnings.clear()
 
@@ -587,6 +653,8 @@ class SafetyMonitor:
                 self._sc_rebase = True                       # the next active period takes its escape baseline
             else:
                 fired = self._self_collision_step(fired)
+        if self.check_collision:
+            fired = self._collision_step(fired, mode)
         if self.check_tcp:
             t = self._tcp
             s = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]) ** 0.5
@@ -733,6 +801,171 @@ class SafetyMonitor:
                     self.warnings.discard(SELF_COLLISION_WARNING)
                     logger.info("self-collision warning cleared: the links are apart again")
         return fired
+
+    def set_collision_mode(self, mode):
+        """The runtime switch (RTI's collision_detection command): off | warn | stop, until RTI restarts — for a PC
+        program that pushes on purpose. Cold. Live warnings end; the next tick takes a new baseline. Returns the mode
+        now in force ("off" when there is nothing to check)."""
+        self.collision_mode = check_mode(mode)
+        self.check_collision = self._cl_possible and self.collision_mode != "off"
+        if self._cl_any:
+            self._collision_clear_all("the check was switched")
+        self._collision_reset()
+        return self.collision_mode if self._cl_possible else "off"
+
+    def _collision_reset(self):
+        """No excursion, no counting; the next checked tick takes a fresh baseline. The warning KEYS are the caller's
+        (_disarm clears the whole set; the switch logs and drops them first)."""
+        self._cl_cc.fill(0)
+        self._cl_oc.fill(0)
+        self._cl_live_c.fill(False)
+        self._cl_live_w.fill(False)
+        self._cl_pk.fill(0.0)
+        self._cl_armed.fill(True)
+        self._cl_any = self._cl_counting = False
+        self._cl_fresh = True
+        self._cl_since = self._cl_settle_n
+
+    def _collision_step(self, fired, mode):
+        """CONTACT_WARNING / COLLISION(_WARNING), one tick (see the module docstring). Allocation-free unless something
+        starts or ends: ~8 array operations while moving, ~6 at rest. _cl_any = something to follow: a live warning or
+        a joint that fired in stop mode and has not come back under (it re-arms there)."""
+        if mode not in COLLISION_MODES:                     # freedrive, hand guiding, ACTIVE_ERROR: nothing to judge
+            if self._cl_any:
+                self._collision_clear_all("the robot left EXEC / JOG / RTI")
+            if not self._cl_fresh:
+                self._collision_reset()
+            return fired
+        obs = self._obs
+        if obs is not None and (not obs.running or obs.resets != self._cl_resets):
+            self._cl_resets = obs.resets                    # the observer (re)starts: its estimate converges first
+            self._cl_hold = self._cl_hold_n
+        if self._cl_hold > 0:
+            self._cl_hold -= 1
+            if self._cl_counting:
+                self._cl_cc.fill(0)
+                self._cl_oc.fill(0)
+                self._cl_counting = False
+            return fired
+        e, base, d, b = self._te, self._cl_base, self._cl_d, self._cl_b1
+        if self._cl_fresh:                                  # the first checked tick of an active period
+            np.copyto(base, e)
+            self._cl_fresh = False
+        np.abs(self._vc, out=d)
+        np.greater(d, self._ho_still, out=b)
+        if b.any():                                         # commanded to move: the check runs (and settle_n after)
+            self._cl_since = 0
+        elif self._cl_since < self._cl_settle_n:
+            self._cl_since += 1
+        np.subtract(e, base, out=d)
+        if self._cl_since >= self._cl_settle_n:             # at rest: the baseline follows what the arm rests with
+            d *= self._cl_k
+            base += d
+            if self._cl_any:
+                self._collision_clear_all("the arm is at rest")
+            if self._cl_counting:
+                self._cl_cc.fill(0)
+                self._cl_oc.fill(0)
+                self._cl_counting = False
+            return fired
+        np.abs(d, out=d)                                    # d = |estimate - baseline|
+        np.greater(d, self._cl_lo, out=b)
+        if not b.any() and not self._cl_any:                # the common tick: every joint under both thresholds
+            if self._cl_counting:
+                self._cl_cc.fill(0)
+                self._cl_oc.fill(0)
+                self._cl_counting = False
+            return fired
+        self._cl_counting = True
+        b2, b3 = self._cl_b2, self._cl_b3
+        np.greater(d, self._cn_thr, out=b2)
+        cc = self._cl_cc
+        cc += b2
+        cc *= b2                                            # consecutive ticks over contact
+        np.greater(d, self._co_thr, out=b3)
+        oc = self._cl_oc
+        oc += b3
+        oc *= b3                                            # consecutive ticks over collision
+        np.equal(cc, self._cl_n, out=b2)
+        np.equal(oc, self._cl_n, out=b3)
+        if b2.any() or b3.any():
+            fired = self._collision_fire(fired, b2, b3, d)
+        if self._cl_any:
+            self._collision_track(d)
+        return fired
+
+    def _collision_msg(self, i, d, thr, what):
+        return (f"{d:.2f} Nm of external torque, over the {thr:.2f} Nm {what} threshold (estimate "
+                f"{float(self._te[i]):+.2f} Nm, {float(self._cl_base[i]):+.2f} Nm at rest before the move)")
+
+    def _collision_fire(self, fired, contact, collision, d):
+        """Cold path: a joint's contact / collision threshold held for the sustain."""
+        for i in np.flatnonzero(contact):
+            if self._cl_live_c[i]:
+                continue
+            self._cl_live_c[i] = True
+            self._cl_pk[i] = max(self._cl_pk[i], d[i])
+            key = self._k_ct[i]
+            self.warnings.add(key)
+            self.details[key] = self._collision_msg(i, d[i], self._cn_thr[i], "contact")
+            logger.warning(f"J{i + 1} contact: {self.details[key]} — a warning")
+        for i in np.flatnonzero(collision):
+            if not self._cl_armed[i]:
+                continue
+            self._cl_armed[i] = False
+            self._cl_pk[i] = max(self._cl_pk[i], d[i])
+            if self.collision_mode == "warn":
+                key = self._k_clw[i]
+                self._cl_live_w[i] = True
+                self.warnings.add(key)
+                self.details[key] = self._collision_msg(i, d[i], self._co_thr[i], "collision")
+                logger.warning(f"J{i + 1} collision (warn): {self.details[key]} — no stop (warn mode)")
+            else:
+                key = self._k_cl[i]
+                self.details[key] = self._collision_msg(i, d[i], self._co_thr[i], "collision")
+                logger.error(f"J{i + 1} {COLLISION}: {self.details[key]}")
+                fired = fired if fired is not None else []
+                fired.append(key)
+        self._cl_any = bool(self._cl_live_c.any() or self._cl_live_w.any() or not self._cl_armed.all())
+        return fired
+
+    def _collision_track(self, d):
+        """While a contact / collision warning is live or a joint is disarmed (stop mode): the peak; a warning ends, and
+        a joint re-arms, once the joint is under half its contact threshold."""
+        live = False
+        for i in range(self.n):
+            if not (self._cl_live_c[i] or self._cl_live_w[i]):
+                if not self._cl_armed[i]:
+                    if d[i] < self._cl_clear[i]:
+                        self._cl_armed[i] = True
+                    else:
+                        live = True
+                continue
+            if d[i] > self._cl_pk[i]:
+                self._cl_pk[i] = d[i]
+            if d[i] < self._cl_clear[i]:
+                self._collision_end(i, "back under half its contact threshold")
+            else:
+                live = True
+        self._cl_any = live
+
+    def _collision_end(self, i, why):
+        """Cold path: a joint's contact / collision warnings end; the peak to RTI.log."""
+        self.warnings.discard(self._k_ct[i])
+        self.warnings.discard(self._k_clw[i])
+        c, o = self._cn_thr[i], self._co_thr[i]
+        logger.info(f"J{i + 1} external torque over ({why}); it peaked at {self._cl_pk[i]:.2f} Nm "
+                     f"(thresholds contact {c:.2f} / collision {o:.2f} Nm)")
+        self._cl_live_c[i] = self._cl_live_w[i] = False
+        self._cl_armed[i] = True
+        self._cl_pk[i] = 0.0
+
+    def _collision_clear_all(self, why):
+        for i in range(self.n):
+            if self._cl_live_c[i] or self._cl_live_w[i]:
+                self._collision_end(i, why)
+        self._cl_armed.fill(True)
+        self._cl_any = False
 
     def _hold_osc_fire(self, fire):
         """Cold path: a joint has buzzed for the sustain window — a live warning."""

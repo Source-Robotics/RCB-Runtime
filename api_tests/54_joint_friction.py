@@ -131,7 +131,8 @@ SLIDE_STEADY = 0.9                     # ... in at least this share of a directi
 SLIDE_PAST_DEG = 3.0                   # further than this past its back-and-forth: stop
 
 
-def run_slide(j, v_dps, amp_deg, send_velocity, read_state, pace, n=6, legs=SLIDE_LEGS):
+def run_slide(j, v_dps, amp_deg, send_velocity, read_state, pace, n=6, legs=SLIDE_LEGS, past_deg=SLIDE_PAST_DEG,
+              skip_s=SLIDE_SKIP_S):
     """SLIDING friction, the way robot friction is usually identified: the DRIVE's own velocity loop (fast, on its
     encoder — no stick-slip from our 250 Hz loop) moves the joint back and forth at a constant v_dps between
     ±amp_deg; every other joint is held at speed 0. RTI adds the gravity model to the command, so the drive's own
@@ -143,7 +144,9 @@ def run_slide(j, v_dps, amp_deg, send_velocity, read_state, pace, n=6, legs=SLID
     what the speed asks (a joint that sticks and jumps needs more than its sliding friction to break loose again).
     Ends with speed 0 commanded on every path. read_state() -> dict with "j_p", "j_s", "j_t", "j_tc" (rad, rad/s,
     Nm) or None. Returns ({+1: (mean extra torque Nm, mean speed rad/s, share steady, mean model gravity Nm),
-    -1: (...)} or None, why stopped or None)."""
+    -1: (...)} or None, why stopped or None). past_deg / skip_s: the travel allowed past ±amp_deg before it stops,
+    and the time after each turn not measured — the constants by default; api_tests/77 widens them for fast slides
+    (2026-10-16). It ends a whole travel (amp_deg) away from where it started: a caller sliding again returns first."""
     vel = [0.0] * n
 
     def to_zero(why):
@@ -174,7 +177,7 @@ def run_slide(j, v_dps, amp_deg, send_velocity, read_state, pace, n=6, legs=SLID
         if s is not None:
             q = np.asarray(s["j_p"], dtype=float)
             x = float(q[j])
-            if abs(x - x0) > a + math.radians(SLIDE_PAST_DEG):
+            if abs(x - x0) > a + math.radians(past_deg):
                 return to_zero(f"J{j + 1} {math.degrees(x - x0):+.1f} deg from its start — past its back-and-forth: "
                                f"stopped")
             others = max((abs(q[i] - q0[i]) for i in range(n) if i != j), default=0.0)
@@ -183,7 +186,7 @@ def run_slide(j, v_dps, amp_deg, send_velocity, read_state, pace, n=6, legs=SLID
             if (d > 0 and x >= x0 + a) or (d < 0 and x <= x0 - a):
                 d, since, xs = -d, 0.0, []
                 done += 1
-            elif since > SLIDE_SKIP_S:
+            elif since > skip_s:
                 r = acc[d]
                 r[0].append(float(s["j_t"][j]) - float(s["j_tc"][j]))
                 r[1].append(float(s["j_s"][j]))
@@ -490,7 +493,7 @@ def main():
 
     robot = RobotClient(sync=False)
     robot.connect(args.host, args.port)
-    claimed, prev_recipe = False, None
+    claimed, prev_recipe, prev_ff = False, None, False
     out = {"joint": args.joint, "ramp": args.ramp, "max": t_max, "angles": []}
     try:
         q_now = np.asarray(robot.get_joints(), dtype=float)
@@ -518,6 +521,10 @@ def main():
         base.claim_control(robot)
         claimed = True
         prev_recipe = st.get("recipe")
+        # the friction feedforward (2026-10-17) would hide the friction this measures: off, back at the end
+        prev_ff = bool(st.get("friction_ff"))
+        if prev_ff:
+            robot.set_friction_ff(False)
         robot.reload_recipes()
         robot.set_recipe(RECIPE)
         robot.set_gravity_comp(True)
@@ -650,6 +657,8 @@ def main():
             try:
                 if prev_recipe:
                     robot.set_recipe(prev_recipe)
+                if prev_ff:
+                    robot.set_friction_ff(True)
                 if robot.status().get("mode") not in ("IDLE",):
                     robot.enter_idle_mode(wait=True)
                 robot.release_control()

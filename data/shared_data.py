@@ -609,6 +609,12 @@ def setup(joints: int = 6, force_reinit: bool = False):
         # _add_dynamics_ff, 2026-10-10) — two separate operator switches; RTI sets their start state from system.xml.
         "inertia_comp_enabled",
         "coriolis_comp_enabled",
+        # Friction feedforward on the commanded speed (utility/mode_dispatch._add_friction_ff, 2026-10-17): 1.0 = on.
+        # RTI sets its start state from system.xml <dynamics_feedforward><friction> (0 as shipped).
+        "friction_ff_enabled",
+        # Collision detection's reaction in force (utility/safety_monitor.py, 2026-10-16): 0 off, 1 warn, 2 stop. RTI
+        # writes it at start (system.xml <safety_monitor><collision>) and on the collision_detection command; status().
+        "collision_mode",
         # Runtime payload (utility/payload.py, set_payload): the part the gripper holds — mass [kg] and its centre
         # of mass [m] in the tool link's frame. 0 at every RTI start (not persisted). Read by status() and the GUI.
         "payload_mass",

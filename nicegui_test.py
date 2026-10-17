@@ -457,8 +457,11 @@ with ui.card().classes("w-full mb-2"):
         except Exception:
             logger.exception("block program badge unavailable")
         ui.separator().props("vertical")
-        robot_cmd_label = ui.label("CMD: ---").classes("font-mono text-sm text-gray-500")
-        recipe_label    = ui.label("Recipe: ---").classes("font-mono text-sm text-gray-500")
+        # FIXED widths (2026-10-17): the text changes with every command (a - jog's is one character longer, jog_stop
+        # much shorter) — a label that grew and shrank re-wrapped this row, the page jumped and a held jog button slid
+        # out from under the pointer (its mouseleave stops the jog). A long command is cut with '…'.
+        robot_cmd_label = ui.label("CMD: ---").classes("font-mono text-sm text-gray-500 w-64 truncate")
+        recipe_label    = ui.label("Recipe: ---").classes("font-mono text-sm text-gray-500 w-44 truncate")
         ui.separator().props("vertical")
         _sw_estop_btn = ui.button("SW E-STOP", icon="emergency", on_click=handle_sw_estop_toggle).props("color=red size=sm")
         ui.separator().props("vertical")
@@ -493,8 +496,10 @@ with ui.card().classes("w-full mb-2"):
         _coriolis_btn.tooltip("Coriolis / centripetal feedforward C(q, q̇)·q̇ on the commanded motion — same modes as "
                               "Inertia. Start state: system.xml <dynamics_feedforward>.")
 
-        # Friction compensation (utility/friction_comp.py): PARKED 2026-10-02 (user: no real effect felt). RTI starts
-        # it OFF and the dashboard has no button for it; to bring it back, see TODO/friction_compensation_plan.md.
+        # Friction (utility/friction_model.py): NO buttons (2026-10-17, user, after measuring both on the arm — the
+        # feedforward does not improve the moves (api_tests/66), freedrive compensation is ~0.04-0.10 Nm with its 0.7
+        # share). The model is used by the external-torque estimate, always; the robot's friction_ff / friction_comp
+        # commands still switch the two (OFF at every start). docs/friction_compensation.md.
         _owned_btns = [_grav_comp_btn, _inertia_btn, _coriolis_btn]   # greyed while someone else holds control (see below)
 
         ui.separator().props("vertical")
@@ -1564,7 +1569,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             'speed':         ('joint_speed_filtered',        'measured on CAN (0 diffs) — 1 pole is plenty'),
             'accel':         ('joint_acceleration_filtered', '1 diff, but its filtered-speed input already supplies the pole — "none" is usually right'),
             'jerk':          ('joint_jerk_filtered',         '2 diffs — NEEDS 2 poles (ema2/butter2/savgol). A single ema cannot fix jerk at any tau'),
-            'torque':        ('joint_torque_filtered',       'measured (0 diffs) — 1 pole. Also cleans torque_external / force_external'),
+            'torque':        ('joint_torque_filtered',       'measured (0 diffs) — 1 pole. (torque_external has its own smoothing: the momentum observer)'),
             'tcp_accel':     ('TCP_acceleration_filtered',   'Cartesian accel; its J̇·q̇ term is quadratic in velocity so it needs its own low-pass'),
             'gripper_speed': ('gripper_joint_speed_filtered', 'measured (0 diffs) — 1 pole'),
         }
@@ -1647,7 +1652,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             'speed':         'measured (0 diffs): 1 pole is plenty',
             'accel':         'input already carries speed\'s pole; "none" measured BEST',
             'jerk':          '2 diffs: needs 2 POLES (ema2/butter2/savgol) - 1-pole ema cannot fix it at any tau',
-            'torque':        'measured (0 diffs): 1 pole. Also cleans torque_external/force_external',
+            'torque':        'measured (0 diffs): 1 pole. torque_external is smoothed by its observer, not by this',
             'tcp_accel':     'Cartesian accel; its Jdot*qdot term is quadratic in velocity',
             'gripper_speed': 'measured (0 diffs): 1 pole',
         }
@@ -1816,7 +1821,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 'cur': ('joint', 'joint_torque',       'Nm',       'Joint Torque'),
                 'jerk': ('joint', 'joint_jerk',        'rad/s^3',  'Joint Jerk'),
                 # External joint torque: per-joint (Nm) but stored in the tcp segment.
-                'etrq': ('tcp',  'torque_external',    'Nm',       'External Joint Torque'),
+                'etrq': ('tcp',  'torque_external',    'Nm',       'External Joint Torque (valid while moving)'),
             },
             'tcp': {
                 'pos': ('tcp', 'robot_pose', 'm / rad', 'TCP Pose'),

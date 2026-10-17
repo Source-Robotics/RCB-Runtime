@@ -100,18 +100,20 @@ class PayloadModel:
 
 def rebuild_dynamics(robot: Any) -> tuple:
     """Fresh dynamics functions from the robot's CURRENT links: (gravity_fn(q) -> g, inertia_fn(q, out),
-    minv_fn(q, out), dynamics_ff_fn(q, v, a, inertia, coriolis)) — each with its own Pinocchio model and Data, exactly
+    minv_fn(q, out), dynamics_ff_fn(q, v, a, inertia, coriolis), momentum_fn(q, v) -> (p, beta) — the external torque
+    observer's terms, 2026-10-16) — each with its own Pinocchio model and Data, exactly
     as start-up builds them (utility/pinocchio_attach.attach_pinocchio, utility/haptic_walls.make_effective_inertia /
     make_inverse_mass). Raises if any of them does not build; the caller then keeps the functions it had."""
     from utility.haptic_walls import make_effective_inertia, make_inverse_mass
-    from utility.pinocchio_attach import _make_pinocchio_gravity, build_pinocchio_dynamics, make_pinocchio_dynamics_ff
+    from utility.pinocchio_attach import (_make_pinocchio_gravity, build_pinocchio_dynamics, make_pinocchio_dynamics_ff,
+                                          make_pinocchio_momentum_terms)
     model, data = build_pinocchio_dynamics(robot)
     gravity_fn = _make_pinocchio_gravity(model, data)
     inertia_fn = make_effective_inertia(robot)
     minv_fn = make_inverse_mass(robot)
     if inertia_fn is None or minv_fn is None:
         raise RuntimeError("the walls' dynamics model did not build")
-    return gravity_fn, inertia_fn, minv_fn, make_pinocchio_dynamics_ff(robot)
+    return gravity_fn, inertia_fn, minv_fn, make_pinocchio_dynamics_ff(robot), make_pinocchio_momentum_terms(robot)
 
 
 def apply_payload_command(cmd_dict: dict, model: PayloadModel, haptic_walls: Any, rti: Any, max_mass: float) -> tuple[bool, str]:
@@ -127,12 +129,13 @@ def apply_payload_command(cmd_dict: dict, model: PayloadModel, haptic_walls: Any
     prev_mass, prev_com = model.mass, model.com.copy()
     model.apply(float(mass), com)
     try:
-        gravity_fn, inertia_fn, minv_fn, dynamics_ff_fn = rebuild_dynamics(model.robot)
+        gravity_fn, inertia_fn, minv_fn, dynamics_ff_fn, momentum_fn = rebuild_dynamics(model.robot)
     except Exception as exc:                      # the link goes back to what the models in use describe
         model.apply(prev_mass, prev_com)
         return False, f"dynamics rebuild failed ({exc}) — payload unchanged ({prev_mass:g} kg)"
     model.robot.pinocchio_gravity = gravity_fn
     model.robot.pinocchio_dynamics_ff = dynamics_ff_fn          # inertia / Coriolis feedforward follows the payload
+    model.robot.pinocchio_momentum = momentum_fn                # so does the external torque (the observer restarts)
     if haptic_walls is not None:
         haptic_walls.set_dynamics(inertia_fn, minv_fn)
     if rti is not None:

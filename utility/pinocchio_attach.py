@@ -245,6 +245,30 @@ def make_pinocchio_dynamics_ff(rtb_robot: Any):
     return dynamics_ff
 
 
+def make_pinocchio_momentum_terms(rtb_robot: Any):
+    """fn(q, v) -> (p, beta) (2026-10-16, utility/momentum_observer.py): the generalized momentum p = M(q)·v (Nm·s;
+    the links AND the rotors' armature) and beta = g(q) - C(q, v)ᵀ·v (Nm) — the two model terms a momentum observer
+    needs to estimate the external joint torque during motion without the joint acceleration. M(q)·v is rnea on a
+    gravity-free copy with v as the acceleration and no velocity; C from computeCoriolisMatrix; g from the model with
+    gravity. Their own models and Data (one Pinocchio Data is not thread-safe). The two arrays are the closure's
+    buffers: use them within the tick. Equal to rtb's inertia(q) @ v and gravload(q) - coriolis(q, v).T @ v to ~1e-12
+    (net test_momentum_observer)."""
+    import pinocchio as pin
+    model, data = build_pinocchio_dynamics(rtb_robot)
+    model_ng, data_ng = build_pinocchio_dynamics(rtb_robot)
+    model_ng.gravity.setZero()
+    zero = np.zeros(model.nv, dtype=np.float64)
+    p = np.zeros(model.nv, dtype=np.float64)
+    beta = np.zeros(model.nv, dtype=np.float64)
+
+    def momentum_terms(q, v):
+        np.copyto(p, pin.rnea(model_ng, data_ng, q, zero, v))                  # M(q)·v
+        np.dot(pin.computeCoriolisMatrix(model, data, q, v).T, v, out=beta)    # C(q, v)ᵀ·v
+        np.subtract(pin.computeGeneralizedGravity(model, data, q), beta, out=beta)
+        return p, beta
+    return momentum_terms
+
+
 def attach_pinocchio(rtb_robot: Any) -> Any:
     """Attach Pinocchio model/data and FK/Jacobian helpers to rtb_robot."""
     model, data, ee_frame_id = _build_pinocchio_model(rtb_robot)
@@ -276,5 +300,11 @@ def attach_pinocchio(rtb_robot: Any) -> Any:
         rtb_robot.pinocchio_dynamics_ff = make_pinocchio_dynamics_ff(rtb_robot)
     except Exception as exc:
         logger.warning("Pinocchio: no dynamics model for inertia / Coriolis feedforward (%s)", exc)
+    # The external torque estimate's model terms (2026-10-16, utility/momentum_observer.py). No model -> the external
+    # torque falls back to the static estimate (measured - gravity), as before.
+    try:
+        rtb_robot.pinocchio_momentum = make_pinocchio_momentum_terms(rtb_robot)
+    except Exception as exc:
+        logger.warning("Pinocchio: no dynamics model for the external torque observer (%s)", exc)
 
     return rtb_robot

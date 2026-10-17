@@ -107,7 +107,7 @@ LOOP_ERROR_TICK_FACTOR   = 3.0    # ...or ONE tick longer than 3 periods (12 ms 
 _WARNING_SUFFIXES = ("CAN_STALE", "NOT_HOMED", "LOOP_DEGRADED", "ZONE_WARNING",
                      "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING", "OVERSPEED_WARNING", "TRACKING_WARNING",
                      "TCP_OVERSPEED_WARNING", "HOLD_OSCILLATION_WARNING", "SELF_COLLISION_WARNING", "SELF_COLLISION_STALE",
-                     "CAN_REPLY_MISSED_WARNING")
+                     "CAN_REPLY_MISSED_WARNING", "CONTACT_WARNING", "COLLISION_WARNING")
 
 
 # The cause/fix catalog lives in utility/error_catalog.py (a leaf module, 2026-10-03); re-exported here so
