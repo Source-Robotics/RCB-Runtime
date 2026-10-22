@@ -1,6 +1,8 @@
 <robot>
 
     <name>PAR6</name> <!-- Name of the robot.-->
+    <hardware_revision>v1.0</hardware_revision> <!-- This arm's hardware revision (2026-10-21, versioning V4): the Versions card and get_versions show it. vMAJOR.MINOR: MINOR = parts still interchangeable, MAJOR = not. -->
+    <description_package min="2.0"/> <!-- The oldest PAR6 description package (URDF / meshes) this arm's models and self-collision geometry are made from: tools/self_collision_capsules.py refuses an older one, the Versions card marks it. -->
     <active_gripper>MSG_small_motor_150mm_rail</active_gripper> <!-- FALLBACK only: config/system.xml takes precedence and is what normally selects the gripper. Must match a filename in the grippers/ folder (e.g. MSG_small_motor_150mm_rail -> grippers/MSG_small_motor_150mm_rail.xml). Keep it in step with system.xml — the gripper drives kt, stroke, homing offsets AND the driver_type that firmware flashing checks against. -->
     <server_port>8080</server_port>
     <network_mode>ethernet</network_mode> <!-- Options: ethernet, wifi, offline -->
@@ -108,6 +110,8 @@
             <gear_ratio>6.4</gear_ratio> <!-- Gear ratio of the joint -->
             <gear_efficiency>0.98</gear_efficiency> <!-- Gear efficiency of the joint -->
             <dir>0</dir> <!-- is positive rotation of the joint matched to the one in kinematic definiton of the robot 0 yes 1 no -->
+            <positive_direction>the whole arm turns counter-clockwise, seen from above</positive_direction> <!-- what + looks like on the arm, in words: the first-run check (tools/first_run.py, stage 3) asks the builder to turn the joint this way by hand and checks the encoder counts up. From the kinematic model at the park pose (2026-10-18). If the arm counts the other way, <dir> above is wrong. -->
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="600"/> <!-- the first-run check's powered test move before homing (tools/first_run.py, stage 3; robotics/joint_test.py): this far from where the joint stands and back, peaking at this speed, the drive's current limited to this meanwhile (1.5 x the joint's worst gravity torque with the MSG gripper; user, 2026-10-18) -->
             <joint_type>revolute</joint_type> <!-- Type of the joint. Options: revolute, prismatic, continuous_revolute -->
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured yet; api_tests/54, 2026-10-02). 0 = not measured: no friction compensation -->
             <friction_coulomb_nm>0.190</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.177 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -156,8 +160,8 @@
             <software_joint_limit_positive>-0.1122665</software_joint_limit_positive>
             <tracking_limit_deg>5.0</tracking_limit_deg> <!-- safety monitor TRACKING limit, |commanded - measured| in EXEC; 0 = unchecked. PROVISIONAL 5 deg (2026-10-01, the check runs warn-only): not measured yet — measure like J4-J6 (api_tests/46) and set ~2x the peak. -->
             <hold_oscillation_ma>100</hold_oscillation_ma> <!-- safety monitor HOLD_OSCILLATION_WARNING: fast motor-current ripple (above 25 Hz, mA RMS) while commanded still, for 1.5 s (system.xml); 0 = unchecked. the J3 value; not measured on this joint (record it with api_tests/59 in its freedrive mode). -->
-            <contact_torque_nm>2.82</contact_torque_nm> <!-- safety monitor CONTACT_WARNING: the external torque estimate (momentum observer) minus the baseline taken at rest before the move, Nm; 0 = unchecked. 2x the moving p99 measured by api_tests/76 (2026-10-17: clean windows — this joint moving, the others still — with the friction model of api_tests/77 live; 2026-10-16 before). Re-measure after a model / friction / gain change. -->
-            <collision_torque_nm>4.24</collision_torque_nm> <!-- safety monitor COLLISION (system.xml <collision>: warn | stop): the same, the larger of 2x the moving max and 1.5x contact (api_tests/76, 2026-10-17); 0 = unchecked. -->
+            <contact_torque_nm>2.97</contact_torque_nm> <!-- safety monitor CONTACT_WARNING: the external torque estimate (momentum observer) minus the baseline taken at rest before the move, Nm; 0 = unchecked. 2x the moving p99 measured by api_tests/76 (2026-10-17: clean windows — this joint moving, the others still — with the friction model of api_tests/77 live; 2026-10-16 before). Re-measure after a model / friction / gain change. [/0.9491: the torque scale of 78 20261017_164505] -->
+            <collision_torque_nm>4.47</collision_torque_nm> <!-- safety monitor COLLISION (system.xml <collision>: warn | stop): the same, the larger of 2x the moving max and 1.5x contact (api_tests/76, 2026-10-17); 0 = unchecked. [/0.9491: the torque scale of 78 20261017_164505] -->
             <encoder>14</encoder>
             <sector_home_master_position>5707 </sector_home_master_position>
             <sector_home_offset>-2.516096327 </sector_home_offset>
@@ -176,13 +180,15 @@
             <homing_release_duration_s>1</homing_release_duration_s>   <!-- Release duration [s] — how long to hold current before latching position -->
             <homing_release_sample_pct>0.8</homing_release_sample_pct>   <!-- When to latch position: 0.0=start, 0.5=midpoint, 1.0=end of release -->
             <gear_ratio>25</gear_ratio>
-            <gear_efficiency>0.90</gear_efficiency>
+            <gear_efficiency>0.9482</gear_efficiency> <!-- calibrated with hung weights (78 20261017_164505, 2026-10-17): was 0.9, the torque scale k 0.9491 (measured / true) — Kt x ratio x this is what counts -->
             <dir>0</dir>
+            <positive_direction>the upper arm leans forward (toward where the arm reaches when parked) and the gripper goes down</positive_direction>
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="1500"/>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
-            <friction_coulomb_nm>0.578</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 26 slides at 4 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
-            <friction_viscous_nm_s>0.625</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
-            <friction_load_per_nm>0.041</friction_load_per_nm> <!-- Nm of friction per Nm of the gravity model's torque on the joint (api_tests/77; 0 = no load effect worth a term) -->
+            <friction_coulomb_nm>0.609</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 26 slides at 4 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive [/0.9491: the torque scale of 78 20261017_164505] -->
+            <friction_viscous_nm_s>0.658</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) [/0.9491: the torque scale of 78 20261017_164505] -->
+            <friction_load_per_nm>0.043</friction_load_per_nm> <!-- Nm of friction per Nm of the gravity model's torque on the joint (api_tests/77; 0 = no load effect worth a term) [/0.9491: the torque scale of 78 20261017_164505] -->
             <gravity_error_nm>0.415</gravity_error_nm> <!-- Nm, the largest gravity-model error measured while sliding, any pose and speed (api_tests/77, applied 2026-10-17). Freedrive friction compensation gives back 0.5 x (sliding friction - this) -->
             <freedrive_wall at="auto" frequency_hz="auto" damping_ratio="auto" filter_ms="auto" max_torque_nm="auto" breakthrough_deg="auto" freedrive="warn" scaling="auto"/> <!-- freedrive wall (docs/safety_zones.md §2b); the dashboard's Walls tab writes this -->
 
@@ -249,6 +255,8 @@
             <gear_ratio>18.0952381</gear_ratio>
             <gear_efficiency>0.95</gear_efficiency> 
             <dir>1</dir>
+            <positive_direction>the elbow opens: the forearm swings away from the upper arm (with the arm parked: the forearm lifts)</positive_direction>
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="800"/>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
             <friction_coulomb_nm>0.541</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 18 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough; poses left out (over 1.5x the others): +354.0 deg). Was <friction_sliding_nm>0.369 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -320,6 +328,8 @@
             <gear_ratio>4</gear_ratio>
             <gear_efficiency>0.98</gear_efficiency>
             <dir>1</dir>
+            <positive_direction>the forearm rolls counter-clockwise, seen from the elbow looking toward the gripper</positive_direction>
+            <first_run_move amplitude_deg="10" speed_dps="5" current_ma="600"/>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.13</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.26; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.190</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.163 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -391,6 +401,8 @@
             <gear_ratio>4</gear_ratio>
             <gear_efficiency>0.98</gear_efficiency>
             <dir>1</dir>
+            <positive_direction>the wrist bends so the gripper tips up (with the arm parked)</positive_direction>
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="600"/>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.06</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.05-0.12; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.093</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.080 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -468,6 +480,8 @@
             <gear_ratio>10</gear_ratio>
             <gear_efficiency>0.95</gear_efficiency>
             <dir>1</dir>
+            <positive_direction>the gripper turns counter-clockwise, seen from the elbow looking toward it</positive_direction>
+            <first_run_move amplitude_deg="10" speed_dps="5" current_ma="400"/>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.111</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.19; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.109</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.070 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -510,7 +524,9 @@
         <!-- The heaviest part a program may declare with set_payload (kg) — robotclient / dashboard "Payload".
              0.75 kg: the user's working limit for PAR6 (2026-10-04, "for now"); a claim above it is refused
              (PAYLOAD_LIMIT). Missing in a robot XML -> 1.0. -->
-        <max_payload_kg>0.75</max_payload_kg>
+        <max_payload_kg>0.4</max_payload_kg> <!-- 0.75 until 2026-10-18; lowered by the user "until more testing": api_tests/78
+             hung 0.5 kg at the TCP — J4 / J5 vibrated, stick-slipped and needed support with it held sideways (~0.70 Nm
+             at a ~14 cm lever + the gripper's ~0.25 of their ~1.5 Nm); 150 g was fine. -->
     </safety>
 
     <!-- Self-collision geometry (2026-10-06; refitted 2026-10-07 from Source Robotics' PAR6 description package 2.0 —

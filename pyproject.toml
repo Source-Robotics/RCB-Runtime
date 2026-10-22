@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rcb-runtime"
-version = "0.1.0"
+dynamic = ["version"]          # from the VERSION file (2026-10-21): one source for the runtime's version
 description = "Runtime control stack for the Source Robotics Robot Control Box"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,3 +46,6 @@ Source = "https://github.com/Source-Robotics/RCB-Runtime"
 # entry points. See README.md and scripts/install.sh for deployment.
 [tool.setuptools]
 py-modules = []
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}

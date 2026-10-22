@@ -12,6 +12,8 @@ logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from config.schema_versions import check_schema
+
 
 # --------------------------------------------------------------------------------------- safety zones
 # Zones describe the CELL (TODO/safety_zones_plan.md, docs/safety_zones.md): config/cells/<name>.xml,
@@ -153,6 +155,7 @@ def parse_cell_zones(path: str | Path) -> list[dict]:
         raise ValueError(f"{path.name}: not valid XML ({e})") from None
     if root.tag != "cell":
         raise ValueError(f"{path.name}: the root element must be <cell>, got <{root.tag}>")
+    check_schema(root, "cell", path.name)       # a newer format: a ValueError like any broken cell file (2026-10-21)
     stray = sorted({c.tag for c in root} - {"zone"})
     if stray:
         raise ValueError(f"{path.name}: unknown element(s) {stray} — a cell holds only <zone> elements")

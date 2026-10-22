@@ -32,11 +32,13 @@ class CartesianPath:
 
 
 def pose_from_xyz_rpy(args: Sequence[float], label: str = "pose") -> SE3:
-    """Build SE3 from [x, y, z, rx, ry, rz], using meters and radians."""
+    """Build SE3 from [x, y, z, rx, ry, rz], metres and radians: R = Rx(rx) Ry(ry) Rz(rz) — about base X by rx, then
+    the tool's new Y by ry, then its own Z by rz (utility/kinematics_backend.py "The pose angles"; pose_angles is the
+    inverse)."""
     if len(args) < 6:
         raise ValueError(f"{label} needs [x, y, z, rx, ry, rz], got {len(args)} values")
     x, y, z, rx, ry, rz = [float(v) for v in args[:6]]
-    return SE3(x, y, z) * SE3.RPY([rx, ry, rz], order="xyz")
+    return SE3(x, y, z) * SE3.Rx(rx) * SE3.Ry(ry) * SE3.Rz(rz)
 
 
 def _rotation_angle(start_pose, target_pose):

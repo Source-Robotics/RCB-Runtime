@@ -18,6 +18,9 @@ from .exceptions import (
     GripFailed,
 )
 from .exceptions import HomingFailed as HomingFailed  # "as": an explicit re-export (2026-10-14)
+# This client's version and the version check at connect (2026-10-21, versioning V3; robotclient/version.py).
+from .exceptions import VersionMismatch, VersionWarning
+from .version import __version__
 
 # dry_run is the ONE module here that is not PC-portable: it imports the planner, the
 # kinematics and pinocchio, i.e. the whole robot-side stack. Importing it eagerly made
@@ -52,4 +55,5 @@ __all__ = [
     "DryRunRobotClient", "DryRunPlan",
     "RobotError", "RobotConnectionError", "RobotTimeout", "CommandRejected",
     "MotionFailed",
+    "VersionMismatch", "VersionWarning", "__version__",
 ]

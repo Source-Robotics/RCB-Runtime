@@ -19,11 +19,11 @@ from robotics.robot_kinematics import (
     calculate_jacobian,
     get_tcp_pose_rpy,
 )
-from utility.kinematics_backend import set_kinematics_backend
+from utility.kinematics_backend import POSE_CONVENTION, set_kinematics_backend
 from utility.pinocchio_attach import attach_pinocchio
 from utility.robot_factory import create_robot
 
-from .client import RobotClient
+from .client import RobotClient, _pose_in, _pose_out
 from .commands import generate_id
 from .constants import DEFAULT_MOVE_TIMEOUT
 from .exceptions import MotionFailed, RobotTimeout
@@ -367,7 +367,8 @@ class DryRunRobotClient(RobotClient):
             completion_policy="settled",
         )
 
-    def connect(self, ip: str | None = None, port: int | None = None) -> DryRunRobotClient:
+    def connect(self, ip: str | None = None, port: int | None = None, *, allow_mismatch: bool = False) -> DryRunRobotClient:
+        del allow_mismatch           # RobotClient.connect's version check (V3): nothing to check in a dry run
         return self
 
     def disconnect(self) -> None:
@@ -520,12 +521,14 @@ class DryRunRobotClient(RobotClient):
         self.plan_summary()
         return np.rad2deg(self._planner.current_joints_rad).tolist()
 
-    def get_pose(self) -> list[float]:
+    def get_pose(self, *, angle_unit: str = "rad") -> list[float]:
         self.plan_summary()
-        return get_tcp_pose_rpy(self._planner._robot, self._planner.current_joints_rad).tolist()
+        return _pose_out(get_tcp_pose_rpy(self._planner._robot, self._planner.current_joints_rad).tolist(), angle_unit)
 
-    def is_reachable(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, near: Sequence[float] | None = None) -> dict:
+    def is_reachable(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, near: Sequence[float] | None = None,
+                     *, angle_unit: str = "rad") -> dict:
         """Same answer as RobotClient.is_reachable; `near` defaults to where the preview has got to."""
+        x, y, z, rx, ry, rz = _pose_in((x, y, z, rx, ry, rz), angle_unit)
         planner = self._planner
         if near is None:
             self.plan_summary()
@@ -555,6 +558,7 @@ class DryRunRobotClient(RobotClient):
             "mode": self._mode,
             "state": self._state,
             "homed": self._homed,
+            "pose_angles": POSE_CONVENTION,
             "dry_run": True,
             "simulated": False,
             "virtual": True,

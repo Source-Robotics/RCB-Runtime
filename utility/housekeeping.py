@@ -26,7 +26,8 @@ import shutil
 RECORDING_DIRS = ("tracking", "can_gaps", "rti_ff", "exec_brake", "wall_delay", "resonance", "haptic_wall",
                   "hold_noise", "idle_release", "virtual_box", "friction", "j6_sampling", "monitor_baseline",
                   "external_torque",       # api_tests/76: the external torque's capture copies (2026-10-16)
-                  "friction_id")           # api_tests/77: friction identification runs (2026-10-16)
+                  "friction_id",           # api_tests/77: friction identification runs (2026-10-16)
+                  "weight_calibration")    # api_tests/78: torque scale with hung weights + force check (2026-10-17)
 # temp_data folders a script writes that are NOT recordings: kept whole (reference data, their own limits, caches).
 KEPT_DIRS = {"calibration": "the arms' calibration-screw readings (api_tests/65): reference data",
              "self_collision": "the geometry tool's fits and reports: reference data",
@@ -40,6 +41,7 @@ KEPT_DIRS = {"calibration": "the arms' calibration-screw readings (api_tests/65)
              "incidents": "utility/incident_dump.py: newest 20",
              "captures": "utility/incident_dump.py: newest 10",
              "support": "gui_logs_tab.py: newest 3 bundles",
+             "first_run": "tools/first_run.py: the first-run check's reports, a few KB each, newest 50",
              "nets": "tools/run_nets.py: one log per net, overwritten each run",
              "quality": "tools/quality.py: baselines, overwritten",
              "coverage": "tools/quality.py: the last coverage report, overwritten"}

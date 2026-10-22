@@ -78,7 +78,8 @@ Blockly.common.defineBlocksWithJsonArray([
     output: 'Pose',
     style: 'rcb_position',
     extensions: ['rcb_use_current'],
-    tooltip: 'A tool pose in the world frame: position in mm, rotation (roll, pitch, yaw) in degrees. ' +
+    tooltip: 'A tool pose in the world frame: position in mm; rx, ry, rz in degrees turn the tool about the world ' +
+             'X axis, then its new Y axis, then its own Z axis (rz = its spin). ' +
              'Right-click: use the current position.',
   },
   {

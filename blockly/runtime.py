@@ -118,6 +118,11 @@ def log(text, level="info"):
     emit({"type": "log", "level": level, "text": str(text)})
 
 
+# The pose-angle convention the points and pose blocks are in (= utility.kinematics_backend.POSE_CONVENTION, which
+# a net pins), checked against the executor's get_status before a program runs.
+POSE_ANGLES = "xyz-mobile"
+
+
 # ── the hooks generated code calls ──────────────────────────────────────────────────────────────────────────────
 
 def start():
@@ -135,6 +140,11 @@ def start():
         raise ProgramRefused("the robot is not enabled: enable it first")
     if not s.get("homed"):
         raise ProgramRefused("the robot is not homed: home it first")
+    if s.get("pose_angles") != POSE_ANGLES:
+        # 2026-10-21: the pose angles became R = Rx(rx) Ry(ry) Rz(rz). This runner converts old programs' points to
+        # them; an executor from before would read those numbers the old way and turn the tool somewhere else.
+        raise ProgramRefused("the robot service runs code from before the pose-angle change of 2026-10-21: restart it "
+                             "(sudo systemctl restart autorun.service), then home the robot")
     if (robot.status() or {}).get("motion_aborted"):
         raise ProgramRefused("motion is aborted after a failed command: clear errors first")
     _take_control(robot)

@@ -29,6 +29,7 @@ import logging
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from config.schema_versions import check_schema
 from utility.signal_filters import FILTER_KINDS, create_filter_bank
 
 logger = logging.getLogger("filters")  # docs/logging.md "Logger names"
@@ -128,6 +129,8 @@ def parse_filter_config(source: str | Path | ET.Element, joint_num: int) -> dict
         root = source
     if root.tag != "filters":
         raise ValueError(f"filter config root must be <filters>, got <{root.tag}>")
+    # A newer format: a ValueError like any malformed file, so the callers keep / fall back to working filters.
+    check_schema(root, "filters", source if isinstance(source, (str, Path)) else "filters (parsed element)")
 
     defaults = default_filter_config()
     config = {}

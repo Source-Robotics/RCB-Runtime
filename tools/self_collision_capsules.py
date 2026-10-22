@@ -738,6 +738,25 @@ def soft_limits_deg():
     return np.array(lo[:6]), np.array(hi[:6])
 
 
+def check_package_version():
+    """Refuse a PAR6 description package older than the robot XML's <description_package min> (versioning V4): the
+    geometry is fitted from its meshes and joint frames, and an older package may place them differently. Returns an
+    exit code, 0 = fine (also when either version is unknown: said, then allowed)."""
+    from utility.versions import at_least, description_package_version, robot_hardware
+    installed = description_package_version(REF)
+    minimum = robot_hardware().get("description_package_min")
+    ok = at_least(installed, minimum)
+    if ok is False:
+        print(f"REFUSED: the PAR6 description package at {REF} is {installed}; the robot XML needs {minimum} or newer "
+              f"(<description_package min>). Install the newer package, or lower the minimum only if you know the "
+              f"older one fits this arm.")
+        return 2
+    if ok is None:
+        print(f"note: description package version {installed or 'unknown'}, minimum {minimum or 'not declared'} — "
+              f"not checked")
+    return 0
+
+
 def check_dh_literals():
     """Warn if robots/PAR6.py's a1..a5 differ from the constants here."""
     src = open(os.path.join(_ROOT, "robots", "PAR6.py")).read()
@@ -1144,6 +1163,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verbose", action="store_true", help="fit: the capsule volume for every k tried")
     args = ap.parse_args()
+    rc = check_package_version()
+    if rc:
+        return rc
     check_dh_literals()
     if args.command == "export":
         args.gripper_name = args.gripper_name or GRIPPER_FILE[args.gripper]

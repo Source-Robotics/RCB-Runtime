@@ -118,6 +118,32 @@ def fmt(x, decimals=3):
     return f"{x:.{decimals}f}"
 
 
+# ─── Angles toggle (2026-10-21, user): rad or deg on every tab ─────────────────
+# Display only. Shared memory, the API and every computation stay in radians; what the dashboard SHOWS converts. One
+# factor serves an angle and all its derivatives alike (rad, rad/s, rad/s², rad/s³ -> deg, deg/s, ...). Per PAGE, like
+# the Plots tab's Units toggle: NiceGUI 3's script mode runs this file once per page load, so each open browser page
+# has its own choice, and a reload starts in radians again.
+# Switched in the status bar (_set_angle_unit, next to update_tables).
+_ANGLE_UNIT = ['rad']                     # 'rad' | 'deg'
+_RAD_TO_DEG = 180.0 / math.pi
+
+
+def _ang(x):
+    """An angle, angular speed, acceleration or jerk (stored in rad...) in the display unit."""
+    return x * _RAD_TO_DEG if _ANGLE_UNIT[0] == 'deg' else x
+
+
+def _ang_tcp(x, i):
+    """Component i of a TCP 6-vector [x, y, z, rx, ry, rz] (pose, twist, acceleration) in the display unit: the
+    three rotation components convert, x / y / z (metres) never do."""
+    return _ang(x) if i >= 3 else x
+
+
+def _ang_label(text):
+    """A unit label in the display unit: 'Speed (rad/s)' -> 'Speed (deg/s)'. Only for labels whose 'rad' is a unit."""
+    return text.replace('rad', 'deg') if _ANGLE_UNIT[0] == 'deg' else text
+
+
 # ─────────────────────────────────────────────────────────────
 # Command channel to command_executor
 # ─────────────────────────────────────────────────────────────
@@ -369,20 +395,20 @@ joint_columns = [
     {'name': 'spd',      'label': 'Speed (rad/s)',   'field': 'spd'},
     {'name': 'trq',      'label': 'Torque (Nm)',     'field': 'trq'},
     {'name': 'acc',      'label': 'Accel (rad/s²)',  'field': 'acc'},
-    {'name': 'jrk',      'label': 'Jerk',            'field': 'jrk'},
-    {'name': 'pos_cmd',  'label': 'Pos Cmd',         'field': 'pos_cmd'},
-    {'name': 'spd_cmd',  'label': 'Spd Cmd',         'field': 'spd_cmd'},
+    {'name': 'jrk',      'label': 'Jerk (rad/s³)',   'field': 'jrk'},
+    {'name': 'pos_cmd',  'label': 'Pos Cmd (rad)',   'field': 'pos_cmd'},
+    {'name': 'spd_cmd',  'label': 'Spd Cmd (rad/s)', 'field': 'spd_cmd'},
     {'name': 'trq_cmd',  'label': 'Trq Cmd',         'field': 'trq_cmd'},
     {'name': 'trq_ext',  'label': 'Ext Torque',      'field': 'trq_ext'},
 ]
 
 tcp_columns = [
     {'name': 'axis',      'label': 'Axis',       'field': 'axis'},
-    {'name': 'pose',      'label': 'Pose',        'field': 'pose'},
-    {'name': 'spd',       'label': 'Speed',       'field': 'spd'},
+    {'name': 'pose',      'label': 'Pose (m / rad)',        'field': 'pose'},
+    {'name': 'spd',       'label': 'Speed (m/s / rad/s)',   'field': 'spd'},
     {'name': 'force_ext', 'label': 'F External',  'field': 'force_ext'},
-    {'name': 'pose_cmd',  'label': 'Pose Cmd',    'field': 'pose_cmd'},
-    {'name': 'spd_cmd',   'label': 'Spd Cmd',     'field': 'spd_cmd'},
+    {'name': 'pose_cmd',  'label': 'Pose Cmd (m / rad)',    'field': 'pose_cmd'},
+    {'name': 'spd_cmd',   'label': 'Spd Cmd (m/s / rad/s)', 'field': 'spd_cmd'},
 ]
 
 rti_columns = [
@@ -581,6 +607,14 @@ with ui.card().classes("w-full mb-2"):
         _owned_btns.append(ui.button("Enter EXEC",  icon="play_circle", on_click=handle_enter_exec).props("color=secondary outline size=sm"))
         _owned_btns.append(ui.button("Exit EXEC",   icon="stop_circle", on_click=handle_exit_exec).props("color=grey outline size=sm"))
         ui.button("Clear Errors", icon="cancel",        on_click=handle_clear_errors).props("color=negative outline size=sm")
+        ui.separator().props("vertical")
+        # Display only (_ANGLE_UNIT): not an owned command, so never greyed.
+        ui.label("Angles").classes("text-sm text-gray-500")
+        ui.toggle({'rad': 'rad', 'deg': 'deg'}, value=_ANGLE_UNIT[0],
+                  on_change=lambda e: _set_angle_unit(e.value)).props("dense") \
+            .tooltip("Show angles, angular speeds, accelerations and jerks in radians or degrees, on every tab "
+                     "(tables, plots, their CSV, Plan Preview, jog speeds). Display only: nothing sent to the robot "
+                     "changes. Back to radians when the page reloads.")
 
 # ─────────────────────────────────────────────────────────────
 # JOG CONTROLS
@@ -718,7 +752,7 @@ with ui.card().classes("w-full mb-2") as _jog_card:
         for i, lbl in enumerate(_jog_speed_labels):
             rad_s  = pct * _jog_max_vel_rad[i]
             tick_s = rad_s * _jog_ticks_per_rad[i]
-            lbl.set_text(f"{rad_s:.2f} rad/s · {tick_s:.0f} t/s")
+            lbl.set_text(f"{_ang(rad_s):.2f} {_ang_label('rad/s')} · {tick_s:.0f} t/s")
 
     with ui.row().classes("gap-6 px-3 pb-3 flex-wrap"):
         for _ji in range(6):
@@ -1412,6 +1446,20 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         except Exception:
             logger.exception("homing arms card unavailable")
 
+        # Every part's version: the runtime, the OS, the description package, the box, each drive
+        # (utility/versions.py, gui_versions_card.py, 2026-10-21). Built in a try: a failure must not break the page.
+        try:
+            from gui_versions_card import add_versions_card
+            from utility.versions import report as _versions_report
+            # The visibility check is guarded: _active_tab_name is defined further down this script, and a card module
+            # cached by a running dashboard may still call it while the page is being built.
+            add_versions_card(lambda: _versions_report(shared_data, int(_sys_cfg["joint_num"]), _gui_has_can_gripper(),
+                                                       _sys_cfg.get('pcb_version', 1)),
+                              is_visible=lambda: ('_active_tab_name' in globals()
+                                                  and _active_tab_name(tabs.value) == 'System Info'))
+        except Exception:
+            logger.exception("versions card unavailable")
+
     # ─── Errors ───────────────────────────────────────────────
     with ui.tab_panel(tab_errors):
         with ui.card().classes("w-full"):
@@ -1770,7 +1818,15 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
     with ui.tab_panel(tab_preview):
         from robotclient.dry_run_preview_ui import add_dry_run_preview
 
-        add_dry_run_preview(is_visible=lambda: _active_tab_name(tabs.value) == 'Plan Preview')
+        # Follows the Angles toggle and returns its redraw (_set_angle_unit). NiceGUI 3's script mode runs this FILE
+        # again at every page load but keeps the modules it imported as they were first imported, so until the GUI
+        # process restarts a page load can meet the Plan Preview from before angle_unit existed: then it is built as
+        # before (radians, returns None) instead of the whole page failing on an unexpected keyword.
+        import inspect as _inspect
+        _preview_kw = ({'angle_unit': lambda: _ANGLE_UNIT[0]}
+                       if 'angle_unit' in _inspect.signature(add_dry_run_preview).parameters else {})
+        _preview_set_units = add_dry_run_preview(
+            is_visible=lambda: _active_tab_name(tabs.value) == 'Plan Preview', **_preview_kw) or (lambda: None)
 
     # ─── Walls (TEMPORARY freedrive joint-wall tuner, gui_walls_tab.py) ───
     with ui.tab_panel(tab_walls):
@@ -1941,10 +1997,22 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                       'jerk': _plot_jerk_filt}
         _plot_ylock_btns = {}          # key -> the 'Y: Auto/Lock' button (label updates)
 
+        # The angular charts per unit, for the Angles toggle: in Joint units position / speed / acceleration / jerk
+        # of every joint, in TCP units the rotation components (rx, ry, rz) of pose / speed / acceleration. Torque,
+        # current, the external wrench, metres and motor ticks never convert.
+        _ANGULAR_KEYS = {'joint': ('pos', 'spd', 'acc', 'jerk'), 'tcp': ('pos', 'spd', 'acc')}
+
+        def _plot_ang(key, i, v):
+            """Sample v of chart `key`, joint/axis `i`, in the display angle unit (unchanged if not an angle)."""
+            unit = _plot_unit[0]
+            if key not in _ANGULAR_KEYS.get(unit, ()):
+                return v
+            return _ang_tcp(v, i) if unit == 'tcp' else _ang(v)
+
         def _plot_read(key, i):
             """Read one sample for chart `key`, joint `i`, in the current units."""
             seg, field, _, _ = _UNIT_META[_plot_unit[0]][key]
-            return round(float(getattr(shared_data, seg)[field][i]), 4)
+            return round(_plot_ang(key, i, float(getattr(shared_data, seg)[field][i])), 4)
 
         def _plot_read_cmd(key, i):
             """Read the commanded sample for chart `key`, axis/joint `i`.
@@ -1958,15 +2026,15 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 v = float(shared_data.motor[_CMD_FIELD['motor'][key]][i])
                 return None if v != v else round(v, 4)      # v != v is the NaN test
             if unit == 'tcp':
-                return round(float(shared_data.tcp[_CMD_FIELD['tcp'][key]][i]), 4)
-            return round(float(shared_data.joint[_CMD_FIELD['joint'][key]][i]), 4)
+                return round(_plot_ang(key, i, float(shared_data.tcp[_CMD_FIELD['tcp'][key]][i])), 4)
+            return round(_plot_ang(key, i, float(shared_data.joint[_CMD_FIELD['joint'][key]][i])), 4)
 
         def _plot_read_tgt(key, i):
             """Read the target sample for chart `key`, axis/joint `i`."""
             unit = _plot_unit[0]
             if unit == 'tcp':
-                return round(float(shared_data.tcp[_TGT_FIELD['tcp'][key]][i]), 4)
-            return round(float(shared_data.joint[_TGT_FIELD['joint'][key]][i]), 4)
+                return round(_plot_ang(key, i, float(shared_data.tcp[_TGT_FIELD['tcp'][key]][i])), 4)
+            return round(_plot_ang(key, i, float(shared_data.joint[_TGT_FIELD['joint'][key]][i])), 4)
 
         def _plot_read_filt(key, i):
             """Read the filtered sample for chart `key`, axis/joint `i`, or None if the
@@ -1975,7 +2043,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             if field is None:
                 return None
             seg = shared_data.tcp if _plot_unit[0] == 'tcp' else shared_data.joint
-            return round(float(seg[field][i]), 4)
+            return round(_plot_ang(key, i, float(seg[field][i])), 4)
 
         # Modern, colourblind-friendlier joint palette (tuned to read well on
         # both dark and light backgrounds).
@@ -2298,9 +2366,13 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             _plot_win[0] = _PLOT_WINDOWS[label]
             # Next frame already redraws the whole window at the new span.
 
-        def _relabel_charts():
+        def _relabel_charts(relayout=True):
             """Re-title charts + Y axes for the current units, and clear buffers
-            so old-unit samples don't mix with new-unit ones."""
+            so old-unit samples don't mix with new-unit ones.
+
+            relayout=False (the Angles toggle, clicked on any tab): the chart sizes stay as they are —
+            resizing a chart the browser has not mounted yet wedges the Plots tab (the NOTE under the
+            chart cards), and an angle switch changes no chart's visibility."""
             _plot_buf_tick.clear()
             for _d in (_plot_pos, _plot_spd, _plot_acc, _plot_cur,
                        _plot_jerk, _plot_etrq, _plot_fext, _plot_ftool,
@@ -2319,11 +2391,13 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                     # Not part of the current unit (chart hidden) — use its home labels so it
                     # re-appears correctly titled when the unit switches back.
                     _ylabel, _title = _KEY_HOME_LABEL[_key]
+                _ylabel = _ang_label(_ylabel)                 # the Angles toggle
                 _card_title_lbls[_key].text = _title
                 _chart.options.clear()
                 _chart.options.update(_echart_opts(_title, _ylabel))
                 _chart.update()
-            _relayout_charts()
+            if relayout:
+                _relayout_charts()
 
         def _set_theme(theme):
             """Switch chart theme (dark/light). Rebuilds each chart's options from
@@ -2339,6 +2413,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                     # Not part of the current unit (chart hidden) — use its home labels so it
                     # re-appears correctly titled when the unit switches back.
                     _ylabel, _title = _KEY_HOME_LABEL[_key]
+                _ylabel = _ang_label(_ylabel)                 # the Angles toggle
                 # EChart.options is read-only - mutate the existing dict in place
                 # (clear + repopulate) rather than reassigning it.
                 _chart.options.clear()
@@ -2613,7 +2688,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
 
             _hdr = ['tick']
             for _k in _keys:
-                _lbl = _UNIT_META[_u][_k][2]                  # unit label (rad/Nm/…)
+                _lbl = _ang_label(_UNIT_META[_u][_k][2])      # unit label (rad or deg/Nm/…)
                 for i in range(JOINTS):
                     _hdr.append(f'J{i+1}_{_k}[{_lbl}]')
             for _k in _cmd_keys:
@@ -3558,8 +3633,28 @@ def _robot_snapshot() -> dict:
     """The robot's state for the support bundle's info.txt (gui_logs_tab.py); None for a block not set up."""
     def read(block, how="get"):
         return getattr(block, how)() if block is not None else None
-    return {"robot_state": read(shared_data.robot_state), "robot_mode": read(shared_data.robot_mode),
+    snap = {"robot_state": read(shared_data.robot_state), "robot_mode": read(shared_data.robot_mode),
             "homed": read(shared_data.homed_state), "errors": read(shared_data.error_state, "get_json")}
+    try:            # every part's version, the drives' included (utility/versions.py, 2026-10-21)
+        from utility.versions import report as _versions_report
+        snap["versions"] = _versions_report(shared_data, int(_sys_cfg["joint_num"]), _gui_has_can_gripper(),
+                                            _sys_cfg.get('pcb_version', 1))
+    except Exception:
+        logger.exception("versions for the support bundle unavailable")
+    return snap
+
+
+def _set_angle_unit(unit):
+    """The status bar's Angles toggle: every angle readout re-labelled and shown in `unit` ('rad' | 'deg') from now
+    on. The plots start afresh (_relabel_charts clears their buffers: the two units never share a chart)."""
+    _ANGLE_UNIT[0] = 'deg' if unit == 'deg' else 'rad'
+    joint_table.columns = [{**c, 'label': _ang_label(c['label'])} for c in joint_columns]
+    joint_table.update()
+    tcp_table.columns = [{**c, 'label': _ang_label(c['label'])} for c in tcp_columns]
+    tcp_table.update()
+    _refresh_jog_speed_labels()
+    _relabel_charts(relayout=False)
+    _preview_set_units()
 
 
 def update_tables():
@@ -3665,13 +3760,13 @@ def update_tables():
         joint_table.rows = [{
             'j':       f'J{i+1}',
             'homed':   'YES' if shared_data.rti['joint_homed'][i] else 'NO',
-            'pos':     fmt(shared_data.joint['joint_position'][i]),
-            'spd':     fmt(shared_data.joint['joint_speed'][i]),
+            'pos':     fmt(_ang(shared_data.joint['joint_position'][i])),
+            'spd':     fmt(_ang(shared_data.joint['joint_speed'][i])),
             'trq':     fmt(shared_data.joint['joint_torque'][i]),
-            'acc':     fmt(shared_data.joint['joint_acceleration'][i]),
-            'jrk':     fmt(shared_data.joint['joint_jerk'][i]),
-            'pos_cmd': fmt(shared_data.joint['joint_position_commanded'][i]),
-            'spd_cmd': fmt(shared_data.joint['joint_speed_commanded'][i]),
+            'acc':     fmt(_ang(shared_data.joint['joint_acceleration'][i])),
+            'jrk':     fmt(_ang(shared_data.joint['joint_jerk'][i])),
+            'pos_cmd': fmt(_ang(shared_data.joint['joint_position_commanded'][i])),
+            'spd_cmd': fmt(_ang(shared_data.joint['joint_speed_commanded'][i])),
             'trq_cmd': fmt(shared_data.joint['joint_torque_commanded'][i]),
             'trq_ext': fmt(shared_data.tcp['torque_external'][i]),
         } for i in range(JOINTS)]
@@ -3679,11 +3774,11 @@ def update_tables():
 
         tcp_table.rows = [{
             'axis':      lbl,
-            'pose':      fmt(shared_data.tcp['robot_pose'][i]),
-            'spd':       fmt(shared_data.tcp['TCP_speed'][i]),
+            'pose':      fmt(_ang_tcp(shared_data.tcp['robot_pose'][i], i)),
+            'spd':       fmt(_ang_tcp(shared_data.tcp['TCP_speed'][i], i)),
             'force_ext': fmt(shared_data.tcp['force_external'][i]),
-            'pose_cmd':  fmt(shared_data.tcp['TCP_pose_commanded'][i]),
-            'spd_cmd':   fmt(shared_data.tcp['TCP_speed_commanded'][i]),
+            'pose_cmd':  fmt(_ang_tcp(shared_data.tcp['TCP_pose_commanded'][i], i)),
+            'spd_cmd':   fmt(_ang_tcp(shared_data.tcp['TCP_speed_commanded'][i], i)),
         } for i, lbl in enumerate(["X", "Y", "Z", "RX", "RY", "RZ"])]
         tcp_table.update()
 
@@ -4289,7 +4384,7 @@ def refresh_plots():
             _spd_tgt = _plot_read_tgt('spd', i)
             # 'actual' TCP accel = the RAW Cartesian accel, so the filtered dash-dot overlay
             # adds information (raw vs filtered). filtered comes from _plot_read_filt below.
-            _acc = float(shared_data.tcp['TCP_acceleration_raw'][i])
+            _acc = _plot_ang('acc', i, float(shared_data.tcp['TCP_acceleration_raw'][i]))
             if _tcp_prev_valid[0]:
                 _acc_cmd = (_spd_cmd - _tcp_prev_speed['cmd'][i]) / _dt
                 _acc_tgt = (_spd_tgt - _tcp_prev_speed['tgt'][i]) / _dt

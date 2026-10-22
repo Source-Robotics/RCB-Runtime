@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import glob
+import json
 import os
 import shutil
 import threading
@@ -197,11 +198,16 @@ def build_bundle(info_text, out_dir=None, keep=BUNDLE_KEEP):
 
 
 def info_text(robot):
-    """info.txt: when, which code, the robot's state, the box."""
+    """info.txt: when, which code, every part's version, the robot's state, the box."""
     from utility.code_version import describe as describe_code
     lines = [f"support bundle, {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC",
              f"code: {describe_code(PROJECT_ROOT)}"]
-    lines += [f"{k}: {v}" for k, v in robot.items()]
+    try:            # every part's version (utility/versions.py, 2026-10-21); the drives' when the dashboard passes them
+        from utility.versions import static_report
+        lines.append("versions: " + json.dumps(robot.get("versions") or static_report(PROJECT_ROOT), default=str))
+    except Exception as exc:                                    # noqa: BLE001 — a bundle is made even if this fails
+        lines.append(f"versions: unavailable ({exc})")
+    lines += [f"{k}: {v}" for k, v in robot.items() if k != "versions"]
     du = shutil.disk_usage(str(PROJECT_ROOT))
     lines.append(f"disk: {du.free / 1e9:.2f} GB free of {du.total / 1e9:.1f} GB")
     try:

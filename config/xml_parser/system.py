@@ -12,6 +12,7 @@ logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from config.schema_versions import check_schema
 from config.xml_parser.xml_access import get_active_gripper, get_joint_count, parse_robot_config
 
 # <drive_watchdog_ms> (2026-10-13): every drive's CAN watchdog. 0 would switch it off in the drive firmware; the
@@ -44,6 +45,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
     """
     tree = ET.parse(str(system_xml_path))
     root = tree.getroot()
+    check_schema(root, "system", system_xml_path)   # a newer format than this runtime reads: refused (2026-10-21)
     active_robot = root.findtext("active_robot", default="").strip()
     if not active_robot:
         raise ValueError(

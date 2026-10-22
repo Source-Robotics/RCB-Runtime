@@ -1,6 +1,7 @@
 <gripper name="MSG_medium_motor_200mm_rail">
     <CAN_gripper>1</CAN_gripper>   <!-- 1 = CAN-driven motor gripper -->
     <driver_type>stepfoc</driver_type>  <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+    <hardware_revision>v1.0</hardware_revision>  <!-- This gripper's hardware revision (2026-10-21, versioning V4): the Versions card and get_versions show it. -->
     <Stroke>200</Stroke>       <!-- Stroke in mm -->
     <kt>0.111</kt>                 <!-- Torque constant in Nm/A TODO: verify for medium motor -->
     <Ilim>1700</Ilim>              <!-- Current limit in mA -->

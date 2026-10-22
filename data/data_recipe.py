@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Optional
 import logging
 
+from config.schema_versions import SchemaError, check_schema
 from data.robotics_data import TAGS
 from utility.serialization import (
     serialize_optimized,
@@ -147,6 +148,11 @@ def _recipe_from_root(root: ET.Element, label: str) -> Optional[DataRecipe]:
         logger.error(
             f"'{label}': root element must be <recipe>, got <{root.tag}> — skipped."
         )
+        return None
+    try:                                         # a newer format: skipped like any unusable recipe (2026-10-21)
+        check_schema(root, "recipe", label)
+    except SchemaError as e:
+        logger.error(f"{e} — skipped.")
         return None
 
     name = root.get("name", "").strip()

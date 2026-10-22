@@ -59,6 +59,11 @@ class TickContext:
     # The Hall sensor check (robotics/hall_check.py): the joint that gets the Hall-index command instead of its data
     # pack while the check runs; -1 = none (every tick but those).
     hall_check_joint: int = -1
+    # A test move (robotics/joint_test.py): the joint that gets Position=joint_test_pos (raw motor ticks; None = not
+    # yet) and Speed=joint_test_speed instead of its own command; -1 = none.
+    joint_test_joint: int = -1
+    joint_test_pos: Any = None
+    joint_test_speed: int = 0
 
 
 @dataclass

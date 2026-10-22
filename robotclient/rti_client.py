@@ -35,6 +35,8 @@ import socket
 import struct
 import time
 
+from .version import check_protocols   # stdlib only (versioning V3): the RTI packet + telemetry format check
+
 # --- Command types. MUST match communication/rti_protocol.py ---------------
 CMD_JOINT_POSITION = 0x01
 CMD_JOINT_VELOCITY = 0x02
@@ -266,7 +268,8 @@ class RTIClient:
     # Lifecycle (TCP)
     # ------------------------------------------------------------------ #
 
-    def connect(self, pc_ip: str | None = None, rate_hz: float | None = None, transport: str | None = None) -> RTIClient:
+    def connect(self, pc_ip: str | None = None, rate_hz: float | None = None, transport: str | None = None, *,
+                allow_mismatch: bool = False) -> RTIClient:
         """Pair with the robot and put it in an RTI mode.
 
         The robot cannot discover our IP before UDP starts, so it rides the handshake.
@@ -285,7 +288,17 @@ class RTIClient:
         Prefer a rate that divides evenly into the robot's loop rate — 50, 25 or 10 Hz on a
         250 Hz robot. A non-integer ratio makes commands land alternately on two tick
         counts, corrupting every velocity estimate derived from the stream.
+
+        Before pairing it checks that the robot speaks this client's RTI packet and telemetry format (versioning V3):
+        a different version raises VersionMismatch and pairs nothing (allow_mismatch=True skips the check). A robot
+        that reports no versions was already warned about by RobotClient.connect.
         """
+        try:
+            st = self.robot.status() or {}
+        except Exception:                    # noqa: BLE001 — a robot object without status(): nothing to check
+            st = {}
+        if isinstance(st.get("protocols"), dict):
+            check_protocols(st, ("rti", "telemetry"), allow_mismatch)
         if rate_hz is None:
             if (transport or self.transport) == 'tcp':
                 raise ValueError("hard RTI is UDP only (TCP stalls the stream behind any lost packet); for TCP give "

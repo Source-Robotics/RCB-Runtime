@@ -16,6 +16,7 @@ import time
 
 from .constants import CONNECT_TIMEOUT
 from .exceptions import RobotConnectionError, RobotTimeout, CommandRejected
+from .version import PROTOCOL_VERSION, __version__
 
 
 class _Pending:
@@ -165,7 +166,10 @@ class Connection:
         p = _Pending()
         with self._lock:
             self._pending[cid] = p
-        msg = {"id": cid, "cmd": cmd, "args": args or [], "client": self.name}
+        # + this client's version and command protocol (2026-10-21, versioning V3): the executor logs them per
+        # connection and lists them in get_versions; an older executor ignores both keys.
+        msg = {"id": cid, "cmd": cmd, "args": args or [], "client": self.name,
+               "client_version": __version__, "protocol": PROTOCOL_VERSION}
         if options:
             msg["options"] = options
         payload = json.dumps(msg) + "\n"

@@ -60,9 +60,10 @@ from config.networking import (
     ZMQ_EXEC_STATUS_SOCKET,
 )
 import config.xml_parser as read_XML2
-from communication.protocol import IMMEDIATE, QUEUED, kind_of, validate, is_owned
+from communication.protocol import IMMEDIATE, POSE_COMMANDS, QUEUED, kind_of, validate, is_owned
 from motion.trajectory_planner import TrajectoryPlanner
 from motion.cartesian_paths import pose_from_xyz_rpy
+from utility.kinematics_backend import POSE_CONVENTION, pose_angles
 from motion.reachability import find_reachable_clear, make_starts
 from utility.zones import reach_reply, zones_summary
 from utility.filter_config import build_filter_banks, parse_filter_config
@@ -76,6 +77,11 @@ from motion.ik_config import DEFAULT_FK_JACOBIAN_BACKEND
 from utility.activity_log import get_exec_activity_logger, log_activity, note_origin, origin_of
 from utility.error_catalog import entry as catalog_entry
 from utility.health import assess as assess_health
+from utility.hardware_report import snapshot as hardware_snapshot
+from hardware import firmware_support
+from utility.versions import PROTOCOLS, report as versions_report, runtime_version
+from utility.sim_mode import can_interface as sim_can_interface
+from hardware.can_health import read_can_link_stats
 from utility.incident_dump import CAPTURE_MAX_S, CAPTURE_MIN_S, safe_capture_name
 from utility.trace_ring import recorder_alive
 from utility.logger_setup import apply_log_level
@@ -307,6 +313,39 @@ def _client_label(conn):
 # The name each client gives itself (2026-10-15): the robotclient sends "client" with every message — "dashboard",
 # "blocks", "pick_place.py on lab-pc". A client that sends none (an older robotclient, a raw socket) stays "ip:port".
 _client_names: dict[object, str] = {}   # connection -> the name it gave
+
+# Each connection's robotclient version and command protocol, as it sends them with every message (2026-10-21,
+# versioning V3): (version, protocol), None for a client that sends none (an older robotclient, a raw socket).
+# Logged once per connection; get_versions lists the connected clients with them.
+_client_versions: dict[object, tuple] = {}
+
+
+def _note_client_version(conn, msg):
+    """Record a message's client version + protocol for its connection; log the first sighting (and a change), with a
+    WARNING when the client speaks another command protocol than this executor (its own connect check refuses that
+    unless the script allowed it)."""
+    if "client_version" not in msg and "protocol" not in msg:
+        return
+    seen = (str(msg.get("client_version"))[:20], msg.get("protocol"))
+    if _client_versions.get(conn) == seen:
+        return
+    _client_versions[conn] = seen
+    if seen[1] != PROTOCOLS["commands"]:
+        log_tcp.warning(f"client {_client_origin(conn)}: robotclient {seen[0]} speaks command protocol {seen[1]}, "
+                        f"this executor {PROTOCOLS['commands']} (runtime {RUNTIME_VERSION})")
+    else:
+        log_tcp.info(f"client {_client_origin(conn)}: robotclient {seen[0]}, command protocol {seen[1]}")
+
+
+def _connected_clients():
+    """[{client, version, protocol}] of every connected client, for get_versions (versioning V3)."""
+    with _clients_lock:
+        conns = list(active_clients.values())
+    out = []
+    for conn in conns:
+        version, protocol = _client_versions.get(conn, (None, None))
+        out.append({"client": _client_origin(conn), "version": version, "protocol": protocol})
+    return out
 
 
 def _client_origin(conn):
@@ -741,7 +780,11 @@ def _handle_get_joints(args, cid, conn):
 
 
 def _handle_get_pose(args, cid, conn):
-    data = list(map(float, shared_data.tcp['robot_pose'][:6]))
+    # The angles from the measured MATRIX with this process's own converter (2026-10-21), not RTI's 6-vector: what
+    # get_pose returns is then always what move_pose / move_linear / is_reachable here parse, whichever RTI runs
+    # (RTI's 6-vector is for the dashboard and telemetry). R = Rx(rx) Ry(ry) Rz(rz), utility/kinematics_backend.py.
+    T = np.asarray(shared_data.tcp['robot_pose_matrix'][:16], dtype=np.float64).reshape(4, 4)
+    data = [float(v) for v in T[:3, 3]] + [float(v) for v in pose_angles(T)]
     reply(conn, {"id": cid, "status": "ok", "data": data})
 
 
@@ -750,6 +793,13 @@ def _handle_get_status(args, cid, conn):
     planner = _planner_status()
     reply(conn, {"id": cid, "status": "ok", "data": {
         "mode": mode, "state": state, "homed": homed,
+        # The pose angles this executor parses and returns (2026-10-21: "xyz-mobile" = R = Rx(rx) Ry(ry) Rz(rz)). A block
+        # program refuses an executor without it — one from before the change would read its points another way.
+        "pose_angles": POSE_CONVENTION,
+        # The runtime this executor runs (the VERSION file, read once at start; 2026-10-21). get_versions has the rest.
+        "runtime_version": RUNTIME_VERSION,
+        # The protocols' versions (versioning V3): commands, rti, telemetry — the client checks them at connect.
+        "protocols": dict(PROTOCOLS),
         "error_active": int(shared_data.rti['error_active'][0]),
         "safety_violation": int(shared_data.rti['safety_violation'][0]),
         "software_estop": int(shared_data.rti['software_estop'][0]),
@@ -985,6 +1035,32 @@ def _handle_get_health(args, cid, conn):
     loop, CAN, the drives, the gripper, errors, homing, the executor, the self-collision worker, the processes, disk,
     memory, the CPU temperature, the clock). Open to every client; ~60 ms (it watches the counters advance)."""
     reply(conn, {"id": cid, "status": "ok", "data": assess_health(shared_data, JOINT_NUM, TICK_S, has_gripper=_HAS_CAN_GRIPPER)})
+
+
+def _handle_get_hardware(args, cid, conn):
+    """get_hardware — what the hardware reports (utility/hardware_report.py, 2026-10-18; the first-run check's data):
+    per drive its CAN id, scan / live answer, firmware, hardware, serial, supply voltage, temperature, fault flags; the
+    gripper's; CAN ids answering that this robot does not use; the CAN interface's counters (`ip`, ~5 ms); the E-stop
+    channels, buttons, isolated inputs / outputs. args [0] skips the CAN counters (a poll). Open to every client;
+    moves nothing."""
+    link = read_can_link_stats(sim_can_interface()) if not args or bool(args[0]) else None
+    reply(conn, {"id": cid, "status": "ok", "data": hardware_snapshot(
+        shared_data, JOINT_NUM, _HAS_CAN_GRIPPER, _sys["pcb_version"], can_link=link,
+        driver_types=cfg.get("motor_driver_type"), gripper_driver_type=cfg.get("gripper_driver_type"))})
+
+
+# The runtime's version (the VERSION file), read once: the executor reports the code it started with.
+RUNTIME_VERSION = runtime_version(PROJECT_ROOT)
+
+
+def _handle_get_versions(args, cid, conn):
+    """get_versions — every part's version (utility/versions.py, 2026-10-21): the runtime (the VERSION file, its
+    branch and commit), Python, the OS, the description package, the control box (the PCB revision configured in
+    system.xml next to what the board reports) and per drive the firmware / hardware / serial it reports. Open to
+    every client; moves nothing. + the connected clients with their robotclient version and protocol (V3)."""
+    data = versions_report(shared_data, JOINT_NUM, _HAS_CAN_GRIPPER, _sys["pcb_version"])
+    data["clients"] = _connected_clients()
+    reply(conn, {"id": cid, "status": "ok", "data": data})
 
 
 # Freedrive joint walls (utility/haptic_walls.py JOINT WALLS, docs/safety_zones.md §2b). The executor keeps the
@@ -1433,6 +1509,60 @@ def _arg_recipe(v):
     return str(v).strip()
 
 
+def _arg_free_joint(v):
+    """free_joint's joint: 1..JOINT_NUM, or 0 = hold it again."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"a joint number 1-{JOINT_NUM}, or 0") from None
+    if not (math.isfinite(f) and f == int(f) and 0 <= int(f) <= JOINT_NUM):
+        raise ValueError(f"a joint number 1-{JOINT_NUM}, or 0")
+    return str(int(f))
+
+
+_JOINT_TEST_MAX_DEG = 15.0          # robotics/joint_test.py MAX_AMPLITUDE_DEG / MAX_SPEED_DPS
+_JOINT_TEST_MAX_DPS = 10.0
+
+
+def _handle_joint_test(args, cid, conn):
+    """joint_test [joint, amplitude_deg, speed_dps, current_ma] — a small powered test move of one joint and back
+    (robotics/joint_test.py, 2026-10-18); [0, ...] stops it. Each value checked here (BAD_ARGS, nothing sent): the
+    joint 1..N, 0 < |amplitude| <= 15 deg, 0 < speed <= 10 deg/s, 0 < current <= that joint's current limit."""
+    def bad(msg):
+        _log_exec_reject(cid, "BAD_ARGS", msg, command=_fmt_command("joint_test", args))
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
+    if len(args) != 4:
+        return bad(f"joint_test needs [joint, amplitude_deg, speed_dps, current_ma], got {len(args)} arg(s)")
+    try:
+        j, a, v, c = int(args[0]), float(args[1]), float(args[2]), float(args[3])
+    except (TypeError, ValueError):
+        return bad(f"joint_test: {list(args)} — expected numbers")
+    if not 0 <= j <= JOINT_NUM:
+        return bad(f"joint_test: joint {j} — expected 1-{JOINT_NUM}, or 0 to stop")
+    if j and not (all(math.isfinite(x) for x in (a, v, c)) and 0 < abs(a) <= _JOINT_TEST_MAX_DEG
+                  and 0 < v <= _JOINT_TEST_MAX_DPS and 0 < c <= float(cfg['motor_Ilim'][j - 1])):
+        return bad(f"joint_test: amplitude 0-{_JOINT_TEST_MAX_DEG:g} deg, speed 0-{_JOINT_TEST_MAX_DPS:g} deg/s, "
+                   f"current up to J{j}'s limit ({float(cfg['motor_Ilim'][j - 1]):.0f} mA)")
+    send_to_rti(f"joint_test:{j}:{a!r}:{v!r}:{c!r}", cid, "TCP")
+    reply(conn, {"id": cid, "status": "ok"})
+    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
+                 command=_fmt_command("joint_test", [j, a, v, c]))
+
+
+def _joint_test_status(rti):
+    """status()["joint_test"] from rti['joint_test'] (robotics/joint_test.py RESULT_FIELDS)."""
+    r = rti["joint_test"]
+    out = {k: round(float(r[i]), 3) for i, k in enumerate(_JOINT_TEST_FIELDS)}
+    out["joint"], out["seq"] = int(r[0]), int(r[7])
+    out["state"] = _JOINT_TEST_STATES.get(int(r[1]), "idle")
+    return out
+
+
+_JOINT_TEST_FIELDS = ("joint", "state", "amplitude_deg", "moved_deg", "max_error_deg", "peak_current_ma",
+                      "end_error_deg", "seq")
+_JOINT_TEST_STATES = {0: "idle", 1: "running", 2: "done", 3: "fell_behind", 4: "stopped"}
+
+
 _JOG_PROFILES = ("trapezoidal", "scurve")       # robotics/jog.py _PROFILE_TO_IDX (pinned by test_exec_command_args)
 _JOG_CONTROL_MODES = ("pid", "pd")              # robotics/jog.py _CONTROL_TO_IDX
 
@@ -1617,6 +1747,8 @@ IMMEDIATE_HANDLERS = {
     "get_pose":         _handle_get_pose,
     "get_status":       _handle_get_status,
     "get_health":       _handle_get_health,            # diagnostics (2026-10-15)
+    "get_hardware":     _handle_get_hardware,          # the first-run check's data (2026-10-18)
+    "get_versions":     _handle_get_versions,          # every part's version (2026-10-21)
     "set_log_level":    _handle_set_log_level,
     "capture_telemetry": _handle_capture_telemetry,
     "stop_capture": _handle_stop_capture,
@@ -1669,6 +1801,8 @@ IMMEDIATE_HANDLERS = {
     "inertia_comp":     _forward_fmt("inertia_comp", "inertia_comp", 1, (_arg_switch,)),
     "can_read_first":   _forward_fmt("can_read_first", "can_read_first", 1, (_arg_switch,)),   # TODO/can_tx_timing_plan.md option B
     "hall_check":       _forward_fmt("hall_check", "hall_check", 1, (_arg_switch,)),   # robotics/hall_check.py (IDLE only: COMMAND_RULES)
+    "free_joint":       _forward_fmt("free_joint", "free_joint", 1, (_arg_free_joint,)),  # robotics/free_joint.py (IDLE only)
+    "joint_test":       _handle_joint_test,             # robotics/joint_test.py (IDLE + ENABLED)
     "coriolis_comp":    _forward_fmt("coriolis_comp", "coriolis_comp", 1, (_arg_switch,)),
     "friction_ff":      _forward_fmt("friction_ff", "friction_ff", 1, (_arg_switch,)),   # utility/friction_model.py
     # collision detection's reaction (utility/safety_monitor.py; until RTI restarts — a PC program that pushes on purpose)
@@ -1778,6 +1912,11 @@ def current_status():
         policy_idx = 1
     evt = {
         "type": "status",
+        # The runtime and the protocols' versions (versioning V3). In EVERY status message, the snapshot a client gets
+        # on connect included: RobotClient.connect checks "protocols" there before anything else is sent. Constants,
+        # so they never trigger a push of their own.
+        "runtime_version": RUNTIME_VERSION,
+        "protocols": dict(PROTOCOLS),
         # Who holds control, or None. Published on the status stream rather than in shared
         # memory: shm needs a coordinated restart of every process plus a re-home, and this
         # event already reaches the GUI and every connected client.
@@ -1830,6 +1969,11 @@ def current_status():
         # The Hall sensor check (hall_check; robotics/hall_check.py): joint = the limp joint's number, 0 = off; pin =
         # its Hall pin, None until read; changes = pin changes seen; edge_deg = its angle at the last change to 0 / 1.
         "hall_check": _hall_check_status(shared_data.rti),
+        # The joint freed for hand turning (free_joint; robotics/free_joint.py, 2026-10-18): its number, 0 = none.
+        "free_joint": int(shared_data.rti["free_joint"][0]),
+        # A test move (joint_test; robotics/joint_test.py): joint, state (idle / running / done / fell_behind /
+        # stopped), amplitude_deg, moved_deg, max_error_deg, peak_current_ma, end_error_deg, seq (finished tests).
+        "joint_test": _joint_test_status(shared_data.rti),
         # The declared payload RTI's gravity model carries (set_payload; 0 after every RTI start).
         # RTI's tick length (s): an RTI client computes the robot's time from the state packets' `tick` with it
         # (RTIClient.control, 2026-10-11) — the robot's clock, not the PC's, as industrial streaming interfaces do.
@@ -1840,6 +1984,37 @@ def current_status():
     }
     evt.update(_planner_status())
     return evt
+
+
+# The drives' firmware against what this runtime supports (versioning V4, hardware/firmware_support.py). RTI reads the
+# versions at its start (selfcheck, tick 8); the status watcher looks at them every pass and logs once per CHANGE of the
+# reported set — a drive outside the range is a WARNING, never a stop (the first-run check fails it).
+_fw_seen = None
+
+
+def _check_drive_firmware():
+    global _fw_seen
+    reported = [int(shared_data.motor["SOFTWARE_VERSION"][i]) for i in range(JOINT_NUM)]
+    names = [f"J{i + 1}" for i in range(JOINT_NUM)]
+    types = list(cfg.get("motor_driver_type") or [])[:JOINT_NUM]
+    types += [None] * (JOINT_NUM - len(types))
+    if _HAS_CAN_GRIPPER:
+        reported.append(int(shared_data.gripper["gripper_motor_sw_version"][0]))
+        names.append("gripper")
+        types.append(cfg.get("gripper_driver_type"))
+    seen = tuple(reported)
+    if seen == _fw_seen:
+        return
+    _fw_seen = seen
+    for name, driver_type, fw in zip(names, types, reported):
+        verdict = firmware_support.check(driver_type, fw)
+        if verdict in ("too_old", "too_new"):
+            log_status.warning(f"{name}: drive firmware {fw} is outside what this runtime supports for {driver_type} "
+                               f"drives ({firmware_support.range_text(driver_type)}); update it: the dashboard's "
+                               f"Firmware tab, 'Update robot'")
+        elif verdict == "undeclared":
+            log_status.warning(f"{name}: drive firmware {fw}, but the robot / gripper XML declares no driver type this "
+                               f"runtime knows ({driver_type!r}) — its firmware cannot be checked")
 
 
 def _broadcast_status(evt):
@@ -1854,6 +2029,7 @@ def status_watcher():
     period = 1.0 / STATUS_POLL_HZ
     last = None
     last_mode = None
+    fw_check_failed = False
     log_status.info(f"watcher running ({STATUS_POLL_HZ:.0f} Hz check, push-on-change)")
     while True:
         evt = current_status()
@@ -1868,6 +2044,12 @@ def status_watcher():
         if evt != last:
             last = evt
             _broadcast_status(evt)
+        try:
+            _check_drive_firmware()                 # logs once per change of the reported firmware (V4)
+        except Exception as e:                      # noqa: BLE001 — a log line must never stop the status stream
+            if not fw_check_failed:
+                log_status.error(f"firmware check failed (not retried in the log): {e}")
+            fw_check_failed = True
         time.sleep(period)
 
 
@@ -1909,6 +2091,7 @@ def dispatch(msg, conn):
     cid = msg.get("id") or generate_short_id()
     if msg.get("client"):                  # the client's own name; kept per connection (2026-10-15)
         _client_names[conn] = str(msg["client"])[:60]
+    _note_client_version(conn, msg)        # its robotclient version + protocol (2026-10-21)
     note_origin(cid, _client_origin(conn))
     cmd = msg.get("cmd")
     args = msg.get("args", []) or []
@@ -1917,6 +2100,14 @@ def dispatch(msg, conn):
         _log_exec_reject(cid, "UNKNOWN_CMD", f"unknown command '{cmd}'", command=_fmt_command(cmd, args))
         return reply(conn, {"id": cid, "status": "error", "code": "UNKNOWN_CMD",
                             "message": f"unknown command '{cmd}'"})
+
+    # Pose angles changed their meaning on 2026-10-21: a client that declares no command protocol may be from before
+    # then, and its angles would turn the tool elsewhere. Refused, not guessed (communication/protocol.POSE_COMMANDS).
+    if cmd in POSE_COMMANDS and "protocol" not in msg:
+        why = (f"{cmd}: this client declares no command protocol version (a robotclient from before 0.9.0, or raw "
+               f"JSON without \"protocol\"); pose angles changed their meaning in 0.9.0")
+        _log_exec_reject(cid, "CLIENT_TOO_OLD", why, command=_fmt_command(cmd, args))
+        return reply(conn, {"id": cid, "status": "error", "code": "CLIENT_TOO_OLD", "message": why})
 
     mode, state, homed = read_live_state()
     ok, reason = validate(cmd, mode, state, homed)
@@ -2012,6 +2203,7 @@ def handle_client(conn, addr):
         # A dropped TCP connection must never hold the robot hostage.
         _release_control(conn, "disconnected")
         _client_names.pop(conn, None)          # after the release, so its log line still names the client
+        _client_versions.pop(conn, None)
         # Drop any of this client's pending completions.
         with _pending_lock:
             for cid in [c for c, cn in pending_client.items() if cn is conn]:

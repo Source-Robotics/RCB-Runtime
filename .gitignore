@@ -20,6 +20,10 @@ config/supervisor_settings.json
 # Public repo cleanup: keep README public, keep internal markdown local
 *.md
 !/README.md
+# The release files are published with the code (2026-10-21, versioning V5): what changed per version, and which
+# client / protocol / firmware / hardware versions work with which runtime.
+!/CHANGELOG.md
+!/COMPATIBILITY.md
 
 # Local/internal docs, planning, assistant instructions, and manual test scripts.
 #

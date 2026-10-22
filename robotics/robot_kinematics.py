@@ -22,7 +22,8 @@ from spatialmath import SE3
 from utility.kinematics_backend import (
     require_selected_backend_available,
     should_use_pinocchio,
-    write_rpy_xyz,
+    pose_angles,
+    write_pose_angles,
 )
 
 logger = logging.getLogger("kin")  # docs/logging.md "Logger names"
@@ -49,20 +50,20 @@ def calculate_forward_kinematics(robot, joint_position):
     return robot.fkine(joint_position)
 
 
-def get_tcp_pose_rpy(robot, joint_position, order='xyz'):
+def get_tcp_pose_rpy(robot, joint_position):
     """
-    Get TCP pose as [x, y, z, roll, pitch, yaw].
+    Get TCP pose as [x, y, z, rx, ry, rz].
     
     Args:
         robot: Robot object
         joint_position (np.array): Joint positions in radians
-        order (str): Rotation order for RPY (default: 'xyz')
     
     Returns:
-        np.array: 6-element array [x, y, z, rx, ry, rz] in meters and radians
+        np.array: 6-element array [x, y, z, rx, ry, rz] in meters and radians, R = Rx(rx) Ry(ry) Rz(rz)
+        (utility/kinematics_backend.py "The pose angles")
     """
     TT = calculate_forward_kinematics(robot, joint_position)
-    rpy_angles = TT.rpy(order=order)  # Returns [roll, pitch, yaw] in radians
+    rpy_angles = pose_angles(TT.A)
     translation_xyz = TT.t  # Returns [x, y, z] translation
     
     return np.concatenate((translation_xyz, rpy_angles))
@@ -220,13 +221,15 @@ def calculate_all_kinematics(
         T = SE3(pose_4x4, check=False) if return_transform else None
         tcp_pose = np.empty(6, dtype=np.float64)
         tcp_pose[:3] = pose_4x4[:3, 3]
-        write_rpy_xyz(pose_4x4, tcp_pose, start=3)
+        write_pose_angles(pose_4x4, tcp_pose, start=3)
         tcp_pose_matrix = pose_4x4.reshape(16)
     else:
         # Forward kinematics - single fkine call, reused by the Jacobian.
         T_full = robot.fkine(joint_position)
         T = T_full if return_transform else None
-        tcp_pose = np.concatenate((T_full.t, T_full.rpy(order="xyz")))
+        tcp_pose = np.empty(6, dtype=np.float64)
+        tcp_pose[:3] = T_full.t
+        write_pose_angles(T_full.A, tcp_pose, start=3)
         tcp_pose_matrix = T_full.A.flatten()
         J = robot.jacob0(q=joint_position, T=T_full)
 

@@ -1,12 +1,17 @@
 """Block programs saved on the robot: one JSON file each in programs/ — TODO/blockly_plan.md §4, D8 (local only).
 
-    {"format": 1, "name": "pick_place", "robot": "PAR6", "gripper": "SSG48", "modified": "2026-10-04T12:00:00Z",
+    {"format": 2, "name": "pick_place", "robot": "PAR6", "gripper": "SSG48", "modified": "2026-10-04T12:00:00Z",
      "points": {"above_pick": {"joints_deg": [6 numbers], "pose": [x, y, z (m), rx, ry, rz (rad)]}},
      "workspace": {<Blockly.serialization.workspaces.save()>}}
 
 The workspace is the source of truth; the Python is generated from it whenever it is needed and never stored.
 A point keeps BOTH the joint angles (what a joint move uses: no IK, no surprise arm configuration) and the TCP pose
 (what a straight-line move uses), captured together from the arm; `pose` is in the units the robot API uses.
+
+Format 2 (2026-10-21): a pose's angles are R = Rx(rx) Ry(ry) Rz(rz) — about base X, then the tool's new Y, then its
+own Z (utility/kinematics_backend.py "The pose angles"). Format 1 files hold the angles before, R = Rx(rz) Ry(ry)
+Rz(rx) — the same convention with rx and rz swapped: read, their first and third angles are swapped (the same
+orientation) and the next save writes format 2.
 
 Limits checked here (everything a file can carry is checked when it is SAVED, so a file that loads is sane):
 - nesting depth: Python's json gives up near 1000 levels and Blockly nests each next block inside the one before,
@@ -20,7 +25,7 @@ import re
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FORMAT = 1
+FORMAT = 2
 MAX_JSON_DEPTH = 900                # json.dumps / loads hit RecursionError near 1000 (measured 2026-10-04)
 MAX_FILE_BYTES = 4_000_000
 MAX_POINTS = 500
@@ -124,8 +129,9 @@ def check_program(program, name=None):
     """The program, checked: its shape, its points, its depth. Raises ProgramError."""
     if not isinstance(program, dict):
         raise ProgramError("a program is a JSON object")
-    if program.get("format", FORMAT) != FORMAT:
-        raise ProgramError(f"program format {program.get('format')!r} is not one this editor reads ({FORMAT})")
+    fmt = program.get("format", FORMAT)
+    if fmt not in (1, FORMAT):
+        raise ProgramError(f"program format {program.get('format')!r} is not one this editor reads (1, {FORMAT})")
     if name is not None:
         check_name(name)
         program["name"] = name
@@ -136,6 +142,10 @@ def check_program(program, name=None):
         raise ProgramError(_too_deep())
     program["workspace"] = workspace
     program["points"] = check_points(program.get("points", {}))
+    if fmt == 1:
+        program["points"] = {pname: dict(point, pose=pose_from_format_1(point["pose"]))
+                             for pname, point in program["points"].items()}
+    program["format"] = FORMAT
     for key in ("robot", "gripper"):
         if program.get(key) is not None and not isinstance(program[key], str):
             raise ProgramError(f"'{key}' must be a name")
@@ -155,6 +165,13 @@ def check_points(points):
         out[pname] = {"joints_deg": _numbers(point.get("joints_deg"), 6, f"point {pname!r}: joints"),
                       "pose": _numbers(point.get("pose"), 6, f"point {pname!r}: pose")}
     return out
+
+
+def pose_from_format_1(pose):
+    """A format-1 pose [x, y, z, a, b, c] (R = Rx(c) Ry(b) Rz(a), the angles before 2026-10-21) in today's angles
+    [x, y, z, c, b, a] (R = Rx(rx) Ry(ry) Rz(rz)): the same position and orientation, the first and third angle
+    swapped — exact, no rounding."""
+    return [float(v) for v in pose[:3]] + [float(pose[5]), float(pose[4]), float(pose[3])]
 
 
 def check_point_name(pname):

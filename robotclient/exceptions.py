@@ -9,6 +9,16 @@ class RobotConnectionError(RobotError):
     """TCP connection could not be established or was lost."""
 
 
+class VersionMismatch(RobotConnectionError):
+    """The robot speaks another version of a protocol this client uses (2026-10-21, versioning V3): raised by connect()
+    before anything is sent; connect(..., allow_mismatch=True) skips the check. robotclient/version.py."""
+
+
+class VersionWarning(UserWarning):
+    """The robot reports no protocol versions (a runtime from before versioning): connect() goes on and warns once
+    (Python's warnings module; filter it like any warning)."""
+
+
 class RobotTimeout(RobotError):
     """A command did not receive its expected reply in time."""
 

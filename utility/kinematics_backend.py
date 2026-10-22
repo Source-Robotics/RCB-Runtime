@@ -112,29 +112,58 @@ def write_quaternion_wxyz(R: np.ndarray, out: np.ndarray, start: int = 0) -> Non
         out[start + 3] = -out[start + 3]
 
 
-def write_rpy_xyz(R: np.ndarray, out: np.ndarray, start: int = 0) -> None:
-    """Write SpatialMath-compatible tr2rpy(..., order='xyz') into out."""
+# ─── The pose angles (2026-10-21, user) ────────────────────────────────────────────────────────────────────────────
+# A TCP pose 6-vector is [x, y, z, rx, ry, rz]: metres, then three angles in radians with
+#     R = Rx(rx) · Ry(ry) · Rz(rz)
+# — turn about the base X axis by rx, then about the tool's NEW Y axis by ry, then about the tool's own Z axis by rz
+# (mobile X, Y', Z''; the same rotation as turning about the fixed base axes Z by rz, then Y by ry, then X by rx).
+# rz is always the spin about the tool's own axis, at any tilt. This is how a number of industrial arms define their
+# rx, ry, rz (or alpha, beta, gamma). Gimbal lock at ry = ±90°: the tool's Z axis along base ±X — rx and rz then turn
+# about the same axis; the readout reports rz = 0 and puts the turn in rx. Chosen over fixed X, Y, Z after measuring
+# PAR6 (2026-10-21, user): around the poses the arm rests in after homing it never comes within 10° of lock (fixed
+# X, Y, Z: 4-7 % of those poses; over the whole joint range the two are equal).
+# ONE definition, two directions: angles -> rotation is motion.cartesian_paths.pose_from_xyz_rpy, rotation -> angles
+# is write_pose_angles / pose_angles below; everything else works on the matrix. Before 2026-10-21 the code stored
+# SpatialMath's order='xyz' angles, R = Rx(rz) Ry(ry) Rz(rx): the same convention with rx and rz swapped —
+# blockly/programs.py swaps programs saved before (format 1).
+POSE_CONVENTION = "xyz-mobile"     # get_status()["pose_angles"]; a block program refuses an executor without it
+
+
+def write_pose_angles(R: np.ndarray, out: np.ndarray, start: int = 0) -> None:
+    """Write the pose angles [rx, ry, rz] of rotation R (3x3, or the top-left of a 4x4) into out[start:start + 3]:
+    R = Rx(rx) Ry(ry) Rz(rz). Exactly SpatialMath's tr2rpy(R, order='xyz') with its three values in reverse order —
+    the same branches, the same pick of the best-conditioned element for ry. In place, no allocation: this runs every
+    RT tick (the measured and the commanded pose)."""
     if abs(abs(R[0, 2]) - 1.0) < _RPY_SINGULAR_TOL:
-        out[start] = 0.0
+        # gimbal lock (ry = ±90°): rx and rz turn about the same axis — rz = 0, rx carries the turn
+        rz = 0.0
         if R[0, 2] > 0.0:
-            out[start + 2] = math.atan2(R[2, 1], R[1, 1])
+            rx = math.atan2(R[2, 1], R[1, 1])
         else:
-            out[start + 2] = -math.atan2(R[1, 0], R[2, 0])
-        out[start + 1] = math.asin(max(-1.0, min(1.0, R[0, 2])))
-        return
-
-    out[start] = -math.atan2(R[0, 1], R[0, 0])
-    out[start + 2] = -math.atan2(R[1, 2], R[2, 2])
-
-    a0 = abs(R[0, 0])
-    a1 = abs(R[0, 1])
-    a2 = abs(R[1, 2])
-    a3 = abs(R[2, 2])
-    if a0 >= a1 and a0 >= a2 and a0 >= a3:
-        out[start + 1] = math.atan(R[0, 2] * math.cos(out[start]) / R[0, 0])
-    elif a1 >= a2 and a1 >= a3:
-        out[start + 1] = -math.atan(R[0, 2] * math.sin(out[start]) / R[0, 1])
-    elif a2 >= a3:
-        out[start + 1] = -math.atan(R[0, 2] * math.sin(out[start + 2]) / R[1, 2])
+            rx = -math.atan2(R[1, 0], R[2, 0])
+        ry = math.asin(max(-1.0, min(1.0, R[0, 2])))
     else:
-        out[start + 1] = math.atan(R[0, 2] * math.cos(out[start + 2]) / R[2, 2])
+        rz = -math.atan2(R[0, 1], R[0, 0])
+        rx = -math.atan2(R[1, 2], R[2, 2])
+        a0 = abs(R[0, 0])
+        a1 = abs(R[0, 1])
+        a2 = abs(R[1, 2])
+        a3 = abs(R[2, 2])
+        if a0 >= a1 and a0 >= a2 and a0 >= a3:
+            ry = math.atan(R[0, 2] * math.cos(rz) / R[0, 0])
+        elif a1 >= a2 and a1 >= a3:
+            ry = -math.atan(R[0, 2] * math.sin(rz) / R[0, 1])
+        elif a2 >= a3:
+            ry = -math.atan(R[0, 2] * math.sin(rx) / R[1, 2])
+        else:
+            ry = math.atan(R[0, 2] * math.cos(rx) / R[2, 2])
+    out[start] = rx
+    out[start + 1] = ry
+    out[start + 2] = rz
+
+
+def pose_angles(R: np.ndarray) -> np.ndarray:
+    """The pose angles [rx, ry, rz] of rotation R as a new array — write_pose_angles for code off the RT path."""
+    out = np.empty(3, dtype=np.float64)
+    write_pose_angles(R, out)
+    return out

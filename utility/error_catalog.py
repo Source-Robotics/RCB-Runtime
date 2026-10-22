@@ -302,6 +302,12 @@ CATALOG = {
     "HALL_CHECK_REFUSED": _e(4006, "Hall sensor check refused",
                              "The Hall sensor check cannot start now. The message says why.", _REFUSED,
                              "Do what the message asks, usually going to IDLE, then start the check again."),
+    "FREE_JOINT_REFUSED": _e(4007, "Freeing a joint refused",
+                             "A joint cannot be freed for hand turning now. The message says why.", _REFUSED,
+                             "Do what the message asks, usually going to IDLE, then try again."),
+    "JOINT_TEST_REFUSED": _e(4008, "Joint test move refused",
+                             "A test move cannot start now. The message says why.", _REFUSED,
+                             "Do what the message asks, usually enabling the arm in IDLE, then try again."),
 
     # ---------------------------------------------------------------- 5xxx motion and the planner
     "PLAN_FAIL": _e(5001, "Trajectory planning failed",
@@ -456,6 +462,12 @@ CATALOG = {
                           _REFUSED,
                           "Wait for the running capture to finish, ask for a length of 1 to 60 s, or check that the "
                           "recorder runs."),
+    "CLIENT_TOO_OLD": _e(6022, "Client too old for pose commands",
+                         "The client declares no command protocol version, so it may be from before 0.9.0, when pose "
+                         "angles had another meaning. A pose it sends could turn the tool to another orientation.",
+                         _REFUSED,
+                         "Use the robotclient that came with the robot's runtime. A client that sends raw JSON adds "
+                         "\"protocol\": 1 to each message."),
     "CONTROL_HELD": _e(6101, "Control held by another client", "Another client holds control of the robot.",
                        _REFUSED,
                        "Release control on that client, or take control. A forced takeover asks for confirmation "
@@ -539,6 +551,8 @@ CATALOG = {
     "CAPTURE_STARTED": _info(9018, "Telemetry capture started"),
     "CAPTURE_SAVED": _info(9019, "Telemetry capture saved"),
     "COLLISION_DETECTION_CHANGED": _info(9020, "Collision detection changed"),
+    "FREE_JOINT": _info(9021, "Joint freed for hand turning"),
+    "JOINT_TEST": _info(9022, "Joint test move"),
 }
 
 ERROR_DESCRIPTIONS = CATALOG          # the old name (utility/error_checks.py, nets)

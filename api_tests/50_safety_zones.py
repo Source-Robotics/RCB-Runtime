@@ -35,6 +35,7 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from robotclient import RobotClient                                   # noqa: E402
 from robotclient.exceptions import CommandRejected, MotionFailed      # noqa: E402
+from utility.kinematics_backend import pose_angles                    # noqa: E402
 
 J = 4                                  # J5, 0-based
 WALL_DEG, PAST_DEG = 4.0, 10.0
@@ -128,7 +129,7 @@ def main():
         print("\n1. is_reachable")
         q_past = q0.copy()
         q_past[J] += sign * 8.0
-        pose_past = [float(v) for v in np.concatenate([tcp(8.0), model.fkine(np.radians(q_past)).rpy(order="xyz")])]
+        pose_past = [float(v) for v in np.concatenate([tcp(8.0), pose_angles(model.fkine(np.radians(q_past)).A)])]
         r = robot.is_reachable(*pose_past, near=q_past.tolist())
         check("the pose at J5 +8 deg is reachable but NOT allowed, zone 'api_wall'",
               r["reachable"] and r["allowed"] is False and r["zone"] == "api_wall", str(r)[:120])

@@ -19,7 +19,12 @@ state is reached and motion blocks until complete. See docs/robotclient_transpor
     robot.enable(); robot.home(); robot.enter_exec_mode()
     robot.move_joints(0, -60, 60, 0, 0, 0)
 
-Angles are DEGREES at the API (converted to radians server-side).
+Joint angles are DEGREES at the API (converted to radians server-side).
+
+TCP poses are [x, y, z, rx, ry, rz]: metres, and three angles in RADIANS by default, or degrees with
+angle_unit="deg" on the call (2026-10-21; converted here, so the robot and its logs always see radians). The angles:
+R = Rx(rx) Ry(ry) Rz(rz) — about base X by rx, then the tool's new Y by ry, then its own Z by rz (rz = the tool's
+spin about its own axis).
 """
 from __future__ import annotations
 from typing import Any, Callable, Sequence
@@ -30,7 +35,32 @@ from .constants import (
     DEFAULT_PORT, IMMEDIATE_TIMEOUT, FORCE_TAKE_TIMEOUT, ACK_TIMEOUT, DEFAULT_MOVE_TIMEOUT,
     WAIT_STATE_TIMEOUT, WAIT_HOMED_TIMEOUT,
 )
-from .exceptions import RobotTimeout, MotionFailed, GripFailed, HomingFailed
+from .exceptions import RobotError, RobotTimeout, MotionFailed, GripFailed, HomingFailed, VersionMismatch
+from .version import check_protocols
+
+# Pose angles (2026-10-21): radians unless a call says angle_unit="deg".
+_RAD_PER = {"rad": 1.0, "deg": 3.141592653589793 / 180.0}
+
+
+def _rad_per(angle_unit):
+    """Radians per one `angle_unit` ("rad" | "deg"). Anything else is refused: a quiet fallback would turn the tool
+    57 times too far, or 57 times too little."""
+    try:
+        return _RAD_PER[angle_unit]
+    except (KeyError, TypeError):
+        raise ValueError(f"angle_unit must be 'rad' or 'deg', got {angle_unit!r}") from None
+
+
+def _pose_in(values, angle_unit):
+    """Whole poses [x, y, z, rx, ry, rz] (one, or several end to end) as floats, the angles in radians."""
+    k = _rad_per(angle_unit)
+    return [float(v) * k if i % 6 >= 3 else float(v) for i, v in enumerate(values)]
+
+
+def _pose_out(values, angle_unit):
+    """A pose from the robot (radians) with its angles in `angle_unit`."""
+    k = _rad_per(angle_unit)
+    return [float(v) / k if i % 6 >= 3 else float(v) for i, v in enumerate(values)]
 
 
 class GripperResult:
@@ -86,6 +116,10 @@ class RobotClient:
         "pick_place"). Default: "<script> on <host>", e.g. "pick_place.py on lab-pc"."""
         self._conn = Connection(name=name)
         self._sync = sync
+        # What the robot reported at connect() (versioning V3): its runtime version ("0.9.0") and protocol versions
+        # ({"commands", "rti", "telemetry"}); None until connected, or when the robot reports none.
+        self.runtime_version: str | None = None
+        self.protocols: dict | None = None
         self._last_queued = None   # most recent queued command's _Pending, for wait_motion_complete()
         # Most recent GRIPPER command's _Pending, tracked separately: queue a
         # gripper command then a joint move and _last_queued is the MOVE, so
@@ -96,11 +130,28 @@ class RobotClient:
     # Connection
     # ------------------------------------------------------------------ #
 
-    def connect(self, ip: str, port: int = DEFAULT_PORT) -> RobotClient:
+    def connect(self, ip: str, port: int = DEFAULT_PORT, *, allow_mismatch: bool = False) -> RobotClient:
+        """Connect to the robot's executor and check that it speaks this client's command protocol (versioning V3):
+        a different version raises VersionMismatch before anything is sent (allow_mismatch=True skips the check); a
+        robot that reports none (a runtime from before 0.9.0) gives a VersionWarning. After it, runtime_version and
+        protocols say what the robot reported (None when it did not)."""
         self._conn.connect(ip, port)
         # The executor pushes a status snapshot on connect; wait briefly for it so
         # status() is populated and the first wait_*() has a baseline.
         self._conn.wait_status(lambda s: bool(s), timeout=1.0)
+        st = self._conn.latest_status()
+        if not st:          # no snapshot within 1 s (a slow link): ask (get_status carries the same fields)
+            try:
+                st = self._immediate("get_status") or {}
+            except RobotError:
+                st = {}
+        self.runtime_version = st.get("runtime_version")
+        self.protocols = dict(st["protocols"]) if isinstance(st.get("protocols"), dict) else None
+        try:
+            check_protocols(st, ("commands",), allow_mismatch)
+        except VersionMismatch:
+            self._conn.disconnect()
+            raise
         return self
 
     def disconnect(self) -> None:
@@ -339,6 +390,25 @@ class RobotClient:
         from it (measured), with the same late-reply rate and tracking; False = the old order. Homing always uses the
         old order. RTI.log reports the waits when it is switched off."""
         return self._immediate("can_read_first", [1 if enabled else 0])
+
+    def joint_test(self, joint: int, amplitude_deg: float = 5.0, speed_dps: float = 5.0,
+                   current_ma: float = 600.0) -> Any:
+        """A small powered test move of one joint and back, homed or not (2026-10-18; the first-run check's stage 3):
+        joint 1..N moves `amplitude_deg` (signed, up to 15) from where it stands and back on a smooth ramp peaking at
+        `speed_dps` (up to 10), its drive's current limited to `current_ma` meanwhile; every other joint keeps holding.
+        joint_test(0) stops it. Only in IDLE with the arm ENABLED. The robot stops it itself when the joint falls 2 deg
+        behind (blocked, an endstop, too little current), on a disable or any mode change. Result in
+        status()["joint_test"]: state (running / done / fell_behind / stopped), moved_deg, max_error_deg,
+        peak_current_ma, end_error_deg, seq (counts finished tests)."""
+        return self._immediate("joint_test", [int(joint), float(amplitude_deg), float(speed_dps), float(current_ma)])
+
+    def free_joint(self, joint: int) -> Any:
+        """Free one joint so it can be turned by hand (2026-10-18; the first-run check): joint 1..N goes limp (its
+        drive's current limit 0) while the others keep holding; 0 holds it again. Only in IDLE (enabled or not, homed
+        or not). A joint that carries the arm's weight (J2, J3) FALLS when freed unless it is supported. The robot holds
+        it again itself before any mode change (homing, a jog, an error, the E-stop) and 2 minutes after the last
+        free_joint(n) (sending it again renews it). status()["free_joint"] = the freed joint, 0 = none."""
+        return self._immediate("free_joint", [int(joint)])
 
     def hall_check(self, on: bool = True) -> Any:
         """The Hall sensor check (2026-10-13): True = the joint homed on a Hall sensor (J6) goes limp (its drive's
@@ -923,25 +993,28 @@ class RobotClient:
             angles_deg = tuple(angles_deg[0])
         return self._queued("move_joints", [float(a) for a in angles_deg], timeout, options)
 
-    def move_pose(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        """Endpoint IK move to TCP pose [m, rad]; timed as a joint-space move."""
-        return self._queued("move_pose", [float(v) for v in (x, y, z, rx, ry, rz)], timeout, options)
+    def move_pose(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
+        """Endpoint IK move to TCP pose [m, rad — or deg with angle_unit="deg"]; timed as a joint-space move."""
+        return self._queued("move_pose", _pose_in((x, y, z, rx, ry, rz), angle_unit), timeout, options)
 
-    def move_linear(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        """Cartesian line move; pass dry_run=True to validate the IK path without motion."""
-        return self._queued("move_linear", [float(v) for v in (x, y, z, rx, ry, rz)], timeout, options)
+    def move_linear(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
+        """Cartesian line move to TCP pose [m, rad — or deg with angle_unit="deg"]; pass dry_run=True to validate the
+        IK path without motion."""
+        return self._queued("move_linear", _pose_in((x, y, z, rx, ry, rz), angle_unit), timeout, options)
 
-    def move_linear_rel_world(self, dx: float, dy: float, dz: float, drx: float = 0.0, dry: float = 0.0, drz: float = 0.0, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        """Cartesian line by world-frame TCP offset [m, rad]."""
+    def move_linear_rel_world(self, dx: float, dy: float, dz: float, drx: float = 0.0, dry: float = 0.0, drz: float = 0.0, timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
+        """Cartesian line by world-frame TCP offset [m, rad — or deg with angle_unit="deg"]: the turn is about axes
+        parallel to the base's, through the TCP."""
         return self._queued(
             "move_linear_rel_wrf",
-            [float(v) for v in (dx, dy, dz, drx, dry, drz)], timeout, options)
+            _pose_in((dx, dy, dz, drx, dry, drz), angle_unit), timeout, options)
 
-    def move_linear_rel_tool(self, dx: float, dy: float, dz: float, drx: float = 0.0, dry: float = 0.0, drz: float = 0.0, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        """Cartesian line by tool-frame TCP offset [m, rad]."""
+    def move_linear_rel_tool(self, dx: float, dy: float, dz: float, drx: float = 0.0, dry: float = 0.0, drz: float = 0.0, timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
+        """Cartesian line by tool-frame TCP offset [m, rad — or deg with angle_unit="deg"]: the turn is about the
+        tool's own axes at the start."""
         return self._queued(
             "move_linear_rel_trf",
-            [float(v) for v in (dx, dy, dz, drx, dry, drz)], timeout, options)
+            _pose_in((dx, dy, dz, drx, dry, drz), angle_unit), timeout, options)
 
     def move_linear_rel_wrf(self, *args: Any, **kwargs: Any) -> str:
         return self.move_linear_rel_world(*args, **kwargs)
@@ -951,28 +1024,28 @@ class RobotClient:
 
 
     @staticmethod
-    def _curve_pose_values(pose, label):
+    def _curve_pose_values(pose, label, angle_unit="rad"):
         values = [float(v) for v in pose]
         if len(values) != 6:
             raise ValueError(f"{label} needs [x, y, z, rx, ry, rz]")
-        return values
+        return _pose_in(values, angle_unit)
 
-    def move_arc(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+    def move_arc(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
         """Absolute world-frame circular arc through via and end poses [m, rad]."""
-        args = self._curve_pose_values(via, "move_arc via")
-        args.extend(self._curve_pose_values(end, "move_arc end"))
+        args = self._curve_pose_values(via, "move_arc via", angle_unit)
+        args.extend(self._curve_pose_values(end, "move_arc end", angle_unit))
         return self._queued("move_arc", args, timeout, options)
 
-    def move_arc_rel_world(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+    def move_arc_rel_world(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
         """Arc with via/end offsets in the world frame at command start [m, rad]."""
-        args = self._curve_pose_values(via, "move_arc_rel_world via")
-        args.extend(self._curve_pose_values(end, "move_arc_rel_world end"))
+        args = self._curve_pose_values(via, "move_arc_rel_world via", angle_unit)
+        args.extend(self._curve_pose_values(end, "move_arc_rel_world end", angle_unit))
         return self._queued("move_arc_rel_wrf", args, timeout, options)
 
-    def move_arc_rel_tool(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+    def move_arc_rel_tool(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
         """Arc with via/end offsets in the starting TCP frame [m, rad]."""
-        args = self._curve_pose_values(via, "move_arc_rel_tool via")
-        args.extend(self._curve_pose_values(end, "move_arc_rel_tool end"))
+        args = self._curve_pose_values(via, "move_arc_rel_tool via", angle_unit)
+        args.extend(self._curve_pose_values(end, "move_arc_rel_tool end", angle_unit))
         return self._queued("move_arc_rel_trf", args, timeout, options)
 
     def move_circle(self, center: Sequence[float], normal: Sequence[float], turns: float = 1.0, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
@@ -1002,23 +1075,23 @@ class RobotClient:
         return self._queued(
             "move_circle_rel_trf", center_values + normal_values + [float(turns)], timeout, options)
 
-    def move_spline(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+    def move_spline(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
         """Absolute world-frame interpolating cubic spline through poses [m, rad]."""
-        poses = [self._curve_pose_values(pose, "move_spline waypoint") for pose in waypoints]
+        poses = [self._curve_pose_values(pose, "move_spline waypoint", angle_unit) for pose in waypoints]
         if len(poses) < 2:
             raise ValueError("move_spline needs at least two waypoint poses")
         return self._queued("move_spline", [v for pose in poses for v in pose], timeout, options)
 
-    def move_spline_rel_world(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+    def move_spline_rel_world(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
         """Spline through world-frame offsets from the TCP at command start [m, rad]."""
-        poses = [self._curve_pose_values(pose, "move_spline_rel_world waypoint") for pose in waypoints]
+        poses = [self._curve_pose_values(pose, "move_spline_rel_world waypoint", angle_unit) for pose in waypoints]
         if len(poses) < 2:
             raise ValueError("move_spline_rel_world needs at least two waypoint poses")
         return self._queued("move_spline_rel_wrf", [v for pose in poses for v in pose], timeout, options)
 
-    def move_spline_rel_tool(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+    def move_spline_rel_tool(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
         """Spline through starting-TCP-frame offsets; waypoints are not chained [m, rad]."""
-        poses = [self._curve_pose_values(pose, "move_spline_rel_tool waypoint") for pose in waypoints]
+        poses = [self._curve_pose_values(pose, "move_spline_rel_tool waypoint", angle_unit) for pose in waypoints]
         if len(poses) < 2:
             raise ValueError("move_spline_rel_tool needs at least two waypoint poses")
         return self._queued("move_spline_rel_trf", [v for pose in poses for v in pose], timeout, options)
@@ -1239,15 +1312,33 @@ class RobotClient:
         """Joint angles in degrees."""
         return self._immediate("get_joints")
 
-    def get_pose(self) -> list[float]:
-        """TCP pose [x, y, z, rx, ry, rz]."""
-        return self._immediate("get_pose")
+    def get_pose(self, *, angle_unit: str = "rad") -> list[float]:
+        """TCP pose [x, y, z, rx, ry, rz]: metres, the angles in radians (or degrees with angle_unit="deg"),
+        R = Rx(rx) Ry(ry) Rz(rz)."""
+        return _pose_out(self._immediate("get_pose"), angle_unit)
 
     def get_health(self) -> dict:
         """The robot's health summary (2026-10-15): {"level": "OK" | "WARN" | "ERROR" | "STALE", "components":
         [{"name", "level", "summary", "values"}]} — the control loop, CAN, drives, errors, homing, the executor, the
         self-collision worker, the processes, disk, memory, CPU temperature, the clock."""
         return self._immediate("get_health")
+
+    def get_hardware(self, can: bool = True) -> dict:
+        """What the robot's hardware reports (2026-10-18; the first-run check's data): {"drives": [{"name", "can_id",
+        "answered_scan", "answering", "lost", "firmware", "hardware", "serial", "batch", "voltage_v", "temperature_c",
+        "fault", "flags", "calibrated"}], "gripper" (the same, or None), "scan_unexpected_ids", "can_link" (the CAN
+        interface's state and error counters, or None), "io": {"estop_pressed", "estop_raw", "buttons_pressed",
+        "inputs", "outputs", ...}, "tick", "time"}. can=False skips the CAN counters (~5 ms; for polling). Moves
+        nothing."""
+        return self._immediate("get_hardware", [1 if can else 0])
+
+    def get_versions(self) -> dict:
+        """Every part's version (2026-10-21): {"runtime": {"version", "branch", "commit"}, "python", "os": {"name",
+        "kernel", "realtime"}, "description_package": {"version", "path"}, "drives": [{"joint", "can_id", "firmware",
+        "hardware", "serial", "batch"}], "gripper" (the same without "batch", or None), "control_box":
+        {"pcb_configured", "hardware", "software", "serial", "batch"}, "time"}. A value a part has not reported yet is
+        None. Moves nothing."""
+        return self._immediate("get_versions")
 
     def set_log_level(self, name: str, level: str) -> Any:
         """Set one logger's level on the robot without a restart (2026-10-15): `name` from docs/logging.md "Logger
@@ -1270,10 +1361,12 @@ class RobotClient:
         """One-shot status query over TCP: mode, state, homed, error_active, joints."""
         return self._immediate("get_status")
 
-    def is_reachable(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, near: Sequence[float] | None = None) -> dict:
+    def is_reachable(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, near: Sequence[float] | None = None,
+                     *, angle_unit: str = "rad") -> dict:
         """Can the arm reach this TCP pose inside its joint limits? Moves nothing.
 
-        Pose as move_pose / get_pose: [m, rad]. Returns
+        Pose as move_pose / get_pose: [m, rad — or deg with angle_unit="deg"]; `near` is joint angles in deg either
+        way. Returns
         {"reachable": bool, "joints": [deg] | None, "allowed": bool, "zone": name | None,
          "self_collision": "upper arm and tool" | None}:
         `joints` is the solution closest to `near` (joint angles in deg; default: where the arm is
@@ -1286,7 +1379,7 @@ class RobotClient:
         (IK_POSE_ERROR); move_joints(joints) will not, unless its PATH self-collides (the end pose
         is all this checks).
         """
-        args = [float(v) for v in (x, y, z, rx, ry, rz)]
+        args = _pose_in((x, y, z, rx, ry, rz), angle_unit)
         if near is not None:
             args += [float(a) for a in near]
         return self._immediate("is_reachable", args)

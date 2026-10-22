@@ -39,8 +39,12 @@ def git_commit(repo_root):
 
 
 def describe(repo_root):
-    """'feat/x @ 80d9701c9a2b' or 'unknown' — for a log line."""
+    """'v0.9.0, feat/x @ 80d9701c9a2b' — for a log line. The runtime's version (the VERSION file, 2026-10-21) first;
+    the commit stays LAST: tools/arm_smoke.py compares the end of RTI's `code:` line with HEAD."""
+    from utility.versions import runtime_version         # here, not at the top: utility.versions imports this module
+    ver = runtime_version(repo_root)
+    head = f"v{ver}" if ver != "unknown" else "version unknown"
     branch, sha = git_commit(repo_root)
     if sha is None:
-        return "unknown (no readable .git)"
-    return f"{branch or 'detached'} @ {sha[:12]}"
+        return f"{head}, unknown (no readable .git)"
+    return f"{head}, {branch or 'detached'} @ {sha[:12]}"

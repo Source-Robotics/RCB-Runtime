@@ -333,6 +333,21 @@ def _collision_nm(contact: Iterable[float | None], collision: Iterable[float | N
     return cn, co
 
 
+def _first_run_moves(joints) -> list:
+    """Per joint <first_run_move amplitude_deg speed_dps current_ma/> as {"amplitude_deg", "speed_dps", "current_ma"}
+    (floats); None where the element is missing or a value is not a positive number (the check then skips that
+    joint's powered move rather than guess a force)."""
+    out: list = []
+    for joint in joints.findall("joint"):
+        el = joint.find("first_run_move")
+        try:
+            d = {k: float(el.get(k)) for k in ("amplitude_deg", "speed_dps", "current_ma")} if el is not None else None
+        except (TypeError, ValueError):
+            d = None
+        out.append(d if d is not None and all(v == v and v > 0 for v in d.values()) else None)
+    return out
+
+
 def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None = None,
                            active_gripper: str | None = None) -> dict:
     """
@@ -440,6 +455,10 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         'homing_timeout_s':       get_all_values(joints, 'homing_timeout_s'),
         'homing_backoff_s':       get_all_values(joints, 'homing_backoff_s'),
         'has_hall_sensor':        get_all_values(joints, 'has_hall_sensor'),
+        # What + looks like on the arm, in words (2026-10-18; the first-run check's stage 3): None where missing.
+        'positive_direction':     get_all_strings(joints, 'positive_direction'),
+        # The first-run check's powered test move per joint (2026-10-18; robotics/joint_test.py): None where missing.
+        'first_run_move':         _first_run_moves(joints),
         # Safety monitor TRACKING limit per joint, deg. Missing / 0 = that joint unchecked.
         'tracking_limit_deg':     get_all_values(joints, 'tracking_limit_deg'),
         # Safety monitor HOLD_OSCILLATION_WARNING threshold per joint, mA (fast motor-current ripple while

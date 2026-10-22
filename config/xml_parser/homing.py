@@ -9,6 +9,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
+from config.schema_versions import check_schema
+
 
 # ---------------------------------------------------------------------------
 # Homing sequence parser
@@ -63,6 +65,7 @@ def parse_homing_sequence(xml_path: str | Path) -> list[dict]:
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    check_schema(root, "homing", xml_path)      # a newer format than this runtime reads: refused (2026-10-21)
 
     steps = []
 

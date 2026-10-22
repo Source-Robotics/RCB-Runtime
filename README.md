@@ -366,6 +366,68 @@ Runtime output is written to `logs/` and transient files to `temp_data/`. These
 folders are kept in the repo with `.gitkeep`, while generated contents are
 ignored.
 
+### Configuration file formats
+
+Each XML configuration file may name the format it is written in with a
+`schema` attribute on its root element, for example `<robot schema="1">`. A
+file without the attribute is format 1. The formats this runtime reads are listed
+in `config/schema_versions.py`, one number per kind of file: system, robot,
+gripper, homing, cell, filters and recipe.
+
+- **A file in a newer format is refused.** It was written for a newer runtime,
+  and reading it with this one could misread a field. A system, robot, gripper or
+  homing file stops the runtime at start with the reason in its log. A cell file
+  is refused like a broken one. A filters file falls back to the working filters.
+  A recipe is skipped.
+- **A file in an older format is read**, with one warning per file in the log.
+- The runtime's version is in `VERSION`. The dashboard's Versions card and
+  `robot.get_versions()` show it, together with how many configuration files were
+  read and which of them are in an older format.
+
+### Client and protocol versions
+
+The Python client in `robotclient/` has the runtime's version
+(`robotclient.__version__`). Three protocols carry a version number each: the
+command protocol to the executor, the real-time command packet, and the telemetry
+packet format. A number changes only when its protocol changes incompatibly. A new
+command or a new field does not change it.
+
+- `robot.connect(ip)` compares the command protocol's number with the robot's
+  before it sends anything. A different number raises `VersionMismatch`. A robot
+  that reports no number, from before version 0.9.0, gives a `VersionWarning` and
+  the connection goes ahead. `allow_mismatch=True` skips the check.
+- The real-time client compares the real-time packet and telemetry numbers the
+  same way before it pairs with the robot.
+- The robot logs each connected client's version, and `robot.get_versions()` lists
+  the connected clients with their versions.
+- Commands that carry pose angles are refused with `CLIENT_TOO_OLD` when the client
+  declares no command protocol. Pose angles changed their meaning in 0.9.0, and an
+  older client would turn the tool to another orientation. A client that sends raw
+  JSON adds `"protocol": 1` to each message.
+
+### Hardware versions
+
+- **Drive firmware:** the runtime supports drive firmware 103 or newer, listed per
+  driver type in `hardware/firmware_support.py`. A drive outside that range gets a
+  warning in the log and on the Versions card. The first-run check fails it. The
+  robot keeps running either way.
+- **Hardware revisions:** the robot XML and each gripper XML can name their hardware
+  revision with `<hardware_revision>`, for example `v1.0`. The Versions card and
+  `robot.get_versions()` show it.
+- **Description package:** the robot XML names the oldest description package its
+  models are made from, with `<description_package min="2.0"/>`. The Versions card
+  marks an older package, and the self-collision geometry tool refuses to use one.
+- **Control box:** the control box board does not report its own version yet, so
+  the PCB version stays declared in `config/system.xml`.
+
+### Releases
+
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md). Which client,
+protocol, firmware and hardware versions work with each release is in
+[COMPATIBILITY.md](COMPATIBILITY.md). A release is a git tag `vMAJOR.MINOR.PATCH`.
+Its GitHub release notes are its changelog section, printed by
+`tools/release_notes.py`.
+
 ## Tools
 
 Hardware debug utilities live in `tools/`. For example, `tools/debug_read_kt.py`

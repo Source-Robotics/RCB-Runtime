@@ -9,6 +9,14 @@ import numpy as np
 
 DEFAULT_PRECISION = 3
 
+# The telemetry / RTI state packet format's version (2026-10-21, versioning V3): "tag:v1,v2,...,tag2:v,..." — a flat
+# comma-separated list where only the first value of a vector carries its tag (robotclient/rti_client.py
+# parse_state_packet reads it). Raise it ONLY for an incompatible change of that layout: another separator, a tag that
+# changes its meaning or unit, a value order changed. A new tag is NOT a new version (a reader ignores tags it does not
+# know; a recipe picks the tags). robotclient/version.py keeps the client's copy; RTIClient.connect refuses a robot whose
+# number differs.
+TELEMETRY_FORMAT = 1
+
 
 def serialize_joint_data(Joint_data, fields, precision_map=None):
     """

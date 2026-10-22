@@ -72,6 +72,8 @@ from utility.error_checks import (
 from utility.activity_log import get_rti_activity_logger, log_activity, note_origin
 from utility.trace_ring import TraceWriter
 from robotics.hall_check import HallCheck, hall_joint_index
+from robotics.free_joint import FreeJoint
+from robotics.joint_test import JointTest
 from robotics.homing import HomingController
 from robotics.homing_arms import HomingArms
 from motion.rti_handler import RTIModeHandler
@@ -953,6 +955,14 @@ def main():
     # limits (stop() restores them; PID apply edits these arrays in place).
     hall_check = HallCheck(Motor, hall_joint_index(cfg['has_hall_sensor'], joint_num), motor_velocity_limit, motor_Ilim,
                            ctx, shared_data.rti, shared_data.joint['joint_position'], log=log_homing.info)
+    # One joint freed for hand turning (robotics/free_joint.py, 2026-10-18; the first-run check's S3) — the same live
+    # limits as the Hall check; never both at once.
+    free_joint = FreeJoint(Motor, joint_num, motor_velocity_limit, motor_Ilim, shared_data.rti, log=log_homing.info)
+    # A small powered test move of one joint, homed or not (robotics/joint_test.py, 2026-10-18; the first-run check's
+    # stage 3) — the same live limits; never beside the Hall check or a freed joint.
+    joint_test = JointTest(Motor, Joint, joint_num, motor_velocity_limit, motor_Ilim, ctx, shared_data.rti, delta_t,
+                           log=log_homing.info,
+                           done=lambda text: log_activity(_rti_activity_logger, "RTI", "info", "JOINT_TEST", message=text))
 
     MODE_HANDLERS = build_mode_dispatch(
         joint_num=joint_num,
@@ -1378,9 +1388,11 @@ def main():
         if len(parts) != 2:
             return
         if parts[1].strip() == "1":
-            why = hall_check.start(idle=st.current_mode == RobotMode.IDLE,
-                                   mode_pending=st.pending_mode_request is not None,
-                                   booting=st.startup_motor_reconfig < 3)
+            why = ("a joint is free for hand turning (free_joint) or in a test move — stop that first"
+                   if free_joint.active or joint_test.active else
+                   hall_check.start(idle=st.current_mode == RobotMode.IDLE,
+                                    mode_pending=st.pending_mode_request is not None,
+                                    booting=st.startup_motor_reconfig < 3))
             if why:
                 log_homing.warning(f"Hall check refused: {why}")
                 log_activity(_rti_activity_logger, "RTI", "warning", "HALL_CHECK_REFUSED", id=st.command_id, message=why)
@@ -1390,6 +1402,62 @@ def main():
         elif hall_check.active:
             hall_check.stop("stopped by the operator")
             log_activity(_rti_activity_logger, "RTI", "info", "HALL_CHECK", id=st.command_id, message="Hall sensor check OFF")
+
+    def _handle_free_joint(cmd_msg, cmd_dict):
+        """free_joint:<n> — one joint limp for hand turning (robotics/free_joint.py, 2026-10-18; the first-run check's
+        S3): n = 1..joint_num frees that joint (the same n again renews its 2-minute timeout), 0 holds it again. Only in
+        IDLE (enabled or not, homed or not); it stops itself before any mode change."""
+        parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
+        if len(parts) != 2:
+            return
+        try:
+            n = int(parts[1].strip())
+        except ValueError:
+            return
+        if n == 0:
+            if free_joint.active:
+                was = free_joint.joint + 1
+                free_joint.stop("stopped by the operator")
+                log_activity(_rti_activity_logger, "RTI", "info", "FREE_JOINT", id=st.command_id,
+                             message=f"J{was} held again")
+            return
+        renewing = free_joint.joint == n - 1
+        why = free_joint.start(n - 1, idle=st.current_mode == RobotMode.IDLE,
+                               mode_pending=st.pending_mode_request is not None,
+                               booting=st.startup_motor_reconfig < 3,
+                               hall_check_active=hall_check.active or joint_test.active)
+        if why:
+            log_homing.warning(f"Free joint refused: {why}")
+            log_activity(_rti_activity_logger, "RTI", "warning", "FREE_JOINT_REFUSED", id=st.command_id, message=why)
+        elif not renewing:
+            log_activity(_rti_activity_logger, "RTI", "info", "FREE_JOINT", id=st.command_id,
+                         message=f"J{n} free for hand turning (current limit 0)")
+
+    def _handle_joint_test(cmd_msg, cmd_dict):
+        """joint_test:<n>:<amplitude deg>:<speed deg/s>:<current mA> — a small powered test move of joint n and back,
+        homed or not (robotics/joint_test.py, 2026-10-18; the first-run check's stage 3); n = 0 stops it. Only in IDLE
+        and ENABLED; it stops itself before any mode change, on a disable, and when the joint falls behind."""
+        parts = cmd_msg.split(":")
+        try:
+            n = int(parts[1])
+            a, v, c = (float(x) for x in parts[2:5]) if n else (0.0, 0.0, 0.0)
+        except (IndexError, ValueError):
+            return
+        if n == 0:
+            if joint_test.active:
+                joint_test.stop("stopped by the operator")
+            return
+        why = joint_test.start(n - 1, a, v, c, idle=st.current_mode == RobotMode.IDLE,
+                               enabled=shared_data.robot_state.get() == "ENABLED",
+                               mode_pending=st.pending_mode_request is not None,
+                               booting=st.startup_motor_reconfig < 3,
+                               other_active=hall_check.active or free_joint.active)
+        if why:
+            log_homing.warning(f"Joint test refused: {why}")
+            log_activity(_rti_activity_logger, "RTI", "warning", "JOINT_TEST_REFUSED", id=st.command_id, message=why)
+        else:
+            log_activity(_rti_activity_logger, "RTI", "info", "JOINT_TEST", id=st.command_id,
+                         message=f"J{n} test move {a:+.1f} deg at {v:.1f} deg/s, {c:.0f} mA")
 
 
     def _handle_set_mode(cmd_msg, cmd_dict):
@@ -2042,6 +2110,8 @@ def main():
         "friction_ff":       _handle_friction_ff,
         "can_read_first":    _handle_can_read_first,
         "hall_check":        _handle_hall_check,
+        "free_joint":        _handle_free_joint,
+        "joint_test":        _handle_joint_test,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
@@ -2684,6 +2754,13 @@ def main():
         # BEFORE a mode change takes effect (homing sends its own limits on entry) or once the robot left IDLE.
         if hall_check.active:
             hall_check.tick(st.current_mode == RobotMode.IDLE and st.pending_mode_request is None)
+        # A joint freed for hand turning (robotics/free_joint.py): held again the same way, and after its timeout.
+        if free_joint.active:
+            free_joint.tick(st.current_mode == RobotMode.IDLE and st.pending_mode_request is None)
+        # A test move (robotics/joint_test.py): this tick's command for its joint, or stopped — before dispatch.
+        if joint_test.active:
+            joint_test.tick(st.current_mode == RobotMode.IDLE and st.pending_mode_request is None
+                            and shared_data.robot_state.get() == "ENABLED")
 
         # ==========================================================================
         # Perform robot state and mode management

@@ -49,7 +49,7 @@ import numpy as np
 
 from utility.state_machine import RobotMode
 from utility.tick_types import TickContext, TickResult, ControlOutput, SELF_MANAGED
-from utility.kinematics_backend import should_use_pinocchio, write_rpy_xyz
+from utility.kinematics_backend import should_use_pinocchio, write_pose_angles
 from communication.can_message_handlers import (
     send_motor_commands,
     send_motor_commands_pd,
@@ -261,16 +261,19 @@ def _record_sent(ctx, pos_buf, vel_buf, curr_buf, mode):
 def _send(ctx, pos_buf, vel_buf, curr_buf, mode):
     """Dispatch the CAN send based on ControlOutput.mode."""
     _record_sent(ctx, pos_buf, vel_buf, curr_buf, mode)
-    # hall_check_joint: the joint in the Hall sensor check (robotics/hall_check.py) gets its Hall-index command instead
+    # hall_check_joint: the joint in the Hall sensor check (robotics/hall_check.py) gets its Hall-index command instead;
+    # joint_test_joint: the joint in a test move (robotics/joint_test.py) gets its position ramp instead
     if mode == "pd":
         send_motor_commands_pd(
             ctx.Motor, ctx.joint_num,
             positions=pos_buf, speeds=vel_buf, currents=curr_buf, hall_joint=ctx.hall_check_joint,
+            test_joint=ctx.joint_test_joint, test_pos=ctx.joint_test_pos, test_speed=ctx.joint_test_speed,
         )
     else:
         send_motor_commands(
             ctx.Motor, ctx.joint_num,
             positions=pos_buf, speeds=vel_buf, currents=curr_buf, hall_joint=ctx.hall_check_joint,
+            test_joint=ctx.joint_test_joint, test_pos=ctx.joint_test_pos, test_speed=ctx.joint_test_speed,
         )
 
 
@@ -302,12 +305,12 @@ def _fk_commanded(ctx):
     if should_use_pinocchio(ctx.robot):
         pose_4x4, J = ctx.robot.pinocchio_fkine_and_jacob0(q_c)
         tcp['TCP_pose_commanded'][:3]       = pose_4x4[:3, 3]
-        write_rpy_xyz(pose_4x4, tcp['TCP_pose_commanded'], start=3)
+        write_pose_angles(pose_4x4, tcp['TCP_pose_commanded'], start=3)
         tcp['TCP_pose_commanded_matrix'][:] = pose_4x4.reshape(16)
     else:
         T = ctx.robot.fkine(q_c)
         tcp['TCP_pose_commanded'][:3]       = T.t
-        tcp['TCP_pose_commanded'][3:6]      = T.rpy(order='xyz')
+        write_pose_angles(T.A, tcp['TCP_pose_commanded'], start=3)
         tcp['TCP_pose_commanded_matrix'][:] = T.A.flatten()
         J = ctx.robot.jacob0(q=q_c, T=T)
 

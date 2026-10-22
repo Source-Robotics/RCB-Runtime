@@ -12,10 +12,13 @@ from pathlib import Path
 
 import numpy as np
 
+from config.schema_versions import check_schema
+
 
 def parse_robot_config(xml_path: str | Path) -> tuple[ET.Element, ET.Element]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    check_schema(root, "robot", xml_path)       # a newer format than this runtime reads: refused (2026-10-21)
     joints = root.find('joints')
     return root, joints
 
@@ -111,7 +114,9 @@ def load_gripper_element(grippers_dir: str | Path, gripper_name: str) -> ET.Elem
     if not path.exists():
         return None
     tree = ET.parse(str(path))
-    return tree.getroot()
+    root = tree.getroot()
+    check_schema(root, "gripper", path)         # a newer format than this runtime reads: refused (2026-10-21)
+    return root
 
 
 def get_gripper_value(gripper_elem: ET.Element | None, tag: str) -> float | str:

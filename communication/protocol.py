@@ -12,6 +12,25 @@ This module owns the command classification and the validation rules — it is p
 functions, importable by both the executor and (later) tests without side effects.
 """
 
+# The command protocol's version (2026-10-21, versioning V3). Raise it ONLY for an incompatible change of this protocol:
+# a command renamed or removed, an argument or a reply field that changes its meaning or unit, a changed default. A new
+# command, a new optional argument, a new reply field is NOT a new version (an older client never sends or reads them).
+# robotclient/version.py keeps the client's copy (pinned equal by dummy_test_scripts/test_protocol_versions.py); the
+# executor publishes it in every status message, and a client refuses an executor whose number differs.
+PROTOCOL_VERSION = 1
+
+# The commands whose arguments carry pose ANGLES (2026-10-21, with versioning V5). Pose angles changed their meaning
+# on 2026-10-21 (R = Rx(rx) Ry(ry) Rz(rz)), and a client from before then sends no "protocol" key: the executor refuses
+# these commands from such a connection (CLIENT_TOO_OLD) rather than read its angles the new way and turn the tool
+# elsewhere. is_reachable is here because its joint answer is fed straight into a joint move. Reads (get_pose) are not:
+# they move nothing. A circle takes a centre and a normal vector, no angles.
+POSE_COMMANDS = frozenset({
+    "move_pose", "move_linear", "move_linear_rel_wrf", "move_linear_rel_trf",
+    "move_arc", "move_arc_rel_wrf", "move_arc_rel_trf",
+    "move_spline", "move_spline_rel_wrf", "move_spline_rel_trf",
+    "is_reachable",
+})
+
 # Command kinds
 IMMEDIATE = "immediate"   # executed now: served from shared memory or forwarded to RTI
 QUEUED = "queued"         # placed on the motion queue → planner → RTI
@@ -36,6 +55,10 @@ ALWAYS_OPEN = frozenset({
     # capture into a file on the robot.
     "get_health", "set_log_level", "capture_telemetry", "stop_capture",
     "get_joint_walls",
+    # The first-run check's data (2026-10-18): what the drives, the CAN bus and the box's inputs report.
+    "get_hardware",
+    # Every part's version (2026-10-21): the runtime, the OS, the description package, the box, each drive.
+    "get_versions",
     # make-it-safer — anyone, always, no exceptions
     "stop", "pause", "disable", "safety_stop", "clear_errors",
     # A jog has NO timeout: the GUI sends one jog_set on mouse-down and one jog_stop on
@@ -77,6 +100,8 @@ COMMAND_RULES = {
     "set_log_level":     (IMMEDIATE, None, None, False),
     "capture_telemetry": (IMMEDIATE, None, None, False),
     "stop_capture":      (IMMEDIATE, None, None, False),
+    "get_hardware":      (IMMEDIATE, None, None, False),   # utility/hardware_report.py (2026-10-18)
+    "get_versions":      (IMMEDIATE, None, None, False),   # utility/versions.py (2026-10-21)
     # IK only, moves nothing — any mode, any state, homed or not (`near` defaults to the measured
     # joints, which only picks WHICH solution is returned, never whether one exists).
     "is_reachable":   (IMMEDIATE, None, None, False),
@@ -158,6 +183,12 @@ COMMAND_RULES = {
     # The Hall sensor check (robotics/hall_check.py, 2026-10-13): the Hall-sensor joint limp, its pin shown live. IDLE
     # only, enabled or not, homed or not (OWNED); RTI stops it itself before any mode change.
     "hall_check":       (IMMEDIATE, ["IDLE"], None, False),
+    # One joint limp for hand turning (robotics/free_joint.py, 2026-10-18; the first-run check): IDLE only, enabled or
+    # not, homed or not (OWNED); RTI holds it again itself before any mode change and after 2 minutes.
+    "free_joint":       (IMMEDIATE, ["IDLE"], None, False),
+    # A small powered test move of one joint, homed or not (robotics/joint_test.py, 2026-10-18; the first-run check's
+    # stage 3): IDLE and ENABLED (OWNED); RTI stops it itself on a mode change, a disable, or a joint falling behind.
+    "joint_test":       (IMMEDIATE, ["IDLE"], "ENABLED", False),
     "set_pid_gains":    (IMMEDIATE, None, None, False),
     # --- RTI mode session control (TODO/RTI_mode_plan.md §3). Only the handshake goes
     # through here; the UDP setpoint stream never touches command_executor.

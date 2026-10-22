@@ -25,6 +25,13 @@ import math
 import struct
 import numpy as np
 
+# The RTI command packet's version (2026-10-21, versioning V3). Raise it ONLY for an incompatible change of the packet:
+# a field moved, resized or changing its meaning or unit, a command type renumbered. An optional field the robot tells
+# apart by the datagram's length (the send time) is NOT a new version. robotclient/version.py keeps the client's copy;
+# RTIClient.connect refuses a robot whose number differs. (The state packets' format is TELEMETRY_FORMAT,
+# utility/serialization.py.)
+RTI_PROTOCOL_VERSION = 1
+
 # Command type constants
 CMD_JOINT_POSITION = 0x01
 CMD_JOINT_VELOCITY = 0x02

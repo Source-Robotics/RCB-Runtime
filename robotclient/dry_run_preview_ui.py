@@ -48,8 +48,12 @@ def raw_window_indices(time_s, start_s, duration_s=RAW_WINDOW_DURATION_S):
     return window_start, window_end, first_index, max(first_index + 1, last_index)
 
 
-def add_dry_run_preview(is_visible=None):
-    """Add a self-contained static/scrub/playback viewer to the current UI context."""
+def add_dry_run_preview(is_visible=None, angle_unit=None):
+    """Add a self-contained static/scrub/playback viewer to the current UI context.
+
+    angle_unit (2026-10-21): optional callable returning 'rad' or 'deg', the unit angles are SHOWN in (the
+    dashboard's Angles toggle). The saved preview stays in radians; the plot, the readout and the tables convert.
+    Returns a function that redraws everything in the current unit — call it after the unit changes."""
     visible = is_visible or (lambda: True)
     state = {
         'data': None, 'index': 0, 'playing': False, 'speed': 1.0,
@@ -58,6 +62,20 @@ def add_dry_run_preview(is_visible=None):
         'window_dirty': False, 'active_mtime_ns': None,
     }
     axis_checkboxes = []
+
+    def in_degrees():
+        return angle_unit is not None and angle_unit() == 'deg'
+
+    def unit_text(text):
+        """A unit label in the display unit: 'rad/s^2' -> 'deg/s^2' while showing degrees."""
+        return text.replace('rad', 'deg') if in_degrees() else text
+
+    def angle_scale(metric, axis):
+        """Factor from the saved value to the display unit: every joint axis is an angle, and so are the TCP's
+        rotation components (axes 3..5); the TCP's x, y, z (metres) never convert."""
+        if not in_degrees() or (metric.startswith('tcp_') and axis < 3):
+            return 1.0
+        return 180.0 / np.pi
 
     def project(x, y, z):
         mode = state['path_mode']
@@ -80,12 +98,12 @@ def add_dry_run_preview(is_visible=None):
 
     def axis_unit(axis):
         if not state['metric'].startswith('tcp_'):
-            return METRICS[state['metric']][1]
+            return unit_text(METRICS[state['metric']][1])
         if state['metric'] == 'tcp_pose':
-            return 'm' if axis < 3 else 'rad'
+            return 'm' if axis < 3 else unit_text('rad')
         if state['metric'] == 'tcp_velocity':
-            return 'm/s' if axis < 3 else 'rad/s'
-        return 'm/s^2' if axis < 3 else 'rad/s^2'
+            return 'm/s' if axis < 3 else unit_text('rad/s')
+        return 'm/s^2' if axis < 3 else unit_text('rad/s^2')
 
     def signal_unit():
         units = {axis_unit(axis) for axis in signal_axes()}
@@ -138,6 +156,7 @@ def add_dry_run_preview(is_visible=None):
         """Build one read-only summary row per saved planned segment."""
         rows = []
         offset = 0
+        k = angle_scale('joint_position_rad', 0)        # the peaks below are joint rates
         for index, segment in enumerate(data.segments):
             count = int(data.segment_sample_counts[index])
             stop = min(offset + count, len(data.time_s))
@@ -159,9 +178,9 @@ def add_dry_run_preview(is_visible=None):
                 'samples': count,
                 'end_joints': ', '.join(f'{value:.2f}' for value in end_q_deg),
                 'end_tcp': ', '.join(f'{value:.2f}' for value in end_tcp_mm),
-                'peak_velocity': f'{float(np.max(np.abs(qd))):.3f}',
-                'peak_acceleration': f'{float(np.max(np.abs(qdd))):.3f}',
-                'peak_jerk': f'{float(np.max(np.abs(qddd))):.3f}',
+                'peak_velocity': f'{float(np.max(np.abs(qd))) * k:.3f}',
+                'peak_acceleration': f'{float(np.max(np.abs(qdd))) * k:.3f}',
+                'peak_jerk': f'{float(np.max(np.abs(qddd))) * k:.3f}',
                 'sigma_min': _number_text(_diagnostic_value(
                     details, 'min_jacobian_sigma', 'jacobian_sigma_min')),
                 'condition': _number_text(_diagnostic_value(
@@ -387,27 +406,31 @@ def add_dry_run_preview(is_visible=None):
             return
         index = state['index']
         time_s = float(data.time_s[index])
-        title, _, attribute, labels = METRICS[state['metric']]
+        metric = state['metric']
+        title, _, attribute, labels = METRICS[metric]
         values = getattr(data, attribute)
         selected = signal_axes()
         if len(selected) == 1:
             axis = selected[0]
-            value_text = f"{labels[axis]}={float(values[index, axis]):.6g} {signal_unit()}"
+            value_text = (f"{labels[axis]}={float(values[index, axis]) * angle_scale(metric, axis):.6g} "
+                          f"{signal_unit()}")
         else:
             value_text = ', '.join(
-                f"{labels[axis]}={float(values[index, axis]):.6g}" for axis in selected)
+                f"{labels[axis]}={float(values[index, axis]) * angle_scale(metric, axis):.6g}" for axis in selected)
         sample_label.text = (
             f"sample {index + 1:,}/{len(data.time_s):,}   t={time_s:.3f} s   "
             f"{title}: {value_text}   {segment_name(time_s)}")
+        kj = [angle_scale('joint_position_rad', axis) for axis in range(6)]
+        kt = [angle_scale('tcp_pose', axis) for axis in range(6)]
         sample_table.rows = [{
             'axis': f'J{axis + 1} / {TCP_LABELS[axis]}',
-            'joint_position': round(float(data.joint_position_rad[index, axis]), 6),
-            'joint_velocity': round(float(data.joint_velocity_rad_s[index, axis]), 6),
-            'joint_acceleration': round(float(data.joint_acceleration_rad_s2[index, axis]), 6),
-            'joint_jerk': round(float(data.joint_jerk_rad_s3[index, axis]), 6),
-            'tcp_pose': round(float(data.tcp_pose[index, axis]), 6),
-            'tcp_velocity': round(float(data.tcp_velocity[index, axis]), 6),
-            'tcp_acceleration': round(float(data.tcp_acceleration[index, axis]), 6),
+            'joint_position': round(float(data.joint_position_rad[index, axis]) * kj[axis], 6),
+            'joint_velocity': round(float(data.joint_velocity_rad_s[index, axis]) * kj[axis], 6),
+            'joint_acceleration': round(float(data.joint_acceleration_rad_s2[index, axis]) * kj[axis], 6),
+            'joint_jerk': round(float(data.joint_jerk_rad_s3[index, axis]) * kj[axis], 6),
+            'tcp_pose': round(float(data.tcp_pose[index, axis]) * kt[axis], 6),
+            'tcp_velocity': round(float(data.tcp_velocity[index, axis]) * kt[axis], 6),
+            'tcp_acceleration': round(float(data.tcp_acceleration[index, axis]) * kt[axis], 6),
         } for axis in range(6)]
         sample_table.update()
 
@@ -421,7 +444,8 @@ def add_dry_run_preview(is_visible=None):
             window_time = data.time_s[first_index:last_index]
             _, _, attribute, _ = METRICS[state['metric']]
             values = getattr(data, attribute)
-            window_values = values[first_index:last_index]
+            window_values = values[first_index:last_index] * np.array(
+                [angle_scale(state['metric'], axis) for axis in range(values.shape[1])])
             selected = signal_axes()
             time_padding_s = max(0.02, (view_end - view_start) * 0.015)
             signal_chart.options['xAxis'][0].update({
@@ -718,7 +742,7 @@ def add_dry_run_preview(is_visible=None):
             ui.label('Planned TCP Path').classes('text-sm font-semibold')
             ui.toggle({'xy': 'XY', 'xz': 'XZ', 'yz': 'YZ', 'iso': 'XYZ'}, value='xy', on_change=lambda event: (state.__setitem__('path_mode', event.value), draw_path())).props('dense')
         path_chart = ui.echart(path_options()).style('width:min(100%, 620px);height:min(620px, calc(100vw - 48px));')
-        sample_table = ui.table(columns=[
+        sample_columns = [
             {'name': 'axis', 'label': 'Axis', 'field': 'axis'},
             {'name': 'joint_position', 'label': 'Joint pos [rad]', 'field': 'joint_position'},
             {'name': 'joint_velocity', 'label': 'Joint vel [rad/s]', 'field': 'joint_velocity'},
@@ -727,9 +751,11 @@ def add_dry_run_preview(is_visible=None):
             {'name': 'tcp_pose', 'label': 'TCP pose [m/rad]', 'field': 'tcp_pose'},
             {'name': 'tcp_velocity', 'label': 'TCP vel [m/s/rad/s]', 'field': 'tcp_velocity'},
             {'name': 'tcp_acceleration', 'label': 'TCP acc [m/s^2/rad/s^2]', 'field': 'tcp_acceleration'},
-        ], rows=[]).classes('w-full').props('dense flat')
+        ]
+        sample_table = ui.table(columns=[{**c, 'label': unit_text(c['label'])} for c in sample_columns],
+                                rows=[]).classes('w-full').props('dense flat')
         ui.label('Program Diagnostics').classes('text-sm font-semibold mt-3')
-        diagnostic_table = ui.table(columns=[
+        diagnostic_columns = [
             {'name': 'sequence', 'label': '#', 'field': 'sequence'},
             {'name': 'command', 'label': 'Command', 'field': 'command'},
             {'name': 'profile', 'label': 'Profile', 'field': 'profile'},
@@ -743,9 +769,20 @@ def add_dry_run_preview(is_visible=None):
             {'name': 'sigma_min', 'label': 'sigma_min', 'field': 'sigma_min'},
             {'name': 'condition', 'label': 'Condition', 'field': 'condition'},
             {'name': 'status', 'label': 'Diagnostics', 'field': 'status'},
-        ], rows=[]).classes('w-full').props('dense flat wrap-cells')
+        ]
+        diagnostic_table = ui.table(columns=[{**c, 'label': unit_text(c['label'])} for c in diagnostic_columns],
+                                    rows=[]).classes('w-full').props('dense flat wrap-cells')
     # Load the one managed active preview when the page is opened. A later run of
     # the offline planner is picked up by playback_tick via its changed mtime.
     if ACTIVE_PREVIEW_PATH.exists():
         load_preview()
     ui.timer(1.0 / 30.0, playback_tick)
+
+    def set_units():
+        """Redraw in the current angle unit (the dashboard's Angles toggle)."""
+        sample_table.columns = [{**c, 'label': unit_text(c['label'])} for c in sample_columns]
+        diagnostic_table.columns = [{**c, 'label': unit_text(c['label'])} for c in diagnostic_columns]
+        update_diagnostics()
+        draw_all()
+
+    return set_units
