@@ -38,6 +38,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
     `gravity_comp` for `set_gravity_comp` and `jog_set` for `jog`. The robot accepts both IDs. A client from this
     release reads the robot's version when it connects and sends an older robot the IDs it knows, so a program runs
     on either; only a command that did not exist on the older robot is refused there, as before.
+- `delay()` refuses a time of 0 or less, or one that is not a finite number, with `INVALID_DURATION`, the moves'
+  rule for `duration`. It used to finish after about 8 ms without an error, so `delay(-5)` written for `delay(5)` went
+  unnoticed. A G-code `G4 P0` dwell still pauses for nothing (the G-code runner skips it), and a negative `P` is
+  refused when the program is read.
 
 ### Fixed
 
@@ -47,6 +51,14 @@ What changed in each version of the RCB runtime. The newest version is at the to
   `ruckig_corner` blend was planned and sent as part of the blended chain around it (any move type), and a move
   blended toward a dry-run successor was sent carrying a corner speed into a move that never came. A dry run now
   never joins a chain, and the move before it ends at rest.
+- A dry run of `move_pose`, `move_linear`, the relative moves and the arc, circle and spline moves stopped after
+  the inverse kinematics, before the timing and the joint-limit, safety-zone and self-collision checks, so it could
+  pass a move the robot then refused. Every move's dry run now plans in full and runs every check, then sends
+  nothing.
+- With `profile="toppra"`, a timing failure on a straight-line or curved move was reported as `PLAN_FAIL`. It is now
+  `TOPPRA_INFEASIBLE` or `TOPPRA_UNAVAILABLE`, as on joint moves.
+- `move_pose` now has the acceleration check every other move has: a planned motion over the acceleration limit is
+  refused with `ACCEL_LIMIT_VIOLATION` instead of being sent.
 - The motion docstrings listed `completion_policy` as a per-move setting, which the robot refuses: it is a session
   setting, changed with `set_completion_policy()`. They now name all 13 per-move settings the robot accepts.
 

@@ -1093,6 +1093,28 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
             ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
 
+        Errors:
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The solver returned an invalid joint solution.
+            IK_MARGIN_VIOLATION: The joint solution is outside the joint limits.
+            IK_POSE_ERROR: The joint solution misses the target pose by more than
+                0.2 mm or 0.5 degrees.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
+        See also:
+            `move_joints()`, `move_linear()`, `is_reachable()`
+
         Examples:
             >>> x, y, z, rx, ry, rz = robot.get_pose()
             >>> robot.move_pose(x, y, z + 0.05, rx, ry, rz)
@@ -1137,9 +1159,35 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
             ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
 
+        Errors:
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the straight line,
+                usually near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Moves along a Cartesian path run at no more than 20 % of the speed
             limit; a higher `speed` has no further effect.
+
+        See also:
+            `move_linear_rel_world()`, `move_linear_rel_tool()`, `move_pose()`
 
         Examples:
             >>> x, y, z, rx, ry, rz = robot.get_pose()
@@ -1186,9 +1234,35 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
             ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
 
+        Errors:
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the straight line,
+                usually near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Moves along a Cartesian path run at no more than 20 % of the speed
             limit; a higher `speed` has no further effect.
+
+        See also:
+            `move_linear_rel_tool()`, `move_linear()`
 
         Examples:
             >>> robot.move_linear_rel_world(0.05, 0, 0)
@@ -1236,9 +1310,35 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
             ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
 
+        Errors:
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the straight line,
+                usually near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Moves along a Cartesian path run at no more than 20 % of the speed
             limit; a higher `speed` has no further effect.
+
+        See also:
+            `move_linear_rel_world()`, `move_linear()`
 
         Examples:
             >>> robot.move_linear_rel_tool(0, 0, 0.02)
@@ -1291,9 +1391,42 @@ class RobotClient:
             ValueError: `via` or `end` does not have 6 values, or `angle_unit` is
                 neither `"rad"` nor `"deg"`.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: The start, `via` and `end` do not define an
+                arc: they lie on one line, or `via` or `end` is the start.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_arc_rel_world()`, `move_arc_rel_tool()`, `move_circle()`
 
         Examples:
             >>> x, y, z, rx, ry, rz = robot.get_pose()
@@ -1339,9 +1472,42 @@ class RobotClient:
             ValueError: `via` or `end` does not have 6 values, or `angle_unit` is
                 neither `"rad"` nor `"deg"`.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: The start, `via` and `end` do not define an
+                arc: they lie on one line, or `via` or `end` is the start.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_arc_rel_tool()`, `move_arc()`
 
         Examples:
             >>> robot.move_arc_rel_world([0.05, 0.05, 0, 0, 0, 0], [0.1, 0, 0, 0, 0, 0])
@@ -1385,9 +1551,42 @@ class RobotClient:
             ValueError: `via` or `end` does not have 6 values, or `angle_unit` is
                 neither `"rad"` nor `"deg"`.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: The start, `via` and `end` do not define an
+                arc: they lie on one line, or `via` or `end` is the start.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_arc_rel_world()`, `move_arc()`
 
         Examples:
             >>> robot.move_arc_rel_tool([0.03, 0.03, 0, 0, 0, 0], [0.06, 0, 0, 0, 0, 0])
@@ -1434,9 +1633,43 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
             ValueError: `center` or `normal` does not have 3 values.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: `normal` is zero, `center` is not in the
+                circle's plane (through the start, at right angles to `normal`),
+                the start is the centre, or `turns` is 0 or not finite.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_circle_rel_world()`, `move_circle_rel_tool()`, `move_arc()`
 
         Examples:
             >>> x, y, z, rx, ry, rz = robot.get_pose()
@@ -1485,9 +1718,43 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
             ValueError: `center` or `normal` does not have 3 values.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: `normal` is zero, `center` is not in the
+                circle's plane (through the start, at right angles to `normal`),
+                the start is the centre, or `turns` is 0 or not finite.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_circle_rel_tool()`, `move_circle()`
 
         Examples:
             >>> robot.move_circle_rel_world([0.03, 0, 0], [0, 0, 1])
@@ -1535,9 +1802,43 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
             ValueError: `center` or `normal` does not have 3 values.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: `normal` is zero, `center` is not in the
+                circle's plane (through the start, at right angles to `normal`),
+                the start is the centre, or `turns` is 0 or not finite.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_circle_rel_world()`, `move_circle()`
 
         Examples:
             >>> robot.move_circle_rel_tool([0.02, 0, 0], [0, 0, 1])
@@ -1583,9 +1884,42 @@ class RobotClient:
             ValueError: Fewer than two waypoints, a waypoint without 6 values, or
                 an `angle_unit` other than `"rad"` or `"deg"`.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: Fewer than two waypoints differ from each other
+                and from the start.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_spline_rel_world()`, `move_spline_rel_tool()`, `move_linear()`
 
         Examples:
             >>> x, y, z, rx, ry, rz = robot.get_pose()
@@ -1635,9 +1969,42 @@ class RobotClient:
             ValueError: Fewer than two waypoints, a waypoint without 6 values, or
                 an `angle_unit` other than `"rad"` or `"deg"`.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: Fewer than two waypoints differ from each other
+                and from the start.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_spline_rel_tool()`, `move_spline()`
 
         Examples:
             >>> robot.move_spline_rel_world([
@@ -1686,9 +2053,42 @@ class RobotClient:
             ValueError: Fewer than two waypoints, a waypoint without 6 values, or
                 an `angle_unit` other than `"rad"` or `"deg"`.
 
+        Errors:
+            CURVE_BLEND_UNSUPPORTED: `blend` is above 0; curves do not blend yet.
+            BAD_ARGUMENTS: A raw client sent the wrong number of values.
+            CURVE_GEOMETRY_INVALID: Fewer than two waypoints differ from each other
+                and from the start.
+            IK_TARGET_UNREACHABLE: The arm cannot reach the target pose.
+            IK_PARTIAL_PATH: The arm cannot reach a pose on the way to the target.
+            IK_MARGIN_VIOLATION: A pose on the path needs a joint outside its
+                limits.
+            IK_BRANCH_JUMP: The arm would have to change its configuration on the
+                way, for example flip its wrist.
+            IK_POSE_ERROR: The joint solution misses a pose on the path.
+            CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
+                near a singularity.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+            JOINT_LIMIT: The path would take a joint outside its limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+
         Note:
             Blending does not apply: `blend` must be 0, and the move starts and ends
             at rest.
+            A curve that would exceed an acceleration limit is slowed down, to
+            25 % of `speed` at most, before it fails; with `duration` set it is
+            not slowed.
+
+        See also:
+            `move_spline_rel_world()`, `move_spline()`
 
         Examples:
             >>> robot.move_spline_rel_tool([
@@ -1721,7 +2121,7 @@ class RobotClient:
         `seconds` after the moves queued before it, then the next move starts.
 
         Args:
-            seconds: How long to wait, in seconds.
+            seconds: How long to wait, in seconds; more than 0.
             timeout: Seconds to wait for the move to finish, in sync mode only.
             **options: Settings for this pause only, the same as a move's: `speed`,
                 `accel`, `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
@@ -1742,6 +2142,15 @@ class RobotClient:
             RobotTimeout: The robot did not accept the pause within 5 s. In sync
                 mode also when the pause did not finish within `timeout`.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            INVALID_DURATION: The time is not more than 0 seconds, or not a
+                finite number.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+
+        See also:
+            `wait_idle()`
 
         Examples:
             >>> robot.move_linear_rel_world(0, 0, -0.02)

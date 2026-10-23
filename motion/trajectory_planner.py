@@ -2638,11 +2638,13 @@ class TrajectoryPlanner(Thread):
         return q
 
     def _plan_move_pose(self, start, args, cid, options):
+        # A dry run is planned in full and stops at _plan_and_send's dry-run gate, after the joint-limit, zone and
+        # self-collision checks (2026-10-23 review: it returned here, after the IK, so it skipped them).
         target = self._solve_endpoint_pose(start, args, cid, options)
-        if bool(options.dry_run):
-            return None
         path = self._path_builder.joint_line_from_radians(start, target)
-        return self._sample_joint_path(path, cid, options)
+        # The read-only acceleration backstop every other move has (2026-10-23 review: move_pose had none).
+        return self._assert_commanded_accel(
+            self._sample_joint_path(path, cid, options), self._joint_accel_limit(options), "move_pose")
 
     def _move_linear_sample_count(self, options):
         if options.samples is None:
@@ -3078,7 +3080,8 @@ class TrajectoryPlanner(Thread):
         pos[-1] = waypoints[-1]
         vel[-1] = 0.0
 
-        if cart_path is not None and bool(getattr(options, "dry_run", False)) is False:
+        # A dry run refines too: it must check the trajectory the real run would send (2026-10-23 review).
+        if cart_path is not None:
             refined = self._ik_every_sample(cart_path, s_t, total, pos, vel)
             if refined is not None:
                 pos, vel = refined
@@ -3142,20 +3145,26 @@ class TrajectoryPlanner(Thread):
             # `accel` and `duration` were ignored on THIS branch even after they were wired
             # into the scalar one — the branch returns early, so it needs them explicitly.
             max_accel = self._max_accel * self._accel_scale_for(options)
-            if options.duration is not None:
-                probe = self._toppra_path_parameterizer.parameterize_path(
+            # The same codes as the joint moves for the same failures (2026-10-23 review: they escaped as PLAN_FAIL).
+            try:
+                if options.duration is not None:
+                    probe = self._toppra_path_parameterizer.parameterize_path(
+                        waypoints, self._max_vel, max_accel, self._dt, speed_scale=speed_scale)
+                    speed_scale = self._scale_for_duration(
+                        options, probe.num_points * self._dt, speed_scale)
+                timed = self._toppra_path_parameterizer.parameterize_path(
                     waypoints, self._max_vel, max_accel, self._dt, speed_scale=speed_scale)
-                speed_scale = self._scale_for_duration(
-                    options, probe.num_points * self._dt, speed_scale)
-            timed = self._toppra_path_parameterizer.parameterize_path(
-                waypoints, self._max_vel, max_accel, self._dt, speed_scale=speed_scale)
+            except TOPPRAUnavailable as e:
+                raise PlannerError("TOPPRA_UNAVAILABLE", str(e)) from e
+            except TOPPRAInfeasible as e:
+                raise PlannerError("TOPPRA_INFEASIBLE", str(e)) from e
             pos, vel = timed.positions, timed.velocities
 
             # Refine to per-sample IK, same as the scalar lanes. TOPPRA hands back q(t)
             # directly rather than an s(t) schedule, so recover the schedule from the output
             # itself: FK each sample, measure how far along the TOOL path it is, and re-solve
             # at the exact pose that arc length corresponds to.
-            if cart_path is not None and not bool(getattr(options, "dry_run", False)):
+            if cart_path is not None:          # a dry run refines too (2026-10-23 review)
                 s_of_t = self._cartesian_arclength(pos)
                 refined = self._ik_every_sample(cart_path, s_of_t, float(s_of_t[-1]), pos, vel)
                 if refined is not None:
@@ -3194,11 +3203,9 @@ class TrajectoryPlanner(Thread):
                                                    cart_s=cart_s, cart_path=cart_path)
 
     def _plan_move_linear(self, ctype, start, args, cid, options):
-        dry_run = bool(options.dry_run)
-        result = self._solve_move_linear_path(ctype, start, args, cid, options, dry_run=dry_run)
-        if dry_run:
-            logger.info(f"{ctype} dry-run id={cid}; no trajectory sent")
-            return None
+        # A dry run is planned in full (timing too) and stops at _plan_and_send's dry-run gate, after the joint-limit,
+        # zone and self-collision checks (2026-10-23 review: it returned here, after the IK, so it skipped them).
+        result = self._solve_move_linear_path(ctype, start, args, cid, options, dry_run=bool(options.dry_run))
         # The profile must be timed against CARTESIAN distance, not joint distance — see
         # _cartesian_arclength.
         cart_s = self._cartesian_arclength(result.positions)
@@ -3383,11 +3390,8 @@ class TrajectoryPlanner(Thread):
         raise last_error
 
     def _plan_move_curve(self, ctype, start, args, cid, options):
-        dry_run = bool(options.dry_run)
-        result = self._solve_curve_path(ctype, start, args, cid, options, dry_run=dry_run)
-        if dry_run:
-            logger.info(f"{ctype} dry-run id={cid}; no trajectory sent")
-            return None
+        # A dry run is planned in full, as for move_linear (2026-10-23 review).
+        result = self._solve_curve_path(ctype, start, args, cid, options, dry_run=bool(options.dry_run))
         return self._retime_curve_path(result, options)
 
     def _cartesian_arclength(self, waypoints):
@@ -3449,6 +3453,10 @@ class TrajectoryPlanner(Thread):
 
         elif ctype == "delay":
             secs = float(options.duration) if options.duration is not None else (float(args[0]) if args else 0.0)
+            # The moves' rule for a time (2026-10-23 review: 0 or less, or NaN, became a silent ~8 ms hold; infinity
+            # failed as PLAN_FAIL).
+            if not (np.isfinite(secs) and secs > 0.0):
+                raise PlannerError("INVALID_DURATION", f"a pause needs a time above 0 seconds (got {secs})")
             n = max(2, int(round(secs / self._dt)))
             pos = np.repeat(start[None, :], n, axis=0)
             vel = np.zeros((n, self.joint_num))
@@ -3481,11 +3489,11 @@ class TrajectoryPlanner(Thread):
         self._check_zones(sample.positions, start, f"{ctype} id={cid}")
         self._check_self_collision(sample.positions, f"{ctype} id={cid}")
         if bool(options.dry_run):
-            # Only move_joints and delay get here with a dry run: every other move returns after its own. Planned and
-            # checked, nothing sent, the planner's endpoint untouched (2026-10-23: move_joints ignored dry_run and
-            # MOVED the arm; found by documenting every per-move setting). The arm is at rest: the move before a dry
-            # run is planned to end at rest (the lookahead above skips a dry-run successor), so the next real move
-            # starts from rest too.
+            # Every move's dry run ends here, planned in full and past every check above; nothing sent, the planner's
+            # endpoint untouched (2026-10-23: move_joints ignored dry_run and MOVED the arm; the review the same day
+            # found the Cartesian moves returning after their IK, before the checks). The arm is at rest: the move
+            # before a dry run is planned to end at rest (the lookahead above skips a dry-run successor), so the next
+            # real move starts from rest too.
             logger.info(f"{ctype} dry-run id={cid}; no trajectory sent")
             self._last_exit_speed = None
             self._report_complete(cid)

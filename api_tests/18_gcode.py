@@ -140,7 +140,8 @@ def run():
                 k.pop("blend", None)
             robot.move_linear(op.x / 1000.0, op.y / 1000.0, op.z / 1000.0, *rpy, **k)
         elif isinstance(op, GcodeDwell):
-            robot.delay(op.seconds)
+            if op.seconds > 0:          # G4 P0 pauses for nothing; delay() refuses a time of 0
+                robot.delay(op.seconds)
         elif isinstance(op, GcodePause):
             print("  M0 pause — resuming immediately (no operator prompt in this test)")
 

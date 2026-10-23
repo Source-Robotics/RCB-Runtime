@@ -175,6 +175,10 @@ def parse(text: str, start_xyz: Sequence[float] = (0.0, 0.0, 0.0), default_blend
                 p = words.pop("P", [None])[0]
                 if p is None:
                     raise GcodeError(f"line {line_no}: G4 needs a P<seconds> — got {raw.strip()!r}")
+                # P0 is a valid dwell that pauses for nothing (a runner skips it: the robot's delay() refuses a time
+                # of 0 since 2026-10-23); a negative time is a mistake, as for delay().
+                if not float(p) >= 0.0:
+                    raise GcodeError(f"line {line_no}: G4 needs P >= 0 seconds — got {raw.strip()!r}")
                 prog.ops.append(GcodeDwell(seconds=float(p), line_no=line_no))
             elif g in (2, 3):
                 raise GcodeError(
