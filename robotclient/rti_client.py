@@ -294,7 +294,7 @@ class RTIClient:
         that reports no versions was already warned about by RobotClient.connect.
         """
         try:
-            st = self.robot.status() or {}
+            st = self.robot.latest_status() or {}
         except Exception:                    # noqa: BLE001 — a robot object without status(): nothing to check
             st = {}
         if isinstance(st.get("protocols"), dict):
@@ -319,7 +319,7 @@ class RTIClient:
         self.robot.rti_connect(pc_ip, rate_hz=rate_hz, transport=self.transport)
         # The robot's tick length, for control()'s robot time (None: an executor that does not publish it).
         try:
-            ts_ = float(self.robot.status().get("tick_s") or 0.0)
+            ts_ = float(self.robot.latest_status().get("tick_s") or 0.0)
         except (TypeError, ValueError, AttributeError):
             ts_ = 0.0
         self.tick_s = ts_ if 0.0 < ts_ < 1.0 else None
@@ -391,7 +391,7 @@ class RTIClient:
                         raise ControlLost(
                             "state stream stopped while we held control — the robot has left "
                             "RTI mode. A latched error forces ACTIVE_ERROR, which ends the "
-                            "stream; check robot.status() and the error list for the cause."
+                            "stream; check robot.latest_status() and the error list for the cause."
                             + self._link_summary())
                     if received:
                         # 2026-10-13: a recipe without rti_state (e.g. `tracking`) cannot tell us whether we held
@@ -400,7 +400,7 @@ class RTIClient:
                         raise ControlLost(
                             "state stream stopped after it had started — the robot has left RTI mode (a latched "
                             "error forces ACTIVE_ERROR, which ends the stream; the active recipe carries no "
-                            "rti_state, so check robot.status() and the error list for the cause)."
+                            "rti_state, so check robot.latest_status() and the error list for the cause)."
                             + self._link_summary())
                     raise RuntimeError("RTI timeout: no state packet from robot "
                                        "(never started streaming — is it paired?)")
@@ -471,7 +471,7 @@ class RTIClient:
         from a network fault.
         """
         try:
-            st = self.robot.status() or {}
+            st = self.robot.latest_status() or {}
         except Exception:
             return ""
         keys = st.get("errors") or []

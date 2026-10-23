@@ -60,7 +60,7 @@ from config.networking import (
     ZMQ_EXEC_STATUS_SOCKET,
 )
 import config.xml_parser as read_XML2
-from communication.protocol import IMMEDIATE, POSE_COMMANDS, QUEUED, kind_of, validate, is_owned
+from communication.protocol import IMMEDIATE, POSE_COMMANDS, QUEUED, kind_of, validate, is_owned, canonical_command
 from motion.trajectory_planner import TrajectoryPlanner
 from motion.cartesian_paths import pose_from_xyz_rpy
 from utility.kinematics_backend import POSE_CONVENTION, pose_angles
@@ -1269,21 +1269,21 @@ def _handle_set_profile(args, cid, conn):
                  command=_fmt_command("set_profile", args))
 
 
-def _handle_set_default_ik_solver(args, cid, conn):
+def _handle_set_ik_solver(args, cid, conn):
     if not args:
-        _log_exec_reject(cid, "BAD_ARGS", "set_default_ik_solver needs [solver]", command="set_default_ik_solver")
+        _log_exec_reject(cid, "BAD_ARGS", "set_ik_solver needs [solver]", command="set_ik_solver")
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS",
-                            "message": "set_default_ik_solver needs [solver]"})
+                            "message": "set_ik_solver needs [solver]"})
     try:
         solver = normalize_ik_solver_name(args[0])
     except ValueError as e:
-        _log_exec_reject(cid, "BAD_IK_SOLVER", str(e), command=_fmt_command("set_default_ik_solver", args))
+        _log_exec_reject(cid, "BAD_IK_SOLVER", str(e), command=_fmt_command("set_ik_solver", args))
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_IK_SOLVER",
                             "message": str(e)})
     _set_motion_defaults(ik_solver=solver)
     reply(conn, {"id": cid, "status": "ok", "data": {"ik_solver": solver}})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                 command=_fmt_command("set_default_ik_solver", args))
+                 command=_fmt_command("set_ik_solver", args))
 
 
 def _handle_set_completion_policy(args, cid, conn):
@@ -1763,9 +1763,7 @@ IMMEDIATE_HANDLERS = {
     "set_joint_speed":  _handle_set_joint_speed,
     "set_blending":     _handle_set_blending,
     "set_profile":      _handle_set_profile,
-    "set_default_profile": _handle_set_profile,
-    "set_ik_solver":   _handle_set_default_ik_solver,
-    "set_default_ik_solver": _handle_set_default_ik_solver,
+    "set_ik_solver":   _handle_set_ik_solver,
     "set_completion_policy": _handle_set_completion_policy,
     "stop":             _handle_stop,
     "enable":           _forward_to_rti("enable", "enable"),
@@ -1790,23 +1788,23 @@ IMMEDIATE_HANDLERS = {
     "release_safety_stop": _forward_to_rti("set_mode:IDLE", "release_safety_stop"),
     "enter_flashing_mode": _handle_enter_flashing_mode,
     "exit_flashing_mode":  _forward_to_rti("set_mode:IDLE", "exit_flashing_mode"),
-    "jog_set":          _forward_fmt("jog_set", "jog_set", 3),
+    "jog":          _forward_fmt("jog_set", "jog", 3),
     "jog_stop":         _forward_to_rti("jog_stop", "jog_stop"),
-    "jog_accel":        _forward_fmt("jog_accel", "jog_accel", 1, (_arg_positive,)),
-    "jog_profile":      _forward_fmt("jog_profile", "jog_profile", 1, (_arg_one_of(*_JOG_PROFILES),)),
-    "jog_jerk_factor":  _forward_fmt("jog_jerk_factor", "jog_jerk_factor", 1, (_arg_positive,)),
-    "jog_control_mode": _forward_fmt("jog_control_mode", "jog_control_mode", 1, (_arg_one_of(*_JOG_CONTROL_MODES),)),
-    "gravity_comp":     _forward_fmt("gravity_comp", "gravity_comp", 1, (_arg_switch,)),
-    "friction_comp":    _forward_fmt("friction_comp", "friction_comp", 1, (_arg_switch,)),
-    "inertia_comp":     _forward_fmt("inertia_comp", "inertia_comp", 1, (_arg_switch,)),
-    "can_read_first":   _forward_fmt("can_read_first", "can_read_first", 1, (_arg_switch,)),   # TODO/can_tx_timing_plan.md option B
+    "set_jog_accel":        _forward_fmt("jog_accel", "set_jog_accel", 1, (_arg_positive,)),
+    "set_jog_profile":      _forward_fmt("jog_profile", "set_jog_profile", 1, (_arg_one_of(*_JOG_PROFILES),)),
+    "set_jog_jerk_factor":  _forward_fmt("jog_jerk_factor", "set_jog_jerk_factor", 1, (_arg_positive,)),
+    "set_jog_control_mode": _forward_fmt("jog_control_mode", "set_jog_control_mode", 1, (_arg_one_of(*_JOG_CONTROL_MODES),)),
+    "set_gravity_comp":     _forward_fmt("gravity_comp", "set_gravity_comp", 1, (_arg_switch,)),
+    "set_friction_comp":    _forward_fmt("friction_comp", "set_friction_comp", 1, (_arg_switch,)),
+    "set_inertia_comp":     _forward_fmt("inertia_comp", "set_inertia_comp", 1, (_arg_switch,)),
+    "set_can_read_first":   _forward_fmt("can_read_first", "set_can_read_first", 1, (_arg_switch,)),   # TODO/can_tx_timing_plan.md option B
     "hall_check":       _forward_fmt("hall_check", "hall_check", 1, (_arg_switch,)),   # robotics/hall_check.py (IDLE only: COMMAND_RULES)
     "free_joint":       _forward_fmt("free_joint", "free_joint", 1, (_arg_free_joint,)),  # robotics/free_joint.py (IDLE only)
     "joint_test":       _handle_joint_test,             # robotics/joint_test.py (IDLE + ENABLED)
-    "coriolis_comp":    _forward_fmt("coriolis_comp", "coriolis_comp", 1, (_arg_switch,)),
-    "friction_ff":      _forward_fmt("friction_ff", "friction_ff", 1, (_arg_switch,)),   # utility/friction_model.py
+    "set_coriolis_comp":    _forward_fmt("coriolis_comp", "set_coriolis_comp", 1, (_arg_switch,)),
+    "set_friction_ff":      _forward_fmt("friction_ff", "set_friction_ff", 1, (_arg_switch,)),   # utility/friction_model.py
     # collision detection's reaction (utility/safety_monitor.py; until RTI restarts — a PC program that pushes on purpose)
-    "collision_detection": _forward_fmt("collision_detection", "collision_detection", 1,
+    "set_collision_detection": _forward_fmt("collision_detection", "set_collision_detection", 1,
                                         (_arg_one_of("off", "warn", "stop"),)),
     "set_pid_gains":    _handle_set_pid_gains,
     # --- RTI mode handshake (TODO/RTI_mode_plan.md §4d). The UDP setpoint stream
@@ -1840,9 +1838,9 @@ IMMEDIATE_HANDLERS = {
     "rti_set_start_pose_check": _forward_fmt("rti_set_start_pose_check",
                                              "rti_set_start_pose_check", 1),
     "rti_set_lowpass":  _forward_fmt("rti_set_lowpass", "rti_set_lowpass", 1),
-    "gripper_calibrate": _forward_to_rti("gripper_calibrate", "gripper_calibrate"),
-    "gripper_ctrl_mode": _forward_fmt("gripper_ctrl_mode", "gripper_ctrl_mode", 1, (_arg_one_of("1", "2"),)),
-    "gripper_set":       _forward_fmt("gripper_set", "gripper_set", 4),
+    "calibrate_gripper": _forward_to_rti("gripper_calibrate", "calibrate_gripper"),
+    "set_gripper_ctrl_mode": _forward_fmt("gripper_ctrl_mode", "set_gripper_ctrl_mode", 1, (_arg_one_of("1", "2"),)),
+    "set_gripper":       _forward_fmt("gripper_set", "set_gripper", 4),
 }
 
 
@@ -2093,7 +2091,7 @@ def dispatch(msg, conn):
         _client_names[conn] = str(msg["client"])[:60]
     _note_client_version(conn, msg)        # its robotclient version + protocol (2026-10-21)
     note_origin(cid, _client_origin(conn))
-    cmd = msg.get("cmd")
+    cmd = canonical_command(msg.get("cmd"))     # an old name of a command is that command (protocol.COMMAND_ALIASES)
     args = msg.get("args", []) or []
 
     if kind_of(cmd) is None:

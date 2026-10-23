@@ -36,7 +36,7 @@ from .constants import (
     WAIT_STATE_TIMEOUT, WAIT_HOMED_TIMEOUT,
 )
 from .exceptions import RobotError, RobotTimeout, MotionFailed, GripFailed, HomingFailed, VersionMismatch
-from .version import check_protocols
+from .version import check_protocols, wire_names_for
 
 # Pose angles (2026-10-21): radians unless a call says angle_unit="deg".
 _RAD_PER = {"rad": 1.0, "deg": 3.141592653589793 / 180.0}
@@ -146,6 +146,9 @@ class RobotClient:
             except RobotError:
                 st = {}
         self.runtime_version = st.get("runtime_version")
+        # A robot older than the command renames (version.COMMANDS_RENAMED_IN) gets the IDs it knows, for every
+        # command this client sends from here on; a current robot gets the documented names (2026-10-23).
+        self._conn.wire_names = wire_names_for(self.runtime_version)
         self.protocols = dict(st["protocols"]) if isinstance(st.get("protocols"), dict) else None
         try:
             check_protocols(st, ("commands",), allow_mismatch)
@@ -179,9 +182,11 @@ class RobotClient:
         toolpath) rather than at the next synchronization point."""
         self._conn.on_motion_error = fn
 
-    def status(self) -> dict:
+    def latest_status(self) -> dict:
         """Latest status snapshot from the event stream: mode, state, homed, err, ..."""
         return self._conn.latest_status()
+
+    status = latest_status      # its other name (2026-10-23): it is not get_status(), which asks the robot
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -373,15 +378,15 @@ class RobotClient:
         for an error, so it is also how api_tests/31_velhold_buzz.py reproduces the J3
         oscillation on demand.
         """
-        return self._immediate("gravity_comp", [1 if enabled else 0])
+        return self._immediate("set_gravity_comp", [1 if enabled else 0])
 
     def set_inertia_comp(self, enabled: bool) -> Any:
         """Robot-wide INERTIA feedforward: the torque M(q)·qdd that the commanded acceleration needs (the links and the
         motor rotors behind the gearboxes), added to the current the drives get — in EXEC, JOG and RTI / SOFT_RTI
         position and velocity commands. Computed from the COMMANDED motion of the tick, never a measured one; not
         added in freedrive, holds, homing or RTI torque commands. Starts as system.xml <dynamics_feedforward> says
-        (ON as shipped); status() reports "inertia_comp". Separate from set_coriolis_comp and set_gravity_comp."""
-        return self._immediate("inertia_comp", [1 if enabled else 0])
+        (ON as shipped); latest_status() reports "inertia_comp". Separate from set_coriolis_comp and set_gravity_comp."""
+        return self._immediate("set_inertia_comp", [1 if enabled else 0])
 
     def set_can_read_first(self, enabled: bool) -> Any:
         """The CAN tick order (option B, 2026-10-12; RTI starts in the order system.xml <can_read_first> names, ON by
@@ -389,7 +394,7 @@ class RobotClient:
         from them and sends them at once — 3.8 instead of 7.8 ms from a drive's measurement to the command computed
         from it (measured), with the same late-reply rate and tracking; False = the old order. Homing always uses the
         old order. RTI.log reports the waits when it is switched off."""
-        return self._immediate("can_read_first", [1 if enabled else 0])
+        return self._immediate("set_can_read_first", [1 if enabled else 0])
 
     def joint_test(self, joint: int, amplitude_deg: float = 5.0, speed_dps: float = 5.0,
                    current_ma: float = 600.0) -> Any:
@@ -420,8 +425,8 @@ class RobotClient:
     def set_coriolis_comp(self, enabled: bool) -> Any:
         """Robot-wide CORIOLIS / centripetal feedforward: the torque C(q, qd)·qd the joints exert on each other when
         several move at once, from the commanded motion — same modes as set_inertia_comp. Starts as system.xml
-        <dynamics_feedforward> says (ON as shipped); status() reports "coriolis_comp"."""
-        return self._immediate("coriolis_comp", [1 if enabled else 0])
+        <dynamics_feedforward> says (ON as shipped); latest_status() reports "coriolis_comp"."""
+        return self._immediate("set_coriolis_comp", [1 if enabled else 0])
 
     def set_friction_ff(self, enabled: bool) -> Any:
         """Robot-wide FRICTION feedforward (2026-10-17): the torque each joint's friction takes at the COMMANDED speed
@@ -429,16 +434,16 @@ class RobotClient:
         speed, measured by api_tests/77_friction_id.py), added to the current the drives get in EXEC, JOG and RTI /
         SOFT_RTI position and velocity commands. Nothing at a commanded speed of zero (a hold), in freedrive (see
         set_friction_comp), homing or RTI torque commands. Starts as system.xml <dynamics_feedforward><friction> says
-        (OFF as shipped); status() reports "friction_ff". Measuring friction (api_tests 54 / 77) needs it OFF."""
-        return self._immediate("friction_ff", [1 if enabled else 0])
+        (OFF as shipped); latest_status() reports "friction_ff". Measuring friction (api_tests 54 / 77) needs it OFF."""
+        return self._immediate("set_friction_ff", [1 if enabled else 0])
 
     def set_friction_comp(self, enabled: bool) -> Any:
         """Friction compensation in FREEDRIVE (IDLE with gravity comp ON): a push in the direction each joint is
         already moving — a fraction of its measured friction minus its measured gravity-model error (robot XML
         <friction_coulomb_nm> + <friction_load_per_nm> x |gravity torque| / <gravity_error_nm>, policy <friction_comp>
         in system.xml). Zero at rest, so a released arm is still held by its static friction. OFF at every RTI start.
-        status() reports "friction_comp"."""
-        return self._immediate("friction_comp", [1 if enabled else 0])
+        latest_status() reports "friction_comp"."""
+        return self._immediate("set_friction_comp", [1 if enabled else 0])
 
     def set_collision_detection(self, mode: str) -> Any:
         """Collision detection's reaction: "off", "warn" or "stop" — until RTI restarts, then system.xml
@@ -447,9 +452,9 @@ class RobotClient:
         above the robot XML's <contact_torque_nm> a live CONTACT_WARNING, above <collision_torque_nm> a
         COLLISION_WARNING ("warn") or the COLLISION error ("stop": the robot stops and holds until errors are
         cleared). A program that presses on things ON PURPOSE switches it to "off" (or "warn") first and back after.
-        Declare a held part with set_payload — an undeclared one reads as external torque. status() reports
+        Declare a held part with set_payload — an undeclared one reads as external torque. latest_status() reports
         "collision_detection"."""
-        return self._immediate("collision_detection", [str(mode).strip().lower()])
+        return self._immediate("set_collision_detection", [str(mode).strip().lower()])
 
     def set_payload(self, mass_kg: float, com_m: Sequence[float] = (0.0, 0.0, 0.0)) -> Any:
         """Declare the part the gripper holds: mass [kg] and its centre of mass [m] in the TOOL frame (the
@@ -615,7 +620,7 @@ class RobotClient:
 
     def control_holder(self) -> str | None:
         """Who currently holds control ("ip:port"), or None. From the status stream."""
-        return self.status().get("control_holder")
+        return self.latest_status().get("control_holder")
 
     def local_label(self) -> str | None:
         """This connection's own "ip:port" as the executor labels it — compare with
@@ -801,7 +806,7 @@ class RobotClient:
         then HomingFailed at once, naming the robot's error keys."""
         self.wait(lambda s: s.get("mode") != "HOMING" and (s.get("homed") is True or s.get("err") == 1),
                   timeout, what)
-        st = self.status()
+        st = self.latest_status()
         if st.get("homed") is not True and st.get("err") == 1:
             raise HomingFailed(st.get("errors") or [])
 
@@ -822,14 +827,12 @@ class RobotClient:
     def set_profile(self, profile: str) -> Any:
         return self._immediate("set_profile", [str(profile).strip().lower()])
 
-    def set_default_profile(self, profile: str) -> Any:
-        return self.set_profile(profile)
-
-    def set_default_ik_solver(self, solver: str) -> Any:
-        return self._immediate("set_default_ik_solver", [str(solver).strip().lower()])
+    set_default_profile = set_profile      # its other name (2026-10-23)
 
     def set_ik_solver(self, solver: str) -> Any:
-        return self.set_default_ik_solver(solver)
+        return self._immediate("set_ik_solver", [str(solver).strip().lower()])
+
+    set_default_ik_solver = set_ik_solver      # its other name (2026-10-23)
 
     def set_completion_policy(self, policy: str) -> Any:
         return self._immediate("set_completion_policy", [str(policy).strip().lower()])
@@ -938,7 +941,7 @@ class RobotClient:
     def jog(self, joint: int, direction: int, speed: float) -> Any:
         """Start jogging one joint. direction: +1 / -1. speed: fraction of the jog speed
         limit. Only valid in JOG mode; call jog_stop() to halt."""
-        return self._immediate("jog_set", [int(joint), int(direction), float(speed)])
+        return self._immediate("jog", [int(joint), int(direction), float(speed)])
 
     def jog_stop(self) -> Any:
         """Halt jog motion. Accepted in any mode, so a released button always stops."""
@@ -946,19 +949,19 @@ class RobotClient:
 
     def set_jog_accel(self, accel_time: float) -> Any:
         """Jog acceleration ramp time (s); persists on RTI's JogHandler."""
-        return self._immediate("jog_accel", [float(accel_time)])
+        return self._immediate("set_jog_accel", [float(accel_time)])
 
     def set_jog_profile(self, profile: str) -> Any:
         """Jog motion profile, e.g. 'scurve' / 'trapezoid'."""
-        return self._immediate("jog_profile", [str(profile).strip()])
+        return self._immediate("set_jog_profile", [str(profile).strip()])
 
     def set_jog_jerk_factor(self, factor: float) -> Any:
         """Jog jerk factor (used by the s-curve profile)."""
-        return self._immediate("jog_jerk_factor", [float(factor)])
+        return self._immediate("set_jog_jerk_factor", [float(factor)])
 
     def set_jog_control_mode(self, mode: str) -> Any:
         """Jog control mode, e.g. 'pid'."""
-        return self._immediate("jog_control_mode", [str(mode).strip()])
+        return self._immediate("set_jog_control_mode", [str(mode).strip()])
 
 
     def set_pid_gains(self, joint: int, **gains: float) -> Any:
@@ -969,19 +972,21 @@ class RobotClient:
         payload.update({k: float(v) for k, v in gains.items()})
         return self._immediate("set_pid_gains", payload)
 
-    def gripper_calibrate(self) -> Any:
+    def calibrate_gripper(self) -> Any:
         """Run the gripper calibration sweep (immediate; requires a CAN gripper)."""
-        return self._immediate("gripper_calibrate")
+        return self._immediate("calibrate_gripper")
+
+    gripper_calibrate = calibrate_gripper      # its other name (2026-10-23)
 
     def set_gripper_ctrl_mode(self, mode: int) -> Any:
         """Gripper control mode: 1 = motor mode, 2 = firmware mode."""
-        return self._immediate("gripper_ctrl_mode", [int(mode)])
+        return self._immediate("set_gripper_ctrl_mode", [int(mode)])
 
     def set_gripper(self, position: int, speed: int = 100, current: int = 200, action: int = 1) -> Any:
         """Firmware/motor-mode direct gripper target (immediate; distinct from the queued
-        gripper_open / gripper_close / move_gripper). position/speed 0-255 raw gripper scale,
+        open_gripper / close_gripper / move_gripper). position/speed 0-255 raw gripper scale,
         current in mA, action 0/1. Requires a CAN gripper (RTI ignores it otherwise)."""
-        return self._immediate("gripper_set",
+        return self._immediate("set_gripper",
                                [int(position), int(speed), int(current), int(action)])
 
     # ------------------------------------------------------------------ #
@@ -989,38 +994,259 @@ class RobotClient:
     # ------------------------------------------------------------------ #
 
     def move_joints(self, *angles_deg: float, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+        """Move every joint to a target angle, in joint space.
+
+        All joints start and arrive together, so the tool's path is not a straight
+        line. Use `move_linear()` for a straight line.
+
+        The robot needs no inverse kinematics along the way, so a joint move also
+        passes through singular poses, where a straight-line move can fail.
+
+        Args:
+            *angles_deg: The target angle of each joint, J1 first, in degrees. Each
+                must lie within its joint's limits, or the move is refused before
+                anything moves. A single list or tuple of the angles works too.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. `ik_solver`, `singularity_strategy` and `samples`
+                have no effect on a joint move. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            JOINT_LIMIT: A target angle is outside its joint's limits.
+            ZONE_LIMIT: The path would enter a safety zone.
+            ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
+                to check them is missing.
+            SELF_COLLISION: The path would bring two parts of the arm too close.
+            DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
+            INVALID_DURATION: `duration` is not more than 0 seconds.
+            TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
+            TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
+                limits.
+            ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
+                acceleration limit.
+
+        See also:
+            `move_pose()`, `set_joint_speed()`
+
+        Examples:
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.move_joints([90, -105, 165, 0, -30, 180], speed=0.2)
+            >>> robot.wait_idle()
+        """
         if len(angles_deg) == 1 and isinstance(angles_deg[0], (list, tuple)):
             angles_deg = tuple(angles_deg[0])
         return self._queued("move_joints", [float(a) for a in angles_deg], timeout, options)
 
     def move_pose(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Endpoint IK move to TCP pose [m, rad — or deg with angle_unit="deg"]; timed as a joint-space move."""
+        """Move the tool to a pose, with the joints moving in joint space.
+
+        The robot works out the joint angles for the pose, starting from where the
+        arm is, then moves there like `move_joints()`: the tool's path is not a
+        straight line. Use `move_linear()` for a straight line, and
+        `is_reachable()` to check a pose first.
+
+        Args:
+            x: Target position along the base X axis, in metres.
+            y: Target position along the base Y axis, in metres.
+            z: Target position along the base Z axis, in metres.
+            rx: Turn about the base X axis, in radians, or degrees with
+                `angle_unit="deg"`. The orientation is R = Rx(rx) Ry(ry) Rz(rz).
+            ry: Turn about the tool's new Y axis, in the same unit.
+            rz: Turn about the tool's own Z axis, in the same unit.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
+
+        Examples:
+            >>> x, y, z, rx, ry, rz = robot.get_pose()
+            >>> robot.move_pose(x, y, z + 0.05, rx, ry, rz)
+            >>> robot.wait_idle()
+        """
         return self._queued("move_pose", _pose_in((x, y, z, rx, ry, rz), angle_unit), timeout, options)
 
     def move_linear(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Cartesian line move to TCP pose [m, rad — or deg with angle_unit="deg"]; pass dry_run=True to validate the
-        IK path without motion."""
+        """Move the tool in a straight line to a pose.
+
+        The tool centre point travels on a straight line in the base frame while
+        its orientation turns smoothly to the target.
+
+        Args:
+            x: Target position along the base X axis, in metres.
+            y: Target position along the base Y axis, in metres.
+            z: Target position along the base Z axis, in metres.
+            rx: Turn about the base X axis, in radians, or degrees with
+                `angle_unit="deg"`. The orientation is R = Rx(rx) Ry(ry) Rz(rz).
+            ry: Turn about the tool's new Y axis, in the same unit.
+            rz: Turn about the tool's own Z axis, in the same unit.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
+
+        Note:
+            Moves along a Cartesian path run at no more than 20 % of the speed
+            limit; a higher `speed` has no further effect.
+
+        Examples:
+            >>> x, y, z, rx, ry, rz = robot.get_pose()
+            >>> robot.move_linear(x, y, z - 0.05, rx, ry, rz)
+            >>> robot.wait_idle()
+        """
         return self._queued("move_linear", _pose_in((x, y, z, rx, ry, rz), angle_unit), timeout, options)
 
     def move_linear_rel_world(self, dx: float, dy: float, dz: float, drx: float = 0.0, dry: float = 0.0, drz: float = 0.0, timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Cartesian line by world-frame TCP offset [m, rad — or deg with angle_unit="deg"]: the turn is about axes
-        parallel to the base's, through the TCP."""
+        """Move the tool in a straight line by an offset along the base axes.
+
+        The offset is measured from where the tool is when the move starts, along
+        axes parallel to the base frame. A turn is
+        about those axes, through the tool centre point.
+
+        Args:
+            dx: Offset along the base X axis, in metres.
+            dy: Offset along the base Y axis, in metres.
+            dz: Offset along the base Z axis, in metres.
+            drx: Turn about the base X axis, in radians, or degrees with
+                `angle_unit="deg"`.
+            dry: Turn about the base Y axis, in the same unit.
+            drz: Turn about the base Z axis, in the same unit.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
+
+        Note:
+            Moves along a Cartesian path run at no more than 20 % of the speed
+            limit; a higher `speed` has no further effect.
+
+        Examples:
+            >>> robot.move_linear_rel_world(0.05, 0, 0)
+            >>> robot.move_linear_rel_world(0, 0, 0, drz=15, angle_unit="deg")
+            >>> robot.wait_idle()
+        """
         return self._queued(
-            "move_linear_rel_wrf",
+            "move_linear_rel_world",
             _pose_in((dx, dy, dz, drx, dry, drz), angle_unit), timeout, options)
 
     def move_linear_rel_tool(self, dx: float, dy: float, dz: float, drx: float = 0.0, dry: float = 0.0, drz: float = 0.0, timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Cartesian line by tool-frame TCP offset [m, rad — or deg with angle_unit="deg"]: the turn is about the
-        tool's own axes at the start."""
+        """Move the tool in a straight line by an offset along its own axes.
+
+        The offset is measured along the tool's axes as they are when the move
+        starts. A turn is about those axes.
+
+        Args:
+            dx: Offset along the tool's X axis, in metres.
+            dy: Offset along the tool's Y axis, in metres.
+            dz: Offset along the tool's Z axis, in metres.
+            drx: Turn about the tool's X axis, in radians, or degrees with
+                `angle_unit="deg"`.
+            dry: Turn about the tool's Y axis, in the same unit.
+            drz: Turn about the tool's Z axis, in the same unit.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
+
+        Note:
+            Moves along a Cartesian path run at no more than 20 % of the speed
+            limit; a higher `speed` has no further effect.
+
+        Examples:
+            >>> robot.move_linear_rel_tool(0, 0, 0.02)
+            >>> robot.wait_idle()
+        """
         return self._queued(
-            "move_linear_rel_trf",
+            "move_linear_rel_tool",
             _pose_in((dx, dy, dz, drx, dry, drz), angle_unit), timeout, options)
-
-    def move_linear_rel_wrf(self, *args: Any, **kwargs: Any) -> str:
-        return self.move_linear_rel_world(*args, **kwargs)
-
-    def move_linear_rel_trf(self, *args: Any, **kwargs: Any) -> str:
-        return self.move_linear_rel_tool(*args, **kwargs)
 
 
     @staticmethod
@@ -1031,25 +1257,192 @@ class RobotClient:
         return _pose_in(values, angle_unit)
 
     def move_arc(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Absolute world-frame circular arc through via and end poses [m, rad]."""
+        """Move the tool along a circular arc through a via pose to an end pose.
+
+        The arc runs from where the tool is, through the via pose's position, to the
+        end pose, in the base frame. The orientation turns smoothly from the start
+        to the end pose's orientation; the via pose's orientation is not used.
+
+        Args:
+            via: A pose `[x, y, z, rx, ry, rz]` the arc passes through: metres,
+                and radians or degrees as `angle_unit` says.
+            end: The pose the arc ends at, in the same form.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `via` or `end` does not have 6 values, or `angle_unit` is
+                neither `"rad"` nor `"deg"`.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> x, y, z, rx, ry, rz = robot.get_pose()
+            >>> robot.move_arc([x + 0.05, y + 0.05, z, rx, ry, rz],
+            ...                [x + 0.10, y, z, rx, ry, rz])
+            >>> robot.wait_idle()
+        """
         args = self._curve_pose_values(via, "move_arc via", angle_unit)
         args.extend(self._curve_pose_values(end, "move_arc end", angle_unit))
         return self._queued("move_arc", args, timeout, options)
 
     def move_arc_rel_world(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Arc with via/end offsets in the world frame at command start [m, rad]."""
+        """Move the tool along a circular arc given by offsets along the base axes.
+
+        Like `move_arc()`, with `via` and `end` given as offsets from where the tool
+        is when the move starts, along axes parallel to the base frame.
+
+        Args:
+            via: The offset `[dx, dy, dz, drx, dry, drz]` the arc passes through:
+                metres, and radians or degrees as `angle_unit` says.
+            end: The offset the arc ends at, in the same form.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `via` or `end` does not have 6 values, or `angle_unit` is
+                neither `"rad"` nor `"deg"`.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> robot.move_arc_rel_world([0.05, 0.05, 0, 0, 0, 0], [0.1, 0, 0, 0, 0, 0])
+            >>> robot.wait_idle()
+        """
         args = self._curve_pose_values(via, "move_arc_rel_world via", angle_unit)
         args.extend(self._curve_pose_values(end, "move_arc_rel_world end", angle_unit))
-        return self._queued("move_arc_rel_wrf", args, timeout, options)
+        return self._queued("move_arc_rel_world", args, timeout, options)
 
     def move_arc_rel_tool(self, via: Sequence[float], end: Sequence[float], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Arc with via/end offsets in the starting TCP frame [m, rad]."""
+        """Move the tool along a circular arc given by offsets along its own axes.
+
+        Like `move_arc()`, with `via` and `end` given as offsets along the tool's
+        axes as they are when the move starts.
+
+        Args:
+            via: The offset `[dx, dy, dz, drx, dry, drz]` the arc passes through:
+                metres, and radians or degrees as `angle_unit` says.
+            end: The offset the arc ends at, in the same form.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `via` or `end` does not have 6 values, or `angle_unit` is
+                neither `"rad"` nor `"deg"`.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> robot.move_arc_rel_tool([0.03, 0.03, 0, 0, 0, 0], [0.06, 0, 0, 0, 0, 0])
+            >>> robot.wait_idle()
+        """
         args = self._curve_pose_values(via, "move_arc_rel_tool via", angle_unit)
         args.extend(self._curve_pose_values(end, "move_arc_rel_tool end", angle_unit))
-        return self._queued("move_arc_rel_trf", args, timeout, options)
+        return self._queued("move_arc_rel_tool", args, timeout, options)
 
     def move_circle(self, center: Sequence[float], normal: Sequence[float], turns: float = 1.0, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        """Full circle around an absolute world-frame center and normal."""
+        """Move the tool around a circle about a centre point.
+
+        The circle starts where the tool is and turns around `center` in the plane
+        at right angles to `normal`. That plane passes through the tool's position,
+        so `center` must lie in it, within 0.2 mm. With a whole number of turns
+        the tool ends where it started. It keeps its orientation the whole way.
+
+        Args:
+            center: The circle's centre `[x, y, z]` in the base frame, in metres.
+            normal: The direction `[x, y, z]` the circle's axis points in; any
+                length. The tool goes around it counter-clockwise, seen from the
+                tip of `normal`.
+            turns: How many times to go around; a fraction goes part of the way, 0
+                is refused. A negative number goes the other way.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `center` or `normal` does not have 3 values.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> x, y, z, rx, ry, rz = robot.get_pose()
+            >>> robot.move_circle([x + 0.03, y, z], [0, 0, 1])
+            >>> robot.wait_idle()
+        """
         center_values = [float(v) for v in center]
         normal_values = [float(v) for v in normal]
         if len(center_values) != 3 or len(normal_values) != 3:
@@ -1058,52 +1451,304 @@ class RobotClient:
             "move_circle", center_values + normal_values + [float(turns)], timeout, options)
 
     def move_circle_rel_world(self, center: Sequence[float], normal: Sequence[float], turns: float = 1.0, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        """Circle with center offset and normal expressed in the world frame."""
+        """Move the tool around a circle given relative to the base axes.
+
+        Like `move_circle()`, with `center` given as an offset from where the tool
+        is when the move starts, and `normal` along axes parallel to the base frame.
+
+        Args:
+            center: The centre's offset `[dx, dy, dz]` from the tool, in metres,
+                at right angles to `normal`.
+            normal: The direction `[x, y, z]` of the circle's axis, along the base
+                axes; any length.
+            turns: How many times to go around; a fraction goes part of the way, 0
+                is refused. A negative number goes the other way.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `center` or `normal` does not have 3 values.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> robot.move_circle_rel_world([0.03, 0, 0], [0, 0, 1])
+            >>> robot.wait_idle()
+        """
         center_values = [float(v) for v in center]
         normal_values = [float(v) for v in normal]
         if len(center_values) != 3 or len(normal_values) != 3:
             raise ValueError("move_circle_rel_world center and normal each need 3 values")
         return self._queued(
-            "move_circle_rel_wrf", center_values + normal_values + [float(turns)], timeout, options)
+            "move_circle_rel_world", center_values + normal_values + [float(turns)], timeout, options)
 
     def move_circle_rel_tool(self, center: Sequence[float], normal: Sequence[float], turns: float = 1.0, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        """Circle with center offset and normal expressed in the starting TCP frame."""
+        """Move the tool around a circle given relative to its own axes.
+
+        Like `move_circle()`, with `center` and `normal` given along the tool's axes
+        as they are when the move starts.
+
+        Args:
+            center: The centre's offset `[dx, dy, dz]` from the tool, along the
+                tool's axes, in metres, at right angles to `normal`.
+            normal: The direction `[x, y, z]` of the circle's axis, along the
+                tool's axes; any length.
+            turns: How many times to go around; a fraction goes part of the way, 0
+                is refused. A negative number goes the other way.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `center` or `normal` does not have 3 values.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> robot.move_circle_rel_tool([0.02, 0, 0], [0, 0, 1])
+            >>> robot.wait_idle()
+        """
         center_values = [float(v) for v in center]
         normal_values = [float(v) for v in normal]
         if len(center_values) != 3 or len(normal_values) != 3:
             raise ValueError("move_circle_rel_tool center and normal each need 3 values")
         return self._queued(
-            "move_circle_rel_trf", center_values + normal_values + [float(turns)], timeout, options)
+            "move_circle_rel_tool", center_values + normal_values + [float(turns)], timeout, options)
 
     def move_spline(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Absolute world-frame interpolating cubic spline through poses [m, rad]."""
+        """Move the tool along a smooth curve through a list of poses.
+
+        The curve starts where the tool is and passes through every pose in order,
+        in the base frame. The orientation turns smoothly from pose to pose.
+
+        Args:
+            waypoints: Two or more poses `[x, y, z, rx, ry, rz]`: metres, and
+                radians or degrees as `angle_unit` says.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: Fewer than two waypoints, a waypoint without 6 values, or
+                an `angle_unit` other than `"rad"` or `"deg"`.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> x, y, z, rx, ry, rz = robot.get_pose()
+            >>> robot.move_spline([
+            ...     [x + 0.03, y + 0.02, z, rx, ry, rz],
+            ...     [x + 0.06, y - 0.02, z, rx, ry, rz],
+            ...     [x + 0.09, y, z, rx, ry, rz],
+            ... ])
+            >>> robot.wait_idle()
+        """
         poses = [self._curve_pose_values(pose, "move_spline waypoint", angle_unit) for pose in waypoints]
         if len(poses) < 2:
             raise ValueError("move_spline needs at least two waypoint poses")
         return self._queued("move_spline", [v for pose in poses for v in pose], timeout, options)
 
     def move_spline_rel_world(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Spline through world-frame offsets from the TCP at command start [m, rad]."""
+        """Move the tool along a smooth curve through offsets along the base axes.
+
+        Like `move_spline()`, with each waypoint given as an offset from where the
+        tool is when the move starts, along axes parallel to the base frame. Each
+        offset is from that start point, not from the previous waypoint.
+
+        Args:
+            waypoints: Two or more offsets `[dx, dy, dz, drx, dry, drz]`: metres,
+                and radians or degrees as `angle_unit` says.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: Fewer than two waypoints, a waypoint without 6 values, or
+                an `angle_unit` other than `"rad"` or `"deg"`.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> robot.move_spline_rel_world([
+            ...     [0.03, 0.02, 0, 0, 0, 0],
+            ...     [0.06, -0.02, 0, 0, 0, 0],
+            ...     [0.09, 0, 0, 0, 0, 0],
+            ... ])
+            >>> robot.wait_idle()
+        """
         poses = [self._curve_pose_values(pose, "move_spline_rel_world waypoint", angle_unit) for pose in waypoints]
         if len(poses) < 2:
             raise ValueError("move_spline_rel_world needs at least two waypoint poses")
-        return self._queued("move_spline_rel_wrf", [v for pose in poses for v in pose], timeout, options)
+        return self._queued("move_spline_rel_world", [v for pose in poses for v in pose], timeout, options)
 
     def move_spline_rel_tool(self, waypoints: Sequence[Sequence[float]], timeout: float = DEFAULT_MOVE_TIMEOUT, *, angle_unit: str = "rad", **options: Any) -> str:
-        """Spline through starting-TCP-frame offsets; waypoints are not chained [m, rad]."""
+        """Move the tool along a smooth curve through offsets along its own axes.
+
+        Like `move_spline()`, with each waypoint given as an offset along the tool's
+        axes as they are when the move starts. Each offset is from that start
+        point, not from the previous waypoint.
+
+        Args:
+            waypoints: Two or more offsets `[dx, dy, dz, drx, dry, drz]`: metres,
+                and radians or degrees as `angle_unit` says.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
+            **options: Settings for this move only, overriding the defaults:
+                `speed` and `accel` (a fraction of the limit up to 1, or a percent
+                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. A setting left out
+                takes its default. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the move;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the move has finished.
+
+        Raises:
+            CommandRejected: The robot refused the move, for example outside EXEC
+                mode, before homing or with an invalid argument. In sync mode also
+                when the move fails after it was accepted.
+            RobotTimeout: The robot did not accept the move within 5 s. In sync
+                mode also when the move did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: Fewer than two waypoints, a waypoint without 6 values, or
+                an `angle_unit` other than `"rad"` or `"deg"`.
+
+        Note:
+            Blending does not apply: `blend` must be 0, and the move starts and ends
+            at rest.
+
+        Examples:
+            >>> robot.move_spline_rel_tool([
+            ...     [0, 0.02, 0.01, 0, 0, 0],
+            ...     [0, 0.04, 0, 0, 0, 0],
+            ... ])
+            >>> robot.wait_idle()
+        """
         poses = [self._curve_pose_values(pose, "move_spline_rel_tool waypoint", angle_unit) for pose in waypoints]
         if len(poses) < 2:
             raise ValueError("move_spline_rel_tool needs at least two waypoint poses")
-        return self._queued("move_spline_rel_trf", [v for pose in poses for v in pose], timeout, options)
+        return self._queued("move_spline_rel_tool", [v for pose in poses for v in pose], timeout, options)
 
+    # Other names (2026-10-23, the naming pass): the relative moves were documented as _rel_wrf / _rel_trf for a day;
+    # every older program uses one of the two spellings, so both stay. The same functions, the robot accepts both
+    # wire IDs (communication/protocol.COMMAND_ALIASES).
+    move_linear_rel_wrf = move_linear_rel_world
     move_arc_rel_wrf = move_arc_rel_world
-    move_arc_rel_trf = move_arc_rel_tool
     move_circle_rel_wrf = move_circle_rel_world
-    move_circle_rel_trf = move_circle_rel_tool
     move_spline_rel_wrf = move_spline_rel_world
+    move_linear_rel_trf = move_linear_rel_tool
+    move_arc_rel_trf = move_arc_rel_tool
+    move_circle_rel_trf = move_circle_rel_tool
     move_spline_rel_trf = move_spline_rel_tool
 
     def delay(self, seconds: float, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+        """Wait a given time between two queued moves.
+
+        The pause is queued like a move: the arm stops and holds still for
+        `seconds` after the moves queued before it, then the next move starts.
+
+        Args:
+            seconds: How long to wait, in seconds.
+            timeout: Seconds to wait for the move to finish, in sync mode only.
+            **options: Settings for this pause only, the same as a move's: `speed`,
+                `accel`, `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
+                `singularity_strategy`, `samples` and `dry_run`. Only `duration`
+                changes a pause: it replaces `seconds`. See Per-move settings.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the pause;
+            call `wait_idle()` to wait until it has finished. In sync mode the call
+            returns when the pause has finished.
+
+        Raises:
+            CommandRejected: The robot refused the pause, for example outside EXEC
+                mode or with an invalid argument. A pause needs neither an enabled
+                nor a homed robot. In sync mode also when it fails after it was
+                accepted.
+            RobotTimeout: The robot did not accept the pause within 5 s. In sync
+                mode also when the pause did not finish within `timeout`.
+            RobotConnectionError: The client is not connected.
+
+        Examples:
+            >>> robot.move_linear_rel_world(0, 0, -0.02)
+            >>> robot.delay(0.5)
+            >>> robot.move_linear_rel_world(0, 0, 0.02)
+            >>> robot.wait_idle()
+        """
         return self._queued("delay", [float(seconds)], timeout, options)
 
     # ------------------------------------------------------------------ #
@@ -1150,11 +1795,15 @@ class RobotClient:
         self._last_gripper_queued = self._last_queued
         return cid
 
-    def gripper_open(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        return self._queued_gripper("gripper_open", [], timeout, options)
+    def open_gripper(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+        return self._queued_gripper("open_gripper", [], timeout, options)
 
-    def gripper_close(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        return self._queued_gripper("gripper_close", [], timeout, options)
+    def close_gripper(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+        return self._queued_gripper("close_gripper", [], timeout, options)
+
+    # Other names (2026-10-23, the naming pass): the names start with the verb, as every other command does.
+    gripper_open = open_gripper
+    gripper_close = close_gripper
 
     def gripper_result(self) -> GripperResult | None:
         """Outcome of the most recently SETTLED gripper command, or None.
@@ -1302,7 +1951,7 @@ class RobotClient:
     def errors(self) -> list[dict]:
         """The latched errors from the latest status: [{"key", "number", "title", "level", "since"}] (2026-10-15;
         [] when clean). `key` is "J3:WATCHDOG" style; the number and title are the catalog's (docs/error_codes.md)."""
-        return list(self.status().get("error_details") or [])
+        return list(self.latest_status().get("error_details") or [])
 
     # ------------------------------------------------------------------ #
     # Data queries (immediate, never block)

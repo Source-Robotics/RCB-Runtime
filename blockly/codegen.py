@@ -130,11 +130,11 @@ def _wait(block, depth, ctx):
 
 
 def _gripper_open(block, depth, ctx):
-    return ["robot.gripper_open()"]
+    return ["robot.open_gripper()"]
 
 
 def _gripper_close(block, depth, ctx):
-    return ["robot.gripper_close()"]
+    return ["robot.close_gripper()"]
 
 
 def _gripper_move(block, depth, ctx):

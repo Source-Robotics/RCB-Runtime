@@ -432,6 +432,11 @@ Its GitHub release notes are its changelog section, printed by
 version to change for which kind of change, and how a release is made, including
 the documentation.
 
+**Docstrings follow [docstrings_guide.md](docstrings_guide.md).** The documentation
+site builds the Python API reference from the `robotclient` docstrings, so a public
+method's docstring is user documentation: Google style, an imperative summary line,
+units for every number, and an example.
+
 ## Tools
 
 Hardware debug utilities live in `tools/`. For example, `tools/debug_read_kt.py`

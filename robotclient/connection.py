@@ -55,6 +55,7 @@ class Connection:
         self._idle_cv = threading.Condition()  # notified when _outstanding shrinks
 
         self._rejected = False                 # executor refused us on the access list
+        self.wire_names = {}                   # command ID -> the ID to send instead (an older robot, 2026-10-23)
         self._status = {}                      # latest {"type":"status",...} from the robot
         self._status_cv = threading.Condition()  # notified on every status event
 
@@ -166,6 +167,7 @@ class Connection:
         p = _Pending()
         with self._lock:
             self._pending[cid] = p
+        cmd = self.wire_names.get(cmd, cmd)      # a robot older than a rename gets the ID it knows (client.connect)
         # + this client's version and command protocol (2026-10-21, versioning V3): the executor logs them per
         # connection and lists them in get_versions; an older executor ignores both keys.
         msg = {"id": cid, "cmd": cmd, "args": args or [], "client": self.name,

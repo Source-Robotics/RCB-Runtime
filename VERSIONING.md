@@ -79,7 +79,9 @@ Go through this list before you commit:
    1. Set `runtime.tag` in `versions.yml` to `vX.Y.Z`. For a MINOR or MAJOR release, also set `docs_version` to
       `"X.Y"`.
    2. Run `tools/sync_runtime.py`. It regenerates the compatibility table, the release notes, the error codes and
-      the telemetry tags from the tag.
+      the telemetry tags from the tag, and copies the source of the command reference: the client's docstrings, the
+      command rules, the error catalog and the per-move settings (that repository's `BUILDING_THE_REFERENCE.md`).
+      Its build check fails when a per-move setting or a value of a choice is not described yet.
    3. Update the guides for what changed and give each changed guide a new revision letter.
    4. Push. The site publishes the version by itself.
 

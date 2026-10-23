@@ -145,7 +145,7 @@ def start():
         # them; an executor from before would read those numbers the old way and turn the tool somewhere else.
         raise ProgramRefused("the robot service runs code from before the pose-angle change of 2026-10-21: restart it "
                              "(sudo systemctl restart autorun.service), then home the robot")
-    if (robot.status() or {}).get("motion_aborted"):
+    if (robot.latest_status() or {}).get("motion_aborted"):
         raise ProgramRefused("motion is aborted after a failed command: clear errors first")
     _take_control(robot)
     if s.get("mode") != "EXEC":

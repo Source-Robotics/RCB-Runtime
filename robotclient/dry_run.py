@@ -270,9 +270,9 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
         return True
 
     def _send_gripper(self, command_type, args, command_id):
-        if command_type == "gripper_open":
+        if command_type == "open_gripper":
             position = self.GRIPPER_OPEN_POS
-        elif command_type == "gripper_close":
+        elif command_type == "close_gripper":
             position = self.GRIPPER_CLOSE_POS
         else:
             if not args:
@@ -392,8 +392,6 @@ class DryRunRobotClient(RobotClient):
         self._on_motion_error = fn
 
 
-    def status(self) -> dict:
-        return self.get_status()
     def _queued(self, command, args=None, timeout=DEFAULT_MOVE_TIMEOUT, options=None):
         del timeout
         command_id = generate_id()
@@ -464,12 +462,12 @@ class DryRunRobotClient(RobotClient):
 
     set_default_profile = set_profile
 
-    def set_default_ik_solver(self, solver: str) -> Any:
+    def set_ik_solver(self, solver: str) -> Any:
         value = str(solver).strip().lower()
         self._defaults = MotionOptions.from_dict({"ik_solver": value}, self._defaults)
         self._record_immediate_event("set_ik_solver", {"solver": value, "kind": "setup"})
 
-    set_ik_solver = set_default_ik_solver
+    set_default_ik_solver = set_ik_solver
 
     def set_completion_policy(self, policy: str) -> Any:
         value = str(policy).strip().lower()
@@ -567,6 +565,7 @@ class DryRunRobotClient(RobotClient):
         }
 
     status = get_status
+    latest_status = get_status     # offline, the last status and a fresh one are the same (2026-10-23)
 
     def set_digital_output(self, pin: int, value: bool | int) -> None:
         pin = int(pin)

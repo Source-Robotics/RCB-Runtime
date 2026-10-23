@@ -25,6 +25,7 @@ config/supervisor_settings.json
 !/CHANGELOG.md
 !/COMPATIBILITY.md
 !/VERSIONING.md
+!/docstrings_guide.md
 
 # Local/internal docs, planning, assistant instructions, and manual test scripts.
 #

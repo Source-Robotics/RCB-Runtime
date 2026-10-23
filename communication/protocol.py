@@ -25,9 +25,9 @@ PROTOCOL_VERSION = 1
 # elsewhere. is_reachable is here because its joint answer is fed straight into a joint move. Reads (get_pose) are not:
 # they move nothing. A circle takes a centre and a normal vector, no angles.
 POSE_COMMANDS = frozenset({
-    "move_pose", "move_linear", "move_linear_rel_wrf", "move_linear_rel_trf",
-    "move_arc", "move_arc_rel_wrf", "move_arc_rel_trf",
-    "move_spline", "move_spline_rel_wrf", "move_spline_rel_trf",
+    "move_pose", "move_linear", "move_linear_rel_world", "move_linear_rel_tool",
+    "move_arc", "move_arc_rel_world", "move_arc_rel_tool",
+    "move_spline", "move_spline_rel_world", "move_spline_rel_tool",
     "is_reachable",
 })
 
@@ -61,7 +61,7 @@ ALWAYS_OPEN = frozenset({
     "get_versions",
     # make-it-safer — anyone, always, no exceptions
     "stop", "pause", "disable", "safety_stop", "clear_errors",
-    # A jog has NO timeout: the GUI sends one jog_set on mouse-down and one jog_stop on
+    # A jog has NO timeout: the GUI sends one jog on mouse-down and one jog_stop on
     # mouse-up, and the arm moves for as long as that takes. If control changes hands
     # mid-jog (forced takeover, or the holder's 30 s idle expiry during a long button hold),
     # the jogger's release-stop would be refused CONTROL_HELD and the arm would keep going
@@ -83,9 +83,49 @@ ALWAYS_OPEN = frozenset({
 })
 
 
+# Other IDs a client may send for a command: the names before the naming pass of 2026-10-23, still accepted so that
+# every existing program and client keeps working. The executor maps an alias to its command the moment a message
+# arrives, before any check, so both spellings get the same rules, the same handler and the same log line. The
+# robotclient keeps the old Python names as aliases of the same functions. A new command needs no entry here.
+COMMAND_ALIASES = {
+    "move_linear_rel_wrf": "move_linear_rel_world",
+    "move_arc_rel_wrf": "move_arc_rel_world",
+    "move_circle_rel_wrf": "move_circle_rel_world",
+    "move_spline_rel_wrf": "move_spline_rel_world",
+    "move_linear_rel_trf": "move_linear_rel_tool",
+    "move_arc_rel_trf": "move_arc_rel_tool",
+    "move_circle_rel_trf": "move_circle_rel_tool",
+    "move_spline_rel_trf": "move_spline_rel_tool",
+    "gripper_open": "open_gripper",
+    "gripper_close": "close_gripper",
+    "gripper_calibrate": "calibrate_gripper",
+    "jog_set": "jog",
+    "jog_accel": "set_jog_accel",
+    "jog_profile": "set_jog_profile",
+    "jog_jerk_factor": "set_jog_jerk_factor",
+    "jog_control_mode": "set_jog_control_mode",
+    "gravity_comp": "set_gravity_comp",
+    "friction_comp": "set_friction_comp",
+    "inertia_comp": "set_inertia_comp",
+    "coriolis_comp": "set_coriolis_comp",
+    "friction_ff": "set_friction_ff",
+    "can_read_first": "set_can_read_first",
+    "collision_detection": "set_collision_detection",
+    "gripper_ctrl_mode": "set_gripper_ctrl_mode",
+    "gripper_set": "set_gripper",
+    "set_default_profile": "set_profile",
+    "set_default_ik_solver": "set_ik_solver",
+}
+
+
+def canonical_command(cmd):
+    """The command an ID names: an alias's command, else the ID itself."""
+    return COMMAND_ALIASES.get(cmd, cmd)
+
+
 def is_owned(cmd):
     """True if `cmd` requires control ownership. Unknown/new commands are OWNED."""
-    return cmd not in ALWAYS_OPEN
+    return canonical_command(cmd) not in ALWAYS_OPEN
 
 # cmd → (kind, required_mode | None, required_state | None, requires_homed)
 #   required_mode: list of allowed RobotMode names, or None = any mode
@@ -134,9 +174,7 @@ COMMAND_RULES = {
     "set_joint_speed": (IMMEDIATE, None, None, False),        # planner speed scale
     "set_blending":   (IMMEDIATE, None, None, False),        # planner blend (Phase F)
     "set_profile":    (IMMEDIATE, None, None, False),        # default planner profile
-    "set_default_profile": (IMMEDIATE, None, None, False),   # alias for set_profile
     "set_ik_solver": (IMMEDIATE, None, None, False),         # default Cartesian IK solver
-    "set_default_ik_solver": (IMMEDIATE, None, None, False), # alias for set_ik_solver
     "set_completion_policy": (IMMEDIATE, None, None, False), # EXEC checkpoint completion
     # --- digital IO (isolated pins 1-3; RTI reads/writes these every tick regardless
     # of mode, same as the physical E-stop) ---
@@ -163,23 +201,23 @@ COMMAND_RULES = {
     "release_safety_stop": (IMMEDIATE, None, None, False),
     "enter_flashing_mode": (IMMEDIATE, None, None, False),
     "exit_flashing_mode":  (IMMEDIATE, None, None, False),
-    # Jog actuation: START only in JOG mode (RTI ignores jog_set outside JOG anyway). STOP is
+    # Jog actuation: START only in JOG mode (RTI ignores its jog_set outside JOG anyway). STOP is
     # allowed in any mode so a released jog button always halts motion, even if a mode change raced.
-    "jog_set":         (IMMEDIATE, ["JOG"], None, False),
+    "jog":         (IMMEDIATE, ["JOG"], None, False),
     "jog_stop":        (IMMEDIATE, None, None, False),
     # Jog configuration — persistent on RTI's JOG handler, applied regardless of current mode.
-    "jog_accel":        (IMMEDIATE, None, None, False),
-    "jog_profile":      (IMMEDIATE, None, None, False),
-    "jog_jerk_factor":  (IMMEDIATE, None, None, False),
-    "jog_control_mode": (IMMEDIATE, None, None, False),
+    "set_jog_accel":        (IMMEDIATE, None, None, False),
+    "set_jog_profile":      (IMMEDIATE, None, None, False),
+    "set_jog_jerk_factor":  (IMMEDIATE, None, None, False),
+    "set_jog_control_mode": (IMMEDIATE, None, None, False),
     # Runtime config relays — RTI-owned state, any mode.
-    "gravity_comp":     (IMMEDIATE, None, None, False),
-    "friction_comp":    (IMMEDIATE, None, None, False),   # freedrive friction compensation switch (OWNED)
-    "inertia_comp":     (IMMEDIATE, None, None, False),   # inertia feedforward switch (OWNED, 2026-10-10)
-    "coriolis_comp":    (IMMEDIATE, None, None, False),   # Coriolis feedforward switch (OWNED, 2026-10-10)
-    "friction_ff":      (IMMEDIATE, None, None, False),   # friction feedforward switch (OWNED, 2026-10-17)
-    "can_read_first":   (IMMEDIATE, None, None, False),   # RTI reads CAN first, sends early (option B; OWNED, 2026-10-12)
-    "collision_detection": (IMMEDIATE, None, None, False),  # off | warn | stop until RTI restarts (OWNED, 2026-10-16)
+    "set_gravity_comp":     (IMMEDIATE, None, None, False),
+    "set_friction_comp":    (IMMEDIATE, None, None, False),   # freedrive friction compensation switch (OWNED)
+    "set_inertia_comp":     (IMMEDIATE, None, None, False),   # inertia feedforward switch (OWNED, 2026-10-10)
+    "set_coriolis_comp":    (IMMEDIATE, None, None, False),   # Coriolis feedforward switch (OWNED, 2026-10-10)
+    "set_friction_ff":      (IMMEDIATE, None, None, False),   # friction feedforward switch (OWNED, 2026-10-17)
+    "set_can_read_first":   (IMMEDIATE, None, None, False),   # RTI reads CAN first, sends early (option B; OWNED, 2026-10-12)
+    "set_collision_detection": (IMMEDIATE, None, None, False),  # off | warn | stop until RTI restarts (OWNED, 2026-10-16)
     # The Hall sensor check (robotics/hall_check.py, 2026-10-13): the Hall-sensor joint limp, its pin shown live. IDLE
     # only, enabled or not, homed or not (OWNED); RTI stops it itself before any mode change.
     "hall_check":       (IMMEDIATE, ["IDLE"], None, False),
@@ -231,39 +269,39 @@ COMMAND_RULES = {
     "set_recipe":               (IMMEDIATE, None, None, False),
     "rti_set_start_pose_check": (IMMEDIATE, None, None, False),
     "rti_set_lowpass":          (IMMEDIATE, None, None, False),
-    # Gripper immediate controls (distinct from the queued gripper_open/close/move_gripper
+    # Gripper immediate controls (distinct from the queued open_gripper / close_gripper / move_gripper
     # below); RTI guards all three on active_CAN_gripper. gripper_set is the firmware/motor-mode
     # direct target (position:speed:current:action) the GUI's gripper card uses.
-    "gripper_calibrate": (IMMEDIATE, None, None, False),
-    "gripper_ctrl_mode": (IMMEDIATE, None, None, False),
-    "gripper_set":       (IMMEDIATE, None, None, False),
+    "calibrate_gripper": (IMMEDIATE, None, None, False),
+    "set_gripper_ctrl_mode": (IMMEDIATE, None, None, False),
+    "set_gripper":       (IMMEDIATE, None, None, False),
     # --- motion (queued, require EXEC + enabled) ---
     "move_joints":    (QUEUED, ["EXEC"], "ENABLED", True),
     "move_pose":      (QUEUED, ["EXEC"], "ENABLED", True),
     "move_linear":    (QUEUED, ["EXEC"], "ENABLED", True),
-    "move_linear_rel_wrf": (QUEUED, ["EXEC"], "ENABLED", True),
-    "move_linear_rel_trf": (QUEUED, ["EXEC"], "ENABLED", True),
+    "move_linear_rel_world": (QUEUED, ["EXEC"], "ENABLED", True),
+    "move_linear_rel_tool": (QUEUED, ["EXEC"], "ENABLED", True),
     "move_arc":       (QUEUED, ["EXEC"], "ENABLED", True),
-    "move_arc_rel_wrf":   (QUEUED, ["EXEC"], "ENABLED", True),
-    "move_arc_rel_trf":   (QUEUED, ["EXEC"], "ENABLED", True),
+    "move_arc_rel_world":   (QUEUED, ["EXEC"], "ENABLED", True),
+    "move_arc_rel_tool":   (QUEUED, ["EXEC"], "ENABLED", True),
     "move_circle":    (QUEUED, ["EXEC"], "ENABLED", True),
-    "move_circle_rel_wrf": (QUEUED, ["EXEC"], "ENABLED", True),
-    "move_circle_rel_trf": (QUEUED, ["EXEC"], "ENABLED", True),
+    "move_circle_rel_world": (QUEUED, ["EXEC"], "ENABLED", True),
+    "move_circle_rel_tool": (QUEUED, ["EXEC"], "ENABLED", True),
     "move_spline":    (QUEUED, ["EXEC"], "ENABLED", True),
-    "move_spline_rel_wrf": (QUEUED, ["EXEC"], "ENABLED", True),
-    "move_spline_rel_trf": (QUEUED, ["EXEC"], "ENABLED", True),
+    "move_spline_rel_world": (QUEUED, ["EXEC"], "ENABLED", True),
+    "move_spline_rel_tool": (QUEUED, ["EXEC"], "ENABLED", True),
     "delay":         (QUEUED, ["EXEC"], None, False),
     # --- gripper (queued, same queue as joint moves so ordering is preserved;
     # fire-and-forget — checkpoint fires on send, not on physical completion) ---
-    "gripper_open":  (QUEUED, ["EXEC"], "ENABLED", True),
-    "gripper_close": (QUEUED, ["EXEC"], "ENABLED", True),
+    "open_gripper":  (QUEUED, ["EXEC"], "ENABLED", True),
+    "close_gripper": (QUEUED, ["EXEC"], "ENABLED", True),
     "move_gripper":  (QUEUED, ["EXEC"], "ENABLED", True),
 }
 
 
 def kind_of(cmd):
     """Return IMMEDIATE / QUEUED, or None if the command is unknown."""
-    rule = COMMAND_RULES.get(cmd)
+    rule = COMMAND_RULES.get(canonical_command(cmd))
     return rule[0] if rule else None
 
 
@@ -272,6 +310,7 @@ def validate(cmd, mode, state, homed):
 
     Returns (ok: bool, reason: str | None).
     """
+    cmd = canonical_command(cmd)
     rule = COMMAND_RULES.get(cmd)
     if rule is None:
         return False, f"unknown command '{cmd}'"

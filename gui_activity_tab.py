@@ -26,7 +26,7 @@ from utility.error_catalog import entry as catalog_entry
 KEEP = 5000
 SHOW_ROWS = 500
 LEVEL_RANK = {"info": 0, "warning": 1, "error": 2}
-JOG_COMMANDS = ("jog_set", "jog_stop")
+JOG_COMMANDS = ("jog(", "jog_set", "jog_stop")   # "jog(...)": the executor's name for it since 2026-10-23; jog_set before
 STEP_CODES = ("CMD_QUEUED", "CMD_STARTED")
 
 

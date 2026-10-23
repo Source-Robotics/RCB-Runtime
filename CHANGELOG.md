@@ -17,6 +17,38 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 - `VERSIONING.md`: which version to change for which kind of change, and how a release is made, including the
   documentation.
+- `docstrings_guide.md`: how every docstring is written. The documentation's Python API reference is built from the
+  `robotclient` docstrings.
+- Full docstrings for the motion commands (`move_joints`, `move_pose`, `move_linear`, the arc, circle and spline
+  moves and their relative forms, `delay`): every argument with its unit, what the call returns and raises, and an
+  example.
+
+### Changed
+
+- Every command has one documented name. Its old names keep working, in Python (the same function) and on the wire
+  (the robot maps an old command ID to its command):
+  - The relative moves are `move_linear_rel_world` / `move_linear_rel_tool`, and the same for arcs, circles and
+    splines. `_rel_wrf` / `_rel_trf` are their other names.
+  - The gripper commands start with the verb, as every other command does: `open_gripper`, `close_gripper`,
+    `calibrate_gripper`. `gripper_open`, `gripper_close` and `gripper_calibrate` still work.
+  - `set_profile` and `set_ik_solver` are the names of their pairs; `set_default_profile` and
+    `set_default_ik_solver` still work. `latest_status()` is the new name of `status()`, so that it is not mistaken
+    for `get_status()`, which asks the robot.
+  - A command's wire ID is its method's name. Fourteen settings were sent under another ID, for example
+    `gravity_comp` for `set_gravity_comp` and `jog_set` for `jog`. The robot accepts both IDs. A client from this
+    release reads the robot's version when it connects and sends an older robot the IDs it knows, so a program runs
+    on either; only a command that did not exist on the older robot is refused there, as before.
+
+### Fixed
+
+- `move_joints(..., dry_run=True)` and `delay(..., dry_run=True)` planned the move and sent it to the robot, so a
+  "dry" joint move moved the arm. They now plan and check it and send nothing, as every other move already did.
+  Two more ways a dry run reached the robot are closed: a dry-run move with a `zone`, `tolerance` or
+  `ruckig_corner` blend was planned and sent as part of the blended chain around it (any move type), and a move
+  blended toward a dry-run successor was sent carrying a corner speed into a move that never came. A dry run now
+  never joins a chain, and the move before it ends at rest.
+- The motion docstrings listed `completion_policy` as a per-move setting, which the robot refuses: it is a session
+  setting, changed with `set_completion_policy()`. They now name all 13 per-move settings the robot accepts.
 
 ## [0.9.0] - 2026-10-22
 

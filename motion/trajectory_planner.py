@@ -9,7 +9,7 @@ Current scope: joint moves and delays can send hardware trajectories; move_pose 
 endpoint-IK joint trajectories; move_linear validates a sampled IK path first, then can
 send a conservative low-speed Cartesian hardware trajectory.
 
-Gripper commands (gripper_open/gripper_close/move_gripper) are not trajectory batches —
+Gripper commands (open_gripper / close_gripper / move_gripper) are not trajectory batches —
 gripper motion is driven by RTI's own firmware-mode CAN command (_gripper_fw_state,
 RTI-process-local), so there's no batch/waypoint pipeline to hook a completion signal
 into. Instead, the checkpoint tracks REAL physical completion via
@@ -80,6 +80,7 @@ import zmq
 from spatialmath import SE3
 
 from communication.exec_channels import BATCH_FLAG_BLEND_CONTINUES, pack_batch, pack_fence
+from communication.protocol import canonical_command
 from config.networking import ZMQ_EXEC_TRAJECTORY_SOCKET, ZMQ_EXEC_STATUS_SOCKET, ZMQ_CMD_SOCKET
 from motion.exec_commands import (
     DEFAULT_PROFILE, MotionOptions, QueuedCommand, normalize_profile_name, normalize_ik_solver_name,
@@ -718,11 +719,11 @@ class TrajectoryPlanner(Thread):
     # Zone blending — TODO/blending_design.md §5
     # ------------------------------------------------------------------ #
 
-    _CARTESIAN_LINEAR_TYPES = ("move_linear", "move_linear_rel_wrf", "move_linear_rel_trf")
+    _CARTESIAN_LINEAR_TYPES = ("move_linear", "move_linear_rel_world", "move_linear_rel_tool")
 
     def _chain_family(self, cmd):
         """'joint' / 'cartesian' / None (not chainable) — a chain only ever
-        holds one family; move_linear/_rel_wrf/_rel_trf are interchangeable
+        holds one family; move_linear/_rel_world/_rel_tool are interchangeable
         with each other within one chain, but never with move_joints."""
         ctype = self._cmd_name(cmd)
         if ctype == "move_joints":
@@ -737,6 +738,12 @@ class TrajectoryPlanner(Thread):
         if self._chain_family(cmd) is None:
             return False
         options = self._cmd_options(cmd)
+        if bool(options.dry_run):
+            # A dry run is never part of a chain: the chain is planned and SENT as one trajectory, and nothing in
+            # that path looks at dry_run again (2026-10-23 review: a zone-blended dry-run move would have moved the
+            # arm). It goes the single-command way, where _plan_and_send's dry-run gate holds; the real commands
+            # around it end at rest, as around any non-chainable command.
+            return False
         return (options.blend_mode in ("zone", "tolerance", "ruckig_corner")
                 and float(options.blend or 0.0) > 0.0)
 
@@ -2069,7 +2076,7 @@ class TrajectoryPlanner(Thread):
 
         Each command resolves its own target pose against the *previous*
         command's resolved pose in the chain (not always the chain's start),
-        so move_linear_rel_wrf/_rel_trf chain correctly — a relative move's
+        so move_linear_rel_world/_rel_tool chain correctly — a relative move's
         delta is relative to where the command before it in the chain ends up,
         exactly as if each had been sent and completed individually.
 
@@ -2264,7 +2271,9 @@ class TrajectoryPlanner(Thread):
         return cmd.seq if isinstance(cmd, QueuedCommand) else int(cmd.get("seq", 0))
 
     def _cmd_name(self, cmd):
-        return cmd.cmd if isinstance(cmd, QueuedCommand) else cmd.get("cmd")
+        # An old name of a command is that command (2026-10-23): the executor already maps them, this covers every
+        # other way in (tests, tools, the offline planner fed directly).
+        return canonical_command(cmd.cmd if isinstance(cmd, QueuedCommand) else cmd.get("cmd"))
 
     def _cmd_args(self, cmd):
         return list(cmd.args) if isinstance(cmd, QueuedCommand) else (cmd.get("args", []) or [])
@@ -2453,7 +2462,10 @@ class TrajectoryPlanner(Thread):
         v_corner = 0.0
         if time_parameterizer.supports_boundary_velocity and blend_pct > 0.0:
             nxt = self._peek_next_command()
-            if nxt is not None and self._cmd_name(nxt) == "move_joints":
+            # A dry-run successor is never sent, so there is nothing to carry a corner speed into: this move must
+            # end at rest (2026-10-23 review: it was sent with BLEND_CONTINUES and a nonzero exit speed, RTI then
+            # stopped it dead at the corner, and the move after the dry run started from that speed).
+            if nxt is not None and self._cmd_name(nxt) == "move_joints" and not bool(self._cmd_options(nxt).dry_run):
                 nxt_args = self._cmd_args(nxt)
                 nxt_profile = normalize_profile_name(self._cmd_options(nxt).profile or DEFAULT_PROFILE)
                 if nxt_profile == profile and len(nxt_args) >= self.joint_num:
@@ -2641,12 +2653,12 @@ class TrajectoryPlanner(Thread):
         delta_or_target = self._pose_from_args(args)
         if ctype == "move_linear":
             return delta_or_target, "absolute"
-        if ctype == "move_linear_rel_wrf":
+        if ctype == "move_linear_rel_world":
             target = np.asarray(start_pose.A, dtype=np.float64).copy()
             target[:3, :3] = delta_or_target.A[:3, :3] @ start_pose.A[:3, :3]
             target[:3, 3] = start_pose.t + delta_or_target.t
             return SE3(target, check=False), "wrf"
-        if ctype == "move_linear_rel_trf":
+        if ctype == "move_linear_rel_tool":
             return start_pose * delta_or_target, "trf"
         raise ValueError(f"unknown Cartesian linear command '{ctype}'")
 
@@ -3202,8 +3214,10 @@ class TrajectoryPlanner(Thread):
         """Return the base curve command and its argument frame."""
         if "_rel_" not in ctype:
             return ctype, "absolute"
-        base, frame = ctype.rsplit("_rel_", 1)
-        if frame not in ("wrf", "trf"):
+        base, suffix = ctype.rsplit("_rel_", 1)
+        # The commands end in _rel_world / _rel_tool (2026-10-23); "wrf" / "trf" stay the planner's own frame tokens.
+        frame = {"world": "wrf", "tool": "trf"}.get(suffix)
+        if frame is None:
             raise PlannerError("BAD_ARGUMENTS", f"unknown curve frame in '{ctype}'")
         return base, frame
 
@@ -3415,7 +3429,7 @@ class TrajectoryPlanner(Thread):
         args = self._cmd_args(cmd)
         options = self._cmd_options(cmd)
 
-        if ctype in ("gripper_open", "gripper_close", "move_gripper"):
+        if ctype in ("open_gripper", "close_gripper", "move_gripper"):
             self._last_exit_speed = None   # gripper breaks any in-flight blend chain
             self._send_gripper(ctype, args, cid)
             return
@@ -3440,7 +3454,7 @@ class TrajectoryPlanner(Thread):
             vel = np.zeros((n, self.joint_num))
             sample = self._sampler.sample(TimedJointPath(pos, vel, n))
 
-        elif ctype in ("move_linear", "move_linear_rel_wrf", "move_linear_rel_trf"):
+        elif ctype in ("move_linear", "move_linear_rel_world", "move_linear_rel_tool"):
             self._last_exit_speed = None
             sample = self._plan_move_linear(ctype, start, args, cid, options)
             if sample is None:
@@ -3448,9 +3462,9 @@ class TrajectoryPlanner(Thread):
                 return
 
         elif ctype in (
-                "move_arc", "move_arc_rel_wrf", "move_arc_rel_trf",
-                "move_circle", "move_circle_rel_wrf", "move_circle_rel_trf",
-                "move_spline", "move_spline_rel_wrf", "move_spline_rel_trf"):
+                "move_arc", "move_arc_rel_world", "move_arc_rel_tool",
+                "move_circle", "move_circle_rel_world", "move_circle_rel_tool",
+                "move_spline", "move_spline_rel_world", "move_spline_rel_tool"):
             self._last_exit_speed = None
             sample = self._plan_move_curve(ctype, start, args, cid, options)
             if sample is None:
@@ -3466,6 +3480,16 @@ class TrajectoryPlanner(Thread):
         self._check_joint_limits(sample.positions, start, f"{ctype} id={cid}")
         self._check_zones(sample.positions, start, f"{ctype} id={cid}")
         self._check_self_collision(sample.positions, f"{ctype} id={cid}")
+        if bool(options.dry_run):
+            # Only move_joints and delay get here with a dry run: every other move returns after its own. Planned and
+            # checked, nothing sent, the planner's endpoint untouched (2026-10-23: move_joints ignored dry_run and
+            # MOVED the arm; found by documenting every per-move setting). The arm is at rest: the move before a dry
+            # run is planned to end at rest (the lookahead above skips a dry-run successor), so the next real move
+            # starts from rest too.
+            logger.info(f"{ctype} dry-run id={cid}; no trajectory sent")
+            self._last_exit_speed = None
+            self._report_complete(cid)
+            return
         flags = BATCH_FLAG_BLEND_CONTINUES if v_corner > 1e-9 else 0
         sent = self._send_chunks(sample.positions, sample.velocities, cid, sample.torque_ff, flags=flags)
         if sent:
@@ -3559,9 +3583,9 @@ class TrajectoryPlanner(Thread):
         docstring: completion is tracked asynchronously via gripper_object_detection
         by _poll_gripper_completions(), the same way move_joints's real completion is
         signaled by ExecHandler rather than by the planner blocking."""
-        if ctype == "gripper_open":
+        if ctype == "open_gripper":
             position = self.GRIPPER_OPEN_POS
-        elif ctype == "gripper_close":
+        elif ctype == "close_gripper":
             position = self.GRIPPER_CLOSE_POS
         else:  # move_gripper
             if not args:
