@@ -2348,7 +2348,7 @@ class TrajectoryPlanner(Thread):
         return float(np.clip(scale, 1e-3, 1.0))
 
     def _accel_scale_for(self, options):
-        """`accel` as a fraction of the acceleration limit — the `a` of MoveJoint(v, a, t).
+        """`accel` as a fraction of the acceleration limit — the `a` of a (speed, accel, duration) joint move.
 
         Was ACCEPTED AND SILENTLY IGNORED: `options.accel` was never read anywhere in this
         file, so move_joints(..., accel=25) planned exactly the same trajectory as without it.
@@ -2364,7 +2364,7 @@ class TrajectoryPlanner(Thread):
         return float(np.clip(scale, 1e-3, 1.0))
 
     def _scale_for_duration(self, options, natural_duration_s, speed_scale):
-        """Re-scale so the move takes exactly `duration` seconds — the `t` of MoveJoint.
+        """Re-scale so the move takes exactly `duration` seconds — the `t` of a (speed, accel, duration) joint move.
 
         Was also ACCEPTED AND SILENTLY IGNORED (options.duration is read exactly once in this
         file, and that is for the `delay` command, not for motion).
@@ -2374,7 +2374,7 @@ class TrajectoryPlanner(Thread):
         trapezoid, quintic, s_curve, TOPPRA and Ruckig alike. So: plan once, see how long the
         move naturally takes at `speed_scale`, and rescale to hit `t`.
 
-        `t` OVERRIDES `speed`, matching the MoveJoint contract. But it cannot override PHYSICS:
+        `t` OVERRIDES `speed`, as a timed joint move does. But it cannot override PHYSICS:
         if `t` is shorter than the fastest legal move, we reject rather than silently violate a
         joint limit. Saying "I cannot do that in 0.2s" is the only honest answer.
         """

@@ -127,7 +127,7 @@ class TrapezoidTimeParameterizer(ProfileTimeParameterizer):
         peak acceleration = peak_vel / r
 
         r = 1/3   -> 1/3 accel, 1/3 cruise, 1/3 decel.  peak vel 1.5x, peak accel 4.5.
-                     THE "1/3 RULE" — Peter Corke's lspb() default (V = 1.5*(qf-q0)/T).
+                     THE "1/3 RULE" — the textbook LSPB default (V = 1.5*(qf-q0)/T).
         r = 0.25  -> 1/4 accel, 1/2 cruise, 1/4 decel.  peak vel 1.333x, peak accel 5.333.
                      Our default: a longer cruise with sharper ramps.
         r -> 0.5  -> triangular, no cruise at all.

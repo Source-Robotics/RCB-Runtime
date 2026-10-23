@@ -229,7 +229,7 @@ class MotionOptions:
       ramp_fraction: TRAPEZOID ONLY. The LSPB blend — the fraction of the move spent
              ACCELERATING (and again decelerating). 1/3 gives the classic
              1/3-accel, 1/3-cruise, 1/3-decel trapezoid (peak vel 1.5x average, the
-             "1/3 rule" and Peter Corke's lspb() default). Our default is 0.25
+             textbook "1/3 rule", the usual LSPB default). Our default is 0.25
              (1/4, 1/2, 1/4 — peak vel 1.333x, sharper ramps). 0.5 = triangular.
              Raises on any other profile: a quintic has no cruise phase to size.
       blend_continuity: the CORNER CURVE. "c1" (default, what has always shipped) is a
@@ -242,8 +242,8 @@ class MotionOptions:
              The trade is real and measured: the C2 curve is tighter at the apex (peak
              curvature 4.34 vs 1.41), so TOPPRA brakes harder there. C2 buys smoothness
              and pays corner speed, which is why you choose rather than being given one.
-      accel: fraction of the ACCELERATION limit, 0..1 or 0..100 (the `a` of
-             MoveJoint(v, a, t)). Lower = gentler ramps = a longer move.
+      accel: fraction of the ACCELERATION limit, 0..1 or 0..100 (the `a` of a
+             (speed, accel, duration) joint move). Lower = gentler ramps = a longer move.
       duration: force the move to take exactly this many seconds (the `t`). OVERRIDES
              `speed`. Cannot override physics: too short => DURATION_INFEASIBLE.
       samples: explicit sample count override, reserved for dry-run/path tools
