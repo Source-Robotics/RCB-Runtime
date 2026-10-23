@@ -428,6 +428,10 @@ protocol, firmware and hardware versions work with each release is in
 Its GitHub release notes are its changelog section, printed by
 `tools/release_notes.py`.
 
+**Before you change anything, read [VERSIONING.md](VERSIONING.md).** It says which
+version to change for which kind of change, and how a release is made, including
+the documentation.
+
 ## Tools
 
 Hardware debug utilities live in `tools/`. For example, `tools/debug_read_kt.py`

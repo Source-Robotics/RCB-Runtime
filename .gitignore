@@ -24,6 +24,7 @@ config/supervisor_settings.json
 # client / protocol / firmware / hardware versions work with which runtime.
 !/CHANGELOG.md
 !/COMPATIBILITY.md
+!/VERSIONING.md
 
 # Local/internal docs, planning, assistant instructions, and manual test scripts.
 #

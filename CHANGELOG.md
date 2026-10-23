@@ -13,7 +13,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `VERSIONING.md`: which version to change for which kind of change, and how a release is made, including the
+  documentation.
 
 ## [0.9.0] - 2026-10-22
 
