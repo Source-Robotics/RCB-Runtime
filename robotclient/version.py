@@ -22,7 +22,7 @@ import warnings
 
 from .exceptions import VersionMismatch, VersionWarning
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 PROTOCOL_VERSION = 1        # the command protocol (newline JSON over TCP to the executor)
 RTI_PROTOCOL_VERSION = 1    # the RTI command packet

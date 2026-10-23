@@ -69,8 +69,10 @@ Go through this list before you commit:
 6. **Commit and tag:** commit the release, then make an annotated tag whose message is the release notes:
    ```bash
    tools/release_notes.py X.Y.Z > /tmp/notes.md
-   git tag -a vX.Y.Z -F /tmp/notes.md
+   git tag -a vX.Y.Z --cleanup=verbatim -F /tmp/notes.md
    ```
+   `--cleanup=verbatim` keeps the notes' `###` headings: without it git strips every line that starts with `#` as a
+   comment.
 7. **Publish:** push the branch and the tag, then create the GitHub release from the tag with the same notes:
    ```bash
    gh release create vX.Y.Z --title "X.Y.Z" --notes-file /tmp/notes.md

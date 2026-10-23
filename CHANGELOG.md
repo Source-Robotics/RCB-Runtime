@@ -13,6 +13,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-23
+
 ### Added
 
 - `VERSIONING.md`: which version to change for which kind of change, and how a release is made, including the
@@ -20,8 +22,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - `docstrings_guide.md`: how every docstring is written. The documentation's Python API reference is built from the
   `robotclient` docstrings.
 - Full docstrings for the motion commands (`move_joints`, `move_pose`, `move_linear`, the arc, circle and spline
-  moves and their relative forms, `delay`): every argument with its unit, what the call returns and raises, and an
-  example.
+  moves and their relative forms, `delay`): every argument with its unit, every per-move setting, what the call
+  returns and raises, every error code it can fail with once the robot accepted it, and an example.
 
 ### Changed
 
