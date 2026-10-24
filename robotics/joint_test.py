@@ -66,8 +66,12 @@ class JointTest:
     (get_encoder_speed), `velocity_limit` / `current_limit` the live per-joint limits (stop() restores them), `ctx` the
     dispatch context (joint_test_joint / _pos / _speed), `rti` the rti shared-memory dict, `dt` the tick (s)."""
 
-    def __init__(self, motors, joints, joint_num, velocity_limit, current_limit, ctx, rti, dt, log=None, done=None):
+    def __init__(self, motors, joints, joint_num, velocity_limit, current_limit, ctx, rti, dt, log=None, done=None,
+                 q_meas=None, soft_lo=None, soft_hi=None):
         self.motors, self.joints, self.joint_num = motors, joints, int(joint_num)
+        # On a homed arm the test's travel must stay inside the soft limits (2026-10-24, user): the measured joint
+        # angles (rad) and the robot XML's soft limits (rad). Unhomed, the angles mean nothing: no check then.
+        self.q_meas, self.soft_lo, self.soft_hi = q_meas, soft_lo, soft_hi
         self.velocity_limit, self.current_limit = velocity_limit, current_limit
         self.ctx, self.rti, self.dt, self.log, self.done = ctx, rti, float(dt), log, done
         self.joint = None
@@ -89,7 +93,7 @@ class JointTest:
             self.motors[j].Send_Limits(Velocity_limit=int(self.velocity_limit[j]), Current_limit=int(current))
 
     def start(self, joint, amplitude_deg, speed_dps, current_ma, idle, enabled, mode_pending, booting,
-              other_active=False):
+              other_active=False, homed=False):
         """Start a test move of `joint` (0-based). Returns None, or why it was refused (nothing is sent then)."""
         j = int(joint)
         if not 0 <= j < self.joint_num:
@@ -108,6 +112,13 @@ class JointTest:
         if not (0.0 < abs(a) <= MAX_AMPLITUDE_DEG and 0.0 < v <= MAX_SPEED_DPS and 0.0 < c <= self.current_limit[j]):
             return (f"amplitude 0-{MAX_AMPLITUDE_DEG:g} deg, speed 0-{MAX_SPEED_DPS:g} deg/s, current up to the "
                     f"joint's limit ({int(self.current_limit[j])} mA)")
+        if homed and self.q_meas is not None and self.soft_lo is not None and self.soft_hi is not None:
+            q = float(self.q_meas[j])
+            end = q + math.radians(a)
+            lo, hi = float(self.soft_lo[j]), float(self.soft_hi[j])
+            if not lo <= end <= hi:
+                return (f"J{j + 1} would move to {math.degrees(end):.1f} deg, past its soft limits "
+                        f"({math.degrees(lo):.1f} to {math.degrees(hi):.1f} deg) — move it away first")
         pos = self.motors[j].position
         if pos is None:
             return f"no position read from J{j + 1} yet — try again"

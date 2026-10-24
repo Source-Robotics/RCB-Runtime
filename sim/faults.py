@@ -21,7 +21,8 @@ from utility import sim_mode
 
 ACTIVITY = os.path.join("temp_data", "sim", "logs", "activity_rti.log")
 ORDER = ("node_lost", "drive_fault", "drive_flags", "reply_loss", "drive_reboot", "hand_push", "push_through",
-         "runaway", "tracking_lag", "hold_buzz", "homing_false_stall", "executor_lost", "estop", "rti_lost")
+         "runaway", "tracking_lag", "hold_buzz", "homing_false_stall", "executor_lost", "estop",
+         "motors_off_with_error", "gripper_hold", "rti_lost")
 ARMS = os.path.join("temp_data", "sim", "data", "homing_arms.json")    # the simulated arm table (project_paths)
 # gpio_states (uint8[16], data/shared_data.py) read as a FILE, with the name prefix shared_data applies — never
 # attached (importing data.shared_data attaches every segment). In simulation the inputs live here.
@@ -595,6 +596,108 @@ def rti_lost(ctx, notes):
     return ok and still < 1.0 and abs(speed) > 1000 and not math.isnan(speed)
 
 
+def motors_off_with_error(ctx, notes):
+    """Motors off with an error latched (2026-10-23, user: "we should be able to off the motors anytime!"): J2's drive
+    faults, safety_stop() switches the motors off and they STAY off — every other drive in current mode (RTI sends no
+    position and no speed) — for a second; before, the error pass took the mode back to ACTIVE_ERROR after one tick.
+    A second error latching while they are off keeps them off; release_safety_stop() then goes to the error state (the
+    errors are still latched); the faults gone + Clear Errors, IDLE."""
+    r = ctx.robot()
+    try:
+        ctx.ready(r)
+        mark = ctx.activity_mark()
+        ctx.sim(cmd="fault", node=1, kind="driver")
+        got = _wait(lambda: ctx.has(mark, "DRIVER", 2), 2.0)
+        faulted = _wait(lambda: r.status().get("mode") == "ACTIVE_ERROR", 2.0)
+        r.safety_stop()
+        entered = _wait(lambda: r.status().get("mode") == "SAFETY_STOP", 2.0)
+        modes = []
+        for _ in range(20):                                   # one second, sampled every 50 ms
+            time.sleep(0.05)
+            modes.append(r.status().get("mode"))
+        held = bool(entered) and all(m == "SAFETY_STOP" for m in modes)
+        nodes = ctx.nodes()
+        others = [n for n in range(6) if n != 1 and n in nodes]
+        limp = all(nodes[n]["mode"] == 3 for n in others)     # 3 = CURRENT: a current-only pack (sim/drive_sim.py)
+        ctx.sim(cmd="fault", node=3, kind="driver")           # a second error while the motors are off
+        got2 = _wait(lambda: ctx.has(mark, "DRIVER", 4), 2.0)
+        time.sleep(0.5)
+        kept = r.status().get("mode") == "SAFETY_STOP"
+        r.release_safety_stop()
+        back = _wait(lambda: r.status().get("mode") == "ACTIVE_ERROR", 2.0)
+        for node in (1, 3):
+            ctx.sim(cmd="fault", node=node, kind="clear")
+        time.sleep(0.2)
+        r.clear_errors(wait=True)
+        rec = _wait(lambda: r.status().get("err") == 0 and r.status().get("mode") == "IDLE", 3.0)
+        notes.append(f"J2:DRIVER {'latched' if got else 'NOT latched'} (mode {'ACTIVE_ERROR' if faulted else 'not'}); "
+                     f"motors off {'entered' if entered else 'NOT entered'} and "
+                     f"{'held 1 s' if held else 'NOT held: ' + ','.join(str(m) for m in modes)}; drives limp (current "
+                     f"mode): {limp} ({[nodes[n]['mode'] for n in others]}); J4:DRIVER while off "
+                     f"{'latched' if got2 else 'NOT latched'}, motors {'still off' if kept else 'ON AGAIN'}; released "
+                     f"with the errors latched -> ACTIVE_ERROR: {bool(back)}; faults gone + Clear Errors -> IDLE: "
+                     f"{bool(rec)}")
+        return bool(got and faulted and held and limp and got2 and kept and back and rec)
+    finally:
+        for node in (1, 3):
+            try:
+                ctx.sim(cmd="fault", node=node, kind="clear")
+            except (OSError, ValueError, RuntimeError):
+                pass
+        r.disconnect()
+
+
+def gripper_hold(ctx, notes):
+    """stop(), disable() and an error hold the gripper's jaws where they are (2026-10-24, user: a stop "should freeze it
+    also"): the jaws close from open (the simulated ones take ~0.85 s for the stroke), 0.3 s later the stop comes; the
+    jaws' target becomes where they are, and they stay there instead of closing on."""
+    r = ctx.robot()
+    g = 6                                                # the gripper's node
+    ok = True
+    try:
+        ctx.ready(r, home=True)
+
+        def state():
+            n = ctx.nodes()[g]
+            return int(n["g_target"]), int(n["g_position"])
+        for how in ("stop", "disable", "error"):
+            ctx.ready(r)
+            r.set_gripper(1, 255, 300, 1)                # open, and wait until open
+            if not _wait(lambda: abs(state()[1] - 1) <= 3, 3.0):
+                n = ctx.nodes()[g]                       # the jaws never moved: nothing below would mean anything
+                notes.append(f"{how}: the jaws did not open — at {n['g_position']}, target {n['g_target']}, activated "
+                             f"{n['g_activated']}, action {n['g_action']}, calibrated {n['g_calibrated']}, error "
+                             f"{n['error']} (estop {n['estop_error']}, watchdog {n['watchdog_error']}, fault "
+                             f"{n['fault']}); robot {r.status().get('state')} / {r.status().get('mode')}")
+                return False
+            r.set_gripper(254, 255, 300, 1)              # close ...
+            time.sleep(0.3)                              # ... and stop it on the way
+            moving_at = state()[1]                       # they must really be closing (else this passes for nothing)
+            if how == "stop":
+                r.stop(wait=True)
+            elif how == "disable":
+                r.disable(wait=True)
+            else:
+                ctx.sim(cmd="fault", node=1, kind="driver")
+                _wait(lambda: r.status().get("err") == 1, 2.0)
+            time.sleep(0.6)                              # long enough for the rest of the stroke
+            target, pos = state()
+            held = moving_at > 20 and pos < 230 and abs(target - pos) <= 4
+            notes.append(f"{how}: closing, at {moving_at} when stopped; at {pos} with their target {target} 0.6 s later "
+                         f"({'held' if held else 'NOT held' if moving_at > 20 else 'not closing when stopped'})")
+            ok = ok and held
+            if how == "error":
+                ctx.sim(cmd="fault", node=1, kind="clear")
+                time.sleep(0.2)
+        return ok
+    finally:
+        try:
+            ctx.sim(cmd="fault", node=1, kind="clear")
+        except (OSError, ValueError, RuntimeError):
+            pass
+        r.disconnect()
+
+
 SCENARIOS = {f.__name__: f for f in (node_lost, drive_fault, drive_flags, reply_loss, drive_reboot, hand_push,
                                      push_through, runaway, tracking_lag, hold_buzz, homing_false_stall, executor_lost,
-                                     estop, rti_lost)}
+                                     estop, rti_lost, motors_off_with_error, gripper_hold)}

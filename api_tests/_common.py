@@ -143,7 +143,10 @@ def prepare_exec(robot, args):
 
     robot.clear_errors(wait=True)
     robot.enable(wait=True)
-    robot.home(wait=True)
+    # In EXEC the arm is homed (EXEC needs it) and home() is refused there since 2026-10-23 (REJECTED; it used to be
+    # refused silently by the robot after a 3 s wait, so a test started in EXEC never re-homed): keep that.
+    if robot.latest_status().get("mode") != "EXEC":
+        robot.home(wait=True)
     robot.enter_exec_mode(wait=True)
     robot.set_joint_speed(args.speed)
     _set_profile_for_test(robot, args)

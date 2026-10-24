@@ -107,16 +107,48 @@ def _num(s):
 
 
 class RobotState(dict):
-    """Parsed state packet. Dict of recipe tag → scalar or list.
+    """One state packet from the robot, as telemetry tag to value.
 
-    `elapsed` is seconds since control started, filled in by RTIClient.control() so
-    callbacks can time themselves without closing over a start timestamp. It is the
-    ROBOT's time (the packet's `tick` x the robot's tick length, 2026-10-11) when both are
-    known: a target computed from it lands on the robot's tick grid exactly, however late
-    the PC's callback runs — the PC's own clock put each target up to ±0.4 ms off that grid
-    (measured), which a pass-through plays back as speed noise. `robot_time` says which
-    (False: the PC's clock — a recipe without `tick`, or an executor too old to publish
-    its tick length).
+    Each key is a tag of the active telemetry recipe (`set_recipe()`). A tag
+    with one value maps to a number, a per-joint or pose tag to a list, `mode`
+    to its text; values are rounded to the recipe's precision. The standard
+    recipe, the default, carries:
+
+    - `j_p`: the joint positions, in rad.
+    - `j_s`: the joint speeds, unfiltered, in rad/s.
+    - `j_err`: each drive's error byte; 0 when the drive reports no fault.
+    - `tick`: the robot's loop tick counter.
+    - `TCP_p`: the tool pose [x, y, z, rx, ry, rz]: metres, and radians with
+      R = Rx(rx) Ry(ry) Rz(rz).
+    - `rti_seq`: the sequence number of the last command the robot accepted;
+      0 before the first.
+    - `rti_state`: 0 not paired, 1 paired without a claim, 2 control active,
+      3 stopping after a release or a stop, 4 stopping after an error.
+    - `mode`: the robot's mode, such as `"RTI"`.
+    - `period_ms`: the measured length of the tick that sent the packet, in
+      ms.
+
+    The `diagnostics` recipe adds `rti_ok`, the share of the last 100 ticks
+    that brought a command (0 to 1), and `rti_miss`, the ticks in a row
+    without one. `latest_status()["recipes"]` lists the recipes on the robot.
+
+    Attributes:
+        elapsed: Seconds since `control()` began: robot time (its tick count
+            times its tick length) when `robot_time` is true, else this PC's
+            clock. 0 outside `control()`.
+        robot_time: Whether `elapsed` is robot time: the recipe carries `tick`
+            and the robot reported its tick length.
+
+    Examples:
+        >>> from robotclient import RTIClient
+        >>> rti = RTIClient(robot)
+        >>> rti.connect()
+        >>> robot.wait_mode("RTI")
+        >>> state = rti.read_once()
+        >>> state["mode"], state["rti_state"]
+        ('RTI', 1.0)
+        >>> robot.rti_disconnect(wait=True)
+        >>> rti.close()
     """
 
     elapsed = 0.0
@@ -132,17 +164,70 @@ class _Command:
 
 
 class JointPositionCommand(_Command):
-    """Target joint positions (rad); feedforward is joint speed (rad/s)."""
+    """Joint position targets for one real-time command.
+
+    Return it from a `control()` callback. It works in both real-time modes.
+
+    Args:
+        payload: The six joint targets in radians. Fewer values are padded with
+            0 rad, which commands those joints to zero; more are cut.
+        feedforward: Each joint's speed at the target, in rad/s; `None` sends
+            zeros.
+
+    Attributes:
+        payload: The targets, as given.
+        feedforward: The speeds, as given, or six zeros.
+
+    Examples:
+        >>> from robotclient import JointPositionCommand
+        >>> cmd = JointPositionCommand([1.571, -1.833, 2.88, 0.0, -0.524, 3.142])
+    """
     cmd_type = CMD_JOINT_POSITION
 
 
 class JointVelocityCommand(_Command):
-    """Target joint velocities (rad/s); feedforward is joint torque (Nm)."""
+    """Joint velocities for one real-time command, RTI mode only.
+
+    Return it from a `control()` callback. SOFT_RTI refuses it. The robot
+    applies it every tick until the next command, for at most the command
+    timeout.
+
+    Args:
+        payload: The six joint velocities in rad/s. Fewer values are padded
+            with 0 rad/s; more are cut.
+        feedforward: Torque in Nm added to each joint's command; `None` sends
+            zeros.
+
+    Attributes:
+        payload: The velocities, as given.
+        feedforward: The torques, as given, or six zeros.
+
+    Examples:
+        >>> from robotclient import JointVelocityCommand
+        >>> cmd = JointVelocityCommand([0, 0, 0, 0, 0, 0.02])
+    """
     cmd_type = CMD_JOINT_VELOCITY
 
 
 class JointTorqueCommand(_Command):
-    """Target joint torques (Nm). Do NOT include gravity comp — the robot adds it."""
+    """Joint torques for one real-time command, RTI mode only.
+
+    Return it from a `control()` callback. SOFT_RTI refuses it. Leave gravity
+    out: the robot adds it. It applies the torque every tick until the next
+    command, for at most the command timeout.
+
+    Args:
+        torques: The six joint torques in Nm. Fewer values are padded with
+            0 Nm; more are cut.
+
+    Attributes:
+        payload: The torques, as given.
+        feedforward: Six zeros.
+
+    Examples:
+        >>> from robotclient import JointTorqueCommand
+        >>> cmd = JointTorqueCommand([0, 0, 0, 0, 0, 0])
+    """
     cmd_type = CMD_JOINT_TORQUE
 
     def __init__(self, torques):
@@ -162,53 +247,147 @@ _RTI_STATE_NAME = {0: "unpaired", 1: "connected (control NOT claimed)",
 
 
 class ControlLost(RuntimeError):
-    """The robot revoked real-time control while control() was running.
+    """Real-time control that the robot ended while this PC streamed.
 
-    Raised rather than returned because silently continuing is the dangerous outcome:
-    the robot ignores commands once the claim is dropped, so a loop that keeps running
-    is an open loop that believes it is closed. The message carries the link metrics
-    (success rate, consecutive losses) so the cause is visible immediately.
+    `control()` raises it when a state packet shows the claim revoked
+    (`rti_state` neither 2 nor a clean release), and when the state stream
+    stops after it had started: a latched error takes the robot out of its
+    real-time mode, which ends the stream. Any read or send raises it when the
+    robot closes the TCP stream. The message names the robot's errors and the
+    link figures this client has; `robot.errors()` gives the robot's errors in
+    full.
+
+    Examples:
+        >>> from robotclient import RTIClient, ControlLost, MotionFinished
+        >>> rti = RTIClient(robot)
+        >>> rti.connect()
+        >>> robot.wait_mode("RTI")
+        >>> rti.claim()
+        >>> try:
+        ...     rti.control(lambda state: MotionFinished())
+        ... except ControlLost:
+        ...     print(robot.errors())
+        ...
+        >>> robot.rti_disconnect(wait=True)
+        >>> rti.close()
     """
 
 
 class MotionFinished:
-    """Return this from a control callback to end the loop cleanly."""
+    """Signal from a `control()` callback that the motion is done.
+
+    `control()` then sends the stop command and returns. The arm brakes to
+    rest within its limits and holds, and after 0.5 s the session is paired
+    and idle again, in RTI and SOFT_RTI mode alike.
+
+    Args:
+        cmd: Not used: `control()` sends the stop only.
+
+    Attributes:
+        cmd: As given.
+
+    Examples:
+        >>> from robotclient import MotionFinished
+        >>> def callback(state):
+        ...     return MotionFinished()
+        ...
+    """
 
     def __init__(self, cmd=None):
         self.cmd = cmd
 
 
 class RTIClient:
-    """Real-time streaming control, with TCP for the handshake.
+    """Real-time streaming control of one robot, beside its `RobotClient`.
 
-    Args:
-        robot:       a connected RobotClient (used for the TCP control channel).
-        clock:       'robot' (blocking, robot-paced — the default) or 'pc'.
-        listen_port: UDP port to receive state on. Must match the robot's
-                     RTI_PORT_SENDER. Unused when transport='tcp'.
-        transport:   'udp' (default) or 'tcp'. UDP is the right transport for real-time
-                     control and stays the default; TCP exists because industrial streaming
-                     interfaces ship both (real-time over UDP, soft real-time over TCP) and because a PC already reaching
-                     the robot through a firewall should not need a second hole opened.
+    It carries the real-time link: commands from your PC to the robot's UDP
+    port 30001 and state packets from the robot to your PC's UDP port 30002,
+    or both over one TCP stream to the robot's port 30003. The `RobotClient`
+    it is given carries the handshake: pairing, claiming, releasing. Joint
+    values are in radians here, unlike the rest of the client.
 
-                     What TCP costs is HEAD-OF-LINE BLOCKING: a lost packet stalls
-                     everything behind it until retransmission, so UDP's "one dropped
-                     setpoint" becomes TCP's "fifty frozen ticks". What it buys is a real
-                     disconnect signal — a closed socket is unambiguous, where a silent UDP
-                     peer is indistinguishable from a quiet one until the watchdog fires.
+    In RTI mode (hard real time, `connect()` without a rate) your PC sends one
+    target every 4 ms tick over UDP, each with its send time, and closes the
+    loop itself: the robot replays your position targets one tick behind and
+    refuses a stream the arm cannot follow. In SOFT_RTI (`connect()` with
+    `rate_hz`) you send joint position targets at your own rate, over UDP or
+    TCP, and the robot fills in the ticks between them.
 
-                     With 'tcp' ONE connection carries both directions and `listen_port` is
-                     not used: the robot listens on RTI_PORT_STREAM_TCP and we dial in.
-        timestamps:  True (default): every UDP command carries its send time (time.perf_counter(), or the
-                     `timestamp` you pass to send_joint_position — e.g. when your device sampled the
-                     target), so the robot follows your real timing instead of the arrival times. An
-                     uneven sender (VR, Wi-Fi) left ~3x more chatter without it (simulated, 2026-10-11).
-                     No clock synchronisation is needed; only differences are used. TCP never sends it.
-                     REQUIRED for hard RTI since 2026-10-12 (the robot refuses a position target without
-                     it); False is for SOFT_RTI only — connect() raises otherwise.
+    When commands stop coming or a stream breaks a limit, the arm brakes to
+    rest within its limits, then the robot latches an error and disables:
+    `RTI_LINK_LOST`, `RTI_NO_SEND_TIME`, or per joint `RTI_POSITION_LIMIT`,
+    `RTI_VELOCITY_LIMIT`, `RTI_ACCELERATION_LIMIT` or `RTI_JERK_LIMIT`. Its
+    state stream then ends, and `control()` raises `ControlLost`.
+
+    Attributes:
+        robot: The `RobotClient` that carries the handshake.
+        clock: `"robot"` or `"pc"`, as given.
+        transport: `"udp"` or `"tcp"`; `connect()` can change it.
+        timestamps: Whether UDP commands carry their send time.
+        seq: The sequence number of the last command sent; the first is 1.
+        robot_ip: The robot's address, set by `connect()`; `None` before.
+        tick_s: The robot's tick length in seconds, read at `connect()`;
+            `None` when the robot does not report it.
+        captured: What `capture()` recorded: (arrival time, packet) pairs.
+        rtt_samples_ms: Every loop delay measured, in milliseconds.
+        lost_seqs: Commands sent that the robot never echoed back.
+        bytes_tx: Bytes of commands sent.
+        bytes_rx: Bytes of state received.
+
+    Examples:
+        >>> import math
+        >>> from robotclient import RTIClient
+        >>> from robotclient import JointPositionCommand, MotionFinished
+        >>> rti = RTIClient(robot)
+        >>> rti.connect()
+        >>> robot.wait_mode("RTI")
+        >>> q0 = rti.read_once()["j_p"]
+        >>> rti.claim()
+        >>> def follow(state):
+        ...     t = state.elapsed
+        ...     if t > 2.0:
+        ...         return MotionFinished()
+        ...     q = list(q0)
+        ...     q[5] += 0.0125 * (1 - math.cos(math.pi * t / 2.0))
+        ...     return JointPositionCommand(q)
+        ...
+        >>> rti.control(follow)
+        >>> robot.rti_disconnect(wait=True)
+        >>> rti.close()
     """
 
     def __init__(self, robot, clock='robot', listen_port=RTI_PORT_SENDER, transport='udp', timestamps=True):
+        """Create the real-time link for a connected `RobotClient`.
+
+        It opens two UDP sockets and, for UDP, binds the state socket to
+        `listen_port` on every interface at once. Nothing is sent until
+        `connect()`. Call `close()` when done.
+
+        Args:
+            robot: A connected `RobotClient`; it carries the handshake.
+            clock: `"robot"`: `control()` runs your callback on each state packet
+                the robot sends. `"pc"`: you send when you like, with
+                `send_joint_position()` and the other send calls; `control()` is not
+                available. The robot behaves the same either way.
+            listen_port: The UDP port state packets arrive on. The robot always
+                sends to 30002, so keep the default. Not used with TCP.
+            transport: `"udp"` or `"tcp"`. TCP carries both directions on one
+                stream that this PC dials, in SOFT_RTI only: a lost packet then
+                stalls everything behind it until it is sent again, while a closed
+                stream is noticed at once.
+            timestamps: Whether every UDP command carries its send time, so that the
+                robot follows your real timing instead of the packets' arrival. RTI
+                mode needs it; `False` is for SOFT_RTI only. TCP never carries it.
+
+        Raises:
+            ValueError: `clock` or `transport` is not one of its values.
+            OSError: The UDP port `listen_port` is not free.
+
+        Examples:
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.close()
+        """
         if clock not in ('robot', 'pc'):
             raise ValueError("clock must be 'robot' or 'pc'")
         if transport not in ('udp', 'tcp'):
@@ -270,28 +449,55 @@ class RTIClient:
 
     def connect(self, pc_ip: str | None = None, rate_hz: float | None = None, transport: str | None = None, *,
                 allow_mismatch: bool = False) -> RTIClient:
-        """Pair with the robot and put it in an RTI mode.
+        """Pair with the robot and switch it to a real-time mode.
 
-        The robot cannot discover our IP before UDP starts, so it rides the handshake.
-        Autodetected from the TCP socket's local address when not given.
+        It checks that the robot speaks this client's real-time packet and
+        telemetry formats, then calls `robot.rti_connect()` with this PC's address,
+        and over TCP dials the robot's stream port. It returns once the robot has
+        answered: unless the `RobotClient` runs in sync mode, the robot switches a
+        few milliseconds later, so wait for the mode (`robot.wait_mode()`) before
+        `claim()`.
 
-        `rate_hz` picks the contract, mirroring the hard / soft real-time split of industrial streaming interfaces:
+        `rate_hz` picks the contract: none for RTI mode, your command rate for
+        SOFT_RTI (see `RobotClient.rti_connect()`).
 
-        - **omitted → RTI** (hard real-time). You close the loop: one setpoint every tick,
-          40 ms watchdog. Over UDP with send times only (2026-10-12): the robot refuses a hard-RTI
-          position target without one (RTI_NO_SEND_TIME), so this raises ValueError up front for
-          `timestamps=False` or `transport='tcp'`.
-        - **given → SOFT_RTI** (soft real-time). You send targets at *your* rate and the
-          robot interpolates. The timeout is sized at three of your command intervals and
-          the generator defaults to `ruckig_advancing`. Send times optional, UDP or TCP.
+        Args:
+            pc_ip: The address the robot sends state to and accepts commands from.
+                `None` uses this PC's address on its connection to the robot.
+            rate_hz: Your command rate in Hz for SOFT_RTI; `None` for RTI mode.
+                Prefer one that divides 250 Hz evenly: 125, 50, 25 or 10 Hz.
+            transport: `"udp"` or `"tcp"`, replacing the one given at creation;
+                `None` keeps it. RTI mode is UDP only.
+            allow_mismatch: Pair even when the robot reports another real-time
+                packet or telemetry format version.
 
-        Prefer a rate that divides evenly into the robot's loop rate — 50, 25 or 10 Hz on a
-        250 Hz robot. A non-integer ratio makes commands land alternately on two tick
-        counts, corrupting every velocity estimate derived from the stream.
+        Returns:
+            This `RTIClient`, so that calls can be chained.
 
-        Before pairing it checks that the robot speaks this client's RTI packet and telemetry format (versioning V3):
-        a different version raises VersionMismatch and pairs nothing (allow_mismatch=True skips the check). A robot
-        that reports no versions was already warned about by RobotClient.connect.
+        Raises:
+            CommandRejected: The robot refused the pairing: it is not enabled or
+                not homed, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, in sync mode,
+                did not report the mode within 10 s.
+            RobotConnectionError: The robot connection was lost.
+            VersionMismatch: The robot reports another real-time packet or
+                telemetry format version, and `allow_mismatch` is false. Nothing is
+                sent.
+            ValueError: Without `rate_hz`, `transport` is `"tcp"` or the client
+                sends no send times; or `transport` or `rate_hz` is not valid.
+                Nothing is sent.
+            TypeError: `rate_hz` is not a number. Nothing is sent.
+            RuntimeError: `robot` is not connected. Nothing is sent.
+            OSError: Over TCP, the robot's stream port did not accept the
+                connection within 5 s.
+
+        Examples:
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.connect(rate_hz=50)
+            >>> robot.wait_mode("SOFT_RTI")
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
         """
         try:
             st = self.robot.latest_status() or {}
@@ -331,20 +537,113 @@ class RTIClient:
         return self
 
     def claim(self) -> RTIClient:
-        """Claim RT control. Timing rules start now; a 40 ms command gap stops the robot."""
+        """Claim real-time control: the robot starts applying your commands.
+
+        It calls `robot.rti_claim()`: see there. Send the first command at once,
+        because the watchdog runs from the claim: 40 ms in RTI mode, three of your
+        intervals in SOFT_RTI.
+
+        Returns:
+            This `RTIClient`, so that calls can be chained.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in a real-time mode
+                (for example right after `connect()`, before the switch), not
+                enabled or not homed, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The robot connection is not open.
+
+        Warning:
+            From the claim on, the arm follows your PC's commands.
+
+        Examples:
+            >>> from robotclient import RTIClient, MotionFinished
+            >>> rti = RTIClient(robot)
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> rti.claim()
+            >>> rti.control(lambda state: MotionFinished())
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
+        """
         self.robot.rti_claim()
         return self
 
     def release(self) -> None:
-        """Clean release over TCP (the UDP CMD_STOP path is preferred)."""
+        """Release real-time control over the robot connection, staying paired.
+
+        It calls `robot.rti_release()`: the arm brakes to rest within its limits
+        and holds, and after 0.5 s the session is paired and idle again. It works
+        in both real-time modes, also when the stream itself is down. Send it
+        within the command timeout after your last command, or the robot latches
+        `RTI_LINK_LOST` first.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The robot connection is not open.
+
+        Examples:
+            >>> import time
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot, clock="pc")
+            >>> rti.connect(rate_hz=50)
+            >>> robot.wait_mode("SOFT_RTI")
+            >>> q = rti.read_once()["j_p"]
+            >>> rti.claim()
+            >>> for i in range(50):
+            ...     rti.send_joint_position(q)
+            ...     time.sleep(0.02)
+            ...
+            >>> rti.release()
+            >>> time.sleep(1)
+            >>> rti.disconnect()
+            >>> rti.close()
+        """
         self.robot.rti_release()
 
     def disconnect(self) -> None:
-        """Unpair and return the robot to IDLE."""
+        """Unpair from the robot and switch it to IDLE mode.
+
+        It ends a running `control()` loop and calls `robot.rti_disconnect()`,
+        which switches to IDLE mode at once, without braking: release first and
+        let the arm come to rest. It waits for IDLE mode only when the
+        `RobotClient` runs in sync mode. The sockets stay open: `close()` them, or
+        `connect()` again.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, in sync mode,
+                did not report IDLE mode within 10 s.
+            RobotConnectionError: The robot connection is not open.
+
+        Warning:
+            The arm does not brake: sent while it moves, it coasts in freedrive
+            until friction stops it (see `robot.rti_disconnect()`).
+
+        Examples:
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> rti.disconnect()
+            >>> robot.wait_mode("IDLE")
+            >>> rti.close()
+        """
         self._running = False
         self.robot.rti_disconnect()
 
     def close(self) -> None:
+        """Close the link's sockets.
+
+        It closes the TCP stream and both UDP sockets; the robot is not told.
+        Unpair first with `disconnect()`. The client cannot be used afterwards.
+
+        Examples:
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.close()
+        """
         if self._tcp is not None:
             try:
                 self._tcp.close()
@@ -359,13 +658,64 @@ class RTIClient:
     # ------------------------------------------------------------------ #
 
     def control(self, callback: Callable[[RobotState], _Command | MotionFinished | None], first_packet_timeout: float = 2.0, timeout: float = 0.1) -> None:
-        """Blocking, robot-paced control loop.
+        """Run your control callback on every state packet the robot sends.
 
-        Blocks on the robot's state packet, calls `callback(state)`, sends the returned
-        command straight back. Returning MotionFinished sends CMD_STOP and exits.
+        It blocks. For each state packet it calls `callback(state)` with a
+        `RobotState` and sends the command the callback returns at once, stamped
+        with `state.elapsed` when that is robot time. Return `None` to send
+        nothing that tick: the robot carries on alone (a position stream along
+        the same curve, a velocity or a torque unchanged) until its command
+        timeout. Return `MotionFinished` to send the stop and return.
 
-        Only the PC blocks — the robot's RT loop never does. If our reply misses a tick
-        the robot reuses the last command, and after 100 ms of silence it stops.
+        It needs an active claim (`claim()`): without one the robot ignores the
+        commands, and nothing reports it. When the recipe carries `rti_state`, it
+        returns quietly once the robot ends the claim cleanly, as `rti_release()`
+        does.
+
+        Args:
+            callback: Called with each `RobotState`. It returns a
+                `JointPositionCommand`, `JointVelocityCommand` or
+                `JointTorqueCommand` to send, `MotionFinished` to end, or `None`.
+            first_packet_timeout: Seconds to wait for the first state packet.
+            timeout: Seconds to wait for each later packet. A longer silence means
+                the robot has left real-time control.
+
+        Raises:
+            ControlLost: The robot revoked the claim (`rti_state` left 2 other than
+                by a clean release), the state stream stopped after it had started,
+                or the robot closed the TCP stream.
+            RuntimeError: `clock` is not `"robot"`, or no state packet came within
+                `first_packet_timeout`, for example before `connect()`.
+
+        Note:
+            Over UDP the packets that arrive while your callback runs queue up, and
+            the next one handed to it is the oldest of them. Keep the callback
+            shorter than a tick, or it falls further behind with every packet.
+
+        Warning:
+            Your callback moves the arm. Start from the measured pose
+            (`state["j_p"]`) and keep the first motions small.
+
+        Examples:
+            >>> import math
+            >>> from robotclient import RTIClient
+            >>> from robotclient import JointPositionCommand, MotionFinished
+            >>> rti = RTIClient(robot)
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> q0 = rti.read_once()["j_p"]
+            >>> rti.claim()
+            >>> def follow(state):
+            ...     t = state.elapsed
+            ...     if t > 2.0:
+            ...         return MotionFinished()
+            ...     q = list(q0)
+            ...     q[5] += 0.0125 * (1 - math.cos(math.pi * t / 2.0))
+            ...     return JointPositionCommand(q)
+            ...
+            >>> rti.control(follow)
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
         """
         if self.clock != 'robot':
             raise RuntimeError("control() is robot-clocked; use send_*() with clock='pc'")
@@ -506,21 +856,172 @@ class RTIClient:
 
     def send_joint_position(self, positions: Sequence[float], feedforward_speed: Sequence[float] | None = None,
                             timestamp: float | None = None) -> None:
-        """`timestamp`: the time this target is FOR, in seconds of a monotonic clock — UDP with `timestamps` on
-        only. Default: now, at the send. Better: read the clock once, compute the target from that reading and pass the
-        same reading (`t = time.perf_counter(); send_joint_position(f(t), timestamp=t)`): a hiccup between computing
-        and sending (a garbage-collection pause) otherwise looks like a jump, and in hard RTI the robot refuses a
-        stream whose speed / acceleration jump beyond the joint limits (RTI_ACCELERATION_LIMIT)."""
+        """Send one joint position target to the robot.
+
+        It sends the target at once and does not wait. The robot applies it only
+        while control is claimed: in RTI mode send one every 4 ms tick, each with
+        its send time; in SOFT_RTI at your own rate. A target beyond a joint's soft
+        limit, or heading for it faster than the joint can still stop, ends the
+        stream with `RTI_POSITION_LIMIT` after the arm has braked to rest. Over TCP
+        it first reads the state that is waiting, so that the stream does not back
+        up.
+
+        Args:
+            positions: The six joint targets in radians. Fewer values are padded
+                with 0 rad, which commands those joints to zero; more are cut.
+            feedforward_speed: Each joint's speed at the target, in rad/s; `None`
+                sends zeros. `"ruckig"` and `"ruckig_advancing"` pass through the
+                target at this speed, and the dynamics feedforward reads your
+                stream's speed from it.
+            timestamp: The time this target is for, in seconds of a monotonic
+                clock, the same clock for every target; used over UDP with
+                `timestamps` on only. `None` stamps the moment of sending. Better:
+                read the clock once, compute the target from that reading and pass
+                it, so that a pause between computing and sending does not look like
+                a jump.
+
+        Raises:
+            ControlLost: Over TCP, the robot closed the stream.
+            RuntimeError: `connect()` was not called.
+            OSError: The packet could not be sent.
+
+        Examples:
+            >>> import time
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot, clock="pc")
+            >>> rti.connect(rate_hz=50)
+            >>> robot.wait_mode("SOFT_RTI")
+            >>> q = rti.read_once()["j_p"]
+            >>> rti.claim()
+            >>> for i in range(50):
+            ...     q[5] += 0.0005
+            ...     rti.send_joint_position(q)
+            ...     time.sleep(0.02)
+            ...
+            >>> rti.release()
+            >>> time.sleep(1)
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
+        """
         self._send(CMD_JOINT_POSITION, positions, feedforward_speed or [0.0] * 6, timestamp)
 
     def send_joint_velocity(self, velocities: Sequence[float], feedforward_torque: Sequence[float] | None = None) -> None:
+        """Send one joint velocity command to the robot.
+
+        RTI mode only: SOFT_RTI refuses velocity commands, and a session that
+        sends only those ends with `RTI_LINK_LOST`. The robot applies the velocity
+        every tick until the next command, for at most the command timeout
+        (40 ms), so send one every tick. With the rate limiter on it is limited in
+        speed, acceleration and jerk; the tool speed cap and the soft joint limits
+        always apply (a joint brakes before its limit). The first one after a
+        claim must be small (`rti_set_start_pose_check()`).
+
+        Args:
+            velocities: The six joint velocities in rad/s. Fewer values are padded
+                with 0 rad/s; more are cut.
+            feedforward_torque: Torque in Nm added to each joint's command, limited
+                in its rate of change like a torque command; `None` sends zeros.
+
+        Raises:
+            ControlLost: Over TCP, the robot closed the stream.
+            RuntimeError: `connect()` was not called.
+            OSError: The packet could not be sent.
+
+        Warning:
+            A velocity command keeps the arm moving until the next command or the
+            command timeout. Send zeros, or `stop()`, to stop.
+
+        Examples:
+            >>> import time
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot, clock="pc")
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> rti.claim()
+            >>> for i in range(250):
+            ...     rti.send_joint_velocity([0, 0, 0, 0, 0, 0.02])
+            ...     time.sleep(0.004)
+            ...
+            >>> rti.stop()
+            >>> time.sleep(1)
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
+        """
         self._send(CMD_JOINT_VELOCITY, velocities, feedforward_torque or [0.0] * 6)
 
     def send_joint_torque(self, torques: Sequence[float]) -> None:
+        """Send one joint torque command to the robot.
+
+        RTI mode only, like velocity commands. The robot adds the torque that
+        holds the arm up against gravity (with both gravity switches on), limits
+        the rate of change while the rate limiter is on, and cuts torque that
+        pushes a joint further past its soft limit; the drives limit the current.
+        It applies the torque every tick until the next command, for at most the
+        command timeout (40 ms). The first one after a claim must be small
+        (`rti_set_start_pose_check()`).
+
+        Args:
+            torques: The six joint torques in Nm, without gravity. Fewer values are
+                padded with 0 Nm; more are cut.
+
+        Raises:
+            ControlLost: Over TCP, the robot closed the stream.
+            RuntimeError: `connect()` was not called.
+            OSError: The packet could not be sent.
+
+        Warning:
+            Under torque control nothing holds a position: with zero torque the arm
+            floats as in freedrive, and an error in the gravity model lets it
+            drift. Keep a hand near the E-stop.
+
+        Examples:
+            >>> import time
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot, clock="pc")
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> rti.claim()
+            >>> for i in range(50):
+            ...     rti.send_joint_torque([0, 0, 0, 0, 0, 0])
+            ...     time.sleep(0.004)
+            ...
+            >>> rti.stop()
+            >>> time.sleep(1)
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
+        """
         self._send(CMD_JOINT_TORQUE, torques, [0.0] * 6)
 
     def stop(self) -> None:
-        """Send CMD_STOP — the robot holds position for 0.5 s, then returns to paired."""
+        """Ask the robot to end the stream: brake to rest and hold.
+
+        It sends the stop command inside the stream and does not wait; it also
+        ends a `control()` loop running in another thread. The robot then does
+        what `rti_release()` does, in RTI and SOFT_RTI mode alike: the arm brakes
+        to rest within its limits and holds, and after 0.5 s the session is paired
+        and idle again.
+
+        Raises:
+            ControlLost: Over TCP, the robot closed the stream.
+            RuntimeError: `connect()` was not called.
+            OSError: The packet could not be sent.
+
+        Examples:
+            >>> import time
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot, clock="pc")
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> rti.claim()
+            >>> for i in range(250):
+            ...     rti.send_joint_velocity([0, 0, 0, 0, 0, 0.02])
+            ...     time.sleep(0.004)
+            ...
+            >>> rti.stop()
+            >>> time.sleep(1)
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
+        """
         self._send(CMD_STOP, [0.0] * 6, [0.0] * 6)
         self._running = False
 
@@ -529,29 +1030,58 @@ class RTIClient:
     # ------------------------------------------------------------------ #
 
     def read_state(self) -> RobotState | None:
-        """Newest state packet, or None. Non-blocking; drains so we never read stale."""
+        """Return the newest state packet that has arrived, or `None`.
+
+        It never blocks: it reads every packet waiting, keeps the newest and
+        discards the others (`capture()` records them). It works while merely
+        paired, without a claim.
+
+        Returns:
+            The newest `RobotState`, or `None` when no packet arrived since the
+            last read. Its `elapsed` is 0: only `control()` sets it.
+
+        Raises:
+            ControlLost: Over TCP, the robot closed the stream.
+
+        Examples:
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> state = rti.read_state()
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
+        """
         latest = self._raw_drain()
         return self._decode(latest) if latest else None
 
     def read_once(self, timeout: float = 1.0) -> RobotState:
-        """Block for the CURRENT state packet. Works while merely paired (no claim).
+        """Return the current state packet, waiting for one if none is queued.
 
-        Drains first, exactly as read_state() does, then blocks only if nothing was queued.
+        It reads every packet waiting and returns the newest; only when none is
+        waiting does it block, up to `timeout`. It works while merely paired,
+        without a claim: read the arm's pose from it before streaming. The oldest
+        packet would show the pose of up to the whole wait before.
 
-        WHY THE DRAIN. A plain recvfrom() is FIFO: it returns the OLDEST datagram in the
-        socket buffer, not the newest. The robot unicasts state at the full loop rate from
-        the moment of connect(), so a caller that pairs, waits, then reads gets a packet as
-        old as the wait -- 0.3 s of pairing queues ~75 packets on a 250 Hz robot and hands
-        back the first of them.
+        Args:
+            timeout: Seconds to wait when no packet is waiting.
 
-        That is not theoretical. api_tests/27_soft_rti.py read its start pose this way and
-        got a snapshot taken during the IDLE -> SOFT_RTI transition, while the arm was still
-        settling. It reported 4.985 deg of joint-2 "drift" that had never happened: it was
-        measuring a stale packet against fresh ones. Worse, it then COMMANDED that stale
-        pose, which is a real step the arm really tracks -- and 4.9 deg sits just inside the
-        0.1 rad start-pose tolerance, so the guard passed it.
+        Returns:
+            The newest `RobotState`. Its `elapsed` is 0: only `control()` sets it.
 
-        No caller ever wants the oldest packet. "Give me the state" means the current state.
+        Raises:
+            ControlLost: Over TCP, the robot closed the stream.
+            RuntimeError: No packet arrived within `timeout`.
+
+        Examples:
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.connect(rate_hz=50)
+            >>> robot.wait_mode("SOFT_RTI")
+            >>> rti.read_once()["j_p"]
+            [1.571, -1.833, 2.88, 0.0, -0.524, 3.142]
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
         """
         latest = self._raw_drain()
         if latest is not None:
@@ -672,7 +1202,36 @@ class RTIClient:
             self._send_sock.sendto(pkt, (self.robot_ip, RTI_PORT_RECEIVE))
 
     def capture(self, on: bool = True, limit: int = 200000) -> RTIClient:
-        """Record EVERY state packet drained, not just the newest. Off-robot measurement."""
+        """Record every state packet that `read_state()` and `read_once()` read.
+
+        Normally a read keeps only the newest packet. With capture on, each packet
+        they read is appended to `captured` as an (arrival time, packet) pair: the
+        time in seconds of this PC's `time.perf_counter()`, the packet as the raw
+        bytes the robot sent. Packets that `control()` receives are not recorded.
+        Switching it on empties `captured`; past `limit` entries the oldest
+        quarter is dropped.
+
+        Args:
+            on: `True` to record, `False` to stop; what was recorded stays.
+            limit: The most entries kept.
+
+        Returns:
+            This `RTIClient`, so that calls can be chained.
+
+        Examples:
+            >>> import time
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> rti.capture(True)
+            >>> time.sleep(0.1)
+            >>> state = rti.read_state()
+            >>> len(rti.captured) > 1
+            True
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
+        """
         self._capturing = bool(on)
         self._cap_limit = limit
         if on:
@@ -797,13 +1356,33 @@ class RTIClient:
             self.lost_seqs += 1
 
     def latency_stats(self) -> dict | None:
-        """Loop-delay summary in ms, or None if the recipe carries no `rti_seq` tag.
+        """Return the loop delay this client measured, in milliseconds.
 
-        NOTE what this measures. The robot sends state at the TOP of each tick, before it
-        reads commands, so a command applied during tick T is only echoed in tick T+1's
-        packet. The figure therefore includes up to one robot tick — deliberately, because
-        "when does my command become visible to me" is the quantity that governs loop
-        stability. To recover wire RTT, subtract the loopback baseline (~1 tick).
+        The robot echoes the sequence number of the last command it accepted
+        (`rti_seq` in the state packet). The time from sending a command until a
+        state packet echoes it is one loop delay: how long until your command's
+        effect is visible to you, including up to one robot tick. It needs
+        `rti_seq` in the active recipe; the standard recipe has it.
+
+        Returns:
+            `None` before any delay was measured. Otherwise `n`, the samples;
+            `min`, `med` (the median), `p95`, `p99` and `max` in ms; and `lost`,
+            the commands the robot never echoed.
+
+        Examples:
+            >>> from robotclient import RTIClient
+            >>> from robotclient import JointPositionCommand, MotionFinished
+            >>> rti = RTIClient(robot)
+            >>> rti.connect()
+            >>> robot.wait_mode("RTI")
+            >>> q0 = rti.read_once()["j_p"]
+            >>> rti.claim()
+            >>> rti.control(lambda state: MotionFinished() if state.elapsed > 1
+            ...             else JointPositionCommand(q0))
+            >>> sorted(rti.latency_stats())
+            ['lost', 'max', 'med', 'min', 'n', 'p95', 'p99']
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
         """
         if not self.rtt_samples_ms:
             return None

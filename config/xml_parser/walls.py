@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import logging
+import os
 logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -129,5 +130,12 @@ def write_freedrive_walls(xml_path: str | Path, specs: Sequence[dict | None]) ->
                     f"Walls tab writes this -->" + body[len(content):])
         text = text[:m.start(1)] + body + text[m.end(1):]
     ET.fromstring(text)                    # never write a file that no longer parses
-    path.write_text(text)
+    # Written next to it, synced, then swapped in (2026-10-24): a write that fails half-way (a full SD card) used to
+    # leave the robot XML cut short, and the robot software would not start until it was fixed by hand.
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
     return len(specs)

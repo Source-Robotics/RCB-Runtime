@@ -88,7 +88,8 @@ checks every `**options` list against the robot's own list of settings.
 4. **`Defaults:`** (required for a command that changes a default, such as `set_joint_speed()`).
 5. **`Returns:`** (required unless it returns `None`). Generators use **`Yields:`** instead.
 6. **`Raises:`** (required when a caller should expect an exception).
-7. **`Errors:`** (required for a queued command: the codes it can fail with once the robot accepted it).
+7. **`Errors:`** (required for a queued command: the codes it can fail with once the robot accepted it; for an
+   immediate command: the codes its own handler answers with, when it has any).
 8. **`Note:`** or **`Warning:`** (optional).
 9. **`See also:`** (optional).
 10. **`Examples:`** (required for every public `robotclient` function and method).
@@ -144,8 +145,9 @@ when the function returns `None`. For a tuple, say what each element is, in orde
 Every exception a caller should be ready for, as `ExceptionName: When it is raised.`:
 
 1. **The robot's exceptions first,** in this order: `CommandRejected`, `MotionFailed`, `HomingFailed`,
-   `GripFailed`, `RobotTimeout`, `RobotConnectionError`, `VersionMismatch`.
+   `GripFailed`, `RobotTimeout`, `RobotConnectionError`, `VersionMismatch`, `ControlLost` (the real-time client's).
 2. **Then the argument errors:** `ValueError`, `TypeError`.
+3. **Then the other built-in exceptions the call passes on,** such as a socket's: `RuntimeError`, `OSError`.
 
 Do not list exceptions that only a broken program could cause.
 
@@ -165,6 +167,14 @@ Leave out what every queued command shares; the documentation adds it from the r
 is sent (`REJECTED`, `CONTROL_HELD`, `MOTION_ABORTED`, `BAD_OPTIONS`, `QUEUE_FULL`), `PLAN_FAIL` and `SEND_TIMEOUT`,
 and the ways a running move ends early (`ABORTED`, `STOPPED`, `SETTLE_TIMEOUT`). Find the command's own codes in the
 planner's code path for it, every one of them (see "Complete, always").
+
+For an immediate command (one the robot carries out when it arrives): every code its handler in
+`command_executor.py` answers with, including the helpers and worker threads it uses, each with when it happens.
+Leave out the refusals the documentation adds from the command's rule: `REJECTED` (a mode, a state or homing it
+needs), `CONTROL_HELD` when the command takes control, `CLIENT_TOO_OLD` for a pose command. A handler that answers
+`CONTROL_HELD` itself, as `take_control()` does, lists it. An immediate command whose handler answers with no code
+has no `Errors:` section. The documentation's sync tool lists every handler's codes from the code; the page shows
+each code, with the docstring's words when it has a line for it.
 
 ### 8. `Note:` and `Warning:`
 

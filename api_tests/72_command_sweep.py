@@ -139,12 +139,13 @@ def run(robot):
           jog_state() == js and not criticals_since(log0), (jog_state(), criticals_since(log0)[:1]))
 
     print("\n3. gripper (simulated CAN gripper)")
+    mode0 = shm_float("gripper_ctrl_mode")              # put back at the end: the mode lasts until RTI restarts
     robot.set_gripper_ctrl_mode(2)
     settle()
     m2 = shm_float("gripper_ctrl_mode")
     robot.set_gripper_ctrl_mode(1)
     settle()
-    check("gripper_ctrl_mode 2 then 1 (motor / firmware), in shared memory", m2 == 2.0 and shm_float("gripper_ctrl_mode")
+    check("gripper_ctrl_mode 2 then 1 (firmware / motor), in shared memory", m2 == 2.0 and shm_float("gripper_ctrl_mode")
           == 1.0, f"{m2} -> {shm_float('gripper_ctrl_mode')}")
     ok, code = refused(lambda: raw("gripper_ctrl_mode", ["3"]), "BAD_ARGS")
     settle()
@@ -152,6 +153,11 @@ def run(robot):
     robot.gripper_calibrate()
     settle(4.0)
     check("gripper_calibrate: no error after 4 s", robot.status().get("err") == 0, robot.status().get("errors"))
+    if mode0 in (1.0, 2.0):
+        robot.set_gripper_ctrl_mode(int(mode0))
+        settle()
+    check(f"the gripper's control mode back to the one found ({mode0})",
+          mode0 not in (1.0, 2.0) or shm_float("gripper_ctrl_mode") == mode0, shm_float("gripper_ctrl_mode"))
 
     print("\n4. PID gains (the XML's own values: a no-op that runs the whole path)")
     sysc = xp.load_system_config(str(SYSTEM_XML), str(ROBOTS_DIR))

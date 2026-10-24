@@ -13,7 +13,7 @@ Gripper commands (open_gripper / close_gripper / move_gripper) are not trajector
 gripper motion is driven by RTI's own firmware-mode CAN command (_gripper_fw_state,
 RTI-process-local), so there's no batch/waypoint pipeline to hook a completion signal
 into. Instead, the checkpoint tracks REAL physical completion via
-gripper_object_detection, the same Robotiq-style status code the GUI already decodes
+gripper_object_detection, the same gripper status code the GUI already decodes
 (nicegui_test.py): 0 = still moving, 1/2 = object detected while opening/closing,
 3 = reached target with no object.
 
@@ -326,7 +326,7 @@ class TrajectoryPlanner(Thread):
                  read_current_joints, speed_scale=1.0, read_gripper_status=None,
                  read_gripper_position=None,
                  robot=None, read_exec_runway=None, offline_output=False,
-                 max_jerk=None, joint_limits=None, zones=(), tool_spheres=()):
+                 max_jerk=None, joint_limits=None, zones=(), tool_spheres=(), gripper_current_limit_ma=None):
         """
         Args:
             motion_queue:        queue.Queue of QueuedCommand records (legacy dicts
@@ -376,6 +376,7 @@ class TrajectoryPlanner(Thread):
         self._dt = dt
         self._read_current_joints = read_current_joints
         self._read_gripper_status = read_gripper_status
+        self._gripper_current_limit_ma = gripper_current_limit_ma   # the gripper XML's <Ilim> (2026-10-24)
         # Optional but strongly wanted: without it the direction cross-check and
         # the position criterion both fall back to trusting the status code alone.
         self._read_gripper_position = read_gripper_position
@@ -505,6 +506,9 @@ class TrajectoryPlanner(Thread):
             self._held = None
             self._last_endpoint = None
             self._last_exit_speed = None
+            # The gripper command a stop / an abort cancelled (the executor fails it; RTI holds the jaws where they
+            # are) is no longer watched (2026-10-24: it outlived the stop and reported on a failed id later).
+            self._pending_gripper = None
             self._epoch += 1
             if self._traj_sock is not None:
                 try:
@@ -3435,7 +3439,14 @@ class TrajectoryPlanner(Thread):
 
         if ctype in ("open_gripper", "close_gripper", "move_gripper"):
             self._last_exit_speed = None   # gripper breaks any in-flight blend chain
-            self._send_gripper(ctype, args, cid)
+            values = self._gripper_values(ctype, args)
+            if bool(options.dry_run):
+                # A dry run sends nothing, as for every move (2026-10-24: a "dry" gripper command moved the jaws —
+                # this branch sent them before any setting was read). The values are checked all the same.
+                logger.info(f"{ctype} dry-run id={cid}; nothing sent")
+                self._report_complete(cid)
+                return
+            self._send_gripper(ctype, values, cid)
             return
 
         start = self._start_point()
@@ -3584,24 +3595,44 @@ class TrajectoryPlanner(Thread):
                 time.sleep(0.002)
         return True
 
-    def _send_gripper(self, ctype, args, cid):
+    def _gripper_values(self, ctype, args):
+        """(position, speed, current) of a gripper command, every value checked (2026-10-24: positions and speeds
+        wrapped at 256 — move_gripper(256) opened fully —, the current reached the drive unchecked — -1 was 65535 mA —,
+        and a speed of None, which the client sends for a current without a speed, is the default speed). The
+        current's ceiling is the gripper XML's <Ilim>. Raises PlannerError BAD_ARGUMENTS."""
+        def whole(value, what, lo, hi):
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                raise PlannerError("BAD_ARGUMENTS", f"{ctype}: the {what} {value!r} is not a number") from None
+            if not (np.isfinite(f) and f == int(f) and lo <= int(f) <= hi):
+                raise PlannerError("BAD_ARGUMENTS", f"{ctype}: the {what} {value!r} is not a whole number "
+                                                    f"from {lo} to {hi}")
+            return int(f)
+
+        if ctype == "open_gripper":
+            position = self.GRIPPER_OPEN_POS
+        elif ctype == "close_gripper":
+            position = self.GRIPPER_CLOSE_POS
+        else:  # move_gripper
+            if not args or args[0] is None:
+                raise PlannerError("BAD_ARGUMENTS", "move_gripper needs a position, 0 (open) to 255 (closed)")
+            position = whole(args[0], "position", 0, 255)
+        speed = (whole(args[1], "speed", 0, 255) if len(args) > 1 and args[1] is not None
+                 else self.GRIPPER_DEFAULT_SPEED)
+        cap = int(self._gripper_current_limit_ma) if self._gripper_current_limit_ma else 65535
+        current = (whole(args[2], "current in mA", 1, cap) if len(args) > 2 and args[2] is not None
+                   else min(self.GRIPPER_DEFAULT_CURRENT, cap))
+        return position, speed, current
+
+    def _send_gripper(self, ctype, values, cid):
         """Send gripper_set:<pos>:<speed>:<current>:1 to RTI on the existing command
         socket (RTI already handles this string identically regardless of sender — the
         GUI uses the exact same format). Does NOT checkpoint here — see module
         docstring: completion is tracked asynchronously via gripper_object_detection
         by _poll_gripper_completions(), the same way move_joints's real completion is
         signaled by ExecHandler rather than by the planner blocking."""
-        if ctype == "open_gripper":
-            position = self.GRIPPER_OPEN_POS
-        elif ctype == "close_gripper":
-            position = self.GRIPPER_CLOSE_POS
-        else:  # move_gripper
-            if not args:
-                raise ValueError("move_gripper needs [position] (0-255 raw scale, "
-                                "1=open .. 254=closed — matches the GUI slider)")
-            position = int(args[0])
-        speed = int(args[1]) if len(args) > 1 else self.GRIPPER_DEFAULT_SPEED
-        current = int(args[2]) if len(args) > 2 else self.GRIPPER_DEFAULT_CURRENT
+        position, speed, current = values      # checked by _gripper_values
 
         # Only one physical target can be in flight (_gripper_fw_state is a single
         # value on RTI, overwritten by each new gripper_set). If a previous command
@@ -3640,7 +3671,7 @@ class TrajectoryPlanner(Thread):
         """Decide whether the one in-flight gripper command has finished.
 
         THREE independent criteria, any of which completes it. One is not enough:
-        `gripper_object_detection` is a Robotiq-style code (0 moving, 1/2 object
+        `gripper_object_detection` is the gripper's status code (0 moving, 1/2 object
         while opening/closing, 3 at target) whose behaviour on a NEW move — reset
         to 0, or hold the previous value — has never been verified on hardware.
         A stale nonzero would complete every command on its first poll.
@@ -3660,9 +3691,10 @@ class TrajectoryPlanner(Thread):
 
         Called from run() after every processed command and on each idle timeout.
         """
-        if self._pending_gripper is None or self._read_gripper_status is None:
+        pending = self._pending_gripper           # one reference: flush() may clear the field from another thread
+        if pending is None or self._read_gripper_status is None:
             return
-        cid, deadline, target, streak = self._pending_gripper
+        cid, deadline, target, streak = pending
         obj = self._read_gripper_status()
         position = self._read_gripper_position() if self._read_gripper_position else None
 
@@ -3684,7 +3716,7 @@ class TrajectoryPlanner(Thread):
 
         # --- 2. debounced, direction-checked status code ------------------------
         streak = streak + 1 if obj != 0 else 0
-        self._pending_gripper[3] = streak
+        pending[3] = streak
         if streak >= self.GRIPPER_DEBOUNCE_TICKS:
             if self._code_matches_direction(obj, target, position):
                 self._finish_gripper(cid, obj, f"object_detection={obj} "

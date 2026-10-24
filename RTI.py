@@ -83,6 +83,7 @@ from communication.rti_protocol import CLOCK_ROBOT, CLOCK_PC, CMD_SIZE
 # System and Configuration
 # ==========================================================================
 from config.system_config import lock_memory, locked_mb, setup_realtime_process
+from utility.gc_pauses import GcPauseMonitor, freeze_startup
 from hardware.can_hardware import start_can_interface, place_can_path, FirstFrameWait, FastCanReader
 from config.cpu_cores import CAN_CPU_CORE, GENERAL_CPU_CORES
 from utility.can_reply_monitor import CanReplyMonitor
@@ -500,6 +501,20 @@ def main():
         'position': 0, 'speed': 100, 'current': 200,
         'action': 0,
     }
+
+    def _freeze_gripper(why):
+        """Hold the jaws where they are (2026-10-24, user: a stop "should freeze it also"). The firmware-mode target
+        becomes the measured jaw position, so a gripper still travelling to its last target stops there. Called on a
+        stop (the executor's gripper_hold), a disable and an error latching. An idle gripper (action 0) stays idle; in
+        motor mode RTI keeps no gripper target, so there is nothing to hold."""
+        if not active_CAN_gripper or not int(_gripper_fw_state.get('action', 0)):
+            return
+        pos = max(0, min(255, int(round(float(shared_data.gripper['gripper_position'][0])))))
+        if pos != int(_gripper_fw_state['position']):
+            log_gripper.info("jaws held at %d (their target was %d): %s", pos, _gripper_fw_state['position'], why)
+            _gripper_fw_state['position'] = pos
+
+    _gripper_err_prev = [False]          # the error pass's last error_active: an error latching holds the jaws
     # Calibrate state machine. After Send_gripper_calibrate fires, the bus must be
     # held with *empty* Send_gripper_data_pack() polls — resuming the full data
     # pack mid-calibration cancels it. We don't try to auto-detect completion
@@ -961,6 +976,8 @@ def main():
     # A small powered test move of one joint, homed or not (robotics/joint_test.py, 2026-10-18; the first-run check's
     # stage 3) — the same live limits; never beside the Hall check or a freed joint.
     joint_test = JointTest(Motor, Joint, joint_num, motor_velocity_limit, motor_Ilim, ctx, shared_data.rti, delta_t,
+                           q_meas=shared_data.joint['joint_position'],
+                           soft_lo=cfg['software_joint_limit_negative'], soft_hi=cfg['software_joint_limit_positive'],
                            log=log_homing.info,
                            done=lambda text: log_activity(_rti_activity_logger, "RTI", "info", "JOINT_TEST", message=text))
 
@@ -1283,7 +1300,13 @@ def main():
         if _before == "ENABLED":
             log_activity(_rti_activity_logger, "RTI", "info", "STATE_CHANGE", id=st.command_id,
                          message="ENABLED → DISABLED")
+        _freeze_gripper("disable")
         st.pending_mode_request = RobotMode.IDLE
+
+
+    def _handle_gripper_hold(cmd_msg, cmd_dict):
+        """gripper_hold — the executor's stop() (2026-10-24): the jaws stop where they are."""
+        _freeze_gripper("stop")
 
 
     def _handle_home(cmd_msg, cmd_dict):
@@ -1451,7 +1474,8 @@ def main():
                                enabled=shared_data.robot_state.get() == "ENABLED",
                                mode_pending=st.pending_mode_request is not None,
                                booting=st.startup_motor_reconfig < 3,
-                               other_active=hall_check.active or free_joint.active)
+                               other_active=hall_check.active or free_joint.active,
+                               homed=bool(np.all(shared_data.rti['homing_status'][:joint_num] == 2)))
         if why:
             log_homing.warning(f"Joint test refused: {why}")
             log_activity(_rti_activity_logger, "RTI", "warning", "JOINT_TEST_REFUSED", id=st.command_id, message=why)
@@ -2125,6 +2149,7 @@ def main():
         "exec_stop":         _handle_exec_stop,
         "exec_completion_policy": _handle_exec_completion_policy,
         "gripper_set":       _handle_gripper_set,
+        "gripper_hold":      _handle_gripper_hold,
         "gripper_calibrate": _handle_gripper_calibrate,
         "gripper_ctrl_mode": _handle_gripper_ctrl_mode,
         "set_pid_gains":     _handle_set_pid_gains,
@@ -2405,6 +2430,8 @@ def main():
             tick=int(_tick_now),
             period=float(shared_data.rti["loop_period"][0]),
         )
+        if _gc_pauses.pending:                     # a garbage collection over 5 ms paused the loop: log it (rare, cold)
+            _gc_pauses.flush(int(_tick_now))
 
         # Safety monitor BEFORE the error pass, so a trip latches — and disables the robot — this tick.
         _monitor_errors = safety_monitor.step(st.current_mode)
@@ -2440,7 +2467,19 @@ def main():
         )
         if st.homing_failures:
             st.homing_failures.clear()             # latched by the call above (the latch keeps them until Clear Errors)
+        _err_now = bool(shared_data.rti['error_active'][0])
+        if _err_now and not _gripper_err_prev[0]:  # an error latched: the jaws stop where they are (2026-10-24)
+            _freeze_gripper("an error latched")
+        _gripper_err_prev[0] = _err_now
         _profile_last = _profile_mark(_profile_last, "error_checks")
+
+    # Python's garbage collector (2026-10-24, utility/gc_pauses.py). Every object start-up made is frozen, so a full
+    # collection inside a tick no longer walks them: one such tick (~70 ms) latched LOOP_CRITICAL a few seconds after
+    # every homing since 2026-10-22. The two collections freeze_startup() times run HERE, before the first tick; from
+    # here on every collection over 5 ms is logged with its generation (the check sits in _check_safety).
+    freeze_startup()
+    _gc_pauses = GcPauseMonitor()
+    _gc_pauses.install()
 
     # ==========================================================================
     # RTI superloop

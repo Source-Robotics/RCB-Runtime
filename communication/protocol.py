@@ -155,10 +155,14 @@ COMMAND_RULES = {
     "get_joint_walls":  (IMMEDIATE, None, None, False),
     "set_joint_wall":   (IMMEDIATE, None, None, False),
     "save_joint_walls": (IMMEDIATE, None, None, False),
-    # --- robot control (always allowed) ---
+    # --- robot control ---
     "enable":        (IMMEDIATE, None, None, False),
     "disable":       (IMMEDIATE, None, None, False),
-    "home":          (IMMEDIATE, None, None, False),
+    # HOMING is entered only from IDLE, enabled (utility/state_machine.py; re-homing a homed arm is allowed). Refused
+    # here, the caller gets REJECTED at once (2026-10-23, user: "Refuse at the executor"): before, the executor
+    # forwarded it, RTI refused the switch into its activity log only, and in EXEC the executor had already aborted
+    # every client's program (_LEAVES_EXEC) while the arm played on what RTI held. An error latched means DISABLED.
+    "home":          (IMMEDIATE, ["IDLE"], "ENABLED", False),
     "clear_errors":   (IMMEDIATE, None, None, False),
     "stop":          (IMMEDIATE, None, None, False),
     # pause/resume only mean something mid-EXEC-motion — reject cleanly elsewhere
@@ -192,15 +196,19 @@ COMMAND_RULES = {
     # as a MAINTENANCE mode precisely so a disabled, unhomed or faulted robot can
     # still be serviced — a driver stuck in its bootloader shows up as a
     # disconnected node, i.e. an active error. The gate that DOES apply is the
-    # parked-pose check, which only RTI can evaluate (it needs live gravity
-    # torque), so it is enforced there rather than duplicated here.
+    # operator's assertion that the arm is parked or supported, which RTI checks.
+    # The MODE gate does apply (2026-10-23): FLASHING is entered only from IDLE or
+    # ACTIVE_ERROR (VALID_TRANSITIONS), so anything else is refused here, before
+    # _LEAVES_EXEC could abort a program for a switch RTI would refuse.
     # Motors driven by NOTHING: Position=None, Speed=None, Current=0. The arm
     # goes limp and WILL fall under gravity. No mode/state gate — the one
     # command guaranteed to stop the machine acting must never be refusable.
     "safety_stop":       (IMMEDIATE, None, None, False),
-    "release_safety_stop": (IMMEDIATE, None, None, False),
-    "enter_flashing_mode": (IMMEDIATE, None, None, False),
-    "exit_flashing_mode":  (IMMEDIATE, None, None, False),
+    # The two releases act only on their own mode: they send set_mode:IDLE, which in any other mode was an
+    # enter_idle_mode() under another name (EXEC braked to IDLE, JOG / RTI dropped to freedrive) — 2026-10-23.
+    "release_safety_stop": (IMMEDIATE, ["SAFETY_STOP"], None, False),
+    "enter_flashing_mode": (IMMEDIATE, ["IDLE", "ACTIVE_ERROR"], None, False),
+    "exit_flashing_mode":  (IMMEDIATE, ["FLASHING"], None, False),
     # Jog actuation: START only in JOG mode (RTI ignores its jog_set outside JOG anyway). STOP is
     # allowed in any mode so a released jog button always halts motion, even if a mode change raced.
     "jog":         (IMMEDIATE, ["JOG"], None, False),
@@ -305,6 +313,11 @@ def kind_of(cmd):
     return rule[0] if rule else None
 
 
+_WAY_TO_IDLE = {"ACTIVE_ERROR": "clear_errors() first", "SAFETY_STOP": "release_safety_stop() first",
+                "FLASHING": "exit_flashing_mode() first",
+                "HOMING": "wait until homing ends (enter_idle_mode() would interrupt it)"}
+
+
 def validate(cmd, mode, state, homed):
     """Check a command against the live robot mode/state/homed.
 
@@ -316,7 +329,11 @@ def validate(cmd, mode, state, homed):
         return False, f"unknown command '{cmd}'"
     _, req_mode, req_state, req_homed = rule
     if req_mode is not None and mode not in req_mode:
-        hint = " — enter_idle_mode() first" if "IDLE" in req_mode and mode != "IDLE" else ""
+        # The way to IDLE from where the robot is: enter_idle_mode() leaves an operating mode, but not these (from
+        # ACTIVE_ERROR it bounces back while the error is latched; the releases are their own commands; in HOMING it
+        # interrupts the homing).
+        way = _WAY_TO_IDLE.get(mode, "enter_idle_mode() first")
+        hint = f" — {way}" if "IDLE" in req_mode and mode != "IDLE" else ""
         return False, f"{cmd} requires mode in {req_mode}, robot is in {mode}{hint}"
     if req_state is not None and state != req_state:
         return False, f"{cmd} requires state {req_state}, robot is {state}"

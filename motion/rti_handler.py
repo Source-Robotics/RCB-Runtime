@@ -3124,7 +3124,9 @@ class RTIModeHandler:
         # refused here and stay in hard RTI, whose 40 ms watchdog a client cannot raise. A
         # refused packet is not "received": it does not feed the watchdog, so a PC that only
         # ever sends velocity trips LINK_LOST rather than moving the arm.
-        if self.soft_mode and cmd_type != CMD_JOINT_POSITION:
+        # The stop packet is no stale command: it ends the motion (2026-10-24: RTIClient.stop() and MotionFinished
+        # were refused here, so a SOFT_RTI session ended in RTI_LINK_LOST instead of a clean stop).
+        if self.soft_mode and cmd_type not in (CMD_JOINT_POSITION, CMD_STOP):
             self._soft_refused += 1
             if self._soft_refused == 1:               # once per session — never per tick
                 logger.warning(
@@ -3167,8 +3169,10 @@ class RTIModeHandler:
         self.last_cmd_type = cmd_type
         if cmd_type != CMD_STOP:
             self._last_motion_type = cmd_type      # what the arm was DOING when a stop arrives (the stop ramp's seed)
-        self._payload[:] = payload[:self.joint_num]
-        self._feedforward[:] = feedforward[:self.joint_num]
+            # A stop's payload is no target (2026-10-24): the last target stays (the stop brakes from where the arm
+            # is commanded; nothing reads the target after a stop, and now nothing could read zeros there).
+            self._payload[:] = payload[:self.joint_num]
+            self._feedforward[:] = feedforward[:self.joint_num]
         return True
 
     def _update_success_rate(self, got):

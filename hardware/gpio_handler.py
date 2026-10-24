@@ -152,6 +152,10 @@ def initialize_gpio():
     """
     global _simulated
     _simulated = sim_mode.enabled()
+    # Every output starts OFF (2026-10-24): the levels live in shared memory, which a service restart keeps, so the
+    # first tick's write_all_outputs() switched an output that was on before the restart back on by itself.
+    for idx, _pin in _OUTPUTS:
+        shared_data.gpio_states[idx] = LOW
     if _simulated:
         for idx in (ISOLATED_INPUT_1, ISOLATED_INPUT_2, ISOLATED_INPUT_3, GPIO_1, GPIO_2, GPIO_3, GPIO_4):
             shared_data.gpio_states[idx] = LOW

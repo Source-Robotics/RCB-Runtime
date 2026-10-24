@@ -64,19 +64,26 @@ def _pose_out(values, angle_unit):
 
 
 class GripperResult:
-    """Why a gripper command finished — not just that it did.
+    """One gripper command's outcome: why its jaws stopped.
 
-    "complete" tells you the jaws stopped; it cannot tell you whether they
-    stopped because they caught something or because they closed on empty air.
-    That distinction is the whole of pick verification, so it gets a name rather
-    than a bare integer nobody can be expected to remember.
+    `gripper_result()`, `wait_holding_part()` and `wait_released_part()`
+    return one. Its code tells a part between the jaws from jaws that reached
+    their target with nothing there; "complete" alone cannot.
 
-    `object_detected` deliberately is not called "gripped": on gripper_open(),
-    code 1 means something BLOCKED the opening, which is not a grip.
+    Attributes:
+        code: Why the jaws stopped. `0`: the jaws came within 5 of the target
+            while the gripper still reported motion. `1`: something stopped
+            them while opening. `2`: something stopped them while closing.
+            `3`: they reached the target with nothing in the way.
+        command_id: The id of the gripper command, as the call that queued it
+            returned it.
 
-        res = robot.gripper_result()
-        if res.object_detected:
-            ...                      # something is between the jaws
+    Examples:
+        >>> robot.close_gripper()
+        >>> robot.wait_gripper_move_complete()
+        >>> result = robot.gripper_result()
+        >>> result.code, result.name
+        (3, 'reached target, no object')
     """
 
     __slots__ = ("code", "command_id")
@@ -94,16 +101,49 @@ class GripperResult:
 
     @property
     def object_detected(self) -> bool:
-        """True if something stopped the jaws (codes 1 and 2)."""
+        """Whether something stopped the jaws before their target.
+
+        `True` for codes 1 and 2: the gripper reported that the jaws pressed on
+        something while opening or closing. After a close that is the part being
+        held; after an open it means something blocked the jaws.
+
+        Examples:
+            >>> robot.close_gripper()
+            >>> robot.wait_gripper_move_complete()
+            >>> robot.gripper_result().object_detected
+            False
+        """
         return self.code in (1, 2)
 
     @property
     def reached_target(self) -> bool:
-        """True if the gripper reached its commanded position with nothing in the way."""
+        """Whether the jaws reached their target with nothing in the way.
+
+        `True` for code 3 only. Code 0, the jaws within 5 of the target while the
+        gripper still reported motion, reads `False`.
+
+        Examples:
+            >>> robot.open_gripper()
+            >>> robot.wait_gripper_move_complete()
+            >>> robot.gripper_result().reached_target
+            True
+        """
         return self.code == 3
 
     @property
     def name(self) -> str:
+        """Short text for the code, such as "reached target, no object".
+
+        Code 0 reads "still moving", 1 "object detected while opening", 2 "object
+        detected while closing" and 3 "reached target, no object". Any other code
+        reads "unknown(N)", with the code for N.
+
+        Examples:
+            >>> robot.close_gripper()
+            >>> robot.wait_gripper_move_complete()
+            >>> robot.gripper_result().name
+            'reached target, no object'
+        """
         return self._NAMES.get(self.code, f"unknown({self.code})")
 
     def __repr__(self):
@@ -131,10 +171,59 @@ class RobotClient:
     # ------------------------------------------------------------------ #
 
     def connect(self, ip: str, port: int = DEFAULT_PORT, *, allow_mismatch: bool = False) -> RobotClient:
-        """Connect to the robot's executor and check that it speaks this client's command protocol (versioning V3):
-        a different version raises VersionMismatch before anything is sent (allow_mismatch=True skips the check); a
-        robot that reports none (a runtime from before 0.9.0) gives a VersionWarning. After it, runtime_version and
-        protocols say what the robot reported (None when it did not)."""
+        """Connect to the robot and check its command protocol version.
+
+        The client opens a connection to the robot software, waiting up to 5 s,
+        then waits for the status the robot sends every new client: up to 2 s,
+        after which it asks the robot for it, up to 5 s more. It compares the
+        robot's command protocol version with its own. A different version raises
+        `VersionMismatch` and the client disconnects again; a robot that reports
+        none gives a `VersionWarning` (a Python warning) and the connection goes
+        ahead. Afterwards the attributes `runtime_version` (the robot software's
+        version) and `protocols` (its protocol versions: `commands`, `rti` and
+        `telemetry`) hold what the robot reported, or `None`.
+
+        Every message the client sends carries its name, which the robot's
+        activity log shows: the name given to `RobotClient()`, or "<script> on
+        <host>". With older robot software that knows some commands by an earlier
+        name, the client sends them under that name, so a program runs on either.
+        A command the robot software does not have is refused with `UNKNOWN_CMD`.
+        Connecting takes no control: the first command that needs it does.
+
+        Args:
+            ip: The robot's IP address or host name.
+            port: The TCP port of the robot software; the robot listens on the
+                default.
+            allow_mismatch: `True` skips the version check: no `VersionMismatch`
+                and no `VersionWarning`. The robot can then misread commands: use
+                it only when you know the two versions work together.
+
+        Returns:
+            The client itself, so that `robot = RobotClient().connect(ip)` works.
+
+        Raises:
+            RobotConnectionError: The connection could not be opened within 5 s:
+                nothing listens at `ip` and `port`, the host name is unknown, or
+                there is no route. Also when the robot refused this computer
+                because its address is not on the robot's access list.
+            VersionMismatch: The robot speaks another command protocol version,
+                and `allow_mismatch` is `False`. The client is disconnected again.
+
+        Note:
+            `VersionMismatch` is a kind of `RobotConnectionError`, so
+            `except RobotConnectionError` catches both. Connect each client once:
+            to connect again, call `disconnect()` first.
+
+        See also:
+            `disconnect()`, `get_versions()`, `take_control()`
+
+        Examples:
+            >>> from robotclient import RobotClient
+            >>> robot = RobotClient(name="pick_place")
+            >>> robot.connect("192.168.0.84")
+            >>> robot.protocols
+            {'commands': 1, 'rti': 1, 'telemetry': 1}
+        """
         self._conn.connect(ip, port)
         # The executor pushes a status snapshot on connect; wait briefly for it so
         # status() is populated and the first wait_*() has a baseline.
@@ -158,32 +247,221 @@ class RobotClient:
         return self
 
     def disconnect(self) -> None:
+        """Close the connection to the robot.
+
+        The robot releases control at once if this client holds it, so another
+        client can take it. On the client, every call still waiting for the robot
+        ends: a command's call raises `CommandRejected` with the code
+        `DISCONNECTED` (or `CONNECTION_LOST`), and a status wait such as
+        `wait_mode()` raises `RobotTimeout`. Queued commands that had not finished
+        count as failed, and the next `wait_idle()` raises `MotionFailed` for
+        them.
+
+        Calling it again, or before `connect()`, does nothing. Leaving a
+        `with RobotClient() as robot:` block calls it.
+
+        Warning:
+            Disconnecting does not stop the arm. Moves the robot accepted keep
+            running, the robot stays in its mode, and a real-time session opened
+            with `rti_connect()` stays open. Call `stop()` first to end a program.
+
+        See also:
+            `connect()`, `stop()`, `release_control()`
+
+        Examples:
+            >>> robot.wait_idle()
+            >>> robot.disconnect()
+            >>> from robotclient import RobotClient
+            >>> with RobotClient() as robot:
+            ...     robot.connect("192.168.0.84")
+            ...     robot.wait_homed()
+        """
         self._conn.disconnect()
 
     @property
     def connected(self) -> bool:
+        """Whether the client is connected to the robot.
+
+        It is `True` from `connect()` until `disconnect()`, or until the
+        connection is lost: the robot software closed it, or the network failed.
+        It reads the client's own state and asks the robot nothing. A
+        network failure shows only once the operating system reports the
+        connection broken, which can take minutes; until then commands raise
+        `RobotTimeout`.
+
+        Returns:
+            `True` while the connection is open; `False` before `connect()`, after
+            `disconnect()` and after the connection was lost.
+
+        See also:
+            `connect()`, `disconnect()`
+
+        Examples:
+            >>> robot.connected
+            True
+        """
         return self._conn.connected
 
     def on_error(self, fn: Callable[[str], None]) -> None:
+        """Set a function to call when the robot sends an error event.
+
+        The function receives the event, a dict, for an error message from the
+        robot that answers no command. The robot software sends no such message
+        at present: errors reach a program through the answers to its commands,
+        `wait_idle()`, the status (`errors()`, `on_status_change()`) and
+        `on_motion_error()`. A client has one such function: a new call replaces
+        it, and `None` removes it.
+
+        Args:
+            fn: The function, called with the event dict. `None` removes it.
+
+        Note:
+            The function runs in the client's receiving thread, which reads
+            nothing else from the robot while it runs: keep it short. A command
+            or a wait called from it cannot receive its answer and ends in
+            `RobotTimeout`. If the function raises, the client prints the
+            exception and goes on receiving.
+
+        See also:
+            `on_status_change()`, `on_motion_error()`, `errors()`
+
+        Examples:
+            >>> robot.on_error(lambda event: print("robot error:", event))
+        """
         self._conn.on_error = fn
 
     def on_status_change(self, fn: Callable[[dict], None]) -> None:
+        """Set a function to call each time the robot's status arrives.
+
+        The function receives a copy of the latest status, the dict
+        `latest_status()` returns. The robot sends its status once when the
+        client connects, then whenever it changes, checking 50 times a second,
+        and at once after `take_control()`, `release_control()` and
+        `set_force_confirm()`. Set the function before `connect()` to receive the
+        first status too. A client has one such function: a new call replaces it,
+        and `None` removes it.
+
+        Args:
+            fn: The function, called with the status dict. `None` removes it.
+
+        Note:
+            The function runs in the client's receiving thread, which reads
+            nothing else from the robot while it runs: keep it short. A command
+            or a wait called from it cannot receive its answer and ends in
+            `RobotTimeout`. If the function raises, the client prints the
+            exception and goes on receiving.
+
+        See also:
+            `latest_status()`, `wait()`, `on_error()`
+
+        Examples:
+            >>> robot.on_status_change(lambda s: print(s.get("mode"), s.get("state")))
+            >>> robot.enter_exec_mode(wait=True)
+        """
         self._conn.on_status_change = fn
 
     def on_motion_complete(self, fn: Callable[[str], None]) -> None:
-        """fn(command_id) called whenever any queued motion command completes successfully."""
+        """Set a function to call when a queued command of this client finishes.
+
+        The function receives the command's id, the value the queued call
+        returned, each time a command this client queued finishes: a move, a
+        delay, or a gripper command once the jaws have settled. Other clients'
+        commands do not call it, nor do failed ones: see `on_motion_error()`.
+
+        It runs before `wait_motion_complete()` for that command returns, while
+        `wait_idle()` can return as it still runs. A client has one such
+        function: a new call replaces it, and `None` removes it.
+
+        Args:
+            fn: The function, called with the command id. `None` removes it.
+
+        Note:
+            The function runs in the client's receiving thread, which reads
+            nothing else from the robot while it runs: keep it short. A command
+            or a wait called from it cannot receive its answer and ends in
+            `RobotTimeout`. If the function raises, the client prints the
+            exception and goes on receiving.
+
+        See also:
+            `on_motion_error()`, `wait_idle()`, `wait_motion_complete()`
+
+        Examples:
+            >>> done = []
+            >>> robot.on_motion_complete(done.append)
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_motion_complete()
+        """
         self._conn.on_motion_complete = fn
 
     def on_motion_error(self, fn: Callable[[dict], None]) -> None:
-        """fn({"id", "code", "message"}) called when a queued motion command fails.
+        """Set a function to call when a queued command of this client fails.
 
-        Fires as soon as the failure arrives. wait_idle() also raises MotionFailed for
-        the same failures — use this callback to react immediately (e.g. abort a
-        toolpath) rather than at the next synchronization point."""
+        The function is called as soon as a command this client queued fails
+        after the robot accepted it, `STOPPED` and `ABORTED` included. It
+        receives a dict with `id` (the value the queued call returned), `code`
+        and `message`, and the error catalog's `number`, `title` and `fix` when
+        the robot sent them. The next `wait_idle()` reports the same failure as
+        `MotionFailed`, unless this client's `stop()` discards it first; this
+        function lets a program react at once.
+
+        A command the robot refused when it was sent raises in its own call
+        instead. The failures a lost connection causes reach only `wait_idle()`.
+        A client has one such function: a new call replaces it, and `None`
+        removes it.
+
+        Args:
+            fn: The function, called with the failure dict. `None` removes it.
+
+        Note:
+            The function runs in the client's receiving thread, which reads
+            nothing else from the robot while it runs: keep it short. A command
+            or a wait called from it, `stop()` included, cannot receive its
+            answer and ends in `RobotTimeout`: set a flag and act on it in the
+            program's own thread. If the function raises, the client prints the
+            exception and goes on receiving.
+
+        See also:
+            `wait_idle()`, `on_motion_complete()`, `stop()`
+
+        Examples:
+            >>> failures = []
+            >>> robot.on_motion_error(failures.append)
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle(raise_on_error=False)
+        """
         self._conn.on_motion_error = fn
 
     def latest_status(self) -> dict:
-        """Latest status snapshot from the event stream: mode, state, homed, err, ..."""
+        """Return the latest status the robot sent, without asking it.
+
+        The robot checks its state 50 times a second and sends the whole status to
+        every connected client whenever a field changes, and once when a client
+        connects. This returns a copy of the newest one, so it never waits and
+        sends nothing. It is empty until the first status arrives, and after a
+        disconnect it keeps the last values it had. Use `get_status()` to ask the
+        robot, and `wait()` to wait until a field changes.
+
+        Returns:
+            The status, a dict. The fields used most: `mode` (the robot mode, such
+            as `"IDLE"` or `"EXEC"`), `state` (`"ENABLED"` or `"DISABLED"`),
+            `homed`, `err` (1 while an error is latched), `errors` (the latched
+            error keys) and `error_details` (as `errors()` returns them),
+            `control_holder`, `exec_paused` and `exec_stopping` (1 while a program
+            is paused or brakes for a stop), `queue_depth` (queued moves not started
+            yet), `active_command`, `motion_aborted` (why new moves are refused, or
+            `None`), `recipe`, `payload` (`mass` in kilograms, `com` in metres),
+            `joint_test`, `free_joint` and `hall_check`. Every field, with its
+            meaning and unit, is in the Status fields reference.
+
+        See also:
+            `get_status()`, `errors()`, `wait()`, `on_status_change()`
+
+        Examples:
+            >>> robot.latest_status()["mode"]
+            'IDLE'
+            >>> robot.latest_status()["errors"]
+            []
+        """
         return self._conn.latest_status()
 
     status = latest_status      # its other name (2026-10-23): it is not get_status(), which asks the robot
@@ -228,17 +506,139 @@ class RobotClient:
     # ------------------------------------------------------------------ #
 
     def enable(self, wait: bool | None = None) -> None:
+        """Enable the robot, so that it can home and move.
+
+        The robot accepts it in any mode. While an error is latched, a pressed
+        E-stop included, the robot refuses to enable and stays disabled. That
+        refusal reaches only the robot's activity log: the call returns normally,
+        and with `wait` it raises `RobotTimeout` after 10 s. Call `clear_errors()`
+        first.
+
+        In IDLE mode, on a homed arm with gravity compensation on (as at every
+        start), enabling starts freedrive: the arm holds itself up against gravity
+        and can be moved by hand.
+
+        Args:
+            wait: Wait until the robot reports itself enabled, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report itself enabled within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `disable()`, `clear_errors()`, `home()`
+
+        Examples:
+            >>> robot.clear_errors(wait=True)
+            >>> robot.enable(wait=True)
+        """
         self._state_change("enable", wait, lambda s: s.get("state") == "ENABLED",
                            what="wait_enabled")
 
     def disable(self, wait: bool | None = None) -> None:
+        """Disable the robot: it stops at once and holds every joint still.
+
+        The robot accepts it in every mode, from every client, and never refuses
+        it. It switches to IDLE mode at once and holds each joint at zero speed:
+        the motors stay on and resist being moved. To take all torque off the arm,
+        use `safety_stop()`. The gripper's jaws stop where they are.
+
+        A program running in EXEC mode is cancelled without braking along its
+        path: the drives stop the joints as fast as their limits allow. Its queued
+        commands fail with `ABORTED`, and the robot refuses new moves with
+        `MOTION_ABORTED` until `clear_errors()`. To stop along the path first, use
+        `stop()` or `enter_idle_mode()`. Homing in progress is abandoned.
+
+        Args:
+            wait: Wait until the robot reports itself disabled, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report itself disabled within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        Warning:
+            It also ends motors off and firmware flashing, whichever client sends
+            it: the motors hold again, and during a flash the robot's CAN traffic
+            resumes, which can make the flash fail.
+
+        See also:
+            `enable()`, `stop()`, `safety_stop()`
+
+        Examples:
+            >>> robot.disable(wait=True)
+        """
         self._state_change("disable", wait, lambda s: s.get("state") == "DISABLED")
 
     def clear_errors(self, wait: bool | None = None) -> None:
+        """Clear the latched errors, and the abort after a failed move.
+
+        The robot sends a clear to every drive that reports a fault, waits about
+        0.15 s, then empties its list of latched errors, warnings included. A fault
+        that is still present latches again; when none is left, the robot leaves
+        the error state for IDLE mode. It stays disabled: call `enable()` next.
+        Homing that an error invalidated stays invalid: call `home()` again.
+
+        It also lifts the motion abort at once: after a move failed or a program
+        was interrupted, the robot refuses new moves with `MOTION_ABORTED` until
+        this call.
+
+        Args:
+            wait: Wait until the robot reports no error and has left the error
+                state, up to 10 s. Warnings do not count; `wait_error_reset()` waits
+                for them too.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, an
+                error was still latched after 10 s.
+            RobotConnectionError: The client is not connected.
+
+        Note:
+            A fault that is still present can be missing from the status for up to
+            about 20 ms before it latches again, so a wait can, rarely, return
+            early. Check `errors()` when it matters.
+
+        See also:
+            `enable()`, `errors()`, `wait_error_reset()`
+
+        Examples:
+            >>> robot.clear_errors(wait=True)
+            >>> robot.enable(wait=True)
+        """
         self._state_change("clear_errors", wait,
             lambda s: s.get("err", 0) == 0 and s.get("mode") != "ACTIVE_ERROR")
 
     def enter_exec_mode(self, wait: bool | None = None) -> None:
+        """Switch to EXEC mode, where the robot runs queued moves.
+
+        In EXEC mode the robot plays the moves a program queues, in the order they
+        were sent. On entry it holds the arm where it is. Calling it in EXEC mode
+        changes nothing (the robot's activity log shows a refused mode change).
+
+        Args:
+            wait: Wait until the robot reports EXEC mode, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in IDLE or EXEC mode,
+                not enabled or not homed, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report EXEC mode within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `enter_idle_mode()`, `stop()`, `move_joints()`
+
+        Examples:
+            >>> robot.enter_exec_mode(wait=True)
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+        """
         self._state_change("enter_exec_mode", wait, lambda s: s.get("mode") == "EXEC",
                            what="wait_mode(EXEC)")
 
@@ -249,36 +649,121 @@ class RobotClient:
     # ------------------------------------------------------------------ #
 
     def remote_ip(self) -> str | None:
-        """Robot's IP as seen on this connection, or None."""
+        """Return the robot's IP address on this connection.
+
+        It reads the address from the client's own connection and asks the robot
+        nothing. The real-time client, `RTIClient`, sends its packets to it.
+
+        Returns:
+            The robot's IP address, for example `"192.168.0.84"`; `None` before
+            `connect()` and after `disconnect()`.
+
+        See also:
+            `local_ip()`, `rti_connect()`
+
+        Examples:
+            >>> robot.remote_ip()
+            '192.168.0.84'
+        """
         return self._conn.remote_ip()
 
     def local_ip(self) -> str | None:
-        """Our IP on the route to the robot, or None. Sent in rti_connect."""
+        """Return this computer's IP address on the route to the robot.
+
+        It is the address of the network interface this connection uses, read
+        from the connection itself, so it is right on a computer with several
+        networks. It asks the robot nothing. `rti_connect()` has the robot send
+        its state packets there when it is given no address. Behind a router that
+        translates addresses (NAT), the robot sees another address.
+
+        Returns:
+            This computer's IP address, for example `"192.168.0.20"`; `None`
+            before `connect()` and after `disconnect()`.
+
+        See also:
+            `remote_ip()`, `local_label()`, `rti_connect()`
+
+        Examples:
+            >>> robot.local_ip()
+            '192.168.0.20'
+        """
         return self._conn.local_ip()
 
     def rti_connect(self, pc_ip: str | None = None, wait: bool | None = None, rate_hz: float | None = None, transport: str | None = None) -> None:
-        """Pair for RTI and enter an RTI mode. Streams state; does NOT grant control.
+        """Pair this PC with the robot and switch to a real-time mode.
 
-        pc_ip is where the robot will send state packets. Defaults to this socket's
-        local address, which is the interface the robot can actually reach.
+        The robot then sends its state to `pc_ip` every 4 ms tick and accepts
+        real-time commands only from that address. It switches from IDLE mode to a
+        real-time mode and holds the arm still where it is. Nothing moves, and no
+        command is applied, until `rti_claim()`. `RTIClient.connect()` calls this
+        for you and opens the link.
 
-        **`rate_hz` picks the contract**, mirroring the hard / soft real-time split of industrial streaming interfaces:
+        `rate_hz` picks the contract. Without it the robot enters RTI mode, hard
+        real time: your PC sends one target per tick over UDP, each with its send
+        time, and the robot replays your position targets one tick behind; it
+        stops when no command comes for 40 ms. With it the robot enters SOFT_RTI
+        mode: you send joint position targets at your own rate, the robot fills in
+        the ticks between them, and it stops when three of your intervals pass
+        without one.
 
-        - **omitted → RTI** (hard real-time). You close the loop: one setpoint every 4 ms,
-          40 ms watchdog. Unchanged, and the mode that is hardware-verified.
-        - **given → SOFT_RTI** (soft real-time). You send targets at *your* rate, 5–50 Hz,
-          and the robot interpolates between them. The timeout is sized at three of your
-          command intervals and the generator defaults to `ruckig_advancing`.
+        Each call sets the session's contract again: the command timeout, the
+        servo generator, the minimum duration and the dynamics feedforward, and in
+        RTI mode the pace limit and the state rate too. The other real-time
+        settings keep their values. Without `pc_ip`, a client that is not connected
+        raises `RuntimeError` and sends nothing.
 
-        The rate is the discriminator because it is the honest one: a PC that knows its own
-        command rate is telling you it does not intend to close the loop every tick.
+        Args:
+            pc_ip: The address the robot sends its state to and accepts commands
+                from. `None` uses this connection's own address on the route to the
+                robot.
+            wait: Wait until the robot reports the real-time mode, up to 10 s: RTI
+                without `rate_hz`, SOFT_RTI with it.
+                `None` follows the client's `sync` setting.
+            rate_hz: Your command rate in Hz, for SOFT_RTI; `None` for RTI mode. It
+                sets the command timeout to three of your intervals, at most 1 s.
+                Prefer a rate that divides 250 Hz evenly: 125, 50, 25 or 10 Hz.
+                Zero, a negative or a non-finite rate pairs in RTI mode instead, and
+                a wait then times out.
+            transport: `"udp"` or `"tcp"`; `None` means `"udp"`. With `"tcp"` the
+                robot waits for your PC to dial its port 30003 from `pc_ip`, and one
+                stream carries both directions (`RTIClient` dials it). SOFT_RTI only:
+                without `rate_hz` the robot uses UDP.
 
-        **Prefer a rate that divides evenly into 250 Hz — 50, 25 or 10.** A non-integer
-        ratio makes commands land alternately on two tick counts, corrupting every velocity
-        estimate the robot derives from your stream.
+        Raises:
+            CommandRejected: The robot refused it: it is not enabled or not homed,
+                or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report the mode within 10 s, for example when it was not in IDLE
+                mode.
+            RobotConnectionError: The client is not connected.
+            ValueError: `transport` is neither `"udp"` nor `"tcp"`, or `rate_hz` is
+                not a number. Nothing is sent.
+            TypeError: `rate_hz` is not a number. Nothing is sent.
 
-        Both modes share one handler, so the soft joint limits, TCP speed cap, start-pose
-        check and gravity compensation are identical. Only the contract differs.
+        Errors:
+            BAD_ARGS: The message did not carry exactly three values; this client
+                always sends three.
+
+        Note:
+            The robot switches only from IDLE mode, or pairs again in the real-time
+            mode it is in. From any other mode it refuses the switch, which only its
+            activity log shows; with `wait` the call times out. The pairing changes
+            anyway, and from EXEC mode every client's queued moves fail with
+            `ABORTED`.
+
+        Warning:
+            Calling it while a stream runs ends the claim at once, without braking:
+            the arm stops as hard as the drives can.
+
+        See also:
+            `rti_claim()`, `rti_disconnect()`, `rti_set_command_timeout()`,
+            `rti_set_servo_generator()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=50, wait=True)
+            >>> robot.latest_status()["mode"]
+            'SOFT_RTI'
+            >>> robot.rti_disconnect(wait=True)
         """
         if pc_ip is None:
             pc_ip = self.local_ip()
@@ -300,297 +785,1252 @@ class RobotClient:
             self.wait(lambda s: s.get("mode") == target, what=f"wait_mode({target})")
 
     def rti_claim(self) -> None:
-        """Claim RT control. Timing rules start: a 100 ms command gap stops the robot.
+        """Claim real-time control: the robot starts applying your commands.
 
-        Rejected if an error is latched or the robot is not already paired.
+        From now on the robot applies the commands your PC streams, and its
+        watchdog runs at once: the first command must arrive within the command
+        timeout (40 ms in RTI mode, three of your intervals in SOFT_RTI), and so
+        must every next one. Otherwise the arm brakes to rest within its limits,
+        then the robot latches `RTI_LINK_LOST`, which disables it. The first
+        command is checked against the arm (`rti_set_start_pose_check()`). A stream
+        the arm cannot follow ends the same way, with `RTI_POSITION_LIMIT`,
+        `RTI_VELOCITY_LIMIT`, `RTI_ACCELERATION_LIMIT`, `RTI_JERK_LIMIT` or
+        `RTI_NO_SEND_TIME` (see `RTIClient`).
+
+        The robot answers at once and never reports whether the claim took. It
+        ignores a claim while an error is latched, while the session is not paired
+        and idle (already claimed, or still stopping after a release), or when the
+        rate limiter is on and its planner is missing. The state packet's
+        `rti_state` shows it: 2 means control is active. While a claim is active,
+        control of the robot (`take_control()`) does not expire.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in a real-time mode
+                (for example right after `rti_connect()` without `wait`), not
+                enabled or not homed, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Warning:
+            From the claim on, the arm follows your PC's commands. Keep the space
+            around the arm clear and a hand near the E-stop.
+
+        See also:
+            `rti_connect()`, `rti_release()`, `rti_set_start_pose_check()`,
+            `rti_set_command_timeout()`
+
+        Examples:
+            >>> import time
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.connect(rate_hz=50)
+            >>> robot.wait_mode("SOFT_RTI")
+            >>> q = rti.read_once()["j_p"]
+            >>> robot.rti_claim()
+            >>> for i in range(50):
+            ...     rti.send_joint_position(q)
+            ...     time.sleep(0.02)
+            ...
+            >>> robot.rti_release()
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
         """
         self._immediate("rti_claim")
 
     def rti_release(self) -> None:
-        """Release control cleanly, staying paired. Robot holds position for 0.5 s."""
+        """End the real-time stream: brake to rest and hold, still paired.
+
+        The arm brakes to rest from where it was commanded to be, within the
+        joints' real-time acceleration and jerk limits, and holds there; no error
+        is latched. After 0.5 s of holding, the session is paired and idle again:
+        the robot stays in its real-time mode, keeps sending state and holds the
+        arm still, and a new `rti_claim()` starts another stream. A claim sent
+        while it brakes or during the 0.5 s is ignored.
+
+        It works in both real-time modes, also when the stream itself is down.
+        Send it within the command timeout after your last command, or the robot
+        latches `RTI_LINK_LOST` first. Without an active claim the robot ignores
+        it.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `rti_claim()`, `rti_disconnect()`
+
+        Examples:
+            >>> import time
+            >>> from robotclient import RTIClient
+            >>> rti = RTIClient(robot)
+            >>> rti.connect(rate_hz=50)
+            >>> robot.wait_mode("SOFT_RTI")
+            >>> q = rti.read_once()["j_p"]
+            >>> rti.claim()
+            >>> for i in range(50):
+            ...     q[5] += 0.0005
+            ...     rti.send_joint_position(q)
+            ...     time.sleep(0.02)
+            ...
+            >>> robot.rti_release()
+            >>> time.sleep(1)
+            >>> robot.rti_disconnect(wait=True)
+            >>> rti.close()
+        """
         self._immediate("rti_release")
 
     def rti_disconnect(self, wait: bool | None = None) -> None:
-        """Unpair and return to IDLE."""
+        """Unpair the PC and switch the robot to IDLE mode.
+
+        The robot stops sending state, forgets the PC's address, closes a TCP
+        stream, and switches to IDLE mode at once, from whatever mode it is in. An
+        enabled, homed arm with gravity compensation on is then in freedrive;
+        otherwise every joint holds still. The real-time settings that last across
+        sessions keep their values.
+
+        End a stream first with `rti_release()` and let the arm come to rest.
+
+        Args:
+            wait: Wait until the robot reports IDLE mode, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report IDLE mode within 10 s, for example with an error latched.
+            RobotConnectionError: The client is not connected.
+
+        Warning:
+            It never brakes. Sent while the arm moves, under a stream or in EXEC or
+            JOG mode, the arm coasts in freedrive until friction stops it, or, with
+            gravity compensation off, stops as hard as the drives can. It also ends
+            motors off and firmware flashing (the CAN traffic resumes mid-flash),
+            and it abandons homing.
+
+        See also:
+            `rti_connect()`, `rti_release()`, `enter_idle_mode()`
+
+        Examples:
+            >>> robot.rti_connect(wait=True)
+            >>> robot.rti_disconnect(wait=True)
+        """
         self._immediate("rti_disconnect")
         if self._should_wait(wait):
             self.wait(lambda s: s.get("mode") == "IDLE", what="wait_mode(IDLE)")
 
     def rti_set_rate_limiter(self, enabled: bool) -> None:
-        """Enable/disable acceleration, jerk and torque-rate clamping on RTI commands.
+        """Switch the real-time rate limiter on or off.
 
-        ON by default. Turning it off streams your commands to the motors untouched —
-        appropriate for measuring true loop latency, not for normal operation.
+        The rate limiter keeps every real-time command within the joints'
+        real-time limits from the robot XML (`<rti_limits>`). Position targets go
+        through the servo generator and, in RTI mode, the stream checks; velocity
+        commands are limited in speed, acceleration and jerk; torque commands in
+        their rate of change. It takes effect at once, also mid-stream.
+
+        With it off, commands reach the motors unshaped. What still applies: the
+        soft joint limits (position targets are clamped to them, a velocity brakes
+        before them, torque pushing past them is cut), the tool speed cap on
+        velocity commands, the SOFT_RTI position check, gravity compensation, the
+        first-command check and the watchdog. No generator runs, the RTI-mode
+        stream checks and the dynamics feedforward are skipped, and a claim no
+        longer needs the generator's planner. It is meant for measuring latency,
+        not for normal work.
+
+        Args:
+            enabled: `True` to limit every command, `False` to pass commands
+                through.
+
+        Defaults:
+            On, set each time the robot software starts. It lasts until changed or
+            the robot software restarts; `rti_connect()` does not reset it.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The value is not true or false (1 / 0), or the message did
+                not carry exactly one value; this client always sends one.
+
+        Warning:
+            Off, nothing limits how fast a command moves the arm: a position step
+            jumps at the drives' full authority, and a velocity command has no
+            speed limit. It stays off for every later session, from any PC, until
+            it is switched on or the robot software restarts.
+
+        See also:
+            `rti_set_start_pose_check()`, `rti_set_servo_generator()`,
+            `rti_set_tcp_vel_limit()`
+
+        Examples:
+            >>> robot.rti_connect(wait=True)
+            >>> robot.rti_set_rate_limiter(True)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_rate_limiter", [1 if enabled else 0])
 
     def rti_set_lowpass(self, cutoff_hz: float) -> None:
-        """Set the command low-pass cutoff in Hz. 0 disables. **Default: OFF.**
+        """Filter incoming real-time commands with a low-pass filter.
 
-        **DO NOT USE THIS IN SOFT_RTI.** Measured on hardware 2026-08-21: at 5 Hz it makes
-        motion monotonically ROUGHER and LAGGIER, the opposite of its purpose --
-        0.0440 Nm / 0.210 deg unfiltered, 0.0638 / 0.251 at a 2 Hz cutoff.
+        The robot passes the main value of every command, a position target, a
+        velocity or a torque, through a second-order Butterworth low-pass filter
+        at `cutoff_hz`, before the rate limiter and the stream checks; feedforward
+        values are not filtered. It removes noise from a sensor-driven stream, at
+        the cost of lag: about 1 ms at 100 Hz, 3 ms at 60 Hz, 9 ms at 25 Hz. In RTI
+        mode noise reads as acceleration and can end the stream with
+        `RTI_ACCELERATION_LIMIT`; 60 Hz is a good start there. Each claim starts
+        the filter afresh.
 
-        The reason is a conflict with the generator. The filter runs at the loop rate on a
-        signal that only updates at your command rate, so between commands it feeds the
-        generator a still-settling value that keeps changing. `ruckig_advancing` estimates
-        target velocity from successive targets, and it then measures FILTER TRANSIENTS
-        rather than target motion; its extrapolation goes wrong and corrects. The filter
-        fights the generator.
+        Do not use it in SOFT_RTI: the filter keeps changing the target between
+        your packets, the generator then follows the filter instead of your
+        motion, and the motion gets rougher (measured). Use
+        `rti_set_min_duration()` there.
 
-        It is meant for RTI, where you send every tick and the thing worth removing is
-        genuine noise in your own command stream. For a sparse stream use
-        `rti_set_min_duration` instead -- it was the entire Pareto frontier in that test.
+        Args:
+            cutoff_hz: The cutoff in Hz. 0 or below switches the filter off, and so
+                does 125 Hz or above (half the loop rate).
 
-        A 2nd-order Butterworth (since 2026-10-11; a one-pole filter before), defaulted
-        OFF: a computed trajectory has no noise and pays nothing. In hard RTI your stream
-        is checked for impossible motion, and noise reads as acceleration — about 0.003 deg
-        of white noise per sample already risks RTI_ACCELERATION_LIMIT on J1. What a
-        cutoff costs and buys there (simulated, J1): 100 Hz +1.0 ms, tolerates 0.005 deg;
-        60 Hz +3.0 ms, 0.010 deg; 40 Hz +5.3 ms, ~0.017 deg; 25 Hz +8.8 ms, 0.030 deg. Enable it if your command stream is
-        noisy; 60 Hz is a good start.
+        Defaults:
+            From `config/system.xml` `<rti_defaults><lowpass_cutoff_hz>`, read at
+            start: 0 (off). It lasts until changed or the robot software restarts;
+            `rti_connect()` does not reset it.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `cutoff_hz` is not a number. Nothing is sent.
+            TypeError: `cutoff_hz` is not a number. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The message did not carry exactly one value; this client
+                always sends one.
+
+        Note:
+            It lasts across sessions, from any PC: switch it off (0) when your
+            program is done.
+
+        See also:
+            `rti_set_min_duration()`, `rti_set_rate_limiter()`
+
+        Examples:
+            >>> robot.rti_connect(wait=True)
+            >>> robot.rti_set_lowpass(60)
+            >>> robot.rti_set_lowpass(0)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_lowpass", [float(cutoff_hz)])
 
     def rti_set_start_pose_check(self, enabled: bool) -> None:
-        """Enable/disable validation of the first setpoint after rti_claim.
+        """Switch the check of the first command after a claim on or off.
 
-        ON by default. It is what stops a controller that initialises to zeros from
-        commanding a step move across the workspace. Takes effect on the next claim.
+        With the check on, the robot compares the first command of each claim with
+        the arm. A position target must lie within 0.1 rad (about 5.7 deg) of every
+        joint's measured position; a velocity within 10 % of the joint's real-time
+        velocity limit (after `rti_set_vel_scale()`); a torque within what the
+        joint's real-time torque-rate limit allows in four ticks (16 ms). A first
+        command outside that is refused: the arm brakes to rest and the robot
+        latches `RTI_LINK_LOST`. It catches a controller that starts from zeros or
+        from an old pose.
+
+        The setting is read when the first command of a claim arrives, so it
+        applies to the next claim, or to the current one before its first command.
+
+        Args:
+            enabled: `True` to check the first command, `False` to let any first
+                command through.
+
+        Defaults:
+            On, set each time the robot software starts. It lasts until changed or
+            the robot software restarts; `rti_connect()` does not reset it. The
+            tolerance, 0.1 rad, is `config/system.xml`
+            `<rti_defaults><start_pose_tol_rad>`, read at start.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The value is not true or false (1 / 0), or the message did
+                not carry exactly one value; this client always sends one.
+
+        Warning:
+            With the check off, a first command far from the arm, such as all
+            zeros, reaches the motors: the arm moves there at its real-time limits.
+            The check stays off for every later session, from any PC, until it is
+            switched on or the robot software restarts.
+
+        See also:
+            `rti_claim()`, `rti_set_rate_limiter()`
+
+        Examples:
+            >>> robot.rti_connect(wait=True)
+            >>> robot.rti_set_start_pose_check(True)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_start_pose_check", [1 if enabled else 0])
 
     def set_gravity_comp(self, enabled: bool) -> Any:
-        """Robot-WIDE gravity compensation. Affects every mode, not just RTI.
+        """Switch gravity compensation on or off for the whole robot.
 
-        Distinct from `rti_set_gravity_comp`, which is RTI-scoped and deliberately leaves
-        this flag alone. This is the operator-level switch the dashboard drives.
+        With it on, the robot adds the torque that holds the arm up against its own
+        weight, from its model at the measured pose. It acts wherever the robot
+        drives the joints: EXEC and JOG moves and holds, real-time streams, and the
+        joints already homed while homing goes on. The error state always holds
+        every joint still, with or without it.
 
-        It also selects how IDLE holds the arm, which is not obvious and matters:
+        In IDLE mode it also decides how the arm is held. On an enabled, homed arm
+        with it on, IDLE is freedrive: the arm floats, can be moved by hand, and
+        feels its joint walls and the haptic zones. With it off, IDLE holds every
+        joint still instead.
 
-            ON   IDLE applies gravity-compensation TORQUE. The arm is weightless and
-                 hand-guidable, and holds only as well as the gravity model is accurate.
-            OFF  IDLE falls back to VELOCITY-hold at 0 rad/s. The arm is stiffer, and the
-                 firmware velocity loop is now in circuit -- which is the loop that
-                 limit-cycles on a joint whose gains are too stiff for its load.
+        The call returns as soon as the robot accepts it. `latest_status()` shows
+        the switch in `gravity_comp` once it is in force, and the robot's activity
+        log records each change.
 
-        That fallback is the only way to enter velocity-hold deliberately, without waiting
-        for an error, so it is also how api_tests/31_velhold_buzz.py reproduces the J3
-        oscillation on demand.
+        Args:
+            enabled: `True` to add gravity compensation, `False` to stop adding it.
+
+        Defaults:
+            On, set each time the robot software starts.
+
+        Returns:
+            Always `None`: the robot's answer carries no data.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The value was not true or false (1 / 0); this client always
+                sends one of them.
+
+        Warning:
+            The switch is a step in the torque the joints get: switch it while the
+            arm stands still. Off, a real-time torque stream gets no gravity torque
+            from the robot, and the arm sags unless the program sends that torque
+            itself. On, IDLE mode makes an enabled, homed arm move when pushed.
+
+        Note:
+            A real-time stream gets gravity compensation only while this switch and
+            `rti_set_gravity_comp()` are both on.
+
+        See also:
+            `rti_set_gravity_comp()`, `set_payload()`, `set_friction_comp()`,
+            `enter_idle_mode()`
+
+        Examples:
+            >>> robot.enter_idle_mode(wait=True)
+            >>> robot.set_gravity_comp(False)  # IDLE now holds every joint still
+            >>> robot.set_gravity_comp(True)   # freedrive again
         """
         return self._immediate("set_gravity_comp", [1 if enabled else 0])
 
     def set_inertia_comp(self, enabled: bool) -> Any:
-        """Robot-wide INERTIA feedforward: the torque M(q)·qdd that the commanded acceleration needs (the links and the
-        motor rotors behind the gearboxes), added to the current the drives get — in EXEC, JOG and RTI / SOFT_RTI
-        position and velocity commands. Computed from the COMMANDED motion of the tick, never a measured one; not
-        added in freedrive, holds, homing or RTI torque commands. Starts as system.xml <dynamics_feedforward> says
-        (ON as shipped); latest_status() reports "inertia_comp". Separate from set_coriolis_comp and set_gravity_comp."""
+        """Switch the inertia feedforward on or off for the whole robot.
+
+        With it on, the robot adds the torque each joint needs to accelerate as
+        commanded: for the arm's links and for the motors' rotors behind the
+        gearboxes. It is computed from the commanded motion of each control cycle,
+        never from a measured one.
+
+        It acts in EXEC and JOG motion and in real-time position streams. There it
+        uses the stream's own acceleration, and only while `rti_set_dynamics_ff()`
+        is `"stream"` (as at the start of every real-time session) and
+        `rti_set_rate_limiter()` is on. Freedrive, holds, homing, and real-time
+        velocity and torque streams get none.
+
+        The call returns as soon as the robot accepts it. `latest_status()` shows
+        the switch in `inertia_comp` once it is in force, and the robot's activity
+        log records each change.
+
+        Args:
+            enabled: `True` to add the inertia torque, `False` to stop adding it.
+
+        Defaults:
+            From `config/system.xml` `<dynamics_feedforward><inertia>`, read when the
+            robot software starts: on as shipped, and when the element is missing.
+
+        Returns:
+            Always `None`: the robot's answer carries no data.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The value was not true or false (1 / 0); this client always
+                sends one of them.
+
+        Note:
+            Off, the drives' own position control makes the accelerating torque, so
+            the joints follow fast moves less closely.
+
+        See also:
+            `set_coriolis_comp()`, `set_friction_ff()`, `rti_set_dynamics_ff()`,
+            `set_payload()`
+
+        Examples:
+            >>> robot.set_inertia_comp(False)
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+            >>> robot.set_inertia_comp(True)
+        """
         return self._immediate("set_inertia_comp", [1 if enabled else 0])
 
     def set_can_read_first(self, enabled: bool) -> Any:
-        """The CAN tick order (option B, 2026-10-12; RTI starts in the order system.xml <can_read_first> names, ON by
-        default): True = RTI reads the joints' CAN replies at the START of each tick, computes that tick's commands
-        from them and sends them at once — 3.8 instead of 7.8 ms from a drive's measurement to the command computed
-        from it (measured), with the same late-reply rate and tracking; False = the old order. Homing always uses the
-        old order. RTI.log reports the waits when it is switched off."""
+        """Choose whether the robot reads CAN first in each control tick.
+
+        On, the robot reads the drives' CAN replies at the start of each tick,
+        computes that tick's commands from them and sends the commands at once:
+        about 3.8 ms from a drive's measurement to the command computed from it,
+        instead of about 7.8 ms in the older order, which reads after sending.
+        Measured with the same rate of late replies and the same tracking. Homing
+        always uses the older order. The change takes effect on the robot's next
+        tick, in any mode, and lasts until the robot software restarts. The
+        status field `can_read_first` shows the order in use; it reads `False`
+        while homing.
+
+        Args:
+            enabled: `True` reads first and sends early; `False` uses the older
+                order.
+
+        Defaults:
+            From `config/system.xml` `<can_read_first>`, read each time the robot
+            software starts: on (1).
+
+        Returns:
+            `None`: the robot sends no data back.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: A raw client sent a value other than true / false or 1 / 0.
+
+        Note:
+            When the robot cannot open the CAN socket it needs to read first, it
+            keeps the older order and says why in its log; the call still returns
+            normally. Check the status field.
+
+        See also:
+            `latest_status()`, `get_health()`
+
+        Examples:
+            >>> robot.set_can_read_first(False)
+            >>> robot.set_can_read_first(True)
+        """
         return self._immediate("set_can_read_first", [1 if enabled else 0])
 
     def joint_test(self, joint: int, amplitude_deg: float = 5.0, speed_dps: float = 5.0,
                    current_ma: float = 600.0) -> Any:
-        """A small powered test move of one joint and back, homed or not (2026-10-18; the first-run check's stage 3):
-        joint 1..N moves `amplitude_deg` (signed, up to 15) from where it stands and back on a smooth ramp peaking at
-        `speed_dps` (up to 10), its drive's current limited to `current_ma` meanwhile; every other joint keeps holding.
-        joint_test(0) stops it. Only in IDLE with the arm ENABLED. The robot stops it itself when the joint falls 2 deg
-        behind (blocked, an endstop, too little current), on a disable or any mode change. Result in
-        status()["joint_test"]: state (running / done / fell_behind / stopped), moved_deg, max_error_deg,
-        peak_current_ma, end_error_deg, seq (counts finished tests)."""
+        """Move one joint a few degrees and back, as a powered test.
+
+        The joint moves `amplitude_deg` from where it stands and back on a smooth
+        ramp that peaks at `speed_dps`, and rests 0.5 s at each end: 5 degrees at
+        5 deg/s takes about 4 s. The drive works in its own encoder counts, so the
+        test needs no homing, and its current is limited to `current_ma`
+        meanwhile. The robot stops the test at once when the joint falls more than
+        2 degrees behind the commanded motion, when the robot is disabled or
+        leaves IDLE mode, and on any mode change, an error or the E-stop. The joint
+        then gets its normal current limit and command back, and stays where it
+        stopped.
+
+        The call returns at once. The result is in the status, `joint_test`:
+        `joint`, `state` (`"running"`, `"done"`, `"fell_behind"` or `"stopped"`),
+        `amplitude_deg`, `moved_deg` (the largest displacement the commanded way),
+        `max_error_deg` (the largest tracking error), `peak_current_ma`,
+        `end_error_deg` (where it ended against its start) and `seq`, which counts
+        finished tests. The figures are written when the test ends.
+
+        Args:
+            joint: The joint to move, 1 for J1; 0 stops a running test.
+            amplitude_deg: How far to move, in degrees, up to 15; the sign gives
+                the direction.
+            speed_dps: The peak speed, in degrees per second, up to 10.
+            current_ma: The drive's current limit during the test, in milliamperes,
+                up to the joint's own current limit. PAR6's first-run check uses
+                400 to 1500 mA, 1.5 times the joint's largest gravity torque.
+
+        Returns:
+            `None`: the robot sends no data back.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in IDLE mode or not
+                enabled, a value is out of range, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: A value is not a number. Nothing is sent.
+            TypeError: A value is `None`. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `joint` is not 0 to the number of joints; or, for a test,
+                `amplitude_deg` is 0, above 15 degrees or not finite, `speed_dps` is
+                not above 0 and up to 10 deg/s, or `current_ma` is not above 0 and
+                up to the joint's current limit.
+
+        Warning:
+            The joint moves by itself, with no check of the safety zones or
+            self-collision. On a homed arm the robot refuses a test that would
+            move the joint past its soft limits; unhomed, the angles are unknown
+            and nothing is checked. Only the 2-degree tracking limit and the
+            current limit stop a running test. The other joints hold still
+            meanwhile. Keep the space clear and a hand on the E-stop.
+
+        Note:
+            The robot can still refuse to start the test after it answered: in the
+            first 1.2 s after the robot software starts, while another test, a
+            freed joint or the Hall sensor check runs, before the joint has
+            reported its position, with a current above the limit in force, or, on
+            a homed arm, for a move past the joint's soft limits. That
+            refusal reaches only the robot's activity log; `seq` does not change.
+
+        See also:
+            `free_joint()`, `hall_check()`, `latest_status()`, `wait()`
+
+        Examples:
+            >>> seq = robot.latest_status()["joint_test"]["seq"]
+            >>> robot.joint_test(6, 5, 5, 400)
+            >>> robot.wait(lambda s: s["joint_test"]["seq"] > seq, 10)
+            >>> robot.latest_status()["joint_test"]["state"]
+            'done'
+        """
         return self._immediate("joint_test", [int(joint), float(amplitude_deg), float(speed_dps), float(current_ma)])
 
     def free_joint(self, joint: int) -> Any:
-        """Free one joint so it can be turned by hand (2026-10-18; the first-run check): joint 1..N goes limp (its
-        drive's current limit 0) while the others keep holding; 0 holds it again. Only in IDLE (enabled or not, homed
-        or not). A joint that carries the arm's weight (J2, J3) FALLS when freed unless it is supported. The robot holds
-        it again itself before any mode change (homing, a jog, an error, the E-stop) and 2 minutes after the last
-        free_joint(n) (sending it again renews it). status()["free_joint"] = the freed joint, 0 = none."""
+        """Free one joint so it can be turned by hand.
+
+        The joint's drive gets a current limit of 0: the joint makes no torque and
+        turns freely, while its encoder keeps counting, so `get_joints()` follows
+        the hand. Every other joint keeps its IDLE behaviour: it holds still or,
+        on a homed, enabled arm with gravity compensation on, floats in freedrive.
+        It works enabled or disabled, homed or not. One joint is free at a time:
+        freeing another first holds the one that was free.
+
+        The robot holds the joint again by itself on any mode change (homing, a
+        jog, an error, the E-stop), and 2 minutes after the last `free_joint()`
+        for that joint; calling it again for the same joint starts the 2 minutes
+        again. `free_joint(0)` holds it now. A joint held again stays where the
+        hand left it. The status field `free_joint` names the free joint, 0 when
+        none is.
+
+        Args:
+            joint: The joint to free, 1 for J1; 0 holds the free joint again.
+
+        Returns:
+            `None`: the robot sends no data back.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in IDLE mode, `joint`
+                is out of range, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `joint` is not a number. Nothing is sent.
+            TypeError: `joint` is `None`. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `joint` is not a whole number from 0 to the number of joints.
+
+        Warning:
+            A freed joint holds nothing. A joint that carries the arm's weight,
+            such as J2 or J3, falls at once unless someone supports the arm.
+
+        Note:
+            The robot can still refuse to free the joint after it answered: in the
+            first 1.2 s after the robot software starts, or while the Hall sensor
+            check or a test move runs. That refusal reaches only the robot's
+            activity log; the status field stays 0.
+
+        See also:
+            `joint_test()`, `hall_check()`, `get_joints()`
+
+        Examples:
+            >>> robot.free_joint(6)
+            >>> robot.get_joints()[5]
+            184.2
+            >>> robot.free_joint(0)
+        """
         return self._immediate("free_joint", [int(joint)])
 
     def hall_check(self, on: bool = True) -> Any:
-        """The Hall sensor check (2026-10-13): True = the joint homed on a Hall sensor (J6) goes limp (its drive's
-        current limit 0) and its Hall pin is read every tick — turn it by hand and watch the dashboard's I/O tab, or
-        status()["hall_check"]. Only in IDLE (enabled or not, homed or not); the robot stops it itself before any mode
-        change (homing, a jog, an error, the E-stop) and puts the joint's limits back. False = stop it."""
+        """Start or stop the Hall sensor check: its joint goes limp.
+
+        The joint that homes on a Hall sensor (J6 on PAR6) gets a current limit of
+        0 and turns freely, and the robot reads the sensor's pin every control
+        tick. Turn the joint by hand through its magnet and watch the status field
+        `hall_check`: `joint` (the limp joint, 0 while the check is off), `pin`
+        (the pin's level, 0 or 1, `None` until read), `changes` (the pin changes
+        seen) and `edge_deg` (the joint's angle in degrees at the last change to 0
+        and at the last change to 1, `None` until seen). It works enabled or
+        disabled, homed or not; every other joint keeps its IDLE behaviour.
+
+        The robot stops the check by itself on any mode change (homing, a jog, an
+        error, the E-stop) and gives the joint its limits back. It has no time
+        limit: stop it with `hall_check(False)`.
+
+        Args:
+            on: `True` starts the check, `False` stops it.
+
+        Returns:
+            `None`: the robot sends no data back.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in IDLE mode, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: A raw client sent a value other than true / false or 1 / 0.
+
+        Warning:
+            The joint holds nothing while the check runs: a load off its axis turns
+            it by itself. Support the tool first.
+
+        Note:
+            The robot can still refuse to start the check after it answered: on an
+            arm without a Hall sensor joint, in the first 1.2 s after the robot
+            software starts, or while a joint is free or a test move runs. That
+            refusal reaches only the robot's activity log; `joint` stays 0.
+
+        See also:
+            `free_joint()`, `joint_test()`, `latest_status()`
+
+        Examples:
+            >>> robot.hall_check(True)
+            >>> robot.wait(lambda s: s["hall_check"]["changes"] >= 2, 60)
+            >>> robot.latest_status()["hall_check"]["edge_deg"]
+            [181.4, 183.9]
+            >>> robot.hall_check(False)
+        """
         return self._immediate("hall_check", [1 if on else 0])
 
     def set_coriolis_comp(self, enabled: bool) -> Any:
-        """Robot-wide CORIOLIS / centripetal feedforward: the torque C(q, qd)·qd the joints exert on each other when
-        several move at once, from the commanded motion — same modes as set_inertia_comp. Starts as system.xml
-        <dynamics_feedforward> says (ON as shipped); latest_status() reports "coriolis_comp"."""
+        """Switch the Coriolis feedforward on or off for the whole robot.
+
+        With it on, the robot adds the torque the joints exert on each other when
+        several move at once (the Coriolis and centripetal effects), computed from
+        the commanded position and speed of each control cycle.
+
+        It acts where the inertia feedforward does: EXEC and JOG motion, and
+        real-time position streams while `rti_set_dynamics_ff()` is `"stream"` and
+        `rti_set_rate_limiter()` is on. Without a commanded speed nothing is added.
+
+        The call returns as soon as the robot accepts it. `latest_status()` shows
+        the switch in `coriolis_comp` once it is in force, and the robot's activity
+        log records each change.
+
+        Args:
+            enabled: `True` to add the Coriolis torque, `False` to stop adding it.
+
+        Defaults:
+            From `config/system.xml` `<dynamics_feedforward><coriolis>`, read when
+            the robot software starts: on as shipped, and when the element is
+            missing.
+
+        Returns:
+            Always `None`: the robot's answer carries no data.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The value was not true or false (1 / 0); this client always
+                sends one of them.
+
+        Note:
+            The torque is small at normal speeds; it grows with the square of the
+            joint speeds.
+
+        See also:
+            `set_inertia_comp()`, `set_friction_ff()`, `rti_set_dynamics_ff()`
+
+        Examples:
+            >>> robot.set_coriolis_comp(False)
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+            >>> robot.set_coriolis_comp(True)
+        """
         return self._immediate("set_coriolis_comp", [1 if enabled else 0])
 
     def set_friction_ff(self, enabled: bool) -> Any:
-        """Robot-wide FRICTION feedforward (2026-10-17): the torque each joint's friction takes at the COMMANDED speed
-        (the robot XML's friction model — Coulomb + load x |gravity torque| rounded through zero speed + viscous x
-        speed, measured by api_tests/77_friction_id.py), added to the current the drives get in EXEC, JOG and RTI /
-        SOFT_RTI position and velocity commands. Nothing at a commanded speed of zero (a hold), in freedrive (see
-        set_friction_comp), homing or RTI torque commands. Starts as system.xml <dynamics_feedforward><friction> says
-        (OFF as shipped); latest_status() reports "friction_ff". Measuring friction (api_tests 54 / 77) needs it OFF."""
+        """Switch the friction feedforward on or off for the whole robot.
+
+        With it on, the robot adds the torque each joint's friction takes at the
+        commanded speed, from the friction model in the robot XML (per joint
+        `<friction_coulomb_nm>`, `<friction_viscous_nm_s>` and
+        `<friction_load_per_nm>`). `<dynamics_feedforward><friction_fraction>` in
+        `config/system.xml` sets the share of the model it adds: all of it as
+        shipped.
+
+        It acts in EXEC and JOG motion and in real-time position and velocity
+        streams. A joint commanded to stand still gets none, and neither do
+        freedrive (see `set_friction_comp()`), homing and real-time torque streams.
+        It uses no measurement, so it cannot run away: each drive's own control
+        corrects what is left.
+
+        The call returns as soon as the robot accepts it. `latest_status()` shows
+        the switch in `friction_ff` once it is in force, and the robot's activity
+        log records each change.
+
+        Args:
+            enabled: `True` to add the friction torque, `False` to stop adding it.
+
+        Defaults:
+            From `config/system.xml` `<dynamics_feedforward><friction>`, read when
+            the robot software starts: off as shipped, and when the element is
+            missing.
+
+        Returns:
+            Always `None`: the robot's answer carries no data.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The value was not true or false (1 / 0); this client always
+                sends one of them.
+
+        Note:
+            It ships off: measured on the arm, it did not make the joints follow
+            their path more closely. Switch it off while you measure friction, or
+            it hides what you measure.
+
+        See also:
+            `set_friction_comp()`, `set_inertia_comp()`, `set_coriolis_comp()`
+
+        Examples:
+            >>> robot.set_friction_ff(True)
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+            >>> robot.set_friction_ff(False)
+        """
         return self._immediate("set_friction_ff", [1 if enabled else 0])
 
     def set_friction_comp(self, enabled: bool) -> Any:
-        """Friction compensation in FREEDRIVE (IDLE with gravity comp ON): a push in the direction each joint is
-        already moving — a fraction of its measured friction minus its measured gravity-model error (robot XML
-        <friction_coulomb_nm> + <friction_load_per_nm> x |gravity torque| / <gravity_error_nm>, policy <friction_comp>
-        in system.xml). Zero at rest, so a released arm is still held by its static friction. OFF at every RTI start.
-        latest_status() reports "friction_comp"."""
+        """Switch friction compensation in freedrive on or off.
+
+        With it on, in freedrive (IDLE mode, on an enabled, homed arm with gravity
+        compensation on), the robot pushes each joint gently in the direction it is
+        already moving, to make up part of its friction. The push is a share of the
+        joint's friction model in the robot XML, less the joint's gravity-model
+        error (`<gravity_error_nm>`): a joint whose gravity model is off by as much
+        as that share gets none.
+
+        It gives nothing at rest, so static friction still holds a released arm. It
+        is full from 2 deg/s and fades out between 20 and 40 deg/s, as shipped. The
+        shares and speeds are `config/system.xml` `<friction_comp>`: `fraction`,
+        `model_share`, `sliding_ratio`, `band_dps`, `fade_start_dps` and
+        `fade_end_dps`, read when the robot software starts. Outside freedrive it
+        has no effect; for motion, see `set_friction_ff()`.
+
+        The call returns as soon as the robot accepts it. `latest_status()` shows
+        the switch in `friction_comp` once it is in force, and the robot's activity
+        log records each change.
+
+        Args:
+            enabled: `True` to help joints moved by hand, `False` to stop helping.
+
+        Defaults:
+            Off, set each time the robot software starts.
+
+        Returns:
+            Always `None`: the robot's answer carries no data.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The value was not true or false (1 / 0); this client always
+                sends one of them.
+
+        See also:
+            `set_gravity_comp()`, `set_friction_ff()`, `get_joint_walls()`
+
+        Examples:
+            >>> robot.enter_idle_mode(wait=True)
+            >>> robot.set_friction_comp(True)
+        """
         return self._immediate("set_friction_comp", [1 if enabled else 0])
 
     def set_collision_detection(self, mode: str) -> Any:
-        """Collision detection's reaction: "off", "warn" or "stop" — until RTI restarts, then system.xml
-        <safety_monitor><collision> again ("warn" as shipped). The safety monitor compares the external torque on each
-        joint while the robot moves it (EXEC, JOG, RTI, SOFT_RTI) with the torque it had at rest before the move:
-        above the robot XML's <contact_torque_nm> a live CONTACT_WARNING, above <collision_torque_nm> a
-        COLLISION_WARNING ("warn") or the COLLISION error ("stop": the robot stops and holds until errors are
-        cleared). A program that presses on things ON PURPOSE switches it to "off" (or "warn") first and back after.
-        Declare a held part with set_payload — an undeclared one reads as external torque. latest_status() reports
-        "collision_detection"."""
+        """Set how the robot reacts when the arm hits something.
+
+        The robot estimates the external torque on each joint from the motor
+        currents and its model. While it moves a joint in EXEC, JOG or a real-time
+        stream, it compares that torque with the one the joint had at rest before
+        the move. Above the joint's contact threshold (robot XML
+        `<contact_torque_nm>`) it shows a live `J<n>:CONTACT_WARNING`; above its
+        collision threshold (`<collision_torque_nm>`) it reacts as `mode` says. A
+        threshold of 0 leaves it unchecked on that joint.
+
+        The check runs on a homed arm, while a joint is commanded faster than
+        0.5 deg/s and for 0.5 s after; an excursion must last 0.012 s
+        (`config/system.xml` `<safety_monitor>`: `<hold_still_dps>`,
+        `<collision_settle_s>`, `<collision_sustain_s>`). It never runs in
+        freedrive, homing or the error state. A warning clears once the joint is
+        back under half its contact threshold, or at rest.
+
+        The setting lasts until the robot software restarts, also after the
+        program that set it has ended. Without thresholds in the robot XML the
+        reaction stays `"off"`, whatever is asked. `latest_status()` shows the
+        reaction in force in `collision_detection`; the robot's log records a
+        switch to a weaker one as a warning.
+
+        Args:
+            mode: `"off"`: no contact or collision check. `"warn"`: a live
+                `J<n>:COLLISION_WARNING`, and the robot keeps moving. `"stop"`: the
+                error `J<n>:COLLISION`: the robot stops and is disabled, holding
+                every joint, until `clear_errors()` and `enable()`; a running
+                program is cancelled. Letter case and spaces around the word do not
+                matter.
+
+        Defaults:
+            From `config/system.xml` `<safety_monitor><collision>`, read when the
+            robot software starts: `"warn"` as shipped, and when the element is
+            missing.
+
+        Returns:
+            Always `None`: the robot's answer carries no data.
+
+        Raises:
+            CommandRejected: The robot refused it: `mode` is not one of the three
+                words, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `mode` is not `"off"`, `"warn"` or `"stop"`.
+
+        Warning:
+            With `"off"` or `"warn"` the arm keeps pushing after it hits something,
+            with all the force its drives give. Turn the check down only for a move
+            that presses on purpose, and back up right after it.
+
+        Note:
+            A part the gripper holds reads as external torque until it is declared
+            with `set_payload()`. A switch takes a new rest torque at once: switch
+            while the arm stands still.
+
+        See also:
+            `set_payload()`, `clear_errors()`, `errors()`, `latest_status()`
+
+        Examples:
+            >>> robot.set_collision_detection("off")
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+            >>> robot.set_collision_detection("warn")
+        """
         return self._immediate("set_collision_detection", [str(mode).strip().lower()])
 
     def set_payload(self, mass_kg: float, com_m: Sequence[float] = (0.0, 0.0, 0.0)) -> Any:
-        """Declare the part the gripper holds: mass [kg] and its centre of mass [m] in the TOOL frame (the
-        gripper's link frame: +z out of the flange toward the jaws). The robot ADDS it to the gripper's own body and
-        rebuilds its gravity feedforward and the freedrive walls' dynamics at once (~1 ms, every mode). `0` restores
-        the gripper alone. Refused above the robot XML's `<max_payload_kg>` or with a COM more than 0.5 m out
-        (`PAYLOAD_LIMIT`). Not persisted: every RTI start begins at 0. Needs control. `status()["payload"]` shows it.
+        """Declare the part the gripper holds: its mass and centre of mass.
+
+        The robot adds the part to the gripper's own body in its model and rebuilds
+        the model at once, in every mode: gravity compensation, the inertia and
+        Coriolis feedforward, the external torque estimate behind collision
+        detection, and the inertia the freedrive walls push against. A declared
+        part then floats with the arm in freedrive and does not read as a contact.
+        While the estimate starts again, collision detection pauses for 0.1 s.
+
+        Call it each time the gripper picks up or lets go of a part;
+        `set_payload(0)` brings back the gripper alone. `latest_status()` shows the
+        payload in force in `payload` (`mass`, `com`) shortly after the call
+        returns.
+
+        Args:
+            mass_kg: The part's mass, in kilograms: from 0 up to the robot XML's
+                `<max_payload_kg>` (0.4 kg on PAR6).
+            com_m: The part's centre of mass `(x, y, z)`, in metres, in the tool
+                frame: its origin is the tool centre point, and +z points from the
+                flange toward the jaws. At most 0.5 m from that origin. The default
+                puts it at the tool centre point.
+
+        Defaults:
+            0 kg (the gripper alone), set each time the robot software starts.
+
+        Returns:
+            `{"mass": kg, "com": [x, y, z], "max_payload_kg": kg}`: the payload
+            asked for, in kilograms and metres, and the robot's maximum.
+
+        Raises:
+            CommandRejected: The robot refused it, for example before homing, with
+                a payload out of bounds (`PAYLOAD_LIMIT`), or because another client
+                holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `mass_kg` or a value in `com_m` is not a number. Nothing is
+                sent.
+            TypeError: `mass_kg` is `None`, or `com_m` is not a sequence. Nothing is
+                sent.
+
+        Errors:
+            PAYLOAD_LIMIT: The mass is below 0 or above `<max_payload_kg>`, a value
+                is not finite, `com_m` does not hold exactly three numbers, or the
+                centre of mass is more than 0.5 m from the tool centre point.
+
+        Warning:
+            Declare what the gripper really holds, and call `set_payload(0)` once it
+            lets go. In freedrive a declared mass the arm does not carry pushes it
+            up, and an undeclared one lets it sink.
+
+        See also:
+            `set_collision_detection()`, `set_gravity_comp()`, `latest_status()`
+
+        Examples:
+            >>> robot.set_payload(0.2, (0.0, 0.0, 0.03))
+            {'mass': 0.2, 'com': [0.0, 0.0, 0.03], 'max_payload_kg': 0.4}
+            >>> robot.set_payload(0)
         """
         return self._immediate("set_payload", [float(mass_kg), [float(v) for v in com_m]])
 
     def rti_set_gravity_comp(self, enabled: bool) -> None:
-        """Enable/disable gravity-compensation feedforward on RTI commands.
+        """Switch gravity compensation on or off for real-time control.
 
-        **ON by default** — the robot carries its own weight, as it does in IDLE, JOG and
-        EXEC. Turn it off only if your controller computes gravity itself, since a torque
-        controller that also receives ours would apply it twice.
+        With it on, the robot adds the torque that holds the arm up against gravity
+        to every real-time command and to its holds and stops, as in the other
+        modes. Turn it off only when your controller computes gravity itself: a
+        torque controller that also gets the robot's would apply it twice. It takes
+        effect at once.
 
-        This is RTI-scoped. It does not change the robot-wide gravity flag, so IDLE and JOG
-        are unaffected when you disconnect; that flag still overrides this one if the
-        operator has switched compensation off globally.
+        It needs the robot-wide switch on too (`set_gravity_comp()`), and it
+        changes nothing outside the real-time modes.
+
+        Args:
+            enabled: `True` to add gravity compensation, `False` to leave gravity to
+                your controller.
+
+        Defaults:
+            On, set each time the robot software starts. It lasts until changed or
+            the robot software restarts; `rti_connect()` and `rti_disconnect()` do
+            not reset it.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The value is not true or false (1 / 0), or the message did
+                not carry exactly one value; this client always sends one.
+
+        Warning:
+            Off, a torque stream that adds no gravity of its own lets the arm fall,
+            and position streams and holds carry the weight on the drives' own
+            position loops alone. It stays off for every later session, from any
+            PC, until it is switched on or the robot software restarts.
+
+        See also:
+            `set_gravity_comp()`, `rti_set_dynamics_ff()`
+
+        Examples:
+            >>> robot.rti_connect(wait=True)
+            >>> robot.rti_set_gravity_comp(True)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_gravity_comp", [1 if enabled else 0])
 
     def rti_set_dynamics_ff(self, source: str) -> None:
-        """Inertia / Coriolis feedforward source for RTI / SOFT_RTI POSITION streams: "off" or "stream".
+        """Choose the inertia and Coriolis feedforward of real-time streams.
 
-        **"stream" at every RTI / SOFT_RTI entry** (since 2026-10-11) — set "off" after `rti_connect`, before claiming,
-        if your PC computes its own dynamics (as with `rti_set_gravity_comp`). "stream" feeds forward
-        M(q)·q̈ (+ C(q, q̇)·q̇) from the stream's OWN acceleration: the change of the target velocity between your
-        packets over their interval, smoothed (~8 Hz). It helps from ~25 Hz up and is too late to help below ~10 Hz.
-        The robot's generator acceleration is never fed forward (it switches between its limits as it chases each
-        target). The robot-wide `set_inertia_comp` / `set_coriolis_comp` switches still apply on top. Velocity and
-        torque commands get none.
+        With `"stream"` the robot estimates your position stream's own
+        acceleration, the change of its speed between your packets smoothed at
+        about 8 Hz, and feeds the torque that motion needs forward to the drives:
+        the joints' inertia, and their Coriolis effect on each other. It helps
+        tracking from about 25 Hz up and comes too late below about 10 Hz; noise
+        in your targets shows as torque ripple. The robot-wide `set_inertia_comp()`
+        and `set_coriolis_comp()` must be on too. With `"off"` nothing is fed
+        forward: choose it when your PC computes its own dynamics.
+
+        It acts on position streams while the rate limiter is on; velocity and
+        torque commands get none. `rti_connect()` sets it again: call this after
+        it.
+
+        Args:
+            source: `"stream"` or `"off"`, in any case. The robot ignores any other
+                value and keeps the current one.
+
+        Defaults:
+            `"stream"`, set at every `rti_connect()`.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The message did not carry exactly one value; this client
+                always sends one.
+
+        See also:
+            `set_inertia_comp()`, `set_coriolis_comp()`, `rti_set_gravity_comp()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=50, wait=True)
+            >>> robot.rti_set_dynamics_ff("off")
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_dynamics_ff", [str(source).strip().lower()])
 
     def rti_set_tcp_vel_limit(self, mps: float) -> None:
-        """Cap the end effector's translational speed at `mps` metres/second. 0 disables.
+        """Cap the tool's straight-line speed under real-time control.
 
-        **OFF by default.** Joint velocity limits do not bound TCP speed — near a
-        singularity a slow joint can produce a very fast end effector, and this is the
-        only guard for that case. The cap scales the limiter's per-tick velocity budget
-        (position commands) or the whole commanded vector, direction preserved (velocity
-        commands). Like the soft joint limits, on the velocity path it applies even with
-        the rate limiter disabled.
+        The robot keeps the tool centre point's translational speed at or below
+        `mps`, computed at the arm's measured pose. Position streams are slowed
+        along the direction they travel, through the generator's speed budget, so
+        the arm trails a stream that asks for more. Velocity commands are scaled
+        down as a whole, which keeps their direction. Torque commands are not
+        capped. It takes effect at once.
 
-        Practical note: near a singularity the cap makes the arm CRAWL rather than let
-        the TCP run away — that slowdown is the feature working, not a fault.
+        Joint speed limits do not bound the tool's speed: near a singularity a slow
+        joint can move the tool fast, and this cap is the guard for that case. The
+        arm then crawls; that is the cap working. With the rate limiter off it
+        still caps velocity commands, but not position streams. Without a
+        kinematic model on the robot it does nothing, and RTI.log says so.
+
+        Args:
+            mps: The cap in metres per second. 0, a negative value or NaN switches
+                it off.
+
+        Defaults:
+            From the robot XML `<safety><max_tcp_velocity>`, read at start: 0 (off)
+            on PAR6. It lasts until changed or the robot software restarts;
+            `rti_connect()` does not reset it.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `mps` is not a number. Nothing is sent.
+            TypeError: `mps` is not a number. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The message did not carry exactly one value; this client
+                always sends one.
+
+        Warning:
+            Switching it off removes the only guard on the tool's speed near a
+            singularity, for every later session, from any PC, until it is set
+            again or the robot software restarts.
+
+        See also:
+            `rti_set_vel_scale()`, `rti_set_rate_limiter()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=50, wait=True)
+            >>> robot.rti_set_tcp_vel_limit(0.25)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_tcp_vel_limit", [float(mps)])
 
     def rti_set_command_timeout(self, seconds: float) -> None:
-        """How long RTI control may go without a command before the robot stops itself.
+        """Set how long the robot waits for the next real-time command.
 
-        **Hard RTI: fixed at 0.040 s, and this can only TIGHTEN it.** A request above 40 ms is
-        clamped to 40 ms. Hard RTI carries velocity and torque commands, and while no new command
-        arrives the robot keeps applying the LAST one every tick — a stale velocity or torque would
-        keep driving for the whole window, so a client is never allowed to widen it.
+        While control is claimed, a gap longer than this between two commands ends
+        the stream: the arm brakes to rest within its limits, then the robot
+        latches `RTI_LINK_LOST`, which disables it. Until then the robot carries on
+        with the last command: a position stream along your last targets, a
+        velocity or a torque command unchanged. It takes effect at once, also
+        mid-stream.
 
-        **SOFT_RTI: sized for your rate, widenable up to the operator's ceiling.** Connecting with
-        `rti_connect(ip, rate_hz=...)` already sets it to 3 command intervals (`3.0 / rate_hz`),
-        which tolerates two dropped packets without tolerating a dead PC. Call this AFTER the
-        session is paired if you want more slack; the robot clamps the request to
-        max(operator ceiling, your rate's own 3 intervals), capped at 1.0 s. The operator's
-        ceiling is `<safety><max_soft_rti_timeout>` in the robot XML (0.25 s by default), so a
-        remote PC can never exceed what the operator allowed. SOFT_RTI is POSITION-ONLY — velocity
-        and torque packets are refused — which is what makes a longer window safe: while no
-        command arrives the robot continues toward your LAST target and stops there.
+        In RTI mode it can only shorten the 40 ms: a stale velocity or torque must
+        not drive on for longer. In SOFT_RTI, which takes position targets only, it
+        can be widened up to the operator's ceiling, the robot XML
+        `<safety><max_soft_rti_timeout>` (0.25 s on PAR6), or up to three of your
+        intervals when that is longer, never above 1 s. Below 8 ms (two ticks)
+        counts as 8 ms. `rti_connect()` sets it again: call this after it.
 
-        Below 2 ticks (8 ms) is clamped up: one jittered packet must not look like a dead link.
-        Set it AFTER rti_connect: pairing re-applies the contract and resets the timeout.
+        Args:
+            seconds: The longest gap allowed between two commands, in seconds,
+                limited as described. A non-finite value is ignored.
+
+        Defaults:
+            Set at every `rti_connect()`: 0.04 s in RTI mode; in SOFT_RTI three of
+            your intervals (3 / `rate_hz`), at least 8 ms and at most 1 s. Before
+            the first one it is `config/system.xml`
+            `<rti_defaults><command_timeout_s>`, 0.04 s, read at start.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `seconds` is not a number. Nothing is sent.
+            TypeError: `seconds` is not a number. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The message did not carry exactly one value; this client
+                always sends one.
+
+        See also:
+            `rti_connect()`, `rti_claim()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=20, wait=True)
+            >>> robot.rti_set_command_timeout(0.2)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_command_timeout", [float(seconds)])
 
     def rti_set_vel_scale(self, fraction: float) -> None:
-        """Scale the RTI joint velocity limits to `fraction` of the robot XML values.
+        """Scale the real-time joint speed limits down.
 
-        **Defaults to 1.0** (the XML values). Can only lower the limit, never raise it.
+        Every joint's real-time velocity limit becomes `fraction` of its value in
+        the robot XML (`<rti_limits><velocity>`). It can only lower the limits, and
+        each call scales from the XML values, so calls do not add up. It takes
+        effect at once. It limits the servo generators, velocity commands while the
+        rate limiter is on, and the first-command check; acceleration and jerk
+        keep their limits, and the RTI-mode stream checks still use the full ones.
 
-        This is the smoothness knob for low-rate streaming. The robot's generator plans to
-        arrive and stop at each target you send; if it is ten times faster than the speed
-        you are actually travelling, it sprints to each target and waits, and the motion
-        pulses. Capping it near your travel speed removes the room to sprint, so it glides
-        instead — measured 59% velocity ripple at 20 Hz down to 0%.
+        In SOFT_RTI it smooths a slow stream: a generator capped near your travel
+        speed glides between your targets instead of sprinting to each and
+        waiting. Set it to about your travel speed divided by the joint's limit. It
+        acts like a cliff: above your travel speed it changes nothing, and at it
+        the arm has no speed in reserve to catch up after a delay.
 
-        Set it to roughly `your_travel_speed / joint_velocity_limit`. It is a cliff rather
-        than a slope: too high and it does nothing at all, and the cost of getting it right
-        is that the arm has no speed in reserve to catch up after a disturbance.
+        Args:
+            fraction: The share of the robot XML limit, from 0.01 to 1: a fraction,
+                not a percent. Above 1 counts as 1 and below 0.01 as 0.01; zero, a
+                negative or a non-finite value is ignored.
 
-        Velocity only — acceleration and jerk limits are unchanged.
+        Defaults:
+            1 (the robot XML limits), set each time the robot software starts. It
+            lasts until changed or the robot software restarts; `rti_connect()`
+            does not reset it.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `fraction` is not a number. Nothing is sent.
+            TypeError: `fraction` is not a number. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The message did not carry exactly one value; this client
+                always sends one.
+
+        Note:
+            It lasts across sessions: set it back to 1 when your program is done,
+            or the next session, from any PC, runs slower.
+
+        See also:
+            `rti_set_pace()`, `rti_set_min_duration()`, `rti_set_tcp_vel_limit()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=20, wait=True)
+            >>> robot.rti_set_vel_scale(0.1)
+            >>> robot.rti_set_vel_scale(1)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_vel_scale", [float(fraction)])
 
     def rti_set_min_duration(self, multiplier: float) -> None:
-        """Make each planned move last at least `multiplier` of your command intervals.
+        """Make each planned move last at least a multiple of your interval.
 
-        **SOFT_RTI sets 1.5 at every entry (since 2026-10-11); hard RTI 0.** Call this after `rti_connect` to choose
-        your own (0 = SOFT_RTI before 2026-10-11). Why the default: with the advancing generator and no pacing, every
-        packet that differs from the robot's extrapolation was corrected with a kick at the full RTI limits — J1 visibly
-        jerky at 50 / 10 Hz on the arm, and an operator's sudden stop overshot 2-7° (simulated); with 1.5, 4-13x
-        smoother, 2-4x more accurate in shape, stop overshoot 0.4° at 50 Hz, none at <= 10 Hz, for more lag (+20 ms at
-        50 Hz, +120 ms at 10 Hz). A minimum trajectory execution time. The robot
-        measures your command rate itself, so you state a shape preference rather than a
-        speed — no need to know your travel velocity in rad/s.
+        The robot measures the interval between your position targets and plans
+        each move toward one to last at least `multiplier` of those intervals.
+        From about 1.5 up each plan outlives the next target, so the arm glides
+        from target to target instead of braking at each; the price is lag, about
+        one interval. At 1 the plan still ends as the next target lands, and the
+        motion still pulses. It takes effect at once.
 
-        **The multiplier must be above 1.** At exactly 1 the plan finishes just as your next
-        command lands, so it still decelerates to a stop and you still get pulsing. From
-        about **1.5** upward the plan always outlives your next command, the deceleration is
-        never reached, and the motion becomes continuous — measured velocity swing at 5 Hz
-        drops from 0.874 rad/s to 0.
+        It acts with `"ruckig"` and `"ruckig_advancing"` only, and makes the joints
+        share one move duration. `rti_connect()` sets it again: call this after
+        it.
 
-        Like every pacing option it buys smoothness with lag. With the plain `ruckig` generator it was the least
-        accurate of the smooth choices (2026-08); `rti_set_servo_generator("ruckig_advancing")` reaches 0.05°
-        where this reaches 6.3°. Use this if you want a duration-floor contract; use the
-        advancing generator if you want the best tracking.
+        Args:
+            multiplier: Command intervals, from 1 to 5 (clamped); 0 switches it
+                off. A negative or non-finite value is ignored.
 
-        Ruckig generators only — the tracker has no planned duration to floor.
+        Defaults:
+            Set at every `rti_connect()`: 1.5 in SOFT_RTI, 0 (off) in RTI mode.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `multiplier` is not a number. Nothing is sent.
+            TypeError: `multiplier` is not a number. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The message did not carry exactly one value; this client
+                always sends one.
+
+        See also:
+            `rti_set_servo_generator()`, `rti_set_pace()`, `rti_set_vel_scale()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=50, wait=True)
+            >>> robot.rti_set_min_duration(1.2)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_min_duration", [float(multiplier)])
 
 
 
     def take_control(self, force: bool = False, timeout: float | None = None) -> dict:
-        """Claim exclusive control of the robot. Returns the holder.
+        """Take control of the robot for this client.
 
-        Usually unnecessary — control attaches automatically to whoever issues the first
-        command that moves or arms the robot. Call it to RESERVE control before starting a
-        programme, or with `force=True` to take it from a holder that is wedged or absent.
+        While a client holds control, the robot refuses every other client the
+        commands that take control, with `CONTROL_HELD`; the commands open to every
+        client still work for all, stopping included. Usually no call is needed:
+        the first command that takes control claims it when nobody holds it. Call
+        it to reserve the robot before a program starts, or with `force=True` to
+        take control from another client.
 
-        Exclusivity is how industrial arms commonly prevent two parties commanding one arm
-        (they typically authenticate nobody, relying on network isolation). It is the half
-        that actually matters.
+        Control is released by `release_control()`, when the client disconnects,
+        or after 30 s without a command that takes control, with nothing queued
+        and no real-time stream running.
 
-        What is NEVER gated, no matter who holds control: `stop`, `pause`, `disable`,
-        `safety_stop`, `clear_errors` and every read. If arbitration could lock someone out
-        of stopping the robot, the safety feature would have become the hazard.
+        With the takeover confirmation on (`set_force_confirm()`), a forced take
+        from another client waits up to 20 s for someone at the control box:
+        holding button 2 for 1 s allows it, button 1 refuses it.
+
+        Args:
+            force: Take control even when another client holds it.
+            timeout: Seconds to wait for the robot's answer. `None` means 30 s with
+                `force=True`, time for the button press, and 5 s otherwise.
+
+        Returns:
+            `{"holder": label}`, the client that now holds control: its address as
+            the robot sees it, "ip:port", as `control_holder()` reports it.
+
+        Raises:
+            CommandRejected: The robot refused it; its error code says why.
+            RobotTimeout: The robot did not answer within `timeout`.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `force` was not true or false (a raw client's 1 / 0 also
+                count).
+            CONFIRM_BUSY: Another forced takeover is already waiting at the
+                control box.
+            CONTROL_HELD: Another client holds control, and `force` is false.
+            CONFIRM_REQUIRED: The forced takeover was not confirmed: refused or not
+                answered at the control box within 20 s, button 2 already held
+                when it started, or this client disconnected meanwhile.
+            INTERNAL: The confirmation failed inside the robot.
+
+        See also:
+            `release_control()`, `control_holder()`, `holds_control()`,
+            `set_force_confirm()`
+
+        Examples:
+            >>> robot.take_control()
+            {'holder': '192.168.1.20:51234'}
+            >>> robot.release_control()
         """
         # A FORCED take can block on the robot for the whole physical-confirmation window
         # (~20 s: someone has to walk over and press the button). IMMEDIATE_TIMEOUT is 5 s,
@@ -602,131 +2042,369 @@ class RobotClient:
         return self._immediate("take_control", [bool(force)], timeout=timeout)
 
     def set_force_confirm(self, enabled: bool) -> dict:
-        """Require a press on the control box before a FORCED takeover succeeds.
+        """Require a button press at the robot for a forced takeover.
 
-        Without it, `take_control(force=True)` is software-only and any machine on the network
-        can seize control from any other. Industrial arms commonly require a physical action at the
-        robot for the same operation (a button on the arm, a pendant's enabling device). This is
-        that gate on our hardware, and it is why the IP allowlist can safely be turned off.
+        With it on, `take_control(force=True)` from a client that does not hold
+        control succeeds only when someone at the control box confirms it within
+        20 s: holding button 2 for 1 s allows it, button 1 refuses it. With it
+        off, any client on the network can take control from another. A claim on
+        a robot that nobody controls never needs the button.
 
-        Only a takeover FROM A LIVE HOLDER is gated — a first claim on an idle robot is
-        unaffected. Ships OFF.
+        Any client can switch it on. Only the client that holds control can
+        switch it off, or any client while nobody holds control.
+
+        Args:
+            enabled: `True` to require the button press, `False` to stop requiring
+                it.
+
+        Defaults:
+            Off, each time the robot software starts.
+
+        Returns:
+            `{"force_confirm": bool}`: the setting now in force.
+
+        Raises:
+            CommandRejected: The robot refused it; its error code says why.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `enabled` was not true or false (a raw client's 1 / 0 also
+                count).
+            CONTROL_HELD: `enabled` is false and another client holds control.
+
+        See also:
+            `take_control()`
+
+        Examples:
+            >>> robot.set_force_confirm(True)
+            {'force_confirm': True}
         """
         return self._immediate("set_force_confirm", [bool(enabled)])
 
     def release_control(self) -> Any:
-        """Give up control. Always allowed; never refused."""
+        """Give up control of the robot.
+
+        Another client can then take control. It is never refused: a client that
+        does not hold control gets `released` false. Moves already queued keep
+        running.
+
+        Returns:
+            `{"released": bool, "holder": label or None}`: whether this client held
+            control and gave it up, and who holds control now ("ip:port").
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `take_control()`, `control_holder()`
+
+        Examples:
+            >>> robot.take_control()
+            >>> robot.release_control()
+            {'released': True, 'holder': None}
+        """
         return self._immediate("release_control")
 
     def control_holder(self) -> str | None:
-        """Who currently holds control ("ip:port"), or None. From the status stream."""
+        """Return the client that holds control, or `None`.
+
+        It reads the latest status the robot sent, and asks the robot nothing.
+        The robot names a client by its address as it sees it, "ip:port". Control
+        that has expired reads as `None`, as it does before the first status
+        arrives after connecting.
+
+        Returns:
+            The holder's "ip:port", or `None` when no client holds control.
+
+        See also:
+            `holds_control()`, `take_control()`
+
+        Examples:
+            >>> robot.control_holder()
+            '192.168.1.20:51234'
+        """
         return self.latest_status().get("control_holder")
 
     def local_label(self) -> str | None:
-        """This connection's own "ip:port" as the executor labels it — compare with
-        control_holder() to learn whether control is yours."""
+        """Return this connection's address as the robot names it.
+
+        The robot names each client connection by its address and port,
+        "ip:port", and reports the holder of control that way. Compare the two to
+        see whether this connection holds control, as `holds_control()` does. It
+        reads the client's own connection and asks the robot nothing. Behind a
+        router that translates addresses (NAT), the robot sees another address
+        and the two never match.
+
+        Returns:
+            This connection's "ip:port", for example `"192.168.0.20:51234"`;
+            `None` before `connect()` and after `disconnect()`.
+
+        See also:
+            `control_holder()`, `holds_control()`, `local_ip()`
+
+        Examples:
+            >>> robot.take_control()
+            >>> robot.control_holder() == robot.local_label()
+            True
+        """
         return self._conn.local_label()
 
     def holds_control(self) -> bool:
-        """True if THIS connection is the current holder."""
+        """Return whether this client holds control.
+
+        It compares `control_holder()` with this connection's own address, so it
+        reads the latest status and asks the robot nothing. Behind a router that
+        translates addresses (NAT) the robot sees another address, and it returns
+        `False`. Right after a command claimed control on its own, the status can
+        lag by about 20 ms.
+
+        Returns:
+            `True` when this connection holds control; `False` otherwise, also when
+            the client is not connected.
+
+        See also:
+            `control_holder()`, `take_control()`
+
+        Examples:
+            >>> robot.take_control()
+            >>> robot.holds_control()
+            True
+        """
         holder = self.control_holder()
         return holder is not None and holder == self.local_label()
 
     def reload_recipes(self) -> None:
-        """Re-scan data_recipe/ on the robot. Needed after ADDING a recipe file.
+        """Read the telemetry recipe files again and use them at once.
 
-        RecipeManager scans once at startup, so a recipe copied to the robot afterwards is
-        invisible until this is called — and `set_recipe` for an unknown name is REFUSED
-        robot-side with only a log line, which the caller never sees. Without this the only
-        remedy was restarting RTI.py, which clears homing.
+        The robot reads every `.xml` file in its `data_recipe/` folder and replaces
+        the recipes it holds with the ones that parse: a new file becomes usable by
+        `set_recipe()`, an edited one takes effect, a removed one is dropped. A
+        file that does not parse is skipped, with a line in the robot's log; when
+        none parses, the recipes in force stay. No restart and no homing are
+        needed.
+
+        Raises:
+            CommandRejected: The robot refused it: the folder could not be read, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            RECIPE_DIR: The robot could not read the recipe folder or a file in it;
+                the recipes in force stay.
+
+        Note:
+            When the file of the recipe in use is removed and the recipes are
+            reloaded, the data streams carry only the joint positions and the tick,
+            while the status field `recipe` still names the old recipe. Choose
+            another one with `set_recipe()`.
+
+        See also:
+            `set_recipe()`, `reload_filters()`
+
+        Examples:
+            >>> robot.reload_recipes()
+            >>> robot.set_recipe("diagnostics")
         """
         self._immediate("reload_recipes")
 
     def reload_filters(self) -> None:
-        """Re-read config/filters.xml on the robot and apply it live — no restart, no re-home.
+        """Read the signal filter file again and apply it at once.
 
-        The executor parses the file and hands RTI the spec table; RTI rebuilds its filter banks from it (each
-        filter's state resets, so expect a brief transient of about one filter window). A malformed file is
-        REFUSED (`FILTER_CONFIG`) and the filters in force stay. The dashboard's "Reload Filters" is this call.
+        The robot parses `config/filters.xml`, which sets the filter of each
+        derived signal: the filtered joint speed, acceleration, jerk and torque,
+        the tool centre point's acceleration and the gripper's speed. When the
+        whole file is valid, the real-time loop rebuilds its filters from it on
+        its next tick; no restart and no homing are needed. A signal the file
+        leaves out gets its built-in default. An invalid file is refused, and the
+        filters in force stay.
+
+        Raises:
+            CommandRejected: The robot refused it: the file is invalid, or another
+                client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            FILTER_CONFIG: The file is missing, does not parse, is written for a
+                newer robot software, or sets an invalid filter, such as an unknown
+                type, a median filter with an even window or an exponential filter
+                without a time constant. The message says where.
+
+        Note:
+            Every filter starts again, so the filtered values, and what the robot
+            computes from them (the tool's speed and acceleration, the external
+            torque estimate, freedrive's friction compensation), settle again over
+            about one filter time constant. Reload with the arm at rest.
+
+        See also:
+            `reload_recipes()`
+
+        Examples:
+            >>> robot.reload_filters()
         """
         self._immediate("reload_filters")
 
     def rti_set_state_rate(self, hz: float) -> None:
-        """How often the robot sends its state packet back. 0 = every tick (the default).
+        """Set how often the robot sends its state packet in SOFT_RTI.
 
-        The state stream runs at the robot's FULL LOOP RATE no matter how slowly you
-        command, so a 5 Hz SOFT_RTI session receives 250 packets a second — fifty per
-        command, and ~136 KB/s on the `standard` recipe.
+        The robot sends a state packet every 4 ms tick, 250 a second, however
+        slowly you command. This lowers the rate: the robot then sends one every
+        250 / `hz` ticks, rounded. It matters most over TCP, where state is many
+        times your command traffic: a PC that reads too slowly fills the robot's
+        send buffer, and the robot then closes the stream. `set_recipe()` makes
+        each packet smaller.
 
-        Worth setting when:
-          * you are on the TCP transport. State is 20-40x the traffic of your commands and
-            is the direction that generates backpressure; this is the knob that prevents it.
-          * you do not read every packet anyway. `read_state()` returns the NEWEST, so the
-            rest were only ever going to be discarded.
+        There is no off: the state stream is how `RTIClient` notices that the
+        robot left real-time control. In RTI mode, where you close the loop every
+        tick, the robot ignores this call; send it after a SOFT_RTI
+        `rti_connect()`.
 
-        Composes with `set_recipe`: that cuts the payload (`minimal` is ~4.5x smaller), this
-        cuts the rate. Clamped to [10 Hz, loop rate]. There is a FLOOR rather than an off
-        switch because the state stream is the PC's only failure detector — RTIClient
-        raises ControlLost when it stops, which is how a latched error on the robot becomes
-        an exception on the PC instead of a silent hang.
+        Args:
+            hz: Packets per second, from 10 to 250 (clamped). 0, a negative or a
+                non-finite value sends every tick again.
 
-        Ignored in hard RTI, where you close the loop every tick and therefore need state
-        every tick.
+        Defaults:
+            Every tick (250 per second), set each time the robot software starts
+            and at every `rti_connect()` in RTI mode. A SOFT_RTI `rti_connect()`
+            keeps the value it finds, so it lasts until changed.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `hz` is not a number. Nothing is sent.
+            TypeError: `hz` is not a number. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The message did not carry exactly one value; this client
+                always sends one.
+
+        Note:
+            `RTIClient.control()` waits 0.1 s for each packet by default, the very
+            gap between packets at 10 Hz: at low rates give it a longer `timeout`.
+
+        See also:
+            `set_recipe()`, `rti_connect()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=10, wait=True)
+            >>> robot.rti_set_state_rate(50)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_state_rate", [float(hz)])
 
     def rti_set_pace(self, factor: float) -> None:
-        """Cap the robot's generator at `factor` × the speed your target is actually moving.
+        """Cap the generator's speed at a multiple of your target's speed.
 
-        **OFF by default.** The self-tuning alternative to `rti_set_vel_scale`: instead of
-        you declaring a speed in rad/s, the robot measures how fast your commands are moving
-        the target and derives the cap itself. It follows you if you change speed or command
-        rate mid-session.
+        The robot measures how fast your position targets move and caps the
+        generator's speed, per joint, at `factor` times that, never below
+        0.02 rad/s and never above the joint's limits. Like `rti_set_vel_scale()`
+        it stops a slow stream from pulsing, but it follows you when you change
+        speed or rate. At 1 the arm cannot catch up once it falls behind; above
+        about 3 the cap no longer binds. It takes effect at once.
 
-        `factor` is headroom. At 1.0 the robot may move exactly as fast as your target and
-        therefore can never catch up once it falls behind — measured 9.3° of tracking error
-        at 5 Hz against 5.0° for a well-chosen fixed cap. Above about 3 it stops binding.
+        It acts with `"ruckig"`, `"ruckig_advancing"` and `"passthrough"`, not with
+        `"tracker"`.
 
-        **Measured verdict: this is dominated.** It removes the pulsing, but so does the
-        fixed cap, and both trail far behind `rti_set_servo_generator("tracker")` on
-        accuracy (0.09°). Exposed for setups where a velocity bound is the
-        expected contract; prefer the tracker if you just want good streaming.
+        Args:
+            factor: The headroom over your target's speed, up to 10 (clamped); 0
+                switches it off. A negative or non-finite value is ignored.
+
+        Defaults:
+            0 (off), set each time the robot software starts and at every
+            `rti_connect()` in RTI mode. A SOFT_RTI `rti_connect()` keeps the value
+            it finds, so it lasts until changed.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `factor` is not a number. Nothing is sent.
+            TypeError: `factor` is not a number. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The message did not carry exactly one value; this client
+                always sends one.
+
+        See also:
+            `rti_set_vel_scale()`, `rti_set_min_duration()`,
+            `rti_set_servo_generator()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=20, wait=True)
+            >>> robot.rti_set_pace(1.5)
+            >>> robot.rti_set_pace(0)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_pace", [float(factor)])
 
     def rti_set_servo_generator(self, name: str, gain: float | None = None, lookahead: float | None = None, self_lookahead: float | None = None) -> None:
-        """Choose how the robot fills in the ticks between your position commands.
+        """Choose how the robot fills in the ticks between position targets.
 
-        **"passthrough"** (hard RTI's default since 2026-10-11, hard RTI only) replays your
-        targets exactly, one tick behind, using each packet's send time (RTIClient sends it
-        by default; `control()` uses the robot's own time): no planning lag. Each joint
-        still stays within its velocity / acceleration / jerk limits — a jump is caught up
-        on, never overshot — and never passes a soft limit. A stream without send times
-        gets "ruckig" below, exactly as before.
+        The generator turns your position targets into one setpoint per tick,
+        within the joints' real-time limits and soft limits. It acts on position
+        streams while the rate limiter is on. A change takes effect at once: the
+        new generator continues from the position and speed the old one reached.
+        `rti_connect()` sets the generator again, so call this after it. A gain or
+        a look-ahead that is not finite makes the robot ignore the call.
 
-        **"ruckig"** plans a jerk-limited move to each target and *arrives* on it, stopped.
-        Exact, no overshoot — right for point-to-point. On a stream it trails by about its
-        stopping distance (15-20 ms on J1 at speed), and on a sparse stream it sprints to
-        each target and idles until the next, which is what makes low-rate streaming pulse
-        unless you cap the speed with `rti_set_vel_scale`.
+        Args:
+            name: `"passthrough"`: RTI mode only; replays your stamped targets
+                exactly, one tick behind, by their send times, and checks every
+                sample against the limits. `"ruckig_advancing"`: plans toward where
+                your target is moving and passes through it at its speed; the
+                closest tracking of a sparse stream. `"ruckig"`: plans a
+                jerk-limited move to each target and stops on it; exact and never
+                overshoots, but on a sparse stream it sprints and waits.
+                `"tracker"`: a servo law that never plans to stop; smooth on any
+                stream, but a large step can overshoot. Any case. The robot ignores
+                another name, and `"passthrough"` in SOFT_RTI.
+            gain: The tracker's bandwidth in rad/s, from 1 to 150 (clamped); above
+                about 20 a large step overshoots. `None` keeps the current value.
+                Only the tracker uses it.
+            lookahead: How far ahead the tracker extrapolates your target, in
+                seconds, from 0 to 0.5 (clamped). `None` keeps the current value,
+                or, with `gain` given, sets 2 / `gain`, which cancels the lag on a
+                target moving at a steady speed.
+            self_lookahead: The tracker's damping look-ahead, in seconds, from 0 to
+                0.5 (clamped): its aim moves back by its own speed times this. `None`
+                keeps the current value.
 
-        **"tracker"** is a servo-style tracking law (the common industrial streaming-servo command). It never plans to stop, so the
-        pulsing has no mechanism to appear, and it needs **nothing** from you — no
-        feedforward velocity, no travel speed to declare. On a constant-speed stream it
-        tracks within 0.08° at any rate from 50 Hz down to 5 Hz, where the capped Ruckig
-        path trails by up to 5°.
+        Defaults:
+            The generator is set at every `rti_connect()`: `"passthrough"` in RTI
+            mode, `"ruckig_advancing"` in SOFT_RTI. The tracker's `gain` 15 rad/s,
+            `lookahead` 2 / 15 s (about 0.133 s) and `self_lookahead` 0 are set each
+            time the robot software starts and last until changed.
 
-        The trade: it is a servo, not a planner. Given a large step it can overshoot, where
-        Ruckig never does. Stream with "tracker", move point-to-point with "ruckig".
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `gain`, `lookahead` or `self_lookahead` is not a number.
+                Nothing is sent.
+            TypeError: `gain`, `lookahead` or `self_lookahead` is not a number.
+                Nothing is sent.
 
-        `gain` is the tracking bandwidth in rad/s (default 15). Higher tracks a fast-moving
-        target more tightly and passes more command noise through; above about 20 a large
-        step starts to overshoot. `lookahead` is the extrapolation horizon in seconds; leave
-        it out and it is re-derived as `2/gain`, the value that cancels the tracker's
-        steady-state lag on a constant-speed target.
+        Errors:
+            BAD_ARGS: The message did not carry exactly four values; this client
+                always sends four.
 
-        Safe to switch mid-session — the new law continues from the position and velocity
-        the old one had actually reached.
+        Note:
+            In RTI mode only `"passthrough"` checks the stream itself (the speed,
+            acceleration, jerk and soft-limit errors); the others absorb a jump
+            within the limits instead. Every one still needs each position
+            target's send time in RTI mode.
+
+        See also:
+            `rti_set_min_duration()`, `rti_set_pace()`, `rti_set_vel_scale()`
+
+        Examples:
+            >>> robot.rti_connect(rate_hz=10, wait=True)
+            >>> robot.rti_set_servo_generator("tracker", gain=15)
+            >>> robot.rti_disconnect(wait=True)
         """
         self._immediate("rti_set_servo_generator",
                         [str(name),
@@ -734,53 +2412,97 @@ class RobotClient:
                          "" if lookahead is None else float(lookahead),
                          "" if self_lookahead is None else float(self_lookahead)])
 
-    def rti_set_profile(self, name: str, rate_hz: float | None = None) -> None:
-        """Pick the streaming contract: **"realtime"** (default) or **"servo"**.
-
-        One call sets a coherent bundle instead of three loose settings. A servo-rate
-        timeout with a point-to-point generator still pulses, and nothing otherwise stops
-        you creating that combination.
-
-        - **realtime** — you close the loop, one setpoint per 4 ms tick. 40 ms watchdog,
-          Ruckig, no pacing. This is what the arm has been hardware-verified with.
-        - **servo** — you send targets at your own rate and the robot fills in between
-          them. Pass `rate_hz` and the timeout is sized at three of your command intervals.
-
-        Prefer a rate that divides evenly into 250 Hz — **50, 25 or 10** — because a
-        non-integer ratio makes command arrivals alternate between two tick counts, which
-        corrupts every velocity estimate taken from the stream.
-
-        Also makes the contract reportable, which matters for reading diagnostics:
-        `control_success_rate` means "packet loss" only when you send once per tick. At
-        20 Hz a perfectly healthy link scores about 8%.
-        """
-        self._immediate("rti_set_profile",
-                        [str(name), "" if rate_hz is None else float(rate_hz)])
-
     def set_recipe(self, name: str) -> None:
-        """Choose which telemetry recipe the robot's state stream carries.
+        """Choose the telemetry recipe that the robot's data streams carry.
 
-        The recipe decides what every state packet contains. Until 2026-08-07 only the GUI
-        could set it, which meant the controlling PC — the one process the recipe system
-        exists to serve — could not ask for the data it needed.
+        A recipe is a file in the robot's `data_recipe/` folder that names the
+        values sent every control tick, both in the telemetry the robot broadcasts
+        on UDP port 30003 and in the state packets of a real-time stream. The
+        robot switches on its next tick. The status field `recipe` names the
+        recipe in use, and `recipes` lists the recipe files on the robot.
 
-        The one that usually matters remotely is **"diagnostics"**: it carries `rti_ok` and
-        `rti_miss`, and those are the ONLY way to see robot-side link quality from another
-        machine. Success rate and miss counters live in the robot's shared memory, which a
-        remote host cannot read, so without this the PC is limited to its own timing.
+        Args:
+            name: The recipe. The robot ships `"standard"` (joint positions and
+                speeds, the drives' errors, the tool centre point's pose, the tick,
+                the mode, the loop period and the real-time link), `"minimal"`
+                (joint positions and the tick), `"commanded"` (measured, commanded
+                and target positions), `"diagnostics"` (the real-time link's
+                quality, the loop's timing, errors and external torques), `"full"`,
+                and `"tracking"`, `"can_gaps"`, `"external_test"`, `"friction_id"`,
+                `"haptic_wall"` and `"monitor_baseline"` for the robot's own tests.
+                A recipe file added while the robot software runs needs
+                `reload_recipes()` first.
 
-        Shipped recipes: minimal, standard (default), commanded, diagnostics, full.
-        `robot.status()["recipes"]` lists what is actually on disk.
+        Defaults:
+            `"standard"`, set each time any of the robot's processes starts: the
+            real-time loop, the command executor, the dashboard, the supervisor or
+            the self-collision worker.
 
-        An unknown name is REFUSED robot-side and logged, leaving the current recipe in
-        place — a typo must not silently strip your telemetry down to a fallback.
+        Raises:
+            CommandRejected: The robot refused it: no recipe file has that name, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No recipe file of that name is on the robot.
+
+        Note:
+            The real-time loop checks the name again, in lower case, against the
+            recipes it has loaded. A file added but not reloaded, or a recipe whose
+            name inside the file has capitals or differs from its file name, is
+            refused there, in its log only; the call still returns normally. Check
+            the status field `recipe`.
+
+        See also:
+            `reload_recipes()`, `rti_set_state_rate()`, `rti_connect()`
+
+        Examples:
+            >>> robot.set_recipe("diagnostics")
         """
         self._immediate("set_recipe", [str(name)])
 
     def stop(self, wait: bool | None = None) -> None:
-        """Stop: the queued program is dropped. In EXEC the arm brakes along its planned path at the joints' hardware
-        limits (at most ~0.15 s from full speed) and HOLDS there, still in EXEC — the next move starts from that point;
-        elsewhere (JOG, RTI, ...) the robot goes to IDLE. Returns once stopped (the executor answers then)."""
+        """Stop the robot's motion and cancel every queued move.
+
+        In EXEC mode the arm brakes along its planned path at the joints'
+        acceleration limits (at most about 0.15 s from full speed) and holds
+        there, still in EXEC mode. Every client's queued moves are cancelled:
+        those commands fail with `STOPPED`, and the gripper's jaws stop where
+        they are. The robot accepts new moves at once,
+        and the next one starts where the arm stopped. The robot answers once the
+        arm is at rest, within 1.5 s.
+
+        In any other mode the robot switches to IDLE mode at once, and answers at
+        once. In the error state it has no effect.
+
+        It also discards this client's failures of earlier moves that
+        `wait_idle()` has not reported yet.
+
+        Args:
+            wait: Wait until the arm has stopped: in EXEC mode until braking has
+                ended, elsewhere until the robot reports IDLE mode; up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, the
+                arm had not stopped within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        Warning:
+            Every client can send it. Outside EXEC mode it does not brake: from JOG
+            mode or a real-time stream at speed the arm coasts in freedrive until
+            friction stops it. It also ends motors off and firmware flashing: the
+            motors hold again, and during a flash the robot's CAN traffic resumes,
+            which can make the flash fail.
+
+        See also:
+            `pause()`, `enter_idle_mode()`, `safety_stop()`, `wait_idle()`
+
+        Examples:
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.stop(wait=True)
+        """
         self._state_change("stop", wait, lambda s: s.get("mode") == "IDLE"
                            or (s.get("mode") == "EXEC" and not s.get("exec_stopping")), what="stop")
         # stop() cancels queued motion server-side, which replies "error"/STOPPED for
@@ -791,6 +2513,44 @@ class RobotClient:
         self._conn.take_motion_errors()
 
     def home(self, wait: bool | None = None) -> None:
+        """Home the arm: find each joint's reference position.
+
+        The arm moves each joint to its endstop, in the order of the robot's
+        homing sequence, and sets the joint's reference there; the gripper is
+        calibrated too. Then the robot returns to IDLE mode. It takes about half a
+        minute. A homed arm can be homed again.
+
+        A failed homing latches an error (`J<n>:HOMING_FAILED` or
+        `GRIPPER_HOMING_FAILED`): the robot is then in the error state, disabled
+        and not homed. An error during homing ends it the same way. Leaving it
+        with `enter_idle_mode()`, `stop()` or `disable()` abandons it: a joint it
+        had not reached keeps its earlier reference, and the robot stays as homed
+        as it was.
+
+        Args:
+            wait: Wait until homing has ended, up to 3 minutes.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in IDLE mode or not
+                enabled, or another client holds control.
+            HomingFailed: With `wait`, homing failed. It names the robot's error
+                keys.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
+                homing had not ended after 3 minutes.
+            RobotConnectionError: The client is not connected.
+
+        Warning:
+            The arm moves by itself to every joint's endstop. Keep the space around
+            it clear.
+
+        See also:
+            `enable()`, `clear_errors()`, `enter_exec_mode()`
+
+        Examples:
+            >>> robot.enable(wait=True)
+            >>> robot.home(wait=True)
+        """
         self._immediate("home")
         if self._should_wait(wait):
             # Homing starts a tick later; wait for it to begin, then to finish. The
@@ -811,30 +2571,348 @@ class RobotClient:
             raise HomingFailed(st.get("errors") or [])
 
     def pause(self, wait: bool | None = None) -> None:
-        """Brake along the planned path to rest and hold there (EXEC). With wait, returns at rest. resume()."""
+        """Pause the running program: brake along its path and hold.
+
+        The arm brakes along its planned path, at the same limits as `stop()`, and
+        holds there in EXEC mode. Nothing is cancelled: moves queued later wait
+        too, and `resume()` continues from exactly this point. Entering or leaving
+        EXEC mode, or `stop()`, ends the pause. While a stop is braking, the robot
+        ignores a pause.
+
+        Every client can pause a program; only the client that holds control can
+        resume it.
+
+        Args:
+            wait: Wait until the robot reports the program paused, up to 10 s: its
+                planned motion has come to rest.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot is not in EXEC mode.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report the program paused within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `resume()`, `stop()`
+
+        Examples:
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.pause(wait=True)
+            >>> robot.resume()
+            >>> robot.wait_idle()
+        """
         self._state_change("pause", wait, lambda s: bool(s.get("exec_paused")))
 
     def resume(self, wait: bool | None = None) -> None:
-        """Speed back up along the same path and continue from exactly where pause() stopped."""
+        """Resume a paused program from where it stopped.
+
+        The arm speeds back up along the same path, at the robot's EXEC
+        acceleration limits, and the program continues. Without a pause it
+        changes nothing. While a stop is braking, the robot ignores it.
+
+        Args:
+            wait: Wait until the robot no longer reports a pause, up to 10 s;
+                without one it returns at once.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in EXEC mode, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
+                still reported the pause after 10 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `pause()`, `stop()`
+
+        Examples:
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.pause(wait=True)
+            >>> robot.resume()
+            >>> robot.wait_idle()
+        """
         self._state_change("resume", wait, lambda s: not s.get("exec_paused"))
 
     def set_joint_speed(self, percent: float) -> Any:
+        """Set the default speed of queued moves, as a share of the limits.
+
+        Every queued move that does not pass its own `speed` runs at this share of
+        each joint's speed limit. It slows the whole move down in time: at 50 % a
+        move takes twice as long along the same path, with half the speed and a
+        quarter of the acceleration. A `duration` given with a move overrides it.
+
+        The setting is the robot's, not this client's: it applies to the moves every
+        client sends after it, unless a move passes its own `speed`. Moves already
+        sent keep the value they were sent with. It lasts until it is changed or the
+        robot software restarts.
+
+        Args:
+            percent: The share of each joint's speed limit, in %, from 0.1 to 100.
+                A value up to 1 is read as a fraction: `0.5` means 50 % and `1`
+                means 100 %. A value outside the range is clamped to it: 0 or less
+                gives 0.1 %.
+
+        Defaults:
+            100 %, set each time the robot software starts.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `percent` cannot be read as a number, for example `"fast"`.
+                Nothing is sent.
+            TypeError: `percent` is `None` or another type that is no number.
+                Nothing is sent.
+
+        Note:
+            Moves along a Cartesian path (straight lines, arcs, circles and splines)
+            run at no more than 20 % of the speed limit, whatever this says. No
+            status field shows the setting.
+
+        See also:
+            `set_profile()`, `set_blending()`, `move_joints()`
+
+        Examples:
+            >>> robot.set_joint_speed(50)
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+        """
         return self._immediate("set_joint_speed", [float(percent)])
 
     def set_blending(self, percent: float) -> Any:
+        """Set the default blend: how queued moves join at their corners.
+
+        Every queued move that does not pass its own `blend` takes this value. What
+        the number means depends on the move's `blend_mode`, which each move passes
+        for itself (`"exact_velocity"` when it passes none):
+
+        - `"exact_velocity"`: the percent of the corner speed kept, from 0 to 100.
+          It works between two `move_joints()` moves in a row with the `"ruckig"` or
+          `"trapezoid"` profile, when the second one uses the same profile and is
+          already queued while the first is planned (so never in sync mode). Every
+          other move stops at its end.
+        - `"zone"`: the radius of the rounded corner, in millimetres.
+        - `"tolerance"`: the largest distance from the programmed path, in
+          millimetres.
+        - `"ruckig_corner"`: the size of the corner cut, in millimetres.
+
+        `"zone"` and `"tolerance"` need the `"toppra"` profile, `"ruckig_corner"`
+        the `"ruckig"` profile; see Per-move settings. The setting is the robot's:
+        it applies to the moves every client sends after it, and moves already sent
+        keep their value. It lasts until it is changed or the robot software
+        restarts.
+
+        Args:
+            percent: The blend value: a percent with `"exact_velocity"` (a value
+                outside 0 to 100 is clamped to it), millimetres with the other modes.
+                0 or less means no blending.
+
+        Defaults:
+            0 (no blending), set each time the robot software starts.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `percent` cannot be read as a number, for example `"some"`.
+                Nothing is sent.
+            TypeError: `percent` is `None` or another type that is no number.
+                Nothing is sent.
+
+        Note:
+            Arcs, circles and splines cannot blend yet: while this value is above 0,
+            each of them fails with `CURVE_BLEND_UNSUPPORTED` unless it passes
+            `blend=0`.
+
+        See also:
+            `set_profile()`, `set_joint_speed()`, `move_joints()`, `move_linear()`
+
+        Examples:
+            >>> robot.set_blending(50)
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.move_joints(95, -105, 165, 0, -30, 180)
+            >>> robot.move_joints(95, -100, 160, 0, -30, 180)
+            >>> robot.wait_idle()
+            >>> robot.set_blending(0)
+        """
         return self._immediate("set_blending", [float(percent)])
 
     def set_profile(self, profile: str) -> Any:
+        """Set the default profile: how queued moves speed up and slow down.
+
+        Every queued move that does not pass its own `profile` is timed with this
+        one, joint moves and Cartesian moves alike. The robot knows these profiles,
+        by these names and their other spellings:
+
+        - `"ruckig"`: limits speed, acceleration and jerk. Smooth starts and stops,
+          with no ringing after a fast stop.
+        - `"trapezoid"` (also `"trapezoidal"`, `"trap"`): limits speed and
+          acceleration. Shorter moves; the arm can ring briefly after a full-speed
+          stop.
+        - `"quintic"` (also `"poly5"`): a smooth polynomial shape that starts and
+          ends at rest.
+        - `"s_curve"` (also `"s-curve"`, `"scurve"`, `"smoothstep7"`): a smooth
+          fixed shape, with the gentlest jerk of the fixed shapes.
+        - `"toppra"`: the fastest timing along the path within the speed and
+          acceleration limits. Needed for `"zone"` and `"tolerance"` blending.
+
+        Case and spaces around the name do not matter. The setting is the robot's:
+        it applies to the moves every client sends after it, and moves already sent
+        keep their profile. It lasts until it is changed or the robot software
+        restarts.
+
+        Args:
+            profile: The profile's name, one of those above.
+
+        Defaults:
+            `"ruckig"`, set each time the robot software starts.
+
+        Returns:
+            `{"profile": name}`: the profile now in force, by its main name, for
+            example `"trapezoid"` for `"trap"`.
+
+        Raises:
+            CommandRejected: The robot refused it: the name is not a known profile,
+                or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No profile was given (only a raw client can send that).
+            BAD_PROFILE: `profile` is not one of the names above.
+
+        Note:
+            No status field shows this default: the status's `current_profile` is
+            the profile of the move that started last.
+
+        See also:
+            `set_joint_speed()`, `set_blending()`, `move_joints()`
+
+        Examples:
+            >>> robot.set_profile("trapezoid")
+            {'profile': 'trapezoid'}
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+            >>> robot.set_profile("ruckig")
+        """
         return self._immediate("set_profile", [str(profile).strip().lower()])
 
     set_default_profile = set_profile      # its other name (2026-10-23)
 
     def set_ik_solver(self, solver: str) -> Any:
+        """Set the default IK solver, which turns poses into joint angles.
+
+        Every queued move that does not pass its own `ik_solver` uses this solver to
+        work out the joint angles for its poses: `move_pose()`, the straight lines,
+        arcs, circles and splines, and their relative forms. Joint moves do not use
+        it, and neither does `is_reachable()`.
+
+        - `"pinocchio"` (also `"pin"`): damped least squares. Deterministic and
+          fast.
+        - `"roboticstoolbox"` (also `"robotics_toolbox"`, `"rtb"`): a
+          Levenberg-Marquardt solve, with damped least squares as its fallback.
+
+        Case and spaces around the name do not matter. The setting is the robot's:
+        it applies to the moves every client sends after it, and moves already sent
+        keep their solver. It lasts until it is changed or the robot software
+        restarts. The status shows it as `default_ik_solver`.
+
+        Args:
+            solver: The solver's name, one of those above.
+
+        Defaults:
+            `"pinocchio"`, set each time the robot software starts.
+
+        Returns:
+            `{"ik_solver": name}`: the solver now in force, by its main name, for
+            example `"roboticstoolbox"` for `"rtb"`.
+
+        Raises:
+            CommandRejected: The robot refused it: the name is not a known solver,
+                or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No solver was given (only a raw client can send that).
+            BAD_IK_SOLVER: `solver` is not one of the names above.
+
+        See also:
+            `set_profile()`, `move_pose()`, `move_linear()`
+
+        Examples:
+            >>> robot.set_ik_solver("rtb")
+            {'ik_solver': 'roboticstoolbox'}
+            >>> x, y, z, rx, ry, rz = robot.get_pose()
+            >>> robot.move_linear(x, y, z - 0.02, rx, ry, rz)
+            >>> robot.wait_idle()
+            >>> robot.set_ik_solver("pinocchio")
+        """
         return self._immediate("set_ik_solver", [str(solver).strip().lower()])
 
     set_default_ik_solver = set_ik_solver      # its other name (2026-10-23)
 
     def set_completion_policy(self, policy: str) -> Any:
+        """Set when the robot counts a queued move as finished.
+
+        The policy decides when each move is reported finished, which is when
+        `wait_idle()` returns, and when the next move starts:
+
+        - `"commanded"`: once the robot has sent the move's last setpoint. The next
+          move starts at once, while the arm may still be on its way.
+        - `"settled"`: the robot holds the move's target until every joint is within
+          0.01 rad (about 0.6 deg) of it, then reports the move finished and starts
+          the next one. After 2 s it reports the move finished anyway.
+        - `"strict"`: as `"settled"`, but after 2 s the move fails with
+          `SETTLE_TIMEOUT` (`wait_idle()` raises `MotionFailed`). The moves after it
+          still run.
+
+        A move blended into the next one never waits. Case and spaces around the
+        name do not matter.
+
+        Unlike the other defaults, a move cannot carry its own policy: this one
+        applies at once to every move, also those already sent, from every client.
+        It lasts until it is changed or the robot software restarts. The status
+        shows it as `exec_completion_policy`.
+
+        Args:
+            policy: `"commanded"`, `"settled"` or `"strict"`.
+
+        Defaults:
+            `"settled"`, set each time the robot software starts.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: The robot refused it: the name is not a policy, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No policy was given (only a raw client can send that).
+            BAD_POLICY: `policy` is not `"commanded"`, `"settled"` or `"strict"`.
+
+        Note:
+            `completion_policy` given as a per-move setting is refused with
+            `BAD_OPTIONS`.
+
+        See also:
+            `wait_idle()`, `set_blending()`, `move_joints()`
+
+        Examples:
+            >>> robot.set_completion_policy("strict")
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+        """
         return self._immediate("set_completion_policy", [str(policy).strip().lower()])
 
     # ------------------------------------------------------------------ #
@@ -845,17 +2923,76 @@ class RobotClient:
     # ------------------------------------------------------------------ #
 
     def enter_jog_mode(self, wait: bool | None = None) -> None:
-        """Enter JOG mode. Requires the robot ENABLED and homed, like enter_exec_mode."""
+        """Switch to JOG mode, where `jog()` moves one joint at a time.
+
+        In JOG mode a joint moves while `jog()` asks for it, and `jog_stop()`
+        stops it. Nothing moves on entry. Calling it in JOG mode changes nothing
+        (the robot's activity log shows a refused mode change).
+
+        Args:
+            wait: Wait until the robot reports JOG mode, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in IDLE or JOG mode,
+                not enabled or not homed, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report JOG mode within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `jog()`, `jog_stop()`, `enter_idle_mode()`
+
+        Examples:
+            >>> import time
+            >>> robot.enter_jog_mode(wait=True)
+            >>> robot.jog(5, 1, 0.05)
+            >>> time.sleep(0.5)
+            >>> robot.jog_stop()
+        """
         self._state_change("enter_jog_mode", wait, lambda s: s.get("mode") == "JOG",
                            what="wait_mode(JOG)")
 
     def enter_idle_mode(self, wait: bool | None = None) -> None:
-        """Return to IDLE (always allowed).
+        """Switch to IDLE mode.
 
-        If queued motion is still pending, RTI discards it on leaving EXEC, so the program is
-        ABORTED: pending commands fail with code ABORTED and new motion is refused
-        (MOTION_ABORTED) until clear_errors(). To cancel a program deliberately, use stop(),
-        which cancels it without that latch."""
+        From EXEC mode the arm first brakes along its planned path to rest, at the
+        joints' acceleration limits (at most about 0.15 s from full speed), then
+        the robot switches. A program still queued is cancelled: its commands fail
+        with `ABORTED`, and the robot refuses new moves with `MOTION_ABORTED` until
+        `clear_errors()`. To cancel a program and stay in EXEC mode, use `stop()`.
+
+        From JOG mode or a real-time stream the robot switches at once, without
+        braking. Homing in progress is abandoned. It also ends motors off and
+        firmware flashing, like their own `release_safety_stop()` and
+        `exit_flashing_mode()`. In the error state it has no effect: the robot
+        returns to it while an error is latched; call `clear_errors()`.
+
+        In IDLE mode an enabled, homed arm with gravity compensation on is in
+        freedrive: it holds itself up and can be moved by hand. Otherwise every
+        joint holds still.
+
+        Args:
+            wait: Wait until the robot reports IDLE mode, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report IDLE mode within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        Warning:
+            From JOG mode or a real-time stream at speed the arm does not brake: in
+            freedrive it coasts until friction stops it. Stop the motion first,
+            then switch.
+
+        See also:
+            `stop()`, `enter_exec_mode()`, `set_gravity_comp()`
+
+        Examples:
+            >>> robot.enter_idle_mode(wait=True)
+        """
         self._state_change("enter_idle_mode", wait, lambda s: s.get("mode") == "IDLE",
                            what="wait_mode(IDLE)")
 
@@ -866,53 +3003,120 @@ class RobotClient:
     # live). It does NOT flash anything itself; it grants the bus.
     # ------------------------------------------------------------------ #
     def safety_stop(self, wait: bool | None = None) -> None:
-        """Drive the motors with NOTHING — the arm goes limp and WILL FALL.
+        """Switch the motors off: the arm goes limp and falls.
 
-        Sends Position=None, Speed=None, Current=0 to every joint, so no loop is
-        holding anything. This is not `disable()`: disable leaves a velocity-0
-        hold that still resists motion. This removes all authority.
+        Every joint's motor gets no position, no speed and zero current, so
+        nothing holds the arm up. The robot accepts it in every mode and state,
+        from every client, also with an error latched, and never refuses it. An
+        error that latches while the motors are off does not switch them on
+        again. The robot stays in this mode until `release_safety_stop()`.
 
-        Support the arm before calling this. It is here for diagnostics — with
-        every motor commanded by nothing, anything still moving or buzzing is the
-        driver's own firmware, not the runtime.
+        Unlike `disable()`, which holds every joint still, this takes all torque
+        off the arm: to free something trapped by hand, or to hear whether a noise
+        comes from a drive's own firmware. From EXEC mode it switches at once,
+        without braking, and a queued program is cancelled as with `disable()`.
 
-        Reachable from any mode and any state, by design.
+        Args:
+            wait: Wait until the robot reports the motors off, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report the motors off within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        Warning:
+            The arm falls under its own weight. Support it, or park it, first.
+            `stop()` and `disable()` from any client switch the motors on again.
+
+        See also:
+            `release_safety_stop()`, `disable()`, `stop()`
+
+        Examples:
+            >>> robot.safety_stop(wait=True)
+            >>> robot.release_safety_stop(wait=True)
         """
         self._state_change("safety_stop", wait,
                            lambda s: s.get("mode") == "SAFETY_STOP",
                            what="wait_mode(SAFETY_STOP)")
 
     def release_safety_stop(self, wait: bool | None = None) -> None:
-        """Leave SAFETY_STOP for IDLE, restoring the normal hold."""
+        """Switch the motors back on after a safety stop.
+
+        The robot returns to IDLE mode. An enabled, homed arm with gravity
+        compensation on is then in freedrive; otherwise every joint holds still
+        where it is. With an error still latched, the robot goes to the error
+        state instead, which holds every joint still.
+
+        Args:
+            wait: Wait until the robot reports IDLE mode, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot refused it: the motors are not off, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report IDLE mode within 10 s, for example with an error still
+                latched.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `safety_stop()`, `clear_errors()`
+
+        Examples:
+            >>> robot.safety_stop(wait=True)
+            >>> robot.release_safety_stop(wait=True)
+        """
         self._state_change("release_safety_stop", wait,
                            lambda s: s.get("mode") == "IDLE",
                            what="wait_mode(IDLE)")
 
     def enter_flashing_mode(self, parked_confirmed: bool = False, force: bool = False, wait: bool | None = None) -> None:
-        """Hand the CAN bus to an external flasher.
+        """Hand the CAN bus to a firmware flasher; the motors let go.
 
-        The motors LOSE TORQUE here (their watchdogs fire into shorted-phase
-        brake), so the arm must be able to hold itself up. **Nothing on the
-        robot can determine that**, so this call requires an explicit claim from
-        you — calling it with no arguments is refused on purpose:
+        The robot stops sending on the CAN bus, so a separate flasher program can
+        use it; everything else keeps running: the E-stop, the I/O, the status.
+        About 0.1 s after the robot falls silent, each drive's watchdog lets go of
+        its motor: the joints brake and sink slowly, the gripper coasts. So the
+        arm must be parked or supported, which nothing on the robot can check:
+        the call needs your claim, and the robot records which one you made.
 
-            robot.move_joints(*robot.park_pose_deg())   # or park it by hand
-            robot.enter_flashing_mode(parked_confirmed=True)
+        It works while disabled, not homed or with an error latched: that is how a
+        drive left in its bootloader by a failed flash is recovered. End it with
+        `exit_flashing_mode()`.
 
-        parked_confirmed=True — you have parked the arm and confirmed it.
-        force=True            — the arm is NOT parked but IS physically
-                                supported. Needed when a driver has lost its
-                                firmware and cannot be commanded to park at all.
+        Args:
+            parked_confirmed: You parked the arm, at the robot's park pose, and
+                confirm it.
+            force: The arm is not parked but supported by other means, for example
+                because a drive cannot move it.
+            wait: Wait until the robot reports flashing mode, up to 10 s.
+                `None` follows the client's `sync` setting.
 
-        Both open the gate; RTI logs which claim was made, so if an arm ever
-        falls during maintenance there is a record of what was asserted.
+        Raises:
+            CommandRejected: The robot refused it: it is not in IDLE mode or the
+                error state, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report flashing mode within 10 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: Neither `parked_confirmed` nor `force` is true. Nothing is
+                sent.
 
-        Unlike the other mode-entry calls this works while DISABLED, unhomed, or
-        with errors active — that is the recovery path for a driver left in its
-        bootloader by a failed flash.
+        Warning:
+            The motors stop holding the arm. Park or support it first.
 
-        Note a flash INVALIDATES HOMING: the driver reboots and the encoders are
-        on the motors, so re-home before moving the arm afterwards.
+        Note:
+            `stop()` and `disable()` from any client end flashing mode and resume
+            the robot's CAN traffic, which can make a flash in progress fail.
+
+        See also:
+            `exit_flashing_mode()`, `safety_stop()`
+
+        Examples:
+            >>> robot.move_joints(0, -90, 180, 0, 0, 180)  # PAR6's park pose
+            >>> robot.wait_idle()
+            >>> robot.enter_idle_mode(wait=True)
+            >>> robot.enter_flashing_mode(parked_confirmed=True, wait=True)
         """
         if not (parked_confirmed or force):
             raise ValueError(
@@ -926,66 +3130,546 @@ class RobotClient:
                            what="wait_mode(FLASHING)", args=[bool(force)])
 
     def exit_flashing_mode(self, wait: bool | None = None) -> None:
-        """Return to IDLE and resume normal CAN traffic.
+        """End firmware flashing and take the CAN bus back.
 
-        RTI re-bases its CAN freshness clock on the way out, so nodes get the
-        normal reconnect window instead of instantly latching a disconnect error
-        after their silence during the flash. A driver that was reflashed comes
-        back with its preloaded config wiped and is reconfigured automatically by
-        the existing stale->fresh reconnect path.
+        The robot resumes its CAN traffic and returns to IDLE mode, where the
+        motors hold the arm again. It gives every drive the normal time to answer
+        again, so their silence during the flash latches no lost-connection
+        error; a drive that was flashed is configured again once it answers. When
+        the flasher reports that it flashed a drive, the robot marks the arm not
+        homed: call `home()` before moving it. With an error still latched, the
+        robot goes to the error state instead.
+
+        Args:
+            wait: Wait until the robot reports IDLE mode, up to 10 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not in flashing mode, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
+                not report IDLE mode within 10 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `enter_flashing_mode()`, `home()`
+
+        Examples:
+            >>> robot.exit_flashing_mode(wait=True)
+            >>> robot.enable(wait=True)
+            >>> robot.home(wait=True)
         """
         self._state_change("exit_flashing_mode", wait,
                            lambda s: s.get("mode") == "IDLE",
                            what="wait_mode(IDLE)")
 
     def jog(self, joint: int, direction: int, speed: float) -> Any:
-        """Start jogging one joint. direction: +1 / -1. speed: fraction of the jog speed
-        limit. Only valid in JOG mode; call jog_stop() to halt."""
+        """Start jogging one joint: it moves until `jog_stop()` or a limit.
+
+        The joint speeds up to `speed` times its speed limit and keeps moving until
+        `jog_stop()`. It speeds up and brakes at the jog's acceleration and jerk
+        (`set_jog_accel()`, `set_jog_profile()`, `set_jog_jerk_factor()`). Near the
+        end of its range it brakes by itself and comes to rest exactly at its joint
+        limit, at any speed; with self-collision checking on, it also comes to rest
+        at the jog margin before two parts of the arm would touch. Asking for the
+        same direction again there moves nothing.
+
+        Calling `jog()` again for the same joint and direction changes the speed
+        smoothly, as a joystick does. For another joint or direction, the moving
+        joint first brakes to rest, then the new jog starts: one joint moves at a
+        time. The call returns once the robot has accepted the jog; it does not
+        wait for the motion.
+
+        Args:
+            joint: The joint to move, counted from 0: `0` is J1 and `5` is J6 on a
+                six-joint arm. A joint that does not exist is refused.
+            direction: `1` for the joint's positive direction, `-1` for its negative
+                one; a larger whole number counts by its sign. `0` stops the jog as
+                `jog_stop()` does.
+            speed: The share of the joint's speed limit, as a fraction from 0 to 1:
+                `0.1` is 10 %. A value above 1 counts as 1, full speed: it is not a
+                percent. 0 or less moves nothing. It must be a finite number.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: The robot refused it, for example outside JOG mode, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `joint`, `direction` or `speed` cannot be read as a number.
+                Nothing is sent.
+            TypeError: An argument is `None` or another type that is no number.
+                Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The joint does not exist, the direction is not a whole
+                number, the speed is not a finite number, or the command did not
+                carry exactly these three values.
+
+        Warning:
+            A jog has no time limit. The joint keeps moving until `jog_stop()`, a
+            mode change, an error or the end of your program's connection, which
+            stops it as `jog_stop()` does. A program that hangs while connected
+            keeps it moving to its joint limit. It does not brake for
+            safety zones: entering a stop zone stops the robot with an error. Keep a
+            hand near the E-stop.
+
+        Note:
+            The braking is planned, so a stop takes time: with the start settings
+            about 0.4 s from 20 % speed and 0.9 s from full speed, while the joint
+            moves on at about half its speed.
+
+        See also:
+            `jog_stop()`, `enter_jog_mode()`, `set_jog_accel()`, `set_jog_profile()`
+
+        Examples:
+            >>> import time
+            >>> robot.enter_jog_mode(wait=True)
+            >>> robot.jog(0, 1, 0.05)
+            >>> time.sleep(0.5)
+            >>> robot.jog_stop()
+        """
         return self._immediate("jog", [int(joint), int(direction), float(speed)])
 
     def jog_stop(self) -> Any:
-        """Halt jog motion. Accepted in any mode, so a released button always stops."""
+        """Stop jogging: the joint brakes to rest along its path.
+
+        The jogging joint brakes at the jog's acceleration and jerk, the same planned
+        braking it uses at a limit, so it stops smoothly but not at once: with the
+        start settings in about 0.4 s from 20 % speed and 0.9 s from full speed. The
+        call returns before the joint is at rest. A later `jog()` starts a new jog.
+
+        The robot accepts it from every client, in every mode, also while another
+        client holds control, so a released jog button always stops the joint.
+        Outside JOG mode it changes nothing.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `jog()`, `stop()`, `enter_idle_mode()`
+
+        Examples:
+            >>> import time
+            >>> robot.jog(0, 1, 0.05)
+            >>> time.sleep(0.5)
+            >>> robot.jog_stop()
+        """
         return self._immediate("jog_stop")
 
     def set_jog_accel(self, accel_time: float) -> Any:
-        """Jog acceleration ramp time (s); persists on RTI's JogHandler."""
+        """Set the jog's ramp time, from rest to a joint's full speed.
+
+        A jogging joint speeds up and brakes at its speed limit divided by this
+        time, but never faster than its acceleration limit: a time shorter than that
+        limit allows changes nothing more. With the `"scurve"` jog profile each ramp
+        also rounds its start and end, which adds up to 1 / jerk factor seconds
+        (`set_jog_jerk_factor()`). The braking at a limit and after `jog_stop()` is
+        planned with the same acceleration.
+
+        The setting is the robot's: it applies at once to every client's jogs and
+        the dashboard's, also to a jog in progress, and mode changes keep it. It
+        lasts until it is changed or the robot software restarts.
+
+        Args:
+            accel_time: Seconds from rest to the joint's full speed. It must be more
+                than 0; a time under 0.05 s counts as 0.05 s.
+
+        Defaults:
+            From `config/system.xml` `<jog_defaults>`, read at start: 0.55 s.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: The robot refused it: `accel_time` is not more than 0
+                or not finite, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `accel_time` cannot be read as a number. Nothing is sent.
+            TypeError: `accel_time` is `None` or another type that is no number.
+                Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `accel_time` is not a finite number above 0.
+
+        See also:
+            `set_jog_profile()`, `set_jog_jerk_factor()`, `jog()`
+
+        Examples:
+            >>> robot.set_jog_accel(1.0)
+        """
         return self._immediate("set_jog_accel", [float(accel_time)])
 
     def set_jog_profile(self, profile: str) -> Any:
-        """Jog motion profile, e.g. 'scurve' / 'trapezoid'."""
+        """Set the jog's profile: with its jerk limited, or not.
+
+        - `"scurve"`: limits the jerk too. The acceleration builds up and falls
+          away gradually, so starts and stops are smooth. The jerk is the
+          acceleration times the factor of `set_jog_jerk_factor()`.
+        - `"trapezoidal"`: the acceleration switches on and off at once. Shorter
+          ramps, harder starts and stops.
+
+        The names must be written exactly so, in lower case. The setting is the
+        robot's: it applies at once to every client's jogs and the dashboard's, also
+        to a jog in progress, and mode changes keep it. It lasts until it is changed
+        or the robot software restarts.
+
+        Args:
+            profile: `"scurve"` or `"trapezoidal"`.
+
+        Defaults:
+            From `config/system.xml` `<jog_defaults>`, read at start: `"scurve"`.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: The robot refused it: the name is neither `"scurve"`
+                nor `"trapezoidal"`, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `profile` is neither `"scurve"` nor `"trapezoidal"`.
+
+        Note:
+            These are not the names of the queued moves' profiles: `"trapezoid"` and
+            `"s_curve"` are refused here.
+
+        See also:
+            `set_jog_jerk_factor()`, `set_jog_accel()`, `set_profile()`
+
+        Examples:
+            >>> robot.set_jog_profile("trapezoidal")
+            >>> robot.set_jog_profile("scurve")
+        """
         return self._immediate("set_jog_profile", [str(profile).strip()])
 
     def set_jog_jerk_factor(self, factor: float) -> Any:
-        """Jog jerk factor (used by the s-curve profile)."""
+        """Set the jog's jerk, as a multiple of its acceleration.
+
+        With the `"scurve"` jog profile the jerk is the jog's acceleration times
+        this factor, per second: the acceleration takes up to 1 / factor seconds to
+        build up, and again to fall away. A higher factor gives shorter, harder
+        ramps; a lower one smoother, longer ones. With `"trapezoidal"` it has no
+        effect.
+
+        The setting is the robot's: it applies at once to every client's jogs and
+        the dashboard's, also to a jog in progress, and mode changes keep it. It
+        lasts until it is changed or the robot software restarts.
+
+        Args:
+            factor: The jerk as a multiple of the acceleration, per second. It must
+                be more than 0; a factor under 0.5 counts as 0.5.
+
+        Defaults:
+            From `config/system.xml` `<jog_defaults>`, read at start: 3.0.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: The robot refused it: `factor` is not more than 0 or
+                not finite, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `factor` cannot be read as a number. Nothing is sent.
+            TypeError: `factor` is `None` or another type that is no number.
+                Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `factor` is not a finite number above 0.
+
+        See also:
+            `set_jog_profile()`, `set_jog_accel()`, `jog()`
+
+        Examples:
+            >>> robot.set_jog_jerk_factor(6.0)
+        """
         return self._immediate("set_jog_jerk_factor", [float(factor)])
 
     def set_jog_control_mode(self, mode: str) -> Any:
-        """Jog control mode, e.g. 'pid'."""
+        """Set how the drives follow a jog: PID or PD control.
+
+        - `"pid"`: each drive runs its own position and speed loops, with an
+          integral term, toward the jog's position and speed.
+        - `"pd"`: each drive turns its position and speed errors into torque with
+          its own two gains, without an integral term.
+
+        The gains are the drives' own (`set_pid_gains()`). It applies in JOG mode
+        only, from the next control tick, also to a jog in progress. The names must
+        be written exactly so, in lower case. The setting is the robot's: it applies
+        to every client's jogs and the dashboard's, and mode changes keep it. It
+        lasts until it is changed or the robot software restarts.
+
+        Args:
+            mode: `"pid"` or `"pd"`.
+
+        Defaults:
+            From `config/system.xml` `<jog_defaults>`, read at start: `"pid"`.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: The robot refused it: the name is neither `"pid"` nor
+                `"pd"`, or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `mode` is neither `"pid"` nor `"pd"`.
+
+        See also:
+            `set_pid_gains()`, `set_jog_profile()`, `jog()`
+
+        Examples:
+            >>> robot.set_jog_control_mode("pd")
+            >>> robot.set_jog_control_mode("pid")
+        """
         return self._immediate("set_jog_control_mode", [str(mode).strip()])
 
 
     def set_pid_gains(self, joint: int, **gains: float) -> Any:
-        """Set control gains for one joint (or the gripper, joint=<joint_count>). Keys:
-        KPP, KPV, KIV, KPIQ, KIIQ, KP, KD, Ilim, vel_lim — unknown keys are dropped by the
-        executor. Forwarded as a dict; RTI reads the fields off the command dict."""
+        """Set the control gains and limits of one joint's drive.
+
+        The robot stores the values given and at once sends that drive its whole
+        configuration again: its watchdog, its current, velocity and voltage
+        limits and every gain. Values not named keep theirs. Joints count from 0
+        here, unlike in `free_joint()` and `joint_test()`. The values last until
+        the robot software restarts; nothing is saved to the robot's
+        configuration.
+
+        Args:
+            joint: The drive: 0 for J1 up to the number of joints minus 1 (5 for
+                J6 on PAR6). The gripper's drive cannot be set this way.
+            **gains: The values to set, in the drive's own units as in the robot's
+                configuration: `KPP` (the position loop's proportional gain), `KPV`
+                and `KIV` (the velocity loop's proportional and integral gains),
+                `KPIQ` and `KIIQ` (the current loop's), `KP` and `KD` (the
+                stiffness and damping of the drive's impedance controller), `Ilim`
+                (the current limit, in milliamperes), `vel_lim` (the motor's
+                velocity limit, in encoder ticks per second) and `vlim` (the voltage
+                limit, in millivolts: 0 uses the supply voltage, and any other value
+                below 6000 mV is raised to 6000 mV).
+
+        Defaults:
+            From the robot's configuration file (`robots/<robot>.xml`), read each
+            time the robot software starts. PAR6's J1, for example: KPP 88, KPV
+            0.078, KIV 0.00012, KPIQ
+            1.5, KIIQ 0.1, KP 0.12, KD 0.002, Ilim 2400 mA, vel_lim 88000 ticks/s,
+            vlim 6000 mV.
+
+        Returns:
+            `None`: the robot sends no data back.
+
+        Raises:
+            CommandRejected: The robot refused it: a value is wrong, homing or a
+                test runs (see Errors), or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `joint` or a gain is not a number. Nothing is sent.
+            TypeError: `joint` or a gain is `None`. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `joint` is out of range, a gain's name is unknown, a value is
+                not a finite number, a gain is negative, `Ilim` or `vel_lim` is
+                not above 0 or is above that joint's limit in the robot's
+                configuration, or no gain is given.
+            REJECTED: The robot is homing, or the Hall sensor check, a freed joint
+                or a joint test runs: each relies on the joint's current limit,
+                which this command sets.
+
+        Warning:
+            A gain can make the joint oscillate or run away, and a low `Ilim` lets
+            it sag or fall. Change gains with the arm at rest and a hand on the
+            E-stop.
+
+        See also:
+            `joint_test()`, `set_jog_control_mode()`
+
+        Examples:
+            >>> robot.set_pid_gains(0, KPP=88, KPV=0.078)
+        """
         payload = {"joint": int(joint)}
         payload.update({k: float(v) for k, v in gains.items()})
         return self._immediate("set_pid_gains", payload)
 
     def calibrate_gripper(self) -> Any:
-        """Run the gripper calibration sweep (immediate; requires a CAN gripper)."""
+        """Calibrate the gripper: find both ends of its jaws' travel.
+
+        The gripper opens its jaws fully, then closes them fully, pressing against
+        each end, and records the two ends as 0 and 255 of its position scale. It
+        takes a few seconds: about 4.5 s from closed jaws. Until a gripper has
+        calibrated, it moves to no target. Homing calibrates the gripper as one of
+        its steps, so call this only to calibrate again without homing, for
+        example after the gripper's drive lost power. No status field reports the
+        calibration.
+
+        The call returns at once. The robot then sends the gripper only status
+        requests, for 30 s or until the next gripper command, which ends a
+        calibration still running. So wait before the next gripper command: the
+        gripper's XML gives the time homing waits, `<homing_calibration_wait_s>`.
+        While homing drives the gripper, and during firmware flashing, the
+        calibration waits until they end. Without a CAN gripper the robot ignores
+        it.
+
+        Returns:
+            `None`. The robot answers before the calibration starts.
+
+        Raises:
+            CommandRejected: Another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Warning:
+            The jaws open and close fully by themselves and let go of a part they
+            hold. After the 30 s, in firmware mode, the robot sends the gripper its
+            last target again if it had one, and the jaws move back to it without
+            a new command. Keep hands away from the jaws.
+
+        See also:
+            `home()`, `set_gripper()`, `set_gripper_ctrl_mode()`, `open_gripper()`
+
+        Examples:
+            >>> import time
+            >>> robot.calibrate_gripper()
+            >>> time.sleep(6)
+            >>> robot.open_gripper()
+            >>> robot.wait_gripper_move_complete()
+        """
         return self._immediate("calibrate_gripper")
 
     gripper_calibrate = calibrate_gripper      # its other name (2026-10-23)
 
     def set_gripper_ctrl_mode(self, mode: int) -> Any:
-        """Gripper control mode: 1 = motor mode, 2 = firmware mode."""
+        """Switch the gripper between motor mode and firmware mode.
+
+        In firmware mode the gripper's own firmware moves the jaws to the targets
+        that `open_gripper()`, `close_gripper()`, `move_gripper()` and
+        `set_gripper()` give it, and reports their position and whether something
+        stopped them. In motor mode the robot gives the gripper's motor zero
+        current: the jaws neither move nor hold, the gripper commands do not reach
+        the gripper, and its position and outcome are not updated. A queued
+        gripper command then fails with `GRIPPER_SETTLE_TIMEOUT`, or settles at
+        once without moving when the last reported position is already near its
+        target.
+
+        Switching to motor mode also drops the gripper's target, so the jaws stay
+        still when firmware mode returns. Homing drives the gripper itself in
+        either mode. No status field reports the mode. Without a CAN gripper the
+        robot ignores it.
+
+        Args:
+            mode: `1` for motor mode or `2` for firmware mode.
+
+        Defaults:
+            From the robot's homing file, read each time the robot software
+            starts: firmware mode when the first homing step that homes the
+            gripper names firmware mode, as `config/PAR6_homing.xml` does, motor
+            mode otherwise. It lasts until changed or until the robot software
+            restarts.
+
+        Returns:
+            `None`. The robot answers before the gripper changes mode.
+
+        Raises:
+            CommandRejected: The robot refused it: `mode` is not 1 or 2, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `mode` cannot be read as a whole number, for example the
+                text "firmware". Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `mode` is not 1 or 2.
+
+        Warning:
+            Motor mode takes the current off the gripper's motor: the jaws stop
+            holding, and a part between them can slip out.
+
+        See also:
+            `set_gripper()`, `move_gripper()`, `calibrate_gripper()`
+
+        Examples:
+            >>> robot.set_gripper_ctrl_mode(2)
+        """
         return self._immediate("set_gripper_ctrl_mode", [int(mode)])
 
     def set_gripper(self, position: int, speed: int = 100, current: int = 200, action: int = 1) -> Any:
-        """Firmware/motor-mode direct gripper target (immediate; distinct from the queued
-        open_gripper / close_gripper / move_gripper). position/speed 0-255 raw gripper scale,
-        current in mA, action 0/1. Requires a CAN gripper (RTI ignores it otherwise)."""
+        """Give the gripper a target at once, outside the queue.
+
+        The robot sends the target to the gripper on its next cycle, whatever the
+        arm is doing, and answers at once: the call does not wait for the jaws
+        and reports nothing about them. For a program, use `move_gripper()`,
+        which runs in order with the moves, waits for the jaws and reports the
+        outcome.
+
+        With `action` 1 the jaws move to `position` and stay there, pressing with
+        up to `current` on whatever stops them. With `action` 0 the gripper is
+        released: it has no target, and depending on its drive the jaws hold
+        still or go limp. The target lasts until the next gripper command;
+        `stop()`, `disable()` and an error replace it with where the jaws are.
+
+        It takes effect only in firmware mode and on a calibrated gripper; in
+        motor mode the robot keeps it and sends it when firmware mode returns. It
+        ends a calibration in progress, and replaces the target of a queued
+        gripper command still under way, which then fails with
+        `GRIPPER_SETTLE_TIMEOUT` unless the jaws pass within 5 of its own target.
+        Without a CAN gripper the robot ignores it.
+
+        Args:
+            position: The target, from 0 (fully open) to 255 (fully closed) on the
+                gripper's scale; not millimetres.
+            speed: How fast the jaws move, from 0 (slowest) to 255 (fastest) on
+                the gripper's scale.
+            current: The gripper motor's current limit while the jaws move and
+                hold, in mA. The robot passes it on unchecked.
+            action: `1` to move to `position` and stay there, or `0` to release
+                the gripper.
+
+        Defaults:
+            No target, the gripper released, each time the robot software starts.
+            Homing ends with the gripper released too, and so does
+            `set_gripper_ctrl_mode(1)`.
+
+        Returns:
+            `None`. The robot answers before the target reaches the gripper.
+
+        Raises:
+            CommandRejected: The robot refused it: another client holds control,
+                or (see Errors) it did not get four values.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: A value cannot be read as a whole number, for example the
+                text "open". Nothing is sent.
+
+        Errors:
+            BAD_ARGS: The robot did not get exactly four values. This method
+                always sends four, so only a raw client meets it.
+
+        Warning:
+            The jaws move at once, also while the robot is disabled, and keep
+            pressing until the next gripper command, `stop()`, `disable()` or an
+            error, which stop them where they are in firmware mode. Keep hands
+            away from the jaws.
+
+        See also:
+            `move_gripper()`, `set_gripper_ctrl_mode()`, `calibrate_gripper()`
+
+        Examples:
+            >>> import time
+            >>> robot.set_gripper(128, 100, 200, 1)
+            >>> time.sleep(1)
+            >>> robot.set_gripper(128, 100, 200, 0)
+        """
         return self._immediate("set_gripper",
                                [int(position), int(speed), int(current), int(action)])
 
@@ -2165,7 +4849,7 @@ class RobotClient:
     # command is never DISPATCHED to RTI ahead of a joint move queued before it).
     #
     # The checkpoint reflects REAL physical completion — the planner watches
-    # gripper_object_detection (a Robotiq-style status code) and only checkpoints
+    # gripper_object_detection (the gripper's status code) and only checkpoints
     # once the gripper has actually stopped (settled at target, or detected an
     # object), not just when the command was sent. So wait_idle()/
     # wait_motion_complete() genuinely wait for the gripper to finish, same as they
@@ -2205,9 +4889,136 @@ class RobotClient:
         return cid
 
     def open_gripper(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+        """Open the gripper's jaws fully, as a queued command.
+
+        The jaws move to position 1, next to the open end (0) of the gripper's 0
+        to 255 scale, at speed 100 of 255 and with at most 200 mA. The command
+        waits in the queue like a move, but the robot does not wait for a move to
+        finish: it starts the jaws as soon as it has sent the moves queued before
+        it. So the jaws can open while the arm still moves, and a move queued
+        after it starts while the jaws still move.
+
+        The command has settled when the jaws are within 5 of their target, or
+        when the gripper steadily reports that they reached it or that something
+        stopped them. `gripper_result()` then says which, and
+        `wait_released_part()` raises `GripFailed` unless the jaws opened clear.
+
+        Args:
+            timeout: Seconds to wait for the jaws to settle, in sync mode only.
+            **options: Accepted as on a move: `speed`, `accel`, `duration`,
+                `profile`, `jerk`, `ramp_fraction`, `blend`, `blend_mode`,
+                `blend_continuity`, `ik_solver`, `singularity_strategy`, `samples`
+                and `dry_run`. Only `dry_run` changes a gripper command: the robot
+                checks it and moves nothing. An unknown setting or a bad value is
+                refused.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the
+            command; call `wait_gripper_move_complete()` to wait until the jaws
+            have settled. In sync mode the call returns when they have settled.
+
+        Raises:
+            CommandRejected: The robot refused the command, for example outside
+                EXEC mode, before homing or with an invalid setting. In sync mode
+                also when it fails after it was accepted.
+            RobotTimeout: The robot did not accept the command within 5 s. In sync
+                mode also when the jaws did not settle within `timeout`.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            GRIPPER_SETTLE_TIMEOUT: The jaws had neither reached the target nor
+                reported an object 5 s after the command started. The commands
+                queued after it still run.
+            SUPERSEDED: Another gripper command started before this one settled
+                and replaced its target. The commands queued after it still run.
+
+        Note:
+            The gripper has one target at a time. A gripper command that starts
+            before the previous one has settled replaces it, and the previous one
+            fails with `SUPERSEDED`. Call `wait_gripper_move_complete()` between
+            two gripper commands.
+
+        Warning:
+            The jaws move with force. Keep hands away from them.
+            `stop()`, `disable()` and an error stop the jaws where they are.
+
+        See also:
+            `close_gripper()`, `move_gripper()`, `wait_released_part()`,
+            `gripper_result()`
+
+        Examples:
+            >>> robot.open_gripper()
+            >>> robot.wait_gripper_move_complete()
+        """
         return self._queued_gripper("open_gripper", [], timeout, options)
 
     def close_gripper(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
+        """Close the gripper's jaws fully, as a queued command.
+
+        The jaws move to position 254, next to the closed end (255) of the
+        gripper's 0 to 255 scale, at speed 100 of 255 and with at most 200 mA. A
+        part between the jaws stops them, and they keep pressing on it with that
+        current. The command waits in the queue like a move, but the robot does
+        not wait for a move to finish: it starts the jaws as soon as it has sent
+        the moves queued before it. So the jaws can close while the arm still
+        moves, and a move queued after it starts while the jaws still move.
+
+        The command has settled when the jaws are within 5 of their target, or
+        when the gripper steadily reports that they reached it or that something
+        stopped them. `gripper_result()` then says which, and
+        `wait_holding_part()` raises `GripFailed` unless the jaws stopped on a
+        part. Wait for one of them before the arm lifts the part.
+
+        Args:
+            timeout: Seconds to wait for the jaws to settle, in sync mode only.
+            **options: Accepted as on a move: `speed`, `accel`, `duration`,
+                `profile`, `jerk`, `ramp_fraction`, `blend`, `blend_mode`,
+                `blend_continuity`, `ik_solver`, `singularity_strategy`, `samples`
+                and `dry_run`. Only `dry_run` changes a gripper command: the robot
+                checks it and moves nothing. An unknown setting or a bad value is
+                refused.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the
+            command; call `wait_gripper_move_complete()` to wait until the jaws
+            have settled. In sync mode the call returns when they have settled.
+
+        Raises:
+            CommandRejected: The robot refused the command, for example outside
+                EXEC mode, before homing or with an invalid setting. In sync mode
+                also when it fails after it was accepted.
+            RobotTimeout: The robot did not accept the command within 5 s. In sync
+                mode also when the jaws did not settle within `timeout`.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            GRIPPER_SETTLE_TIMEOUT: The jaws had neither reached the target nor
+                reported an object 5 s after the command started. The commands
+                queued after it still run.
+            SUPERSEDED: Another gripper command started before this one settled
+                and replaced its target. The commands queued after it still run.
+
+        Note:
+            The gripper has one target at a time. A gripper command that starts
+            before the previous one has settled replaces it, and the previous one
+            fails with `SUPERSEDED`. Call `wait_gripper_move_complete()` between
+            two gripper commands.
+
+        Warning:
+            The jaws close with force and press on whatever is between them. Keep
+            hands away from them.
+            `stop()`, `disable()` and an error stop the jaws where they are.
+
+        See also:
+            `open_gripper()`, `move_gripper()`, `wait_holding_part()`,
+            `gripper_result()`
+
+        Examples:
+            >>> robot.close_gripper()
+            >>> robot.wait_gripper_move_complete()
+            >>> robot.gripper_result().object_detected
+            False
+        """
         return self._queued_gripper("close_gripper", [], timeout, options)
 
     # Other names (2026-10-23, the naming pass): the names start with the verb, as every other command does.
@@ -2215,24 +5026,28 @@ class RobotClient:
     gripper_close = close_gripper
 
     def gripper_result(self) -> GripperResult | None:
-        """Outcome of the most recently SETTLED gripper command, or None.
+        """Return the outcome of this client's last settled gripper command.
 
-        Returns a GripperResult. Available as soon as the command's checkpoint
-        arrives, which is:
+        It reads what the robot reported when the command settled, and asks the
+        robot nothing. In sync mode that is when the gripper call returned;
+        otherwise after a wait such as `wait_gripper_move_complete()` or
+        `wait_idle()`. A gripper command that failed leaves it unchanged: it then
+        still returns the outcome of the one before. Gripper commands of other
+        clients do not count.
 
-            sync  — immediately after gripper_close() returns
-            async — after wait_motion_complete() / wait_idle()
+        Returns:
+            A `GripperResult` with the code and the command's id, or `None` when no
+            gripper command of this client has settled yet.
 
-        The queued call itself still returns a command id, like every other
-        queued command; the outcome is fetched rather than returned so gripper
-        commands keep the same shape as joint moves.
+        See also:
+            `wait_holding_part()`, `wait_released_part()`,
+            `wait_gripper_move_complete()`
 
-            robot.gripper_close()
-            robot.wait_motion_complete()
-            if robot.gripper_result().object_detected:
-                print("picked something")
-
-        None means no gripper command has settled on this connection yet.
+        Examples:
+            >>> robot.close_gripper()
+            >>> robot.wait_gripper_move_complete()
+            >>> robot.gripper_result()
+            GripperResult(code=3, 'reached target, no object')
         """
         last = self._conn.last_gripper_result()
         if last is None:
@@ -2241,12 +5056,91 @@ class RobotClient:
         return GripperResult(code, command_id=cid)
 
     def move_gripper(self, position: int, speed: int | None = None, current: int | None = None, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
-        """position: 0-255 raw gripper scale, 1=fully open .. 254=fully closed —
-        matches the GUI's gripper slider. NOT millimeters: firmware-mode grippers
-        don't expose a verified mm conversion (see motion/trajectory_planner.py)."""
-        args = [int(position)]
-        if speed is not None:
-            args.append(int(speed))
+        """Move the gripper's jaws to a position, as a queued command.
+
+        The position is on the gripper's own scale, not in millimetres: 0 is the
+        fully open end and 255 the fully closed end, as the gripper found them
+        when it was calibrated, and the scale runs evenly in between.
+        `open_gripper()` and `close_gripper()` use 1 and 254. A part between the
+        jaws stops them, and they keep pressing on it with `current`.
+
+        Otherwise it behaves like them. The command waits in the queue like a
+        move, but the robot starts the jaws as soon as it has sent the moves
+        queued before it, so jaws and arm can move at the same time. It has
+        settled when the jaws are within 5 of the target, or when the gripper
+        steadily reports that they reached it or that something stopped them;
+        `gripper_result()` then says which.
+
+        Args:
+            position: The target, from 0 (fully open) to 255 (fully closed). A
+                fraction is dropped: 127.9 is sent as 127.
+            speed: How fast the jaws move, from 0 (slowest) to 255 (fastest) on
+                the gripper's scale. `None` means 100.
+            current: The gripper motor's current limit while the jaws move and
+                hold, in mA: they press with up to this current, and a stop
+                against something is reported once they press with most of it.
+                `None` means 200 mA. At most the current limit in the gripper's
+                configuration.
+            timeout: Seconds to wait for the jaws to settle, in sync mode only.
+            **options: Accepted as on a move: `speed`, `accel`, `duration`,
+                `profile`, `jerk`, `ramp_fraction`, `blend`, `blend_mode`,
+                `blend_continuity`, `ik_solver`, `singularity_strategy`, `samples`
+                and `dry_run`. Only `dry_run` changes a gripper command: the robot
+                checks it and moves nothing. An unknown setting or a bad value is
+                refused.
+
+        Returns:
+            The command id. The call returns once the robot has accepted the
+            command; call `wait_gripper_move_complete()` to wait until the jaws
+            have settled. In sync mode the call returns when they have settled.
+
+        Raises:
+            CommandRejected: The robot refused the command, for example outside
+                EXEC mode, before homing or with an invalid setting. In sync mode
+                also when it fails after it was accepted.
+            RobotTimeout: The robot did not accept the command within 5 s. In sync
+                mode also when the jaws did not settle within `timeout`.
+            RobotConnectionError: The client is not connected.
+            ValueError: `position`, `speed` or `current` cannot be read as a whole
+                number, for example the text "half". Nothing is sent.
+
+        Errors:
+            GRIPPER_SETTLE_TIMEOUT: The jaws had neither reached the target nor
+                reported an object 5 s after the command started, for example at
+                a low `speed` over a long way; the jaws then still move on. The
+                commands queued after it still run.
+            BAD_ARGUMENTS: `position` or `speed` is outside 0 to 255, or `current`
+                is below 1 mA or above the current limit in the gripper's
+                configuration.
+            SUPERSEDED: Another gripper command started before this one settled
+                and replaced its target. The commands queued after it still run.
+
+        Note:
+            The gripper has one target at a time. A gripper command that starts
+            before the previous one has settled replaces it, and the previous one
+            fails with `SUPERSEDED`. Call `wait_gripper_move_complete()` between
+            two gripper commands.
+
+        Warning:
+            The jaws move with force and press on whatever stops them. Keep hands
+            away from them.
+            `stop()`, `disable()` and an error stop the jaws where they are.
+
+        See also:
+            `open_gripper()`, `close_gripper()`, `set_gripper()`,
+            `gripper_result()`
+
+        Examples:
+            >>> robot.move_gripper(128)
+            >>> robot.wait_gripper_move_complete()
+            >>> robot.move_gripper(200, speed=50, current=300)
+            >>> robot.wait_gripper_move_complete()
+        """
+        args: list[int | None] = [int(position)]
+        if speed is not None or current is not None:
+            # A current without a speed keeps the speed's place empty: the robot takes its default speed there
+            # (2026-10-24: the current was sent in the speed's place and read as the speed).
+            args.append(None if speed is None else int(speed))
         if current is not None:
             args.append(int(current))
         return self._queued_gripper("move_gripper", args, timeout, options)
@@ -2256,16 +5150,55 @@ class RobotClient:
     # ------------------------------------------------------------------ #
 
     def wait_idle(self, timeout: float | None = None, raise_on_error: bool = True) -> list[dict]:
-        """Block until all queued motion has finished (checkpoints, must-not-lose).
+        """Wait until every command this client queued has finished.
 
-        "Finished" includes *failed*: a command that errors is terminal, so it stops
-        being outstanding. In async mode _queued() returned at the "queued" ack, so
-        nothing was waiting on that command and its failure would otherwise vanish.
-        Any such failure is raised here as MotionFailed — the robot may have executed
-        only part of the motion you asked for.
+        It waits for this client's queued commands only: the moves, delays and
+        gripper commands the robot accepted from it and has not yet answered as
+        done. A command is done when it has finished, as `set_completion_policy()`
+        defines it, or when it has failed. Another client's commands are not
+        waited for.
 
-        raise_on_error=False returns the failure list instead of raising (still
-        clearing it), for callers that want to inspect partial execution themselves.
+        A queued command can fail after the robot accepted it: the robot cannot
+        plan it (for example `JOINT_LIMIT`), `stop()` cancels it (`STOPPED`), or
+        an earlier command failed or the robot left EXEC mode (`ABORTED`). The
+        call reports every such failure since its last call, then forgets them,
+        so a program that ran only part of its moves does not go on unnoticed.
+        This client's `stop()` discards the failures not yet reported. A command
+        the robot refused when it was sent is not among them: its own call
+        raised `CommandRejected`. When the connection is lost, the commands still
+        running count as failed, with the code `CONNECTION_LOST`, or
+        `DISCONNECTED` after `disconnect()`.
+
+        Args:
+            timeout: Seconds to wait at most. `None` waits as long as it takes;
+                `0` checks once without waiting.
+            raise_on_error: `True` raises `MotionFailed` when a command failed;
+                `False` returns the failures instead.
+
+        Returns:
+            The failures since the last call, in the order they arrived: a dict
+            each, with `id` (the id the queued call returned), `code` and
+            `message`, and the error catalog's `number`, `title` and `fix` when
+            the robot sent them. An empty list when every command finished, and
+            always with `raise_on_error=True`.
+
+        Raises:
+            MotionFailed: With `raise_on_error=True`, a command failed. Its
+                `failures` holds the list described under Returns.
+            RobotTimeout: A command had not finished after `timeout`. The
+                failures seen so far stay for the next call.
+
+        See also:
+            `wait_motion_complete()`, `on_motion_error()`, `stop()`,
+            `set_completion_policy()`
+
+        Examples:
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.move_joints(90, -100, 160, 0, -30, 180)
+            >>> robot.wait_idle()
+            []
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> failures = robot.wait_idle(timeout=60, raise_on_error=False)
         """
         if not self._conn.wait_idle(timeout=timeout):
             raise RobotTimeout("wait_idle timed out")
@@ -2275,22 +5208,73 @@ class RobotClient:
         return failures
 
     def wait_motion_complete(self, timeout: float | None = None) -> None:
-        """Block until the most recently queued command completes — NOT the whole
-        queue (see wait_idle for that). No-op if nothing has been queued yet."""
+        """Wait until the last command this client queued has finished.
+
+        It waits for one command: the last move, delay or gripper command the
+        robot accepted from this client. A command the robot refused when it was
+        sent does not count. It returns at once when this client has queued
+        nothing yet, or when that command has already finished.
+
+        It does not wait for the commands queued before it, nor report their
+        failures: `wait_idle()` does both. Moves finish in the order they were
+        queued, but a gripper command does not hold up the moves after it, so an
+        earlier gripper command can still be moving.
+
+        Args:
+            timeout: Seconds to wait at most. `None` or `0` waits up to 120 s.
+
+        Raises:
+            CommandRejected: The command failed after the robot accepted it, for
+                example with `JOINT_LIMIT`, `STOPPED` or `ABORTED`, or the
+                connection was lost first (`CONNECTION_LOST` or `DISCONNECTED`).
+                Its `code` names the failure. Every later call raises it again,
+                until another command is queued.
+            RobotTimeout: The command had not finished after `timeout`, or 120 s.
+
+        See also:
+            `wait_idle()`, `wait_gripper_move_complete()`, `on_motion_complete()`
+
+        Examples:
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_motion_complete()
+            >>> robot.move_joints(90, -100, 160, 0, -30, 180)
+            >>> robot.wait_motion_complete(timeout=30)
+        """
         if self._last_queued is None:
             return
         Connection.wait_done(self._last_queued, timeout or DEFAULT_MOVE_TIMEOUT)
 
     def wait_gripper_move_complete(self, timeout: float | None = None) -> None:
-        """Block until the most recent GRIPPER command finishes moving.
+        """Wait until this client's last gripper command has settled.
 
-        Distinct from wait_motion_complete(), which waits for the most recent
-        QUEUED command of any kind — queue a gripper command then a joint move
-        and that would wait for the move instead.
+        The jaws have settled when they reached the command's target, or when the
+        gripper reported that something stopped them; this wait does not say
+        which, `gripper_result()` does. It waits for the gripper command itself:
+        `wait_motion_complete()` waits for the last queued command of any kind,
+        which is often a move queued after the gripper. It returns at once when
+        the command has already settled, and when this client has sent no
+        gripper command.
 
-        "Finished" means the jaws stopped: reached the commanded position, or
-        something stopped them. It does not say which. Use wait_holding_part() /
-        wait_released_part() when the outcome is what you care about.
+        Args:
+            timeout: The longest wait, in seconds. `None` or 0 mean 120 s.
+
+        Raises:
+            CommandRejected: The gripper command failed: its code says why, for
+                example `GRIPPER_SETTLE_TIMEOUT`, `SUPERSEDED`, `STOPPED` or
+                `ABORTED`, or the connection closed before it settled. Each call
+                raises it again until the next gripper command, and `wait_idle()`
+                reports the same failure once more, as `MotionFailed`.
+            RobotTimeout: The command had not settled within `timeout`.
+
+        See also:
+            `gripper_result()`, `wait_holding_part()`, `wait_released_part()`,
+            `wait_idle()`
+
+        Examples:
+            >>> robot.close_gripper()
+            >>> robot.wait_gripper_move_complete()
+            >>> robot.move_linear_rel_world(0, 0, 0.02)
+            >>> robot.wait_idle()
         """
         if self._last_gripper_queued is None:
             return
@@ -2298,21 +5282,41 @@ class RobotClient:
                              timeout or DEFAULT_MOVE_TIMEOUT)
 
     def wait_holding_part(self, timeout: float | None = None) -> GripperResult:
-        """Block until the last gripper command confirms it is holding something.
+        """Wait until the last gripper command has settled holding a part.
 
-        Raises GripFailed immediately if the jaws settled with nothing between
-        them — an empty close is a definite answer, so there is nothing to gain
-        by waiting out the timeout. Raises RobotTimeout if they never settle.
+        It waits like `wait_gripper_move_complete()`, then checks why the jaws
+        stopped: something must have stopped them before their target. Jaws that
+        closed on nothing raise `GripFailed` as soon as they settle, so a missed
+        pick cannot go unnoticed. Call it after `close_gripper()`, or a
+        `move_gripper()` that closes, before the arm moves away.
 
-        This is the safe idiom for a pick, and it is deliberately shorter than
-        the unsafe one:
+        Args:
+            timeout: The longest wait for the jaws to settle, in seconds. `None` or
+                0 mean 120 s.
 
-            robot.gripper_close()
-            robot.wait_holding_part()        # missed grips cannot be ignored
-            robot.move_joints(lift)
+        Returns:
+            The command's `GripperResult`: code 2 after a close. Code 1, an opening
+            that something blocked, passes too.
 
-        The alternative — wait, then check gripper_result() — works, but relies
-        on remembering to write the check.
+        Raises:
+            CommandRejected: The gripper command failed: its code says why, for
+                example `GRIPPER_SETTLE_TIMEOUT` or `SUPERSEDED`, or the connection
+                closed before it settled.
+            GripFailed: The jaws settled without stopping on anything, or no
+                gripper command of this client has settled yet. Its `result` holds
+                the `GripperResult`, or `None`.
+            RobotTimeout: The command had not settled within `timeout`.
+
+        See also:
+            `close_gripper()`, `wait_released_part()`, `gripper_result()`
+
+        Examples:
+            >>> from robotclient import GripFailed
+            >>> robot.close_gripper()
+            >>> try:
+            ...     robot.wait_holding_part()
+            ... except GripFailed as missed:
+            ...     print(missed.result)
         """
         self.wait_gripper_move_complete(timeout)
         result = self.gripper_result()
@@ -2321,12 +5325,40 @@ class RobotClient:
         return result
 
     def wait_released_part(self, timeout: float | None = None) -> GripperResult:
-        """Block until the last gripper command confirms the part is released.
+        """Wait until the last gripper command has settled with the jaws clear.
 
-        The mirror of wait_holding_part(): raises GripFailed if the jaws stopped
-        because something was still between them, which on an open means the
-        part did not come free — worth catching before the arm travels away with
-        it still attached.
+        The mirror of `wait_holding_part()`: it waits like
+        `wait_gripper_move_complete()`, then the jaws must have reached their
+        target with nothing in the way. Jaws that something still blocked raise
+        `GripFailed`: after an open, the part did not come free, and the arm must
+        not carry it away. Call it after `open_gripper()`, or a `move_gripper()`
+        that opens.
+
+        Args:
+            timeout: The longest wait for the jaws to settle, in seconds. `None` or
+                0 mean 120 s.
+
+        Returns:
+            The command's `GripperResult`, with code 3.
+
+        Raises:
+            CommandRejected: The gripper command failed: its code says why, for
+                example `GRIPPER_SETTLE_TIMEOUT` or `SUPERSEDED`, or the connection
+                closed before it settled.
+            GripFailed: The jaws did not report reaching their target with nothing
+                in the way: something stopped them, or the gripper still reported
+                motion when they came within 5 of the target (code 0), or no
+                gripper command of this client has settled yet. Its `result` holds
+                the `GripperResult`, or `None`.
+            RobotTimeout: The command had not settled within `timeout`.
+
+        See also:
+            `open_gripper()`, `wait_holding_part()`, `gripper_result()`
+
+        Examples:
+            >>> robot.open_gripper()
+            >>> robot.wait_released_part()
+            GripperResult(code=3, 'reached target, no object')
         """
         self.wait_gripper_move_complete(timeout)
         result = self.gripper_result()
@@ -2335,31 +5367,202 @@ class RobotClient:
         return result
 
     def wait(self, predicate: Callable[[dict], bool], timeout: float | None = WAIT_STATE_TIMEOUT, what: str = 'wait') -> None:
-        """Block until predicate(status) is true, event-driven on the status stream.
+        """Wait until the robot's status meets a condition of your own.
 
-        status keys: mode, state, homed, err, safety, estop.
+        `predicate` receives the latest status the robot sent: the dict
+        `latest_status()` returns, with keys such as `mode`, `state`, `homed`,
+        `err`, `errors`, `exec_paused` and `control_holder`. The call returns once
+        `predicate` returns a true value. It checks it at once, then each time a
+        new status arrives: the robot sends its status when it changes, checking
+        50 times a second. It sends no command. `wait_mode()`, `wait_enabled()`,
+        `wait_homed()` and `wait_error_reset()` are built on it.
+
+        Args:
+            predicate: A function that takes the status dict and returns a true
+                value when the wait is over. Read it with `s.get(...)`: before the
+                first status arrives the dict is empty.
+            timeout: Seconds to wait at most. `None` waits as long as it takes.
+            what: A name for the wait in the `RobotTimeout` message, which reads
+                "<what> timed out".
+
+        Raises:
+            RobotTimeout: `predicate` was not true within `timeout`, or the client
+                lost its connection or is not connected.
+
+        Note:
+            `predicate` gets the client's own status dict, and the client takes
+            in no new status until it returns: keep it short, do not change the
+            dict, and do not send commands from it. An exception it raises ends
+            the wait and reaches the caller.
+
+        See also:
+            `wait_mode()`, `latest_status()`, `on_status_change()`
+
+        Examples:
+            >>> robot.wait(lambda s: s.get("state") == "ENABLED" and s.get("homed"))
+            >>> robot.wait(lambda s: not s.get("exec_paused"), timeout=30,
+            ...            what="wait_resumed")
         """
         if self._conn.wait_status(predicate, timeout) is None:
             raise RobotTimeout(f"{what} timed out")
 
     def wait_enabled(self, timeout: float | None = WAIT_STATE_TIMEOUT) -> None:
+        """Wait until the robot is enabled.
+
+        It waits until the robot's status shows it enabled, and sends no command:
+        enable it with `enable()`, or call `enable(wait=True)` to do both. It
+        returns at once when the robot is already enabled.
+
+        While an error is latched, the robot refuses to enable and says so only
+        in its activity log: this call then runs into its timeout. Call
+        `clear_errors()` first.
+
+        Args:
+            timeout: Seconds to wait at most. `None` waits as long as it takes.
+
+        Raises:
+            RobotTimeout: The robot did not report itself enabled within
+                `timeout`, or the client lost its connection or is not connected.
+
+        See also:
+            `enable()`, `clear_errors()`, `wait()`
+
+        Examples:
+            >>> robot.enable()
+            >>> robot.wait_enabled()
+        """
         self.wait(lambda s: s.get("state") == "ENABLED", timeout, "wait_enabled")
 
     def wait_mode(self, mode: str, timeout: float | None = WAIT_STATE_TIMEOUT) -> None:
+        """Wait until the robot is in a given mode.
+
+        It waits until the robot's status shows `mode`, and sends no command:
+        change the mode first, with `enter_exec_mode()`, `enter_idle_mode()` or
+        the like, or call those with `wait=True` to do both. It returns at once
+        when the latest status already shows `mode`. The robot sends its status
+        when it changes, checking 50 times a second, so a mode that lasts less
+        than about 20 ms can pass unseen.
+
+        Args:
+            mode: The mode, as the robot names it: `"IDLE"`, `"EXEC"`, `"JOG"`,
+                `"HOMING"`, `"RTI"`, `"SOFT_RTI"`, `"SAFETY_STOP"`, `"FLASHING"`,
+                `"ACTIVE_ERROR"` or `"BOOTING"`. Spelled any other way, for
+                example in lower case, it never matches, and the wait runs into
+                its timeout.
+            timeout: Seconds to wait at most. `None` waits as long as it takes.
+
+        Raises:
+            RobotTimeout: The robot did not report `mode` within `timeout`, or the
+                client lost its connection or is not connected.
+
+        See also:
+            `wait()`, `latest_status()`, `enter_exec_mode()`, `enter_idle_mode()`
+
+        Examples:
+            >>> robot.enter_exec_mode()
+            >>> robot.wait_mode("EXEC")
+        """
         self.wait(lambda s: s.get("mode") == mode, timeout, f"wait_mode({mode})")
 
     def wait_homed(self, timeout: float | None = WAIT_HOMED_TIMEOUT) -> None:
-        """Wait until homed and not currently homing (guards a stale HOMED flag). HomingFailed when the homing ends in
-        an error instead."""
+        """Wait until the robot is homed and no homing is running.
+
+        It waits until the robot's status shows the arm homed and the robot out of
+        HOMING mode, so the homed flag of an earlier homing does not end the wait
+        while a new one runs. It sends no command: start homing with `home()`, or
+        call `home(wait=True)` to do both. It returns at once when the arm is
+        homed and no homing runs.
+
+        When homing ends in an error, it raises `HomingFailed` at once instead of
+        waiting out the timeout. It also raises it when the arm is not homed and
+        an error is latched, such as a pressed E-stop, even if no homing ran.
+        Warnings do not count.
+
+        Args:
+            timeout: Seconds to wait at most. `None` waits as long as it takes.
+
+        Raises:
+            HomingFailed: Homing ended with an error, or an error is latched while
+                the arm is not homed. Its `errors` lists the robot's error and
+                warning keys, for example `J3:HOMING_FAILED`.
+            RobotTimeout: The arm was not homed within `timeout`, for example
+                because the robot refused or abandoned the homing, or the client
+                lost its connection or is not connected.
+
+        Note:
+            Right after `home()` on an arm that is already homed, the status can
+            still show the earlier homing: this call then returns before the new
+            homing starts. To home again and wait, call `home(wait=True)`.
+
+        See also:
+            `home()`, `clear_errors()`, `errors()`
+
+        Examples:
+            >>> robot.wait_homed()
+            >>> robot.enter_exec_mode(wait=True)
+        """
         self._wait_homed(timeout, "wait_homed")
 
     def wait_error_reset(self, timeout: float | None = WAIT_STATE_TIMEOUT) -> None:
-        """Wait until no error is latched (after clear_errors(), or someone pressing Clear Errors). 2026-10-15."""
-        self.wait(lambda s: not s.get("err") and not s.get("errors"), timeout, "wait_error_reset")
+        """Wait until the robot reports no error and no warning.
+
+        It waits until the robot's status lists nothing but the warning
+        `NOT_HOMED`, and sends no command. An
+        error stays until `clear_errors()`, or the dashboard's Clear Errors
+        button, clears it; a fault that is still present latches again. A warning
+        lasts as long as its condition. It returns at once when nothing is
+        listed.
+
+        Unlike `clear_errors(wait=True)`, which ignores warnings, it also waits
+        for every other warning to end.
+
+        Args:
+            timeout: Seconds to wait at most. `None` waits as long as it takes.
+
+        Raises:
+            RobotTimeout: An error or a warning was still listed after `timeout`,
+                or the client lost its connection or is not connected.
+
+        Note:
+            `NOT_HOMED`, listed while the arm is not homed, does not count: it
+            describes a state, not a fault. To wait for the errors alone, use
+            `clear_errors(wait=True)`.
+
+        See also:
+            `clear_errors()`, `errors()`, `wait()`
+
+        Examples:
+            >>> robot.clear_errors()
+            >>> robot.wait_error_reset()
+            >>> robot.enable(wait=True)
+        """
+        # NOT_HOMED is a state, not a fault: with it counted, this never passed on an unhomed arm (2026-10-24).
+        self.wait(lambda s: not s.get("err") and not [k for k in (s.get("errors") or []) if k != "NOT_HOMED"],
+                  timeout, "wait_error_reset")
 
     def errors(self) -> list[dict]:
-        """The latched errors from the latest status: [{"key", "number", "title", "level", "since"}] (2026-10-15;
-        [] when clean). `key` is "J3:WATCHDOG" style; the number and title are the catalog's (docs/error_codes.md)."""
+        """Return the errors and warnings latched on the robot.
+
+        It reads the latest status the robot sent, and asks the robot nothing; the
+        list follows the robot within about 20 ms. An error stops the robot until
+        `clear_errors()`. A warning is listed too, but it does not stop the robot.
+
+        Returns:
+            One dict per latched error or warning, oldest first, or `[]` when there
+            is none: `key` (the error code, with `J<n>:` in front for a joint or
+            `Z_<zone>:` for a safety zone, such as `"J3:WATCHDOG"`), `number` and
+            `title` (from the error catalog; `None` and `""` for a code it lacks),
+            `level` (`"error"` or `"warning"`) and `since` (when it latched, in
+            seconds since 1970, UTC).
+
+        See also:
+            `clear_errors()`, `wait_error_reset()`, `latest_status()`
+
+        Examples:
+            >>> [e["key"] for e in robot.errors()]
+            ['J3:WATCHDOG']
+            >>> robot.clear_errors(wait=True)
+        """
         return list(self.latest_status().get("error_details") or [])
 
     # ------------------------------------------------------------------ #
@@ -2367,75 +5570,481 @@ class RobotClient:
     # ------------------------------------------------------------------ #
 
     def get_joints(self) -> list[float]:
-        """Joint angles in degrees."""
+        """Return the measured joint angles, in degrees.
+
+        The robot reads every joint's encoder each control tick (4 ms on PAR6);
+        this asks it for the latest reading. The angles are measured against the
+        reference that homing sets, so read them on a homed arm. An angle is not
+        wrapped into one turn: a joint whose range passes 180 degrees reports more,
+        for example up to 376 degrees on PAR6's J3.
+
+        Returns:
+            One angle per joint, in degrees, J1 first.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `get_pose()`, `latest_status()`, `move_joints()`
+
+        Examples:
+            >>> robot.get_joints()
+            [90.0, -105.0, 165.0, 0.0, -30.0, 180.0]
+        """
         return self._immediate("get_joints")
 
     def get_pose(self, *, angle_unit: str = "rad") -> list[float]:
-        """TCP pose [x, y, z, rx, ry, rz]: metres, the angles in radians (or degrees with angle_unit="deg"),
-        R = Rx(rx) Ry(ry) Rz(rz)."""
+        """Return the measured pose of the tool centre point.
+
+        The robot computes the pose every control tick from the measured joint
+        angles, with the arm's model and the gripper in use. It is the tool centre
+        point's position and orientation in the robot's base frame, the form
+        `move_pose()` and `move_linear()` take.
+
+        The orientation is three angles, R = Rx(rx) Ry(ry) Rz(rz): `rx` about the
+        base X axis, then `ry` about the tool's new Y axis, then `rz` about the
+        tool's own Z axis, its spin. `rx` and `rz` lie within -180 to 180 degrees,
+        `ry` within -90 to 90 degrees.
+
+        Args:
+            angle_unit: `"rad"` or `"deg"`: the unit of the three angles returned.
+
+        Returns:
+            `[x, y, z, rx, ry, rz]`: the position in metres, then the angles in
+            radians, or degrees with `angle_unit="deg"`.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
+
+        Note:
+            A tool pointing straight down reads `rx` near 180 or -180 degrees, and
+            can jump between the two on a tiny motion: the same orientation. With
+            the tool's Z axis along base X or -X (`ry` at 90 or -90 degrees), `rx`
+            and `rz` turn about the same axis: the robot then reports `rz` as 0 and
+            the whole turn in `rx`.
+
+        See also:
+            `get_joints()`, `move_pose()`, `move_linear()`, `is_reachable()`
+
+        Examples:
+            >>> robot.get_pose(angle_unit="deg")
+            [0.0, 0.2617, 0.2329, -120.0, 0.0, -90.0]
+            >>> x, y, z, rx, ry, rz = robot.get_pose()
+            >>> robot.move_linear(x, y, z + 0.02, rx, ry, rz)
+            >>> robot.wait_idle()
+        """
         return _pose_out(self._immediate("get_pose"), angle_unit)
 
     def get_health(self) -> dict:
-        """The robot's health summary (2026-10-15): {"level": "OK" | "WARN" | "ERROR" | "STALE", "components":
-        [{"name", "level", "summary", "values"}]} — the control loop, CAN, drives, errors, homing, the executor, the
-        self-collision worker, the processes, disk, memory, CPU temperature, the clock."""
+        """Return the robot's health summary, one level per part.
+
+        The robot judges each of its parts from its counters and readings, as the
+        dashboard's Health card shows them, and returns one line per part. It first
+        watches its counters advance for 50 ms, so the call takes a little longer
+        than other reads. It moves nothing.
+
+        A part's level is `"OK"`, `"WARN"`, `"ERROR"`, or `"STALE"` when the
+        part's heartbeat has stopped and its data is old.
+
+        Returns:
+            A dict: `level` (the most serious part's level; `"STALE"` counts above
+            `"ERROR"`), `time` (when it was judged, in seconds since 1970, UTC) and
+            `components`, one dict per part: `name`, `level`, `summary` (one line
+            saying why) and `values` (the numbers it was judged on; each part's are
+            in the Status fields reference). The parts, in this order:
+            `"control loop"`, `"memory lock"`, `"CAN"`, `"drives"`, `"gripper"`
+            (with a CAN gripper only), `"errors"`, `"homing"`, `"executor"`,
+            `"self-collision worker"`, `"recorder"`, `"processes"`, `"disk"`,
+            `"memory"`, `"CPU temperature"` and `"clock"`.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `get_hardware()`, `get_versions()`, `errors()`
+
+        Examples:
+            >>> health = robot.get_health()
+            >>> health["level"]
+            'OK'
+            >>> [c["summary"] for c in health["components"] if c["level"] != "OK"]
+            []
+        """
         return self._immediate("get_health")
 
     def get_hardware(self, can: bool = True) -> dict:
-        """What the robot's hardware reports (2026-10-18; the first-run check's data): {"drives": [{"name", "can_id",
-        "answered_scan", "answering", "lost", "firmware", "hardware", "serial", "batch", "voltage_v", "temperature_c",
-        "fault", "flags", "calibrated"}], "gripper" (the same, or None), "scan_unexpected_ids", "can_link" (the CAN
-        interface's state and error counters, or None), "io": {"estop_pressed", "estop_raw", "buttons_pressed",
-        "inputs", "outputs", ...}, "tick", "time"}. can=False skips the CAN counters (~5 ms; for polling). Moves
-        nothing."""
+        """Return what the drives, the CAN bus and the control box report.
+
+        One read of everything the hardware reports, for checking a build: each
+        drive's identity, supply and faults, the CAN interface's error counters,
+        and the E-stop, the buttons and the isolated inputs and outputs. It moves
+        nothing.
+
+        Args:
+            can: Also read the CAN interface's state and error counters, which
+                takes the robot about 5 ms. `False` skips them, for polling.
+
+        Returns:
+            A dict:
+            `drives`: one dict per joint, J1 first: `name` (`"J1"`), `can_id`,
+                `answered_scan` (it answered the scan at start-up), `answering` (its
+                data is fresh now), `lost` (its lost-connection error is latched),
+                `firmware`, `hardware`, `serial`, `batch`, `voltage_v` (its supply,
+                in volts), `temperature_c` (in degrees Celsius), `fault` (a fault is
+                reported), `flags` (each fault flag: `temperature`, `encoder`,
+                `supply_voltage`, `driver`, `velocity`, `current`, `estop` and
+                `watchdog`), `calibrated`, `driver_type`, `firmware_supported`
+                (`"ok"`, `"too_old"`, `"too_new"`, `"undeclared"`, or `None` before
+                the drive reports) and `supported_range`.
+            `gripper`: the same for a CAN gripper's drive, without `batch`, or
+                `None`.
+            `scan_unexpected_ids`: the CAN ids that answered the start-up scan
+                although this robot does not use them.
+            `can_link`: the CAN interface's `interface`, `state`, `restart_ms` and
+                its counters `restarts`, `bus_errors`, `arbitration_lost`,
+                `error_warning`, `error_passive` and `bus_off`; `None` with
+                `can=False` or when the robot cannot read them.
+            `io`: the control box: `estop_pressed`, per E-stop channel `estop_raw`
+                (the level, 0 = pressed) and `estop_channel_pressed`,
+                `estop_channels_used`, `software_estop`, `buttons_pressed` (`B1` and
+                `B2`), `inputs` and `outputs` (the three isolated pins' levels) and
+                `pcb_version`.
+            `joint_num`, `has_gripper`, `tick` (the control tick of the read) and
+                `time` (in seconds since 1970, UTC).
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `get_versions()`, `get_health()`
+
+        Examples:
+            >>> hardware = robot.get_hardware(can=False)
+            >>> [d["voltage_v"] for d in hardware["drives"]]
+            [23.6, 23.5, 23.4, 23.6, 23.5, 23.3]
+        """
         return self._immediate("get_hardware", [1 if can else 0])
 
     def get_versions(self) -> dict:
-        """Every part's version (2026-10-21): {"runtime": {"version", "branch", "commit"}, "python", "os": {"name",
-        "kernel", "realtime"}, "description_package": {"version", "path"}, "drives": [{"joint", "can_id", "firmware",
-        "hardware", "serial", "batch"}], "gripper" (the same without "batch", or None), "control_box":
-        {"pcb_configured", "hardware", "software", "serial", "batch"}, "time"}. A value a part has not reported yet is
-        None. Moves nothing."""
+        """Return the version of every part of the robot.
+
+        The robot reports its software, the operating system, the description
+        package, the control box and each drive, and the clients connected now. A
+        value a part has not reported yet is `None`. The software's own version is
+        the one the robot software started with. It moves nothing.
+
+        Returns:
+            A dict:
+            `runtime`: the robot software's `version`, `branch` and `commit`.
+            `python`: the Python version that runs it.
+            `os`: `name`, `kernel` and `realtime` (whether the kernel is a
+                real-time one).
+            `description_package`: `version`, `path`, `min` (the oldest version the
+                robot's configuration accepts) and `ok` (whether it is at least
+                that).
+            `protocols`: `commands`, `rti` and `telemetry`, the protocol versions.
+            `hardware`: what the configuration declares: `robot`, `revision`,
+                `driver_types` (per joint), `gripper`, `gripper_revision`,
+                `gripper_driver_type` and `description_package_min`; and `error`
+                when a configuration file could not be read.
+            `drives`: one dict per joint: `joint` (1 for J1), `can_id`, `firmware`,
+                `hardware`, `serial`, `batch`, `driver_type`, `supported` (as
+                `firmware_supported` in `get_hardware()`) and `supported_range`.
+            `gripper`: the same for a CAN gripper's drive, without `joint` and
+                `batch`, or `None`.
+            `control_box`: `pcb_configured` (the PCB revision the configuration
+                names), and `hardware`, `software`, `serial` and `batch` as the
+                board reports them.
+            `config_formats`: `reads` (per kind of configuration file, the newest
+                format this software reads) and `files` (each file read, with its
+                `kind` and `schema`).
+            `clients`: one dict per connected client: `client` (its name and
+                address), and its client library's `version` and `protocol`.
+            `time`: when it was read, in seconds since 1970, UTC.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `get_hardware()`, `get_health()`
+
+        Examples:
+            >>> robot.get_versions()["runtime"]["version"]
+            '0.10.0'
+        """
         return self._immediate("get_versions")
 
     def set_log_level(self, name: str, level: str) -> Any:
-        """Set one logger's level on the robot without a restart (2026-10-15): `name` from docs/logging.md "Logger
-        names" ("rti.can", "exec.planner", ...), `level` DEBUG / INFO / WARNING / ERROR. Applied in RTI and the
-        executor; not persisted (a restart returns to INFO)."""
+        """Set the level of one of the robot's loggers, without a restart.
+
+        The robot software writes its logs through named loggers, one per part.
+        This sets one of them in the robot's two control processes, the command
+        executor and the real-time loop: lines below the level are no longer
+        written. A logger's level also applies to the loggers under it that have
+        none of their own: `"rti"` covers `"rti.can"` until `"rti.can"` is set.
+        The dashboard, the supervisor, the recorder and the self-collision worker
+        keep their own levels; the dashboard's Logs tab sets the dashboard's. The
+        level lasts until that process restarts.
+
+        Args:
+            name: The logger: `"rti"`, `"rti.startup"`, `"rti.loop"`, `"rti.mode"`,
+                `"rti.flash"`, `"rti.errors"`, `"rti.can"`, `"rti.safety"`,
+                `"rti.homing"`, `"rti.handler"`, `"rti.exec"`, `"rti.gripper"`,
+                `"rti.dynamics"`, `"rti.selfcheck"`, `"rti.recipe"`,
+                `"rti.incident"`, `"rti.net"`, `"exec"`, `"exec.control"`,
+                `"exec.tcp"`, `"exec.forward"`, `"exec.status"`, `"exec.planner"`,
+                `"exec.stop"`, `"sup"`, `"sup.process"`, `"sup.pcb"`, `"sup.gpio"`,
+                `"sup.can_link"`, `"sup.ui"`, `"gui"`, `"sc"`, `"rec"`, `"config"`,
+                `"filters"`, `"shm"`, `"kin"`, `"proc"`, `"io"`, or the libraries'
+                `"toppra"` and `"can"`. The logging documentation says what each
+                one writes.
+            level: `"DEBUG"`, `"INFO"`, `"WARNING"` or `"ERROR"`, in any case.
+
+        Defaults:
+            `"INFO"` for every logger, `"WARNING"` for `"toppra"` and `"can"`, set
+            each time the command executor or the real-time loop starts.
+
+        Returns:
+            `{"name": name, "level": level}`: the logger and the level now set.
+
+        Raises:
+            CommandRejected: The robot refused it: the logger or the level is
+                unknown.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `name` is not one of the loggers above, or `level` is not one
+                of the four levels.
+
+        Note:
+            `"DEBUG"` on `"rti"` or `"rti.handler"` writes a line for every packet
+            of a real-time stream, up to 250 a second, from the real-time loop
+            itself. Use it briefly.
+
+        See also:
+            `capture_telemetry()`, `get_health()`
+
+        Examples:
+            >>> robot.set_log_level("exec.planner", "DEBUG")
+            {'name': 'exec.planner', 'level': 'DEBUG'}
+            >>> robot.set_log_level("exec.planner", "INFO")
+        """
         return self._immediate("set_log_level", [str(name), str(level).upper()])
 
     def capture_telemetry(self, seconds: float = 10.0, name: str = "") -> Any:
-        """Record `seconds` (1-60) of the robot's per-tick channels into a file on the robot
-        (temp_data/captures/<UTC time>_<name>.npz; the dashboard's Recordings tab > Captures shows and downloads it; the
-        activity log says CAPTURE_SAVED when it is done). The loop does no extra work. 2026-10-15."""
+        """Record the robot's per-tick data into a file on the robot.
+
+        The robot's recorder saves every control tick's values from 5 s before
+        the request to `seconds` after it: the joints' positions, speeds,
+        accelerations, jerks and torques, raw and filtered; the commanded and
+        target values; the tool centre point's pose, speed and acceleration; the
+        external torques and forces; the feedforward torques; the drives' error
+        flags; the loop's timing and the real-time link. The file is
+        `temp_data/captures/<UTC time>_<name>.npz` on the robot; the dashboard's
+        Recordings tab, Captures, plots it and downloads it. The real-time loop
+        does no extra work for it.
+
+        The call returns at once, when the request is placed. The robot's activity
+        log says `CAPTURE_STARTED`, then `CAPTURE_SAVED` once the file is written.
+        One capture runs at a time; `stop_capture()` ends it early.
+
+        Args:
+            seconds: How long to record after the request, in seconds, 1 to 60.
+            name: A label for the file name. Letters, digits, `-` and `_` are kept,
+                anything else becomes `-`, up to 32 characters; an empty one is
+                `"capture"`.
+
+        Returns:
+            `{"seconds", "name", "folder"}`: the length, the label as the file name
+            will carry it, and the captures' folder on the robot.
+
+        Raises:
+            CommandRejected: The robot refused it; the code says why (see Errors).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `seconds` is not a number. Nothing is sent.
+            TypeError: `seconds` is `None`. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `seconds` is not from 1 to 60.
+            CAPTURE_REFUSED: The recorder process is not running; nothing is
+                recorded.
+
+        Note:
+            While another capture runs, the recorder refuses this one in its
+            activity log only (`CAPTURE_REFUSED`); the call still returns normally.
+            The robot keeps the 10 newest captures and deletes older ones. The 5 s
+            before the request and the 10 kept are the Capture settings of the
+            dashboard's Recordings tab (`config/system.xml` `<recorder>`).
+
+        See also:
+            `stop_capture()`, `set_log_level()`
+
+        Examples:
+            >>> robot.capture_telemetry(5, "start_pose")
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+        """
         return self._immediate("capture_telemetry", [float(seconds), str(name)])
 
     def stop_capture(self) -> Any:
-        """End the running capture now: the robot saves what it has recorded so far (the activity log says
-        CAPTURE_SAVED, "stopped early"; CAPTURE_REFUSED when none runs). 2026-10-16."""
+        """End the running telemetry capture now and save what it has.
+
+        The recorder writes the capture's file with the ticks recorded so far, and
+        the robot's activity log says `CAPTURE_SAVED`, "stopped early". The call
+        returns at once. Any client can stop a capture, also one that another
+        client started.
+
+        Returns:
+            `None`: the robot sends no data back.
+
+        Raises:
+            CommandRejected: The recorder process is not running.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            CAPTURE_REFUSED: The recorder process is not running.
+
+        Note:
+            With no capture running, the recorder refuses the stop in its activity
+            log only (`CAPTURE_REFUSED`); the call still returns normally.
+
+        See also:
+            `capture_telemetry()`
+
+        Examples:
+            >>> robot.capture_telemetry(60, "long_test")
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+            >>> robot.stop_capture()
+        """
         return self._immediate("stop_capture")
 
     def get_status(self) -> dict:
-        """One-shot status query over TCP: mode, state, homed, error_active, joints."""
+        """Ask the robot for its state now, with the joint angles.
+
+        The robot answers at once from its shared memory. The answer is not the
+        status that `latest_status()` keeps: it adds the joint angles, the pose
+        angle convention and the planner's state in one dict, and it names three
+        flags differently. Most programs read `latest_status()`, which needs no
+        round trip to the robot.
+
+        Returns:
+            A dict:
+            `mode`, `state` and `homed`: as in `latest_status()`.
+            `pose_angles`: `"xyz-mobile"`, the pose angles R = Rx Ry Rz that this
+                robot reads and returns.
+            `runtime_version`: the robot software's version, such as `"0.10.0"`.
+            `protocols`: `commands`, `rti` and `telemetry`, the protocol versions.
+            `error_active`: 1 while an error is latched (`err` in the status).
+            `safety_violation`: 1 while a safety monitor error is latched
+                (`safety` in the status).
+            `software_estop`: 1 while the dashboard's software E-stop is on
+                (`estop` in the status).
+            `exec_paused`, `exec_settling`, `exec_stopping`: 1 while a program is
+                paused, waits for the arm to settle at the end of a move, or brakes
+                for a stop.
+            `exec_completion_policy`: `"commanded"`, `"settled"` or `"strict"`.
+            `planner`: the planner's state: `queue_depth`, `active_command`,
+                `executing_seq`, `completed_seq`, `current_profile`, `last_error`,
+                `last_diagnostic`, `motion_aborted`, `ik_config`,
+                `default_ik_solver` and `default_fk_jacobian_backend` (see the
+                Status fields reference).
+            `joints`: the measured joint angles, in degrees, J1 first.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `latest_status()`, `get_joints()`, `errors()`
+
+        Examples:
+            >>> status = robot.get_status()
+            >>> status["mode"], status["planner"]["queue_depth"]
+            ('EXEC', 0)
+        """
         return self._immediate("get_status")
 
     def is_reachable(self, x: float, y: float, z: float, rx: float, ry: float, rz: float, near: Sequence[float] | None = None,
                      *, angle_unit: str = "rad") -> dict:
-        """Can the arm reach this TCP pose inside its joint limits? Moves nothing.
+        """Check whether the arm can reach a pose, without moving it.
 
-        Pose as move_pose / get_pose: [m, rad — or deg with angle_unit="deg"]; `near` is joint angles in deg either
-        way. Returns
-        {"reachable": bool, "joints": [deg] | None, "allowed": bool, "zone": name | None,
-         "self_collision": "upper arm and tool" | None}:
-        `joints` is the solution closest to `near` (joint angles in deg; default: where the arm is
-        now) among those clear of self-collision (the planner's margin); `allowed` is reachable AND
-        inside every stop-zone of the active cell (`zone` names the one it violates) AND clear of
-        self-collision (`self_collision` names two links only when EVERY solution found brings them
-        within the margin — `joints` is then the closest of those). A global search, like an industrial
-        controller's "does an IK solution exist" query: "no" means no configuration inside the limits reaches the pose.
-        move_pose only searches near its start, so it can still refuse a pose this calls reachable
-        (IK_POSE_ERROR); move_joints(joints) will not, unless its PATH self-collides (the end pose
-        is all this checks).
+        The robot searches for joint angles that put the tool centre point at the
+        pose, within 0.2 mm and 0.5 degrees, with every joint inside its software
+        limits. It starts from `near`, then from 128 fixed points spread over the
+        joint range, so a pose always gets the same answer. Of the solutions it
+        finds, it returns the one closest to `near` that keeps the arm's parts
+        apart by the planner's self-collision margin. It also checks the pose
+        against the enabled safety zones that stop the robot, margins included. A
+        pose out of reach takes around 50 ms to refuse.
+
+        It checks the end pose only. A `move_joints()` to the joints returned can
+        still be refused for its path, which can cross a safety zone or bring two
+        parts of the arm too close. `move_pose()` searches only near where the arm
+        stands, so it can refuse a pose this call finds reachable.
+
+        Args:
+            x: Position along the base X axis, in metres.
+            y: Position along the base Y axis, in metres.
+            z: Position along the base Z axis, in metres.
+            rx: Turn about the base X axis, in radians, or degrees with
+                `angle_unit="deg"`. The orientation is R = Rx(rx) Ry(ry) Rz(rz).
+            ry: Turn about the tool's new Y axis, in the same unit.
+            rz: Turn about the tool's own Z axis, in the same unit.
+            near: Joint angles in degrees, one per joint, J1 first: the solution
+                closest to them is preferred. `None` means the arm's measured
+                angles now.
+            angle_unit: `"rad"` or `"deg"`: the unit of `rx`, `ry` and `rz`. `near`
+                is in degrees either way.
+
+        Returns:
+            A dict:
+            `reachable`: `True` when joint angles inside the limits reach the pose.
+            `joints`: those joint angles in degrees, J1 first, or `None` when the
+                pose is out of reach.
+            `allowed`: `True` when the pose is reachable, outside every stopping
+                safety zone and clear of self-collision.
+            `zone`: the name of a stopping safety zone the pose is in, or `None`.
+            `self_collision`: the two parts of the arm that come too close, such
+                as `"upper arm and tool"`, when every solution found does so;
+                `joints` is then the closest of those. Otherwise `None`.
+
+        Raises:
+            CommandRejected: The robot refused it; the code says why (see Errors).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `angle_unit` is neither `"rad"` nor `"deg"`, or a value is
+                not a number. Nothing is sent.
+            TypeError: A value is `None`, or `near` is not a sequence of numbers.
+                Nothing is sent.
+
+        Errors:
+            BAD_ARGS: A value is not a finite number, or `near` does not have one
+                angle per joint.
+            NO_ROBOT_MODEL: The robot software could not load the arm's model, so
+                it cannot search.
+            SELF_COLLISION_MODEL: Self-collision checking is on, but its model
+                could not be built from the geometry files.
+
+        See also:
+            `move_joints()`, `move_pose()`, `get_pose()`, `get_zones()`
+
+        Examples:
+            >>> x, y, z, rx, ry, rz = robot.get_pose()
+            >>> answer = robot.is_reachable(x, y, z - 0.05, rx, ry, rz)
+            >>> answer["allowed"]
+            True
+            >>> robot.move_joints(*answer["joints"])
+            >>> robot.wait_idle()
         """
         args = _pose_in((x, y, z, rx, ry, rz), angle_unit)
         if near is not None:
@@ -2443,36 +6052,290 @@ class RobotClient:
         return self._immediate("is_reachable", args)
 
     def get_zones(self) -> dict:
-        """The safety zones in force: {"cell", "zones": [...], "tool_spheres": [...]}. A read."""
+        """Return the safety zones in force.
+
+        A zone describes the cell around the robot, not the arm: an allowed zone is
+        a space the robot must stay inside, a forbidden one a space it must stay
+        out of. The robot checks the tool centre point and the gripper's tool
+        spheres against every enabled zone: the planner before each EXEC move,
+        keeping the zone's margin, and the safety monitor on the measured pose,
+        once a sphere is more than 5 mm past the zone's surface
+        (`<safety_monitor><zone_tolerance>` in `config/system.xml`). In freedrive a
+        zone can push back as a wall you feel.
+
+        It asks the robot for what is in force now and moves nothing.
+
+        Returns:
+            A dict with four keys:
+
+            - `cell`: the active cell's name, from `config/system.xml`
+              `<active_cell>`; `""` means no zones.
+            - `zones`: one dict per zone of the cell file, disabled ones included:
+              `name`; `shape` (`"box"`, `"prism"`, `"cylinder"`, `"sphere"` or
+              `"plane"`); `kind` (`"allowed"` or `"forbidden"`); `reaction`
+              (`"stop"`: the error `Z_<name>:ZONE_VIOLATION` stops the robot;
+              `"warn"`: a live `Z_<name>:ZONE_WARNING`); `checks` (`"tool"`: the
+              tool centre point and the tool spheres; `"tcp"`: the point only);
+              `margin` (m, the planner's clearance); `enabled`; `haptic` (a wall in
+              freedrive); `freedrive` (`"warn"` or `"stop"`: the reaction when
+              pushed through by hand); `geometry`, in metres in the base frame
+              (box: `min`, `max`; prism: `vertices`, `z_min`, `z_max`; cylinder:
+              `p1`, `p2`, `radius`, `rounded`; sphere: `center`, `radius`; plane:
+              `point`, `normal`).
+            - `tool_spheres`: `[x, y, z, radius]` per tool sphere, in metres, in
+              the tool frame.
+            - `haptic_walls`: the `<haptic_walls>` policy of `config/system.xml`:
+              `enabled`, `stiffness` (N/m), `damping` (N s/m), `max_force` (N),
+              `breakthrough` (m), `velocity_tau` (s), `zone_mass_scaled`,
+              `joint_walls`, `joint_max_torque` (Nm), `joint_breakthrough` (deg).
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `reload_zones()`, `is_reachable()`, `get_joint_walls()`
+
+        Examples:
+            >>> zones = robot.get_zones()
+            >>> [z["name"] for z in zones["zones"] if z["enabled"]]
+        """
         return self._immediate("get_zones")
 
     def reload_zones(self) -> dict:
-        """Re-read <active_cell> and its cell file and apply them (planner, is_reachable, RTI's
-        monitor) without a restart. A bad file raises CommandRejected ZONE_CONFIG and the zones in
-        force stay as they were. Returns the same summary as get_zones()."""
+        """Re-read the safety zones from their files and apply them.
+
+        The robot reads `config/system.xml` again (the `<active_cell>` name and the
+        `<haptic_walls>` policy), then the cell file `config/cells/<name>.xml` and
+        the gripper XML's tool spheres, and checks every zone. Only when all of it
+        is valid does it apply them, at once and without a restart or re-homing:
+        to the planner, to `is_reachable()`, to the safety monitor and to the
+        freedrive walls. An empty `<active_cell>` removes every zone.
+
+        A cell file or tool sphere that is not valid is refused with
+        `ZONE_CONFIG`, and the zones in force stay as they were. A `<haptic_walls>`
+        value outside its range is not refused: it falls back to its default, with
+        a warning in the robot's log. The gripper is the one the robot software
+        started with; another `<active_gripper>` needs a restart.
+
+        Moves planned before the call are not checked again; the safety monitor
+        checks every move against the new zones. A wall never pushes on its own: a
+        tool sphere already inside a zone when it is reloaded feels nothing until
+        it has been outside once.
+
+        Defaults:
+            When the robot software starts it reads the same files, and a file that
+            is not valid stops it. No zones as shipped: `<active_cell>` is empty.
+
+        Returns:
+            The zones now in force, as `get_zones()` returns them.
+
+        Raises:
+            CommandRejected: The robot refused it: the cell file or a tool sphere is
+                not valid (`ZONE_CONFIG`), or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            ZONE_CONFIG: `config/system.xml` or the gripper XML cannot be read or
+                is not valid XML; `<active_cell>`
+                is not a plain name (letters, digits, `_`,
+                `-`) or names no file in `config/cells/`; the cell file is not
+                valid XML, its root is not `<cell>`, it holds other elements than
+                `<zone>`, or it is written for a newer robot software; a zone in it
+                breaks a rule of the cell file (its name, shape, kind, reaction,
+                checks, margin, enabled, haptic or freedrive value, its geometry,
+                an unknown attribute or element) or shares its name with another;
+                or a tool sphere in the gripper XML is not four numbers with a
+                radius of at least 0. The message names the file, the zone and the
+                reason.
+
+        Warning:
+            Zones are not a safety-rated function, and they check only the tool
+            centre point and the gripper's tool spheres: the arm's links can still
+            enter a zone.
+
+        See also:
+            `get_zones()`, `is_reachable()`, `get_joint_walls()`
+
+        Examples:
+            >>> zones = robot.reload_zones()
+            >>> zones["cell"]
+        """
         return self._immediate("reload_zones")
 
     def get_joint_walls(self) -> dict:
-        """The freedrive joint walls (docs/safety_zones.md §2b). A read. Returns {"walls": [...], "policy",
-        "robot_xml"}; each wall (joint 1-based) carries what is in force — at, lo_deg/hi_deg, frequency_hz,
-        damping_ratio, max_torque_nm, breakthrough_deg, freedrive — the stable ranges (frequency_max_hz,
-        damping_ratio_window at the current frequency, the same for every joint), the stiffness/damping in Nm/deg that
-        gives at the joint's lightest pose and the pose scale at the measured pose now (scale_here), the live `spec`
-        (None = auto) and `unsaved` (live differs from the robot XML)."""
+        """Return the freedrive joint walls in force, with their stable ranges.
+
+        In freedrive (IDLE mode, on an enabled, homed arm with gravity compensation
+        on) every joint has a wall near each end of its range, which pushes back
+        like a spring with damping as you turn the joint into it. A wall is set by
+        how it behaves, its natural frequency and damping ratio, the same on every
+        joint; the robot turns that into stiffness and damping with the joint's
+        inertia at each pose. A joint pushed through its wall gets its `freedrive`
+        reaction.
+
+        It asks the robot for the walls in force, the values they resolve to and
+        the ranges that stay stable. It moves nothing.
+
+        Returns:
+            `{"walls": [...], "policy": {...}, "robot_xml": name}`. `walls` holds
+            one dict per joint:
+
+            - `joint` (1 to 6), `enabled` (whether the joint has a wall), `at`
+              (`"soft"` or `"hard"`: at the soft or the hard limit), `lo_deg` and
+              `hi_deg` (where its two walls are, deg).
+            - In force: `frequency_hz`, `damping_ratio`, `filter_ms` (the speed
+              filter behind the damping, ms), `scaling` (`"adaptive"` or
+              `"fixed"`), `max_torque_nm`, `breakthrough_deg`, `freedrive`
+              (`"warn"` or `"stop"`).
+            - Stable ranges: `frequency_max_hz` (for this filter),
+              `damping_ratio_window` (at this frequency and filter),
+              `breakthrough_max_deg` (`None` when no endstop limits it).
+            - At the joint's lightest pose: `stiffness_nm_per_deg`,
+              `damping_nm_s_per_deg`, `stiffness_max_nm_per_deg`,
+              `damping_window_nm_s_per_deg` and `inertia_kg_m2`;
+              `stiffness_scale_max` (how many times stiffer at its heaviest pose),
+              `scale_here` (at the arm's pose now), `drive_torque_nm` (the most
+              the joint's drive can give, Nm).
+            - `spec` (the settings as given, `None` meaning auto), `unsaved`
+              (`True` when they differ from the robot XML), `note` (why a setting
+              is not used, or `""`).
+
+            `policy` is the part of `config/system.xml` `<haptic_walls>` the walls
+            use: `enabled`, `joint_walls`, `stiffness` (N/m), `damping` (N s/m),
+            `velocity_tau` (s), `joint_max_torque` (Nm), `joint_breakthrough`
+            (deg). `robot_xml` names the robot XML file the walls are saved to.
+
+        Raises:
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        See also:
+            `set_joint_wall()`, `save_joint_walls()`, `get_zones()`
+
+        Examples:
+            >>> wall = robot.get_joint_walls()["walls"][4]  # J5
+            >>> wall["frequency_hz"], wall["damping_ratio"]
+        """
         return self._immediate("get_joint_walls")
 
     def set_joint_wall(self, joint: int, **fields: Any) -> Any:
-        """Change one joint's freedrive wall LIVE (joint 1-based). Fields: at ("soft" | "hard"), frequency_hz,
-        damping_ratio, filter_ms (0-8, the speed filter behind the damping), max_torque_nm, breakthrough_deg, freedrive
-        ("warn" | "stop"), scaling ("adaptive" | "fixed": stiffness follows the pose's inertia, or stays at the lightest
-        pose's); "auto" puts a field back to its default. Fields not given keep their value. A frequency /
-        damping ratio outside the stable range for that filter raises CommandRejected WALL_UNSTABLE (the message
-        gives the range) and nothing changes. Not saved until
-        save_joint_walls(). Returns the same as get_joint_walls()."""
+        """Change one joint's freedrive wall, live.
+
+        The robot merges the fields given into the joint's wall settings, checks
+        the result and applies it at once; fields left out keep their value.
+        Numbers are kept to 4 significant digits. Every wall re-arms: a joint that
+        is inside its wall feels nothing until it has been back in its range once.
+        Called with no fields, it sends every joint's live walls again.
+
+        The change is not saved: `save_joint_walls()` writes it into the robot
+        XML. Until then, the robot software starts again with the robot XML's
+        walls.
+
+        Args:
+            joint: The joint, from 1 to 6.
+            **fields: The settings to change. Each takes a value, or `"auto"` (or
+                `None`) for its default; `freedrive` takes no `"auto"`.
+                `at`: `"soft"` (the wall at the soft limit) or `"hard"` (at the
+                hard limit; refused on a joint with an endstop, whose hard limit
+                is the endstop).
+                `frequency_hz`: the wall's natural frequency, in Hz, above 0 and up
+                to the filter's stable maximum; higher feels stiffer.
+                `damping_ratio`: above 0 and inside the stable window at that
+                frequency; about 0.7 settles without bouncing, below 0.3 it rings.
+                `filter_ms`: the speed filter behind the damping, 0 to 8 ms; less
+                filtering allows a stiffer wall.
+                `max_torque_nm`: the most the wall pushes, in Nm, above 0 and up to
+                `<haptic_walls><joint_max_torque>` (20 Nm as shipped).
+                `breakthrough_deg`: how far past the wall the joint counts as
+                pushed through, 2 to 90 deg, never past an endstop.
+                `freedrive`: `"warn"` (a live `J<n>:JOINT_WALL_WARNING`) or
+                `"stop"` (the error `J<n>:JOINT_WALL`) when pushed through.
+                `scaling`: `"adaptive"` (stiffness and damping follow the joint's
+                inertia at each pose) or `"fixed"` (the lightest pose's at every
+                pose: softer where the joint carries more).
+
+        Defaults:
+            From each joint's `<freedrive_wall>` in the robot XML, read when the
+            robot software starts; `save_joint_walls()` writes it. Every field
+            `auto` as shipped: 7.1 Hz, damping ratio 0.67 and a 4 ms filter (from
+            `config/system.xml` `<haptic_walls>`), `"adaptive"`, `"warn"`; the
+            wall at the soft limit, or at the hard limit on a joint without an
+            endstop; a breakthrough of the soft-to-hard margin, 2 to 15 deg (15 deg
+            at a hard limit); a max torque of the spring at the breakthrough at the
+            heaviest pose, at most 5 Nm.
+
+        Returns:
+            The walls now in force, as `get_joint_walls()` returns them.
+
+        Raises:
+            CommandRejected: The robot refused it; the code says why (see Errors).
+                Also when another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `joint` cannot be read as a whole number. Nothing is sent.
+            TypeError: `joint` is not a number. Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `joint` is not from 1 to 6; a field name is unknown; a value
+                is not one of its words, not a number or outside its range; `at` is
+                `"hard"` on a joint with an endstop; or `breakthrough_deg` reaches
+                past the joint's endstop. Nothing changes.
+            WALL_UNSTABLE: The frequency is above the stable maximum for the
+                joint's filter, or the damping ratio is outside the stable window
+                at that frequency and filter. The message gives the stable range;
+                nothing changes.
+            WALL_OFF: The joint has no wall: joint walls are off in
+                `config/system.xml` `<haptic_walls>` (`<enabled>` or
+                `<joint_walls>` is 0), or the robot has no inertia for the joint.
+                Nothing changes.
+
+        Warning:
+            A wall pushes with up to its max torque: let go of a joint deep inside
+            its wall and it springs back. Try a new setting gently, with a hand on
+            the arm.
+
+        See also:
+            `get_joint_walls()`, `save_joint_walls()`
+
+        Examples:
+            >>> robot.set_joint_wall(5, frequency_hz=5.0, damping_ratio=0.7)
+            >>> robot.set_joint_wall(5, frequency_hz="auto", damping_ratio="auto")
+        """
         return self._immediate("set_joint_wall", [int(joint), dict(fields)])
 
     def save_joint_walls(self) -> Any:
-        """Write the live freedrive walls into the robot XML (<freedrive_wall> per joint). Returns get_joint_walls()."""
+        """Save the live freedrive walls into the robot XML.
+
+        The robot writes every joint's live wall settings into its `<joint>` block
+        of the robot XML as a `<freedrive_wall>` element, replacing the one there
+        or adding it; the rest of the file, comments included, stays as it is.
+        Settings at their default are written as `auto`. The walls in force do not
+        change; from then on the robot software also starts with them.
+
+        Returns:
+            The walls in force, as `get_joint_walls()` returns them, now with
+            `unsaved` false.
+
+        Raises:
+            CommandRejected: The robot refused it: the file could not be written
+                (`SAVE_FAILED`), or another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            SAVE_FAILED: The robot XML could not be read or written, has no
+                `<joint>` block for one of the joints, or would no longer be valid
+                XML after the change. The walls in force stay as they are.
+
+        See also:
+            `set_joint_wall()`, `get_joint_walls()`
+
+        Examples:
+            >>> robot.set_joint_wall(5, frequency_hz=6.0)
+            >>> robot.save_joint_walls()
+        """
         return self._immediate("save_joint_walls")
 
     # ------------------------------------------------------------------ #
@@ -2480,9 +6343,106 @@ class RobotClient:
     # ------------------------------------------------------------------ #
 
     def set_digital_output(self, pin: int, value: bool | int) -> None:
-        return self._immediate("set_digital_output", [int(pin), bool(value)])
+        """Switch one of the control box's isolated outputs on or off.
+
+        The robot takes the new level at once and switches the output within one
+        control tick (4 ms). Outputs 1, 2 and 3 are on terminals 6, 7 and 8 of the
+        control box; an isolated output switches an external voltage.
+        `get_hardware()` reports every output's level, under `"io"`.
+
+        It is not queued: the output switches when the command arrives, while moves
+        sent before it may still be running. To switch it after a move, call
+        `wait_idle()` first.
+
+        Args:
+            pin: The output: `1`, `2` or `3`. A number with a fraction is cut to a
+                whole number first.
+            value: `True` or `1` switches the output on, `False` or `0` off. Any
+                other value is refused.
+
+        Defaults:
+            Every output is off each time the robot software starts, also after a
+            restart.
+
+        Raises:
+            CommandRejected: The robot refused it: `pin` is not 1, 2 or 3, or
+                another client holds control.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `pin` cannot be read as a whole number, for example
+                `"one"`, or `value` is not `True`, `False`, 1 or 0. Nothing is
+                sent.
+            TypeError: `pin` is `None` or another type that is no number. Nothing
+                is sent.
+
+        Errors:
+            BAD_ARGS: The pin or the value is missing, or the value is not true or
+                false (1 / 0); only a raw client can send that.
+            BAD_PIN: `pin` is not 1, 2 or 3.
+
+        Warning:
+            The robot never switches an output off by itself: not on an error, a
+            pressed E-stop, `disable()` or `safety_stop()`, nor when your program
+            ends or disconnects. Switch outputs off yourself when they must not
+            stay on.
+
+        See also:
+            `get_digital_input()`, `wait_idle()`, `get_hardware()`
+
+        Examples:
+            >>> robot.move_joints(90, -105, 165, 0, -30, 180)
+            >>> robot.wait_idle()
+            >>> robot.set_digital_output(1, True)
+            >>> robot.set_digital_output(1, False)
+        """
+        # Strict (2026-10-24): bool(value) made any non-empty string, even "0", switch the output on.
+        if isinstance(value, bool) or (isinstance(value, (int, float)) and value in (0, 1)):
+            return self._immediate("set_digital_output", [int(pin), bool(value)])
+        raise ValueError(f"set_digital_output: value must be True / False or 1 / 0, got {value!r}")
 
     def get_digital_input(self, pin: int) -> bool:
+        """Return whether one of the control box's isolated inputs is on.
+
+        The robot reads every input once per control tick (4 ms) and takes a change
+        only after five equal reads in a row (20 ms), so a short glitch is ignored.
+        The call returns the level it read last. Inputs 1, 2 and 3 are on terminals
+        11, 10 and 9 of the control box. An input with no signal on it reads
+        `False`.
+
+        Each call asks the robot and waits for its answer. To wait for an input,
+        call it in a loop.
+
+        Args:
+            pin: The input: `1`, `2` or `3`. A number with a fraction is cut to a
+                whole number first.
+
+        Returns:
+            `True` while the input is on, `False` while it is off.
+
+        Raises:
+            CommandRejected: The robot refused it: `pin` is not 1, 2 or 3.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+            ValueError: `pin` cannot be read as a whole number, for example
+                `"one"`. Nothing is sent.
+            TypeError: `pin` is `None` or another type that is no number. Nothing
+                is sent.
+
+        Errors:
+            BAD_ARGS: No pin was given (only a raw client can send that).
+            BAD_PIN: `pin` is not 1, 2 or 3.
+
+        See also:
+            `set_digital_output()`, `get_hardware()`
+
+        Examples:
+            >>> robot.get_digital_input(1)
+            False
+            >>> import time
+            >>> deadline = time.monotonic() + 10
+            >>> while not robot.get_digital_input(2) and time.monotonic() < deadline:
+            ...     time.sleep(0.05)
+        """
         return self._immediate("get_digital_input", [int(pin)])
 
     # ------------------------------------------------------------------ #

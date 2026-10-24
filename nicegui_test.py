@@ -3238,9 +3238,11 @@ async def handle_fw_enter():
     # gets a dialog naming the consequence rather than a quiet checkbox.
     if force and not await _fw_confirm(
             "Override the park requirement?",
-            "Every motor will LOSE TORQUE within ~5 s (watchdogs fire into "
-            "shorted-phase brake) and stay limp for the whole session — "
-            "about 25 s per joint.\n\n"
+            # The drives' watchdog from system.xml (<drive_watchdog_ms>, 100 ms since 2026-10-13; the text said ~5 s, the
+            # old bring-up value, until 2026-10-24).
+            f"Every motor will LOSE TORQUE {_sys_cfg.get('drive_watchdog_ms', 100) / 1000:g} s after the robot falls "
+            "silent on the bus: each drive's watchdog lets go, the joints brake into a slow sag (shorted-phase "
+            "brake), the gripper coasts. They stay that way for the whole session — about 25 s per joint.\n\n"
             "If the arm is not parked or physically supported, IT WILL FALL. "
             "Anything it lands on, including a person, is in the way.\n\n"
             "Only continue if you have supported it by other means.",
@@ -3934,7 +3936,7 @@ def update_tables():
             gripper_ctrl_mode_toggle.set_value(_expected_toggle)
 
         # Gripper command status text — derives motion / object detection from
-        # gripper_object_detection (Robotiq codes 0–3), gripper_action, and the
+        # gripper_object_detection (the gripper's codes 0–3), gripper_action, and the
         # last commanded direction. ctrl_mode != 2 means firmware path is off.
         _obj    = int(shared_data.gripper['gripper_object_detection'][0])
         _action = int(shared_data.gripper['gripper_action'][0])

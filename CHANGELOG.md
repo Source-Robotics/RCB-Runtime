@@ -13,6 +13,82 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+### Added
+
+- Full docstrings for the robot control commands (`enable`, `disable`, `home`, `clear_errors`, the mode changes,
+  `stop`, `pause`, `resume`, `safety_stop` and its release, the flashing commands, and the control commands): what
+  each does in every mode, every code it can be refused with, what it raises, and an example.
+- The same for every other public `RobotClient` method (waiting, connection and events, motion settings, jogging,
+  I/O, the gripper, status and data, safety and dynamics, the real-time interface, diagnostics and service), and for
+  `RTIClient` with its classes and `GripperResult`.
+
+### Changed
+
+- A client that disconnects while its jog runs stops that jog: the robot brakes the joint to rest. The joint used to
+  run on until its joint limit.
+- `stop()`, `disable()` and an error stop the gripper's jaws where they are. They used to go on to their last target
+  and press there.
+- `joint_test()` on a homed arm refuses a move past the joint's soft limits, and the other joints hold still during a
+  test. They used to float in freedrive.
+- `wait_error_reset()` ignores the `NOT_HOMED` warning, which describes a state, not a fault. It never returned on an
+  arm that was not homed.
+- `set_pid_gains()` refuses an `Ilim` or `vel_lim` above the joint's limit in the robot XML, a negative gain and the
+  gripper's drive (`BAD_ARGS`), and refuses to run while the robot homes or the Hall sensor check, a freed joint or a
+  joint test runs (`REJECTED`): each relies on the joint's current limit, which the command resets.
+- `set_digital_output()` takes only true or false, 1 or 0. The Python client raises `ValueError` for anything else and
+  a raw client gets `BAD_ARGS`; the string "false" or "0" used to switch the output on.
+- `rti_set_rate_limiter()`, `rti_set_gravity_comp()` and `rti_set_start_pose_check()` refuse anything but true or
+  false with `BAD_ARGS`. A raw client's string "true" used to switch these protections off.
+- `move_gripper()` refuses a position or speed outside 0 to 255 and a current outside 1 mA to the gripper XML's current
+  limit (`BAD_ARGUMENTS`). The values used to wrap at 256, and a current of -1 reached the drive as 65535 mA.
+- The control box's isolated outputs start off each time the robot software starts. After a restart, an output that
+  had been on used to switch back on by itself.
+- `home()`, `enter_flashing_mode()`, `release_safety_stop()` and `exit_flashing_mode()` are refused with `REJECTED`
+  when the robot is in a mode they cannot act in: `home()` needs IDLE mode and an enabled robot,
+  `enter_flashing_mode()` IDLE mode or the error state, `release_safety_stop()` the motors off, and
+  `exit_flashing_mode()` flashing mode. Before, the robot accepted the call and then refused the mode change in its
+  activity log only, so a wait timed out. In EXEC mode, `home()` and `enter_flashing_mode()` also cancelled every
+  client's program while the arm went on playing the moves the robot already held, and the two releases acted as
+  `enter_idle_mode()` in every other mode.
+- `take_control()` and `set_force_confirm()` accept only true or false, 1 or 0, or "1" or "0" from a raw client, and
+  refuse anything else with `BAD_ARGS`. The JSON string "false" used to read as true, which for `take_control()`
+  meant a forced takeover. The Python client always sent a real boolean.
+- With the takeover confirmation on, the client that holds control no longer needs the button press for its own
+  `take_control(force=True)`.
+- A command refused for the robot's mode names the way out of that mode: `clear_errors()` in the error state,
+  `release_safety_stop()` with the motors off, `exit_flashing_mode()` while flashing, and waiting while homing.
+
+### Fixed
+
+- A jog speed that was not a number ran the joint at full speed, and a jog of a joint that does not exist was
+  answered "ok" and raised an exception inside the control loop. Both are refused with `BAD_ARGS`.
+- `move_gripper(position, current=...)` without a speed sent the current as the speed.
+- A dry run of a gripper command moved the jaws. It now checks the command and sends nothing, as for moves.
+- In soft real-time mode the robot refused the client's stop, so `RTIClient.stop()` and `MotionFinished` ended the
+  session with `RTI_LINK_LOST`. They now end it with a clean stop.
+- A callback (`on_status_change()`, `on_motion_complete()`, `on_motion_error()`, `on_error()`) that raised stopped
+  the client's receiver: the client counted as disconnected and refused every command, `stop()` included. The
+  exception is now printed and the client goes on.
+- `reload_zones()` with a malformed `config/system.xml` or gripper XML, and `is_reachable()` with geometry files that
+  no longer load, dropped the client's connection. They answer `ZONE_CONFIG` and `SELF_COLLISION_MODEL`.
+- `save_joint_walls()` writes the robot XML through a temporary file, so a write that fails, for example on a full SD
+  card, leaves the file as it was instead of cut short.
+- `safety_stop()` with an error latched switched the motors off for one control tick (4 ms) only: the robot went
+  straight back to holding the arm. The motors now stay off until `release_safety_stop()`, and an error that latches
+  while they are off no longer switches them on again.
+- After almost every restart, one control tick of about 70 ms, a few seconds after homing, latched `LOOP_CRITICAL`
+  and disabled the robot. It was Python's garbage collector walking every object the real-time process made while
+  starting. Those objects are now frozen before the control loop starts: on the arm, a full collection took 67 ms
+  before and 0 ms after. Any collection that still pauses the loop for more than 5 ms is logged in `RTI.log`.
+- The dashboard's firmware-flashing override dialog said the motors lose torque within about 5 s. It now shows the
+  drive watchdog time from `config/system.xml`, 0.1 s, and says that the joints brake and the gripper coasts.
+
+### Removed
+
+- `RobotClient.rti_set_profile()`. It sent a command the robot no longer has, so every call failed with
+  `UNKNOWN_CMD`. Choose the streaming contract with `rti_connect(pc_ip, rate_hz=...)`: with a rate the robot uses the
+  soft real-time mode, without one the hard real-time mode.
+
 ## [0.10.0] - 2026-10-23
 
 ### Added

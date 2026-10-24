@@ -57,6 +57,10 @@ from utility.activity_log import get_rti_activity_logger, log_activity, RateLimi
 _activity_rate_limiter = RateLimiter()
 _ACTIVITY_MIN_INTERVAL = 1.0  # seconds
 
+# The modes a latched error leaves in place (_apply_error_mode): the robot still goes DISABLED, but keeps the mode.
+# FLASHING (every maintenance mode) and SAFETY_STOP — motors off is available at any time (2026-10-23).
+KEEP_MODE_ON_ERROR = MAINTENANCE_MODES | frozenset({RobotMode.SAFETY_STOP})
+
 
 # ---------------------------------------------------------------------------
 # Tuning constants — shared by the RTI superloop and process_errors_tick().
@@ -694,8 +698,16 @@ def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, 
             if _was_enabled:                   # nobody asked: the error did it (2026-10-15)
                 log_activity(get_rti_activity_logger(), "RTI", "info", "STATE_CHANGE",
                              message="ENABLED → DISABLED: an error latched")
-        # MAINTENANCE_MODES are exempt from the forced mode change — they still
-        # go DISABLED above (motors ARE limp), but they keep the mode.
+        # KEEP_MODE_ON_ERROR (the MAINTENANCE_MODES and SAFETY_STOP) is exempt from the
+        # forced mode change — they still go DISABLED above (motors ARE limp), but they
+        # keep the mode.
+        #
+        # SAFETY_STOP since 2026-10-23 (user: "we should be able to off the motors
+        # anytime!"): state_machine.py allowed ACTIVE_ERROR → SAFETY_STOP for exactly the
+        # faulted robot, and this block reverted it after one tick — the same bug as
+        # FLASHING's below. An error latching WHILE limp no longer re-energises the arm
+        # either; release_safety_stop() then returns to IDLE, and the next tick here
+        # takes it to ACTIVE_ERROR while the error is still latched.
         #
         # Without this, FLASHING is unreachable in the exact case it exists for.
         # A driver sitting in its bootloader answers nothing, which latches
@@ -708,7 +720,7 @@ def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, 
         # The transition table alone cannot express this; only the per-tick
         # handler can.
         if (current_mode != RobotMode.ACTIVE_ERROR
-                and current_mode not in MAINTENANCE_MODES):
+                and current_mode not in KEEP_MODE_ON_ERROR):
             if current_mode == RobotMode.HOMING:
                 homing_ctrl.exit(Motor, joint_num)
                 shared_data.homed_state.set("NOT HOMED")

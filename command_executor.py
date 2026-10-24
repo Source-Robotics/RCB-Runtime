@@ -41,6 +41,7 @@ from pathlib import Path
 import threading
 import time
 from queue import Queue, Full
+from xml.etree.ElementTree import ParseError as _XMLParseError  # nosec B405 — only the exception type (reload_zones catches it); nothing is parsed here
 
 import numpy as np
 import zmq
@@ -827,7 +828,15 @@ def _reach_model():
     if _reach["model"] is None:
         global _self_collision_model
         planner_sc = _self_collision_model          # _build_robot_model() rebinds it; the planner's stays the planner's
-        _reach["model"] = _build_robot_model()
+        try:
+            _reach["model"] = _build_robot_model()
+        except SystemExit:
+            # Its start-up refusal (raise SystemExit(2): self-collision on, the geometry unloadable) stops the executor
+            # at start; here, in a client's thread, it ended the thread and dropped the connection (2026-10-24).
+            _self_collision_model = planner_sc
+            _reach["sc_error"] = "the self-collision geometry files cannot be loaded (changed since the start?)"
+            logger.error(f"is_reachable: {_reach['sc_error']}")
+            return None
         _self_collision_model = planner_sc
         _reach["lo"] = np.asarray(cfg['software_joint_limit_negative'], dtype=np.float64)[:JOINT_NUM]
         _reach["hi"] = np.asarray(cfg['software_joint_limit_positive'], dtype=np.float64)[:JOINT_NUM]
@@ -855,7 +864,7 @@ def _handle_is_reachable(args, cid, conn):
             else np.asarray(shared_data.joint['joint_position'][:JOINT_NUM], dtype=np.float64).copy())
     with _reach_lock:
         _reach_model()
-        if _reach["model"] is None:
+        if _reach["model"] is None and _reach["sc_error"] is None:
             msg = "no robot model (see the executor log)"
             _log_exec_reject(cid, "NO_ROBOT_MODEL", msg, command="is_reachable")
             return reply(conn, {"id": cid, "status": "error", "code": "NO_ROBOT_MODEL", "message": msg})
@@ -883,7 +892,8 @@ def _handle_reload_zones(args, cid, conn):
     global _zone_setup
     try:
         setup = read_XML2.load_zone_setup(SYSTEM_XML, CELLS_DIR, _GRIPPER_XML)
-    except (ValueError, FileNotFoundError) as e:
+    except (ValueError, OSError, _XMLParseError) as e:   # + a malformed XML / an unreadable file (2026-10-24: they
+        # escaped to handle_client, which closed the connection instead of answering)
         _log_exec_reject(cid, "ZONE_CONFIG", str(e), command="reload_zones")
         return reply(conn, {"id": cid, "status": "error", "code": "ZONE_CONFIG",
                             "message": f"{e} — the zones in force are unchanged"})
@@ -1362,6 +1372,8 @@ def _handle_stop(args, cid, conn):
     with _abort_gate():                    # a command being queued right now lands before this, never after
         _planner.flush()                   # drop queued motion + reset endpoint; a new stop epoch + its fence to RTI
         _fail_pending("STOPPED", "motion stopped")
+        # The gripper stops too (2026-10-24, user: a stop "should freeze it also"): RTI holds the jaws where they are.
+        send_to_rti("gripper_hold", cid, "TCP")
         epoch = _planner.epoch
         # In EXEC: brake along the path, drop the program up to the fence, hold there (still in EXEC). Elsewhere
         # (JOG, RTI, ...): IDLE as before.
@@ -1397,15 +1409,24 @@ def _handle_set_digital_output(args, cid, conn):
         _log_exec_reject(cid, "BAD_ARGS", "set_digital_output needs [pin, value]", command="set_digital_output")
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS",
                             "message": "set_digital_output needs [pin, value]"})
-    idx = _DIGITAL_OUTPUT_PINS.get(int(args[0]))
+    try:
+        idx = _DIGITAL_OUTPUT_PINS.get(int(args[0]))
+    except (TypeError, ValueError):          # a raw client's "one": BAD_PIN, not a dropped connection (2026-10-24)
+        idx = None
     if idx is None:
         _log_exec_reject(cid, "BAD_PIN", f"output pin must be 1-3, got {args[0]}",
                           command=_fmt_command("set_digital_output", args))
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_PIN",
                             "message": f"output pin must be 1-3, got {args[0]}"})
+    try:
+        on = _arg_switch(args[1]) == "1"     # strict (2026-10-24): a raw JSON "false" switched the output ON
+    except ValueError as e:
+        msg = f"set_digital_output: value {args[1]!r} — expected {e}"
+        _log_exec_reject(cid, "BAD_ARGS", msg, command=_fmt_command("set_digital_output", args))
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
     # No RTI command needed — write_all_outputs() reads this shared-memory array and
     # writes the physical pin every tick, same as any other RTI-owned IO.
-    shared_data.gpio_states[idx] = 1 if args[1] else 0
+    shared_data.gpio_states[idx] = 1 if on else 0
     reply(conn, {"id": cid, "status": "ok"})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
                  command=_fmt_command("set_digital_output", args))
@@ -1520,6 +1541,40 @@ def _arg_free_joint(v):
     return str(int(f))
 
 
+def _arg_jog_joint(v):
+    """jog's joint: counted from 0, an existing one (2026-10-24: a joint past the last was "ok" and RTI raised)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"a joint number 0-{JOINT_NUM - 1}") from None
+    if not (math.isfinite(f) and f == int(f) and 0 <= int(f) < JOINT_NUM):
+        raise ValueError(f"a joint number 0-{JOINT_NUM - 1}")
+    return str(int(f))
+
+
+def _arg_whole(v):
+    """A whole number (jog's direction: its sign counts)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError("a whole number") from None
+    if not (math.isfinite(f) and f == int(f)):
+        raise ValueError("a whole number")
+    return str(int(f))
+
+
+def _arg_finite(v):
+    """Any finite number (2026-10-24: a jog speed of NaN ran the joint at FULL speed — RTI's clamp
+    max(0, min(1, nan)) is 1)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError("a finite number") from None
+    if not math.isfinite(f):
+        raise ValueError("a finite number")
+    return repr(f)
+
+
 _JOINT_TEST_MAX_DEG = 15.0          # robotics/joint_test.py MAX_AMPLITUDE_DEG / MAX_SPEED_DPS
 _JOINT_TEST_MAX_DPS = 10.0
 
@@ -1563,6 +1618,19 @@ _JOINT_TEST_FIELDS = ("joint", "state", "amplitude_deg", "moved_deg", "max_error
 _JOINT_TEST_STATES = {0: "idle", 1: "running", 2: "done", 3: "fell_behind", 4: "stopped"}
 
 
+# The client whose jog moves the arm (2026-10-24, user: a lost client's jog "should" stop): a jog has no time-out of
+# its own, so a program that died mid-jog left the joint running to its limit. handle_client's cleanup sends jog_stop
+# when this client disconnects while the robot is in JOG mode.
+_jog_conn = None
+
+
+def _handle_jog(args, cid, conn):
+    """jog [joint, direction, speed] -> RTI jog_set (each value checked: _arg_jog_joint, _arg_whole, _arg_finite)."""
+    global _jog_conn
+    _jog_conn = conn
+    return _forward_fmt("jog_set", "jog", 3, (_arg_jog_joint, _arg_whole, _arg_finite))(args, cid, conn)
+
+
 _JOG_PROFILES = ("trapezoidal", "scurve")       # robotics/jog.py _PROFILE_TO_IDX (pinned by test_exec_command_args)
 _JOG_CONTROL_MODES = ("pid", "pd")              # robotics/jog.py _CONTROL_TO_IDX
 
@@ -1604,38 +1672,87 @@ def _hall_check_status(rti):
 _PID_GAIN_KEYS = ("KPP", "KPV", "KIV", "KPIQ", "KIIQ", "KP", "KD", "Ilim", "vel_lim", "vlim")
 
 
+def _pid_gains_problem(args):
+    """(joint, gains, None) for a valid set_pid_gains dict, else (None, {}, why). Checked here, not left to RTI
+    (2026-10-13): RTI silently ignores a joint it does not have, so a wrong index was answered "ok" and changed
+    nothing; an unknown gain name (a typo) was dropped the same way. 2026-10-24: the arm's joints only (RTI ignored the
+    gripper's index after an "ok"), no negative gain, and the robot XML's Ilim / vel_lim are ceilings nobody exceeds
+    (CLAUDE.md "Limits live in the robot XML")."""
+    if not isinstance(args, dict) or "joint" not in args:
+        return None, {}, "set_pid_gains needs a dict with a 'joint' field and one or more gains"
+    unknown = sorted(k for k in args if k != "joint" and k not in _PID_GAIN_KEYS)
+    try:
+        joint = int(args["joint"])
+        gains = {k: float(args[k]) for k in _PID_GAIN_KEYS if k in args}
+    except (TypeError, ValueError):
+        return None, {}, f"set_pid_gains: the joint and every gain must be numbers ({args})"
+    if not all(math.isfinite(v) for v in gains.values()):
+        return None, {}, f"set_pid_gains: every gain must be a finite number ({gains})"
+    if not 0 <= joint < JOINT_NUM:
+        return None, {}, f"set_pid_gains: joint {joint} does not exist (0..{JOINT_NUM - 1}, counted from 0)"
+    if any(v < 0 for k, v in gains.items() if k not in ("Ilim", "vel_lim")):
+        return None, {}, f"set_pid_gains: a gain cannot be negative ({gains})"
+    for key, ceiling_key, unit in (("Ilim", "motor_Ilim", " mA"), ("vel_lim", "motor_velocity_limit", "")):
+        ceiling = float(cfg[ceiling_key][joint])
+        if key in gains and not 0 < gains[key] <= ceiling:
+            return None, {}, (f"set_pid_gains: {key} {gains[key]:g}{unit} — more than 0 and at most J{joint + 1}'s "
+                              f"limit in the robot XML ({ceiling:g}{unit})")
+    if unknown:
+        return None, {}, f"set_pid_gains: unknown gain(s) {unknown} — known: {', '.join(_PID_GAIN_KEYS)}"
+    if not gains:
+        return None, {}, "set_pid_gains: no gain given"
+    return joint, gains, None
+
+
+def _pid_gains_busy():
+    """What set_pid_gains must not interrupt, or None (2026-10-24). Every call re-sends the joint's whole drive
+    configuration, its normal current limit included: never while homing (its stall detection relies on the homing
+    current limit) or while the Hall check, a freed joint or a joint test holds a joint at its own, lowered limit."""
+    if shared_data.robot_mode.get() == "HOMING":
+        return "homing"
+    if int(shared_data.rti["hall_check_joint"][0]) > 0:
+        return "the Hall sensor check"
+    if int(shared_data.rti["free_joint"][0]) > 0:
+        return "a freed joint"
+    if int(shared_data.rti["joint_test"][1]) == 1:
+        return "a joint test"
+    return None
+
+
 def _handle_set_pid_gains(args, cid, conn):
     """set_pid_gains carries {joint, <gain>: value, ...} as a dict (RTI reads the fields off the
     command dict, not a colon string), so forward the dict whole via send_payload_to_rti."""
-    msg = None
-    if not isinstance(args, dict) or "joint" not in args:
-        msg = "set_pid_gains needs a dict with a 'joint' field and one or more gains"
-    else:
-        # Checked here, not left to RTI (2026-10-13): RTI silently ignores a joint it does not have, so a wrong index
-        # was answered "ok" and changed nothing; an unknown gain name (a typo) was dropped the same way.
-        unknown = sorted(k for k in args if k != "joint" and k not in _PID_GAIN_KEYS)
-        try:
-            joint = int(args["joint"])
-            gains = {k: float(args[k]) for k in _PID_GAIN_KEYS if k in args}
-        except (TypeError, ValueError):
-            joint, gains = None, {}
-            msg = f"set_pid_gains: the joint and every gain must be numbers ({args})"
-        if msg is None and not all(math.isfinite(v) for v in gains.values()):
-            msg = f"set_pid_gains: every gain must be a finite number ({gains})"
-        elif msg is None and not 0 <= joint <= JOINT_NUM:
-            msg = f"set_pid_gains: joint {joint} does not exist (0..{JOINT_NUM - 1}, {JOINT_NUM} = the gripper)"
-        elif msg is None and unknown:
-            msg = f"set_pid_gains: unknown gain(s) {unknown} — known: {', '.join(_PID_GAIN_KEYS)}"
-        elif msg is None and not gains:
-            msg = "set_pid_gains: no gain given"
+    joint, gains, msg = _pid_gains_problem(args)
     if msg is not None:
         _log_exec_reject(cid, "BAD_ARGS", msg, command="set_pid_gains")
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
+    busy = _pid_gains_busy()
+    if busy is not None:
+        msg = f"set_pid_gains: not while {busy} runs — it sets the joint's current limit"
+        _log_exec_reject(cid, "REJECTED", msg, command="set_pid_gains")
+        return reply(conn, {"id": cid, "status": "error", "code": "REJECTED", "message": msg})
     payload = {"msg": "set_pid_gains", "joint": joint, **gains}
     send_payload_to_rti(payload, cid, "TCP")
     reply(conn, {"id": cid, "status": "ok"})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
                  command=_fmt_command("set_pid_gains", [payload["joint"]]))
+
+
+def _bool_arg(args, cid, conn, command, *, required):
+    """The one boolean argument of take_control / set_force_confirm, read strictly as every switch is (_arg_switch:
+    true / false, 1 / 0, "1" / "0"). None after a BAD_ARGS reply. Until 2026-10-23 these read bool(args[0]): a raw
+    JSON "false" was True — for take_control, a FORCED takeover (user: "Strict booleans")."""
+    args = [] if args is None else args
+    if not isinstance(args, (list, tuple)) or len(args) > 1 or (required and not args):
+        why = f"{command} takes {'one argument' if required else 'at most one argument'}: true or false"
+    else:
+        try:
+            return _arg_switch(args[0]) == "1" if args else False
+        except ValueError:
+            why = f"{command}: {args[0]!r} is not true or false (or 1 / 0)"
+    _log_exec_reject(cid, "BAD_ARGS", why, command=command)
+    reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": why})
+    return None
 
 
 def _handle_set_force_confirm(args, cid, conn):
@@ -1645,7 +1762,9 @@ def _handle_set_force_confirm(args, cid, conn):
     feature changes who can take the arm, and that should be a deliberate choice rather than
     something that appears under an existing installation after an update.
     """
-    on = bool(args and args[0])
+    on = _bool_arg(args, cid, conn, "set_force_confirm", required=True)
+    if on is None:
+        return
     # Raising protection: anyone, always. Lowering it: only the control holder (or nobody
     # holding). Without that asymmetry the gate is one command deep — a remote client would
     # simply disable it and then force-take, and the button would never be asked for.
@@ -1708,10 +1827,13 @@ def _handle_take_control(args, cid, conn):
     deliberate takeover — a wedged session, or an operator who needs the arm now — and for a
     client that wants to reserve control before it starts issuing commands.
     """
-    force = bool(args and args[0])
-    # Only a takeover FROM A LIVE HOLDER needs physical confirmation. Forcing an unheld robot
-    # is just a claim, and gating that would make the feature an obstacle rather than a guard.
-    if force and _force_confirm_required() and control_holder() is not None:
+    force = _bool_arg(args, cid, conn, "take_control", required=False)
+    if force is None:
+        return
+    # Only a takeover FROM ANOTHER, LIVE HOLDER needs physical confirmation. Forcing an unheld robot
+    # is just a claim, and gating that would make the feature an obstacle rather than a guard; nor
+    # does the holder's own forced take (it holds control already — 2026-10-23).
+    if force and _force_confirm_required() and control_holder() not in (None, _client_label(conn)):
         if not _confirm_lock.acquire(blocking=False):
             msg = ("another takeover request is already waiting at the control box — "
                    "answer or wait it out, then retry.")
@@ -1788,7 +1910,7 @@ IMMEDIATE_HANDLERS = {
     "release_safety_stop": _forward_to_rti("set_mode:IDLE", "release_safety_stop"),
     "enter_flashing_mode": _handle_enter_flashing_mode,
     "exit_flashing_mode":  _forward_to_rti("set_mode:IDLE", "exit_flashing_mode"),
-    "jog":          _forward_fmt("jog_set", "jog", 3),
+    "jog":          _handle_jog,
     "jog_stop":         _forward_to_rti("jog_stop", "jog_stop"),
     "set_jog_accel":        _forward_fmt("jog_accel", "set_jog_accel", 1, (_arg_positive,)),
     "set_jog_profile":      _forward_fmt("jog_profile", "set_jog_profile", 1, (_arg_one_of(*_JOG_PROFILES),)),
@@ -1820,8 +1942,9 @@ IMMEDIATE_HANDLERS = {
     "rti_claim":        _forward_to_rti("rti_claim", "rti_claim"),
     "rti_release":      _forward_to_rti("rti_release", "rti_release"),
     "rti_disconnect":   _forward_to_rti("rti_disconnect", "rti_disconnect"),
-    "rti_set_rate_limiter":     _forward_fmt("rti_set_rate_limiter", "rti_set_rate_limiter", 1),
-    "rti_set_gravity_comp":     _forward_fmt("rti_set_gravity_comp", "rti_set_gravity_comp", 1),
+    # Strict switches (2026-10-24): RTI reads only "1" as on, so a raw JSON "true" switched these protections OFF.
+    "rti_set_rate_limiter":     _forward_fmt("rti_set_rate_limiter", "rti_set_rate_limiter", 1, (_arg_switch,)),
+    "rti_set_gravity_comp":     _forward_fmt("rti_set_gravity_comp", "rti_set_gravity_comp", 1, (_arg_switch,)),
     "rti_set_dynamics_ff":      _forward_fmt("rti_set_dynamics_ff", "rti_set_dynamics_ff", 1),
     "rti_set_tcp_vel_limit":    _forward_fmt("rti_set_tcp_vel_limit", "rti_set_tcp_vel_limit", 1),
     "rti_set_command_timeout":  _forward_fmt("rti_set_command_timeout", "rti_set_command_timeout", 1),
@@ -1836,7 +1959,7 @@ IMMEDIATE_HANDLERS = {
     "rti_set_min_duration":     _forward_fmt("rti_set_min_duration", "rti_set_min_duration", 1),
     "set_recipe":               _forward_fmt("set_recipe", "set_recipe", 1, (_arg_recipe,)),
     "rti_set_start_pose_check": _forward_fmt("rti_set_start_pose_check",
-                                             "rti_set_start_pose_check", 1),
+                                             "rti_set_start_pose_check", 1, (_arg_switch,)),
     "rti_set_lowpass":  _forward_fmt("rti_set_lowpass", "rti_set_lowpass", 1),
     "calibrate_gripper": _forward_to_rti("gripper_calibrate", "calibrate_gripper"),
     "set_gripper_ctrl_mode": _forward_fmt("gripper_ctrl_mode", "set_gripper_ctrl_mode", 1, (_arg_one_of("1", "2"),)),
@@ -1888,7 +2011,7 @@ def checkpoint_listener():
         if status.get("status") == "error":
             out["code"] = status.get("code", "EXEC_ERROR")
             out["message"] = status.get("message", "")
-        # Gripper completions carry the settle reason (Robotiq-style: 1/2 = an
+        # Gripper completions carry the settle reason (the gripper's status code: 1/2 = an
         # object stopped the jaws, 3 = reached the target with nothing there).
         # Forwarded verbatim so the client can tell a successful pick from a
         # gripper that closed on air. Absent for every non-gripper command.
@@ -2200,6 +2323,12 @@ def handle_client(conn, addr):
             active_clients.pop(conn, None)
         # A dropped TCP connection must never hold the robot hostage.
         _release_control(conn, "disconnected")
+        global _jog_conn
+        if _jog_conn is conn:                  # its jog must not outlive it (2026-10-24)
+            _jog_conn = None
+            if shared_data.robot_mode.get() == "JOG":
+                send_to_rti("jog_stop", None, "TCP")
+                log_tcp.warning(f"{ip}:{port} disconnected while jogging: jog stopped")
         _client_names.pop(conn, None)          # after the release, so its log line still names the client
         _client_versions.pop(conn, None)
         # Drop any of this client's pending completions.
@@ -2263,6 +2392,7 @@ def main():
         # to. Passed explicitly so the check survives a robot model that failed to build.
         joint_limits=(cfg['software_joint_limit_negative'], cfg['software_joint_limit_positive']),
         zones=_zone_setup["zones"], tool_spheres=_zone_setup["tool_spheres"],
+        gripper_current_limit_ma=cfg.get('gripper_Ilim'),    # the gripper XML's <Ilim>: no gripper command above it
     )
     _planner.set_self_collision(_self_collision_model)
     _planner.start()

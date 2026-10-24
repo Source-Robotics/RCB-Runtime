@@ -31,6 +31,7 @@ rest point depended on the speed: soft limits early by up to half the stopping d
 A new direction waits until the previous motion has braked to rest, then starts a new session from where it stopped.
 """
 
+import logging
 import math
 
 import numpy as np
@@ -210,6 +211,9 @@ class JogHandler:
         """Jog one joint: `direction` +1 / -1 (0 = stop), speed as a fraction of that joint's velocity limit.
         `cmd_id`: the jog command's id, for the activity log's JOG_STARTED / JOG_STOPPED (2026-10-15)."""
         self._cmd_id = cmd_id
+        if not 0 <= int(axis) < self.joint_num:      # the executor refuses it; never an IndexError in the loop (2026-10-24)
+            logging.getLogger("rti").warning("jog refused: no joint %s (joints count from 0)", axis)
+            return
         if direction == 0:
             self.stop_jog(cmd_id)
             return
@@ -245,7 +249,8 @@ class JogHandler:
         self._want_is_session = self._has_session and bool(np.array_equal(unit_dir, self._dir))
         self._want_dir[:] = unit_dir
         self._want_on = True
-        self._jog_speed_pct = max(0.0, min(1.0, speed_pct))
+        # NaN / infinity: no speed (2026-10-24: max(0, min(1, nan)) is 1 — a NaN speed ran the joint at FULL speed)
+        self._jog_speed_pct = max(0.0, min(1.0, speed_pct)) if math.isfinite(speed_pct) else 0.0
         if self._shared_data is not None:
             self._shared_data.rti['jog_speed_pct'][0] = self._jog_speed_pct
         if not self._jog_session_active:

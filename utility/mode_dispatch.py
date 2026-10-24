@@ -333,7 +333,9 @@ def handle_idle(ctx: TickContext) -> tuple[TickResult, ControlOutput]:
     robot_enabled   = ctx.shared_data.robot_state.get() == "ENABLED"
     gravity_comp_on = bool(ctx.shared_data.rti['gravity_comp_enabled'][0])
 
-    if robot_homed and robot_enabled and gravity_comp_on:
+    # During a joint test every other joint holds still (2026-10-24, user): in freedrive they floated and took the
+    # tested joint's reaction.
+    if robot_homed and robot_enabled and gravity_comp_on and getattr(ctx, "joint_test_joint", -1) < 0:
         gravity = ctx.shared_data.joint['joint_gravity_torque'][:ctx.joint_num]
         # Freedrive: the safety zones push back as haptic walls (utility/haptic_walls.py). None = no wall
         # touched this tick, so the arm is exactly as weightless as it always was.

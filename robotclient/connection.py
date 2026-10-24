@@ -11,8 +11,10 @@ A queued motion command receives TWO replies: ``{"status":"queued"}`` (ack) then
 
 import json
 import socket
+import sys
 import threading
 import time
+import traceback
 
 from .constants import CONNECT_TIMEOUT
 from .exceptions import RobotConnectionError, RobotTimeout, CommandRejected
@@ -258,13 +260,13 @@ class Connection:
             # p.queued (set on the earlier "queued" ack) confirms this was a motion
             # command, not just any pending happening to see status=="complete".
             if status == "complete" and p.queued and self.on_motion_complete:
-                self.on_motion_complete(cid)
+                self._call_back("on_motion_complete", self.on_motion_complete, cid)
             elif status == "error" and p.queued:
                 failure = {"id": cid, "code": p.error[0], "message": p.error[1], **p.error_info}
                 with self._lock:
                     self._motion_errors.append(failure)
                 if self.on_motion_error:
-                    self.on_motion_error(dict(failure))
+                    self._call_back("on_motion_error", self.on_motion_error, dict(failure))
         p.ack.set()
         p.done.set()
 
@@ -275,10 +277,22 @@ class Connection:
                 self._status.update(msg)
                 self._status_cv.notify_all()
             if self.on_status_change:
-                self.on_status_change(dict(self._status))
+                self._call_back("on_status_change", self.on_status_change, dict(self._status))
         elif mtype == "error":
             if self.on_error:
-                self.on_error(msg)
+                self._call_back("on_error", self.on_error, msg)
+
+    @staticmethod
+    def _call_back(name, fn, arg):
+        """Run a program's callback on this receiver thread. An exception it raises is printed and dropped
+        (2026-10-24): it used to end the receiver thread, so the client called itself disconnected and refused every
+        command, stop() too, while the robot kept the connection and this client's control; and a command whose
+        callback raised was never answered."""
+        try:
+            fn(arg)
+        except Exception:
+            print(f"robotclient: the {name} callback raised; the client goes on receiving:", file=sys.stderr)
+            traceback.print_exc()
 
     def _fail_all(self, code, message):
         """Wake every waiter with a connection error (on disconnect / socket loss)."""
