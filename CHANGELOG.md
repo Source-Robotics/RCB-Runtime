@@ -13,6 +13,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-25
+
 ### Added
 
 - Full docstrings for the robot control commands (`enable`, `disable`, `home`, `clear_errors`, the mode changes,
