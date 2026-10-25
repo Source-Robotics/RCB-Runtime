@@ -291,9 +291,11 @@ CATALOG = {
                                 "endstop. The message says which.", _HARD,
                                 "Check that the jaws move freely and the gripper is powered. Clear errors, enable and "
                                 "home again."),
-    "HOMING_ABORTED": _e(4004, "Homing aborted", "An error latched while the robot was homing.",
+    "HOMING_ABORTED": _e(4004, "Homing aborted",
+                         "An error latched while the robot was homing, or the homing was interrupted before it "
+                         "finished (Stop, Disable or another mode).",
                          "Homing stopped and the robot is not homed.",
-                         "Clear the error the error list names, then home the robot again.", kind="stop"),
+                         "Clear any error the error list names, then home the robot again.", kind="stop"),
     "HOMING_INVALIDATED": _e(4005, "Homing invalidated",
                              "The position reference can no longer be trusted: a drive lost its connection, a joint "
                              "measured past its endstop, or firmware was flashed. The message says which.",
@@ -467,7 +469,18 @@ CATALOG = {
                          "angles had another meaning. A pose it sends could turn the tool to another orientation.",
                          _REFUSED,
                          "Use the robotclient that came with the robot's runtime. A client that sends raw JSON adds "
-                         "\"protocol\": 1 to each message."),
+                         "\"protocol\": 2 to each message."),
+    "NO_GRIPPER": _e(6023, "No gripper", "The robot has no CAN gripper, so a gripper command cannot run.", _REFUSED,
+                     "Leave gripper commands out of the program, or select a CAN gripper as <active_gripper> in "
+                     "config/system.xml and restart the robot service."),
+    "GRIPPER_MOTOR_MODE": _e(6024, "Gripper in motor mode",
+                             "The gripper is in motor mode, where the robot sends it no target, so a gripper move "
+                             "cannot run.", _REFUSED,
+                             "Switch it to firmware mode with set_gripper_ctrl_mode(2), then send the command again."),
+    "RTI_NOT_RUNNING": _e(6025, "Measured values unavailable",
+                          "RTI is not running, or the robot is in flashing mode, so the measured values in the robot's "
+                          "memory are old.", _REFUSED,
+                          "Check the robot service and RTI.log (Logs tab), or leave flashing mode, then ask again."),
     "CONTROL_HELD": _e(6101, "Control held by another client", "Another client holds control of the robot.",
                        _REFUSED,
                        "Release control on that client, or take control. A forced takeover asks for confirmation "
@@ -494,6 +507,11 @@ CATALOG = {
                          "The PC's hard-RTI stream changed the joint's acceleration faster than its jerk limit plus "
                          "10 %.", _STREAM,
                          "Send a jerk-limited trajectory, or filter noisy targets (rti_set_lowpass). " + _AGAIN_RTI),
+    "RTI_START_POSE": _e(6206, "First setpoint too far from the arm",
+                         "The first command of an RTI session is too far from where the arm is. The start-pose check "
+                         "refuses a session that would begin with a jump.", _STREAM,
+                         "Start the stream from the arm's measured position (the state packets give it). "
+                         + _AGAIN_RTI),
     "RTI_NO_SEND_TIME": _e(6205, "PC packet without its send time",
                            "A hard-RTI position command arrived without the PC's send time. Hard RTI follows the PC's "
                            "own timing and needs it.", _STREAM,
@@ -553,6 +571,7 @@ CATALOG = {
     "COLLISION_DETECTION_CHANGED": _info(9020, "Collision detection changed"),
     "FREE_JOINT": _info(9021, "Joint freed for hand turning"),
     "JOINT_TEST": _info(9022, "Joint test move"),
+    "STOPPED_ON_DISCONNECT": _info(9023, "Stopped: the controlling client left"),
 }
 
 ERROR_DESCRIPTIONS = CATALOG          # the old name (utility/error_checks.py, nets)

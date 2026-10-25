@@ -58,7 +58,7 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=29000)
     ap.add_argument("--go", action="store_true")
-    ap.add_argument("--jog", type=float, default=0.02, help="jog speed, fraction of the jog limit (default 0.02)")
+    ap.add_argument("--jog", type=float, default=2.0, help="jog speed, percent of the jog limit (default 2)")
     ap.add_argument("--rate", type=float, default=8.0, help="RTI ramp speed, deg/s (default 8)")
     args = ap.parse_args()
 
@@ -212,7 +212,7 @@ def main():
         robot.enter_idle_mode(wait=True)
 
         # ------------------------------------------------------------------ 2. JOG
-        print(f"\n2. JOG: jog J5 towards the zone at {args.jog:.2f} of the jog limit — no prevention, the monitor stops it")
+        print(f"\n2. JOG: jog J5 towards the zone at {args.jog:g} % of the jog limit — no prevention, the monitor stops it")
         robot.enter_jog_mode(wait=True)
         start = len(capture.packets)
         robot.jog(J, int(sign), args.jog)

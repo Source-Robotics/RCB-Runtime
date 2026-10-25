@@ -24,6 +24,53 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Changed
 
+- **Every speed share is a percent, and the command protocol is 2.** `set_joint_speed()`, a move's `speed`, `accel`
+  and `jerk`, and `jog()`'s speed take a percent: above 0 and at most 100 (0 to 100 for `jog()`), so `1` means 1 %
+  and `0.5` half a percent. A value of 1 or less used to be a fraction, so a program asking for "1 %" ran at 100 %;
+  `jog()`'s speed was always a fraction. A program that passes fractions must pass percents now. A client and a robot
+  of different command protocols refuse each other at connect instead of misreading a speed.
+- When the client holding control disconnects, or loses its connection, while moves it queued still run, the robot
+  stops the arm as `stop()` does. They used to play to the end with nobody connected. Call `wait_idle()` before
+  disconnecting to let them finish.
+- A homing that Stop, Disable or another mode interrupts leaves the arm not homed: home it again. The arm used to stay
+  marked homed while the joints that had started homing still read as homing.
+- Every `rti_connect()` switches the rate limiter, the start-pose check and real-time gravity compensation on, and sets
+  the tool speed cap back to its start value. A session used to inherit them switched off from an earlier one, from any
+  PC.
+- A collision-detection change returns to its start value when the client that made it releases control, loses it or
+  disconnects. It used to last until the robot software restarted. `"warn"` and `"stop"` are refused when nothing can
+  be checked, and the status reports `"off"` while the safety monitor is off.
+- `set_gravity_comp()` is refused while a joint moves or a PC drives the arm in a real-time session: the switch is a
+  step in the joints' torque.
+- `rti_connect()` is refused outside IDLE mode and the real-time mode it asks for, and while a PC drives the arm; it
+  used to end a running claim without braking. `rti_disconnect()` is refused outside IDLE mode, the real-time modes and
+  the error state; it used to end a safety stop or a firmware flash and abandon a homing.
+- The real-time interface's settings, `set_gripper()`, `set_joint_speed()` and `set_blending()` refuse a value outside
+  their range with `BAD_ARGS`. A negative or NaN tool speed cap used to switch the cap off, and a `set_gripper()`
+  current of -1 reached the drive as 65535 mA.
+- Gripper commands are refused on a robot without a CAN gripper (`NO_GRIPPER`), and the queued ones while the gripper is
+  in motor mode (`GRIPPER_MOTOR_MODE`). They used to be accepted and then time out or settle without moving.
+- `get_joints()`, `get_pose()` and `get_digital_input()` are refused with `RTI_NOT_RUNNING` while the control loop is
+  not running or the robot is flashing, instead of answering old values.
+- `set_log_level()` refuses the loggers of the robot's other processes, which it never reached.
+- The jog's ramp settings (`set_jog_accel()`, `set_jog_jerk_factor()`, `set_jog_profile()`) take effect once the joint
+  is at rest: a longer ramp applied mid-jog could carry the joint past its soft limit. `set_jog_profile()` and
+  `set_jog_control_mode()` take any letter case, and the profile also its usual other spellings.
+- Arcs, circles and splines ignore the session's default blend (`set_blending()`); one that passes its own blend above 0
+  still fails. Every curve used to fail while a default blend was set.
+- The Hall sensor check stops by itself 2 minutes after the last `hall_check(True)`, as a freed joint does.
+- `calibrate_gripper()` ends when the gripper reports itself calibrated, and drops the gripper's target: the jaws no
+  longer move back to an old target 30 s later.
+- A gripper command's settle time grows at low speeds (about 30 s at speed 15); a slow full stroke used to fail after
+  5 s.
+- A first real-time command too far from the arm latches `RTI_START_POSE` instead of `RTI_LINK_LOST`.
+- The client's callbacks run on a thread of their own, so a command or a wait inside one works. `on_error()` receives
+  the robot's id-less errors, `on_motion_error()` the failures of a lost connection, and a failure a call already
+  raised is not raised again by `wait_idle()`. Waits raise `RobotConnectionError` for a lost connection. `connect()`
+  refuses a second connect and a connection that never answered as a robot, and starts afresh. A joint number must be a
+  whole number.
+- The telemetry recipe returns to `"standard"` only when the control loop starts, no longer when the dashboard or
+  another process restarts.
 - A client that disconnects while its jog runs stops that jog: the robot brakes the joint to rest. The joint used to
   run on until its joint limit.
 - `stop()`, `disable()` and an error stop the gripper's jaws where they are. They used to go on to their last target
@@ -60,6 +107,19 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- `safety_stop()` now stops the gripper's jaws where they are, as `stop()`, `disable()` and an error do.
+- A raw client's argument the robot could not read dropped that client's connection, and with it control. It is
+  answered `BAD_ARGS` now, a fault on the robot's side `INTERNAL`.
+- A gripper command that settled on its position could report code 0, "still moving", so `wait_released_part()` failed
+  an open that arrived. It reports 3.
+- `rti_set_servo_generator()` stored a gain before it refused a bad look-ahead; the gain then took effect later.
+- `set_pid_gains()` is recorded with its values in the activity log, and `joint_test()` checks the current limit in
+  force after it.
+- `reload_recipes()` without a recipe folder answered "ok"; it answers `RECIPE_DIR`.
+- A network that fails silently is noticed in about 11 s on both sides (TCP keepalive); it took minutes, or never with
+  nothing to send.
+- `set_log_level("rti.handler", "DEBUG")` no longer writes a line for every real-time packet from inside the control
+  loop.
 - A jog speed that was not a number ran the joint at full speed, and a jog of a joint that does not exist was
   answered "ok" and raised an exception inside the control loop. Both are refused with `BAD_ARGS`.
 - `move_gripper(position, current=...)` without a speed sent the current as the speed.

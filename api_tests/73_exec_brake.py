@@ -346,7 +346,7 @@ def main():
     ap.add_argument("--port", type=int, default=29000)
     ap.add_argument("--go", action="store_true", help="actually move J1 and J5")
     ap.add_argument("--deg", type=float, default=50.0, help="J1's travel (J5: a fifth of it)")
-    ap.add_argument("--speed", type=float, default=0.6, help="the move's speed (a fraction; J1 peaks near 60 deg/s)")
+    ap.add_argument("--speed", type=float, default=60.0, help="the move's speed (percent; J1 peaks near 60 deg/s)")
     ap.add_argument("--hold", type=float, default=1.0, help="seconds paused before the resume")
     ap.add_argument("--cases", default="pause,stop,idle")
     ap.add_argument("--selftest", action="store_true")

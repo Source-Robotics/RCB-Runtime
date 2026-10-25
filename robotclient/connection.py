@@ -10,6 +10,7 @@ A queued motion command receives TWO replies: ``{"status":"queued"}`` (ack) then
 """
 
 import json
+import queue
 import socket
 import sys
 import threading
@@ -23,9 +24,11 @@ from .version import PROTOCOL_VERSION, __version__
 
 class _Pending:
     """Tracks the lifecycle of one in-flight command id."""
-    __slots__ = ("ack", "done", "data", "error", "error_info", "queued")
+    __slots__ = ("ack", "done", "data", "error", "error_info", "queued", "cid", "owner")
 
-    def __init__(self):
+    def __init__(self, cid=None, owner=None):
+        self.cid = cid                  # its command id, and the Connection that keeps its failure for wait_idle()
+        self.owner = owner
         self.ack = threading.Event()    # first reply seen (queued / ok / error)
         self.done = threading.Event()   # terminal reply seen (ok / complete / error)
         self.data = None
@@ -73,6 +76,13 @@ class Connection:
         # close on empty air.
         self._last_gripper = None
 
+        # The program's callbacks run on a thread of their own, in arrival order (2026-10-24): on the receiver
+        # thread a command sent from a callback could not get its reply — only the receiver delivers replies.
+        self._callbacks = queue.SimpleQueue()  # (name, fn, arg)
+        self._callback_thread = None
+        self._callback_lock = threading.Lock()
+        self._closing = False                  # disconnect() runs: the receiver's end is DISCONNECTED, not a loss
+
         self.on_error = None                   # callback(dict) for unsolicited errors
         self.on_status_change = None           # callback(dict) for unsolicited status
         self.on_motion_complete = None         # callback(command_id) on queued-command success
@@ -84,9 +94,12 @@ class Connection:
 
     def remote_ip(self):
         """Robot's IP, or None if not connected. RTIClient needs it to aim UDP."""
-        if self._sock is None:
+        if self._sock is None or not self._connected:      # also after a lost connection (2026-10-24)
             return None
-        return self._sock.getpeername()[0]
+        try:
+            return self._sock.getpeername()[0]
+        except OSError:
+            return None
 
     def local_ip(self):
         """Our IP *on the route to the robot*, or None if not connected.
@@ -95,9 +108,12 @@ class Connection:
         a multi-homed PC — the robot must be told the interface it can actually
         reach us on, not whichever address resolves first.
         """
-        if self._sock is None:
+        if self._sock is None or not self._connected:
             return None
-        return self._sock.getsockname()[0]
+        try:
+            return self._sock.getsockname()[0]
+        except OSError:
+            return None
 
     def local_label(self):
         """Our address exactly as the executor labels this connection ("ip:port"), or None.
@@ -108,7 +124,7 @@ class Connection:
         local_ip(). (Direct connections only: behind a NAT the server sees the translated
         address and this will not match — the answer is then "not mine", the safe side.)
         """
-        if self._sock is None:
+        if self._sock is None or not self._connected:
             return None
         try:
             ip, port = self._sock.getsockname()[:2]
@@ -117,13 +133,28 @@ class Connection:
         return f"{ip}:{port}"
 
     def connect(self, ip, port, timeout=CONNECT_TIMEOUT):
+        if self._connected:                    # 2026-10-24: a second receiver read the new socket beside the old one
+            raise RobotConnectionError("already connected: call disconnect() first")
         try:
-            self._sock = socket.create_connection((ip, port), timeout=timeout)
+            sock = socket.create_connection((ip, port), timeout=timeout)
         except OSError as e:
             raise RobotConnectionError(f"could not connect to {ip}:{port}: {e}")
-        self._sock.settimeout(None)
+        sock.settimeout(None)
+        _keepalive(sock)
+        # Nothing of an earlier connection carries over (2026-10-24): its access-list refusal, its status (the version
+        # check read another robot's after an IP change), its failures and its last gripper result.
+        with self._lock:
+            self._pending.clear()
+            self._motion_errors = []
+            self._last_gripper = None
+            self._outstanding.clear()
+        with self._status_cv:
+            self._status = {}
+        self._rejected = False
+        self._closing = False
+        self._sock = sock
         self._connected = True
-        self._recv_thread = threading.Thread(target=self._receive_loop, daemon=True,
+        self._recv_thread = threading.Thread(target=self._receive_loop, args=(sock,), daemon=True,
                                               name="RobotClientReceiver")
         self._recv_thread.start()
         # The TCP handshake succeeding does NOT mean we are allowed in: the executor accepts
@@ -144,19 +175,25 @@ class Connection:
             time.sleep(0.02)
 
     def disconnect(self):
+        self._closing = True                   # the receiver, ending now, reports DISCONNECTED too (2026-10-24)
         self._connected = False
-        if self._sock is not None:
+        sock, self._sock = self._sock, None
+        if sock is not None:
             try:
-                self._sock.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            self._sock.close()
-            self._sock = None
+            sock.close()
         self._fail_all("DISCONNECTED", "connection closed")
 
     @property
     def connected(self):
         return self._connected
+
+    @property
+    def rejected(self):
+        """True after the robot refused this machine (its access list)."""
+        return self._rejected
 
     # ------------------------------------------------------------------ #
     # Sending
@@ -166,7 +203,7 @@ class Connection:
         """Register a pending entry and send {"id","cmd","args", optional "options"}."""
         if not self._connected:
             raise RobotConnectionError("not connected")
-        p = _Pending()
+        p = _Pending(cid, self)
         with self._lock:
             self._pending[cid] = p
         cmd = self.wire_names.get(cmd, cmd)      # a robot older than a rename gets the ID it knows (client.connect)
@@ -180,7 +217,7 @@ class Connection:
         try:
             with self._send_lock:
                 self._sock.sendall(payload.encode())
-        except OSError as e:
+        except (OSError, AttributeError) as e:          # AttributeError: disconnect() ran meanwhile (no socket)
             with self._lock:
                 self._pending.pop(cid, None)
             raise RobotConnectionError(f"send failed: {e}")
@@ -190,11 +227,11 @@ class Connection:
     # Receiving / dispatch
     # ------------------------------------------------------------------ #
 
-    def _receive_loop(self):
+    def _receive_loop(self, sock):
         buf = b""
         try:
             while self._connected:
-                data = self._sock.recv(4096)
+                data = sock.recv(4096)          # its own socket: disconnect() clears self._sock meanwhile
                 if not data:
                     break
                 buf += data
@@ -207,7 +244,10 @@ class Connection:
             pass
         finally:
             self._connected = False
-            self._fail_all("CONNECTION_LOST", "receiver stopped")
+            if self._closing:                   # our own disconnect(): it reports DISCONNECTED (2026-10-24)
+                self._fail_all("DISCONNECTED", "connection closed")
+            else:
+                self._fail_all("CONNECTION_LOST", "receiver stopped")
 
     def _dispatch(self, line):
         try:
@@ -224,6 +264,10 @@ class Connection:
             # the robot states plainly must not be silently dropped by the client.
             if msg.get("code") == "FORBIDDEN":
                 self._rejected = True
+            if msg.get("code") and msg.get("type") is None:
+                # An error with no command id — the access-list refusal, a line the robot could not read (BAD_JSON) —
+                # goes to on_error (2026-10-24: they carried no "type", so on_error never fired).
+                msg = {**msg, "type": "error"}
             self._fire_event(msg)
             return
 
@@ -282,17 +326,33 @@ class Connection:
             if self.on_error:
                 self._call_back("on_error", self.on_error, msg)
 
-    @staticmethod
-    def _call_back(name, fn, arg):
-        """Run a program's callback on this receiver thread. An exception it raises is printed and dropped
-        (2026-10-24): it used to end the receiver thread, so the client called itself disconnected and refused every
-        command, stop() too, while the robot kept the connection and this client's control; and a command whose
-        callback raised was never answered."""
-        try:
-            fn(arg)
-        except Exception:
-            print(f"robotclient: the {name} callback raised; the client goes on receiving:", file=sys.stderr)
-            traceback.print_exc()
+    def _call_back(self, name, fn, arg):
+        """Hand a program's callback to the callback thread (2026-10-24): on the receiver thread a command sent from a
+        callback (robot.stop() in on_motion_error) waited 5 s for a reply only the busy receiver could deliver."""
+        with self._callback_lock:
+            if self._callback_thread is None or not self._callback_thread.is_alive():
+                self._callback_thread = threading.Thread(target=self._run_callbacks, daemon=True,
+                                                         name="RobotClientCallbacks")
+                self._callback_thread.start()
+        self._callbacks.put((name, fn, arg))
+
+    def _run_callbacks(self):
+        """The callback thread: every callback in arrival order. An exception one raises is printed and dropped
+        (2026-10-24): on the receiver thread it ended the receiver, so the client called itself disconnected and
+        refused every command, stop() too, while the robot kept the connection and this client's control."""
+        while True:
+            name, fn, arg = self._callbacks.get()
+            try:
+                fn(arg)
+            except Exception:
+                print(f"robotclient: the {name} callback raised; the client goes on:", file=sys.stderr)
+                traceback.print_exc()
+
+    def _forget_failure(self, cid):
+        """A failure already raised to the program (a sync call, a wait_*_complete) is not raised again by the next
+        wait_idle() (2026-10-24: one failure was reported twice)."""
+        with self._lock:
+            self._motion_errors = [f for f in self._motion_errors if f.get("id") != cid]
 
     def _fail_all(self, code, message):
         """Wake every waiter with a connection error (on disconnect / socket loss)."""
@@ -302,9 +362,8 @@ class Connection:
             # Queued motion that never reached a terminal reply is a failure, not a
             # success — record it so the _outstanding.clear() below can't make
             # wait_idle() look like everything completed.
-            self._motion_errors.extend(
-                {"id": cid, "code": code, "message": message}
-                for cid, p in pendings if p.queued)
+            lost = [{"id": cid, "code": code, "message": message} for cid, p in pendings if p.queued]
+            self._motion_errors.extend(lost)
         for _, p in pendings:
             if p.error is None and p.data is None:
                 p.error = (code, message)
@@ -315,6 +374,9 @@ class Connection:
             self._idle_cv.notify_all()
         with self._status_cv:
             self._status_cv.notify_all()   # wake status waiters so they don't hang
+        if self.on_motion_error:           # the lost connection's failures reach the callback too (2026-10-24)
+            for failure in lost:
+                self._call_back("on_motion_error", self.on_motion_error, dict(failure))
 
     # ------------------------------------------------------------------ #
     # Synchronization helpers
@@ -347,10 +409,11 @@ class Connection:
 
         Returns the status dict, or None on timeout / disconnect.
         """
+        # The predicate gets a copy (2026-10-24): it was handed the client's own dict, which it could change.
         with self._status_cv:
             self._status_cv.wait_for(
-                lambda: predicate(self._status) or not self._connected, timeout=timeout)
-            if not self._connected or not predicate(self._status):
+                lambda: predicate(dict(self._status)) or not self._connected, timeout=timeout)
+            if not self._connected or not predicate(dict(self._status)):
                 return None
             return dict(self._status)
 
@@ -373,5 +436,24 @@ class Connection:
         if not p.done.wait(timeout):
             raise RobotTimeout("command did not complete within timeout")
         if p.error is not None:
+            if p.queued and p.owner is not None:
+                p.owner._forget_failure(p.cid)      # raised here, so not again by wait_idle()
             raise CommandRejected(*p.error, **p.error_info)
         return p.data
+
+
+# TCP keepalive (2026-10-24): a network that dies silently (a cable pulled, no reset) was noticed only when a send
+# failed — minutes of retransmission, or never without a send — so wait_idle(None) could block that long. Probes after
+# 5 s idle, every 2 s, 3 lost: a dead robot is found in about 11 s. The robot does the same on its side.
+KEEPALIVE_IDLE_S, KEEPALIVE_INTERVAL_S, KEEPALIVE_PROBES = 5, 2, 3
+
+
+def _keepalive(sock):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, value in (("TCP_KEEPIDLE", KEEPALIVE_IDLE_S), ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S),
+                       ("TCP_KEEPCNT", KEEPALIVE_PROBES)):
+        if hasattr(socket, opt):                    # Linux (and macOS for some); elsewhere the system's timing
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), value)
+            except OSError:
+                pass

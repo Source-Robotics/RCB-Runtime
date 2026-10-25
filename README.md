@@ -403,7 +403,10 @@ command or a new field does not change it.
 - Commands that carry pose angles are refused with `CLIENT_TOO_OLD` when the client
   declares no command protocol. Pose angles changed their meaning in 0.9.0, and an
   older client would turn the tool to another orientation. A client that sends raw
-  JSON adds `"protocol": 1` to each message.
+  JSON adds `"protocol": 2` to each message.
+- Command protocol 2: every speed share is a percent (`set_joint_speed()`, a move's
+  `speed`, `accel` and `jerk`, `jog()`): 1 means 1 %. A client and a robot of
+  different command protocols refuse each other at connect.
 
 ### Hardware versions
 

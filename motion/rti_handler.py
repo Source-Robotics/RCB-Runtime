@@ -724,6 +724,7 @@ class RTIModeHandler:
         self._refresh_tracker_constants()
 
         self.tcp_vel_limit = max(0.0, float(tcp_vel_limit))
+        self._tcp_vel_limit_start = self.tcp_vel_limit          # reset_safety_switches() returns to it
         self._tcp_u = np.zeros(joint_num, dtype=np.float64)          # direction to target
         self._tcp_scaled_vmax = np.zeros(joint_num, dtype=np.float64)
         self._tcp_cap_applied = False    # Ruckig max_velocity currently holds a scaled set
@@ -1059,7 +1060,8 @@ class RTIModeHandler:
             if not self._start_pose_checked:
                 self._start_pose_checked = True
                 if self.start_pose_check_enabled and not self._start_pose_ok(ctx):
-                    self._begin_stop('stopping_error', link_lost=True)
+                    # Its own key (2026-10-24): RTI_LINK_LOST said "the PC stopped sending" for a refused start.
+                    self._begin_stop('stopping_error', errors=("RTI_START_POSE",))
                     return self._step_stopping(ctx)
 
         # Only score ticks from the first accepted command onward. Counting the
@@ -2449,6 +2451,21 @@ class RTIModeHandler:
 
         return True
 
+    def reset_safety_switches(self):
+        """Every rti_connect starts with the four safety switches at their start values (2026-10-24, user: "Reset the 4
+        safety switches"): the rate limiter, the start-pose check and RTI gravity comp ON, the TCP cap from the robot
+        XML. A PC that switched one off left the next session — from any PC — without it until RTI restarted. Tuning
+        (low-pass, generator, gains, pace) carries over."""
+        back = [name for name, on in (("the rate limiter", self.rate_limit_enabled),
+                                      ("the start-pose check", self.start_pose_check_enabled),
+                                      ("RTI gravity comp", self.gravity_comp_enabled)) if not on]
+        if self.tcp_vel_limit != self._tcp_vel_limit_start:
+            back.append(f"the TCP cap ({self._tcp_vel_limit_start:g} m/s, 0 = none)")
+        self.rate_limit_enabled = self.start_pose_check_enabled = self.gravity_comp_enabled = True
+        self.tcp_vel_limit = self._tcp_vel_limit_start
+        if back:
+            logger.warning("rti_connect: %s back to the start values", ", ".join(back))
+
     def set_rate_limiter(self, enabled):
         """Runtime toggle (plan §11c). OFF streams the PC's commands through untouched."""
         self.rate_limit_enabled = bool(enabled)
@@ -2808,6 +2825,18 @@ class RTIModeHandler:
                            "is OFF — the limiter-off path streams commands through "
                            "unshaped, so NO generator runs at all. Re-enable the rate "
                            "limiter for the tracker to have any effect.")
+        # Every number checked before any is stored (2026-10-24: a finite gain was stored before a non-finite
+        # lookahead returned, and took effect silently at the next successful call).
+        for label, value in (("gain", gain), ("lookahead", lookahead), ("self_lookahead", self_lookahead)):
+            if value is None:
+                continue
+            try:
+                finite = bool(np.isfinite(float(value)))
+            except (TypeError, ValueError):
+                finite = False
+            if not finite:
+                logger.warning("Servo generator refused: %s %r is not a finite number", label, value)
+                return
 
         if gain is not None:
             try:
@@ -3030,7 +3059,15 @@ class RTIModeHandler:
         raw position stream passes unshaped — there is no velocity being generated for the
         cap to scale. That asymmetry is inherent, not an oversight.
         """
-        self.tcp_vel_limit = max(0.0, float(mps))
+        try:
+            v = float(mps)
+        except (TypeError, ValueError):
+            logger.warning("TCP velocity limit refused: not a number: %r", mps)
+            return
+        if not (np.isfinite(v) and v >= 0.0):        # 2026-10-24: max(0.0, nan) and a negative value meant no cap
+            logger.warning("TCP velocity limit refused: %r is not a number of 0 or more (0 = no cap)", mps)
+            return
+        self.tcp_vel_limit = v
         logger.info("TCP velocity limit %s",
                        f"{self.tcp_vel_limit:.3f} m/s" if self.tcp_vel_limit > 0
                        else "DISABLED")
@@ -3075,6 +3112,9 @@ class RTIModeHandler:
         below Nyquist, above which a discrete filter is meaningless.
         """
         cutoff = float(cutoff_hz)
+        if not np.isfinite(cutoff):                  # 2026-10-24: NaN passed both checks below into butter()
+            logger.warning("Low-pass cutoff refused: %r is not a number", cutoff_hz)
+            return
         nyquist = 0.5 / self.delta_t
         if cutoff <= 0.0:
             self._lp_bank = None

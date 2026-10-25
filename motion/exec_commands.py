@@ -8,6 +8,8 @@ legacy dict commands working in tests during the transition.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
@@ -199,12 +201,23 @@ _ALLOWED_OPTION_KEYS = {
 }
 
 
+def _percent(key, value):
+    """A share of a limit in percent: 0 < p <= 100, 1 means 1 % (command protocol 2, 2026-10-24). Before, a value
+    <= 1 was read as a fraction, so a program asking for "1 %" ran at 100 %."""
+    p = float(value)
+    if not (math.isfinite(p) and 0.0 < p <= 100.0):
+        raise ValueError(f"{key} must be a percent above 0 and at most 100 (1 means 1 %, 50 means 50 %); "
+                         f"got {value!r}")
+    return p
+
+
 @dataclass(frozen=True)
 class MotionOptions:
     """Planner options carried by every queued EXEC command.
 
     Units are client/API-facing unless noted otherwise:
-      speed: 0..1 fraction or 1..100 percent
+      speed, accel, jerk: percent, 0 < p <= 100 (1 = 1 %). The 0..1 fraction form was dropped with
+             command protocol 2 (2026-10-24): 0.5 is half a percent, never a half.
       blend: unit depends on blend_mode — percent (0..100) under "exact_velocity"
              (scales compute_corner_speed's preserved corner speed), millimeters
              under "zone" (physical Bezier blend-zone radius, the usual
@@ -289,7 +302,9 @@ class MotionOptions:
                 updates[key] = normalize_singularity_strategy(value)
             elif key == "completion_policy":
                 updates[key] = str(value).strip().lower()
-            elif key in ("speed", "accel", "duration", "blend"):
+            elif key in ("speed", "accel", "jerk"):
+                updates[key] = _percent(key, value)
+            elif key in ("duration", "blend"):
                 updates[key] = float(value)
             elif key == "samples":
                 updates[key] = int(value)
@@ -297,15 +312,6 @@ class MotionOptions:
                 updates[key] = _parse_bool(value)
             elif key == "blend_continuity":
                 updates[key] = normalize_blend_continuity(value)
-            elif key == "jerk":
-                j = float(value)
-                scale = j if j <= 1.0 else j / 100.0        # accepts 0.25 or 25
-                if not (0.0 < scale <= 1.0):
-                    raise ValueError(
-                        f"jerk must be in (0, 100] percent (or (0, 1] as a fraction) — it is a "
-                        f"percentage of the default jerk budget (3x the acceleration limit). "
-                        f"Got {value!r}")
-                updates[key] = scale
             elif key == "ramp_fraction":
                 r = float(value)
                 if not (0.0 < r <= 0.5):

@@ -27,6 +27,7 @@ R = Rx(rx) Ry(ry) Rz(rz) — about base X by rx, then the tool's new Y by ry, th
 spin about its own axis).
 """
 from __future__ import annotations
+import math
 from typing import Any, Callable, Sequence
 
 from .connection import Connection
@@ -35,11 +36,21 @@ from .constants import (
     DEFAULT_PORT, IMMEDIATE_TIMEOUT, FORCE_TAKE_TIMEOUT, ACK_TIMEOUT, DEFAULT_MOVE_TIMEOUT,
     WAIT_STATE_TIMEOUT, WAIT_HOMED_TIMEOUT,
 )
-from .exceptions import RobotError, RobotTimeout, MotionFailed, GripFailed, HomingFailed, VersionMismatch
+from .exceptions import (RobotError, RobotTimeout, MotionFailed, GripFailed, HomingFailed, VersionMismatch,
+                         RobotConnectionError)
 from .version import check_protocols, wire_names_for
 
 # Pose angles (2026-10-21): radians unless a call says angle_unit="deg".
 _RAD_PER = {"rad": 1.0, "deg": 3.141592653589793 / 180.0}
+
+
+def _whole(value, what):
+    """A joint number or a direction as a whole number: 2.7 is refused, not cut to 2 (2026-10-24: set_joint_wall(2.7, ...)
+    changed joint 2). A value that is no number raises as int() did."""
+    f = float(value)
+    if not (math.isfinite(f) and f == int(f)):
+        raise ValueError(f"{what} must be a whole number, got {value!r}")
+    return int(f)
 
 
 def _rad_per(angle_unit):
@@ -71,10 +82,11 @@ class GripperResult:
     their target with nothing there; "complete" alone cannot.
 
     Attributes:
-        code: Why the jaws stopped. `0`: the jaws came within 5 of the target
-            while the gripper still reported motion. `1`: something stopped
-            them while opening. `2`: something stopped them while closing.
-            `3`: they reached the target with nothing in the way.
+        code: Why the jaws stopped. `1`: something stopped them while opening.
+            `2`: something stopped them while closing. `3`: they reached the
+            target with nothing in the way, also when they came within 5 of it
+            while the gripper still reported motion. A settled command never
+            reports `0`, the gripper's "still moving".
         command_id: The id of the gripper command, as the call that queued it
             returned it.
 
@@ -205,14 +217,16 @@ class RobotClient:
             RobotConnectionError: The connection could not be opened within 5 s:
                 nothing listens at `ip` and `port`, the host name is unknown, or
                 there is no route. Also when the robot refused this computer
-                because its address is not on the robot's access list.
+                because its address is not on the robot's access list, when the
+                connection closed or nothing answered as a robot, and when this
+                client is already connected.
             VersionMismatch: The robot speaks another command protocol version,
                 and `allow_mismatch` is `False`. The client is disconnected again.
 
         Note:
             `VersionMismatch` is a kind of `RobotConnectionError`, so
-            `except RobotConnectionError` catches both. Connect each client once:
-            to connect again, call `disconnect()` first.
+            `except RobotConnectionError` catches both. To connect again, call
+            `disconnect()` first: nothing of the earlier connection carries over.
 
         See also:
             `disconnect()`, `get_versions()`, `take_control()`
@@ -222,9 +236,10 @@ class RobotClient:
             >>> robot = RobotClient(name="pick_place")
             >>> robot.connect("192.168.0.84")
             >>> robot.protocols
-            {'commands': 1, 'rti': 1, 'telemetry': 1}
+            {'commands': 2, 'rti': 1, 'telemetry': 1}
         """
         self._conn.connect(ip, port)
+        self._last_queued = self._last_gripper_queued = None     # an earlier connection's commands (2026-10-24)
         # The executor pushes a status snapshot on connect; wait briefly for it so
         # status() is populated and the first wait_*() has a baseline.
         self._conn.wait_status(lambda s: bool(s), timeout=1.0)
@@ -234,6 +249,14 @@ class RobotClient:
                 st = self._immediate("get_status") or {}
             except RobotError:
                 st = {}
+        if not self._conn.connected or not st:
+            # 2026-10-24: connect() returned "successfully" here — after a late access-list refusal, a connection
+            # that closed, or a TCP server on that port that is not the robot (nothing ever answered).
+            rejected = self._conn.rejected
+            self._conn.disconnect()
+            raise RobotConnectionError(
+                f"{ip} refused this machine: not in the robot's access list (RCB_ALLOWED_IPS on the robot)" if rejected
+                else f"{ip}:{port} closed the connection or never answered as a robot")
         self.runtime_version = st.get("runtime_version")
         # A robot older than the command renames (version.COMMANDS_RENAMED_IN) gets the IDs it knows, for every
         # command this client sends from here on; a current robot gets the documented names (2026-10-23).
@@ -252,18 +275,20 @@ class RobotClient:
         The robot releases control at once if this client holds it, so another
         client can take it. On the client, every call still waiting for the robot
         ends: a command's call raises `CommandRejected` with the code
-        `DISCONNECTED` (or `CONNECTION_LOST`), and a status wait such as
-        `wait_mode()` raises `RobotTimeout`. Queued commands that had not finished
-        count as failed, and the next `wait_idle()` raises `MotionFailed` for
-        them.
+        `DISCONNECTED`, and a status wait such as `wait_mode()` raises
+        `RobotConnectionError`. Queued commands that had not finished count as
+        failed: `on_motion_error()` gets them, and the next `wait_idle()` raises
+        `MotionFailed` for them.
 
         Calling it again, or before `connect()`, does nothing. Leaving a
         `with RobotClient() as robot:` block calls it.
 
         Warning:
-            Disconnecting does not stop the arm. Moves the robot accepted keep
-            running, the robot stays in its mode, and a real-time session opened
-            with `rti_connect()` stays open. Call `stop()` first to end a program.
+            When this client holds control and moves it queued still run, the
+            robot stops the arm as `stop()` does; a lost connection does the same.
+            Call `wait_idle()` first to let them finish. A jog stops too. The
+            robot stays in its mode, and a real-time session opened with
+            `rti_connect()` stays open.
 
         See also:
             `connect()`, `stop()`, `release_control()`
@@ -284,10 +309,9 @@ class RobotClient:
 
         It is `True` from `connect()` until `disconnect()`, or until the
         connection is lost: the robot software closed it, or the network failed.
-        It reads the client's own state and asks the robot nothing. A
-        network failure shows only once the operating system reports the
-        connection broken, which can take minutes; until then commands raise
-        `RobotTimeout`.
+        It reads the client's own state and asks the robot nothing. A network
+        that fails silently is noticed within about 11 s (the connection's
+        keepalive probes); until then commands raise `RobotTimeout`.
 
         Returns:
             `True` while the connection is open; `False` before `connect()`, after
@@ -302,12 +326,13 @@ class RobotClient:
         """
         return self._conn.connected
 
-    def on_error(self, fn: Callable[[str], None]) -> None:
+    def on_error(self, fn: Callable[[dict], None]) -> None:
         """Set a function to call when the robot sends an error event.
 
-        The function receives the event, a dict, for an error message from the
-        robot that answers no command. The robot software sends no such message
-        at present: errors reach a program through the answers to its commands,
+        The function receives the event, a dict with `code` and `message`, for
+        an error message from the robot that answers no command: its refusal of
+        this computer (`FORBIDDEN`) and a line it could not read (`BAD_JSON`).
+        Other errors reach a program through the answers to its commands,
         `wait_idle()`, the status (`errors()`, `on_status_change()`) and
         `on_motion_error()`. A client has one such function: a new call replaces
         it, and `None` removes it.
@@ -316,11 +341,10 @@ class RobotClient:
             fn: The function, called with the event dict. `None` removes it.
 
         Note:
-            The function runs in the client's receiving thread, which reads
-            nothing else from the robot while it runs: keep it short. A command
-            or a wait called from it cannot receive its answer and ends in
-            `RobotTimeout`. If the function raises, the client prints the
-            exception and goes on receiving.
+            The function runs on the client's callback thread, one call at a
+            time, in the order the events arrived, so a command or a wait called
+            from it works. Keep it short: the next events wait for it. If the
+            function raises, the client prints the exception and goes on.
 
         See also:
             `on_status_change()`, `on_motion_error()`, `errors()`
@@ -345,11 +369,10 @@ class RobotClient:
             fn: The function, called with the status dict. `None` removes it.
 
         Note:
-            The function runs in the client's receiving thread, which reads
-            nothing else from the robot while it runs: keep it short. A command
-            or a wait called from it cannot receive its answer and ends in
-            `RobotTimeout`. If the function raises, the client prints the
-            exception and goes on receiving.
+            The function runs on the client's callback thread, one call at a
+            time, in the order the events arrived, so a command or a wait called
+            from it works. Keep it short: the next events wait for it. If the
+            function raises, the client prints the exception and goes on.
 
         See also:
             `latest_status()`, `wait()`, `on_error()`
@@ -368,19 +391,18 @@ class RobotClient:
         delay, or a gripper command once the jaws have settled. Other clients'
         commands do not call it, nor do failed ones: see `on_motion_error()`.
 
-        It runs before `wait_motion_complete()` for that command returns, while
-        `wait_idle()` can return as it still runs. A client has one such
+        It runs on the callback thread, so `wait_motion_complete()` and
+        `wait_idle()` can return before it has run. A client has one such
         function: a new call replaces it, and `None` removes it.
 
         Args:
             fn: The function, called with the command id. `None` removes it.
 
         Note:
-            The function runs in the client's receiving thread, which reads
-            nothing else from the robot while it runs: keep it short. A command
-            or a wait called from it cannot receive its answer and ends in
-            `RobotTimeout`. If the function raises, the client prints the
-            exception and goes on receiving.
+            The function runs on the client's callback thread, one call at a
+            time, in the order the events arrived, so a command or a wait called
+            from it works. Keep it short: the next events wait for it. If the
+            function raises, the client prints the exception and goes on.
 
         See also:
             `on_motion_error()`, `wait_idle()`, `wait_motion_complete()`
@@ -401,24 +423,22 @@ class RobotClient:
         receives a dict with `id` (the value the queued call returned), `code`
         and `message`, and the error catalog's `number`, `title` and `fix` when
         the robot sent them. The next `wait_idle()` reports the same failure as
-        `MotionFailed`, unless this client's `stop()` discards it first; this
-        function lets a program react at once.
+        `MotionFailed`, unless this client's `stop()` discards it first or a
+        call already raised it; this function lets a program react at once.
 
         A command the robot refused when it was sent raises in its own call
-        instead. The failures a lost connection causes reach only `wait_idle()`.
-        A client has one such function: a new call replaces it, and `None`
-        removes it.
+        instead. The failures a lost connection causes reach it too, with the
+        code `CONNECTION_LOST`, or `DISCONNECTED` after `disconnect()`. A client
+        has one such function: a new call replaces it, and `None` removes it.
 
         Args:
             fn: The function, called with the failure dict. `None` removes it.
 
         Note:
-            The function runs in the client's receiving thread, which reads
-            nothing else from the robot while it runs: keep it short. A command
-            or a wait called from it, `stop()` included, cannot receive its
-            answer and ends in `RobotTimeout`: set a flag and act on it in the
-            program's own thread. If the function raises, the client prints the
-            exception and goes on receiving.
+            The function runs on the client's callback thread, one call at a
+            time, in the order the events arrived, so a command or a wait called
+            from it works. Keep it short: the next events wait for it. If the
+            function raises, the client prints the exception and goes on.
 
         See also:
             `wait_idle()`, `on_motion_complete()`, `stop()`
@@ -492,11 +512,15 @@ class RobotClient:
         if self._should_wait(wait):
             self.wait(predicate, timeout, what or cmd)
 
-    def _queued(self, cmd, args=None, timeout=DEFAULT_MOVE_TIMEOUT, options=None):
+    def _queued(self, cmd, args=None, timeout=DEFAULT_MOVE_TIMEOUT, options=None, gripper=False):
         cid = generate_id()
         p = self._conn.send_command(cid, cmd, args, options=options)
         Connection.wait_ack(p, ACK_TIMEOUT)          # raises if rejected at validation
         self._last_queued = p                        # for wait_motion_complete()
+        if gripper:
+            # Before the sync wait (2026-10-24): a failing gripper command raised before it was recorded, so the next
+            # wait_gripper_move_complete() judged the gripper command before it.
+            self._last_gripper_queued = p
         if self._sync:
             Connection.wait_done(p, timeout)
         return cid
@@ -550,7 +574,8 @@ class RobotClient:
         path: the drives stop the joints as fast as their limits allow. Its queued
         commands fail with `ABORTED`, and the robot refuses new moves with
         `MOTION_ABORTED` until `clear_errors()`. To stop along the path first, use
-        `stop()` or `enter_idle_mode()`. Homing in progress is abandoned.
+        `stop()` or `enter_idle_mode()`. Homing in progress is abandoned, and the
+        arm is then not homed.
 
         Args:
             wait: Wait until the robot reports itself disabled, up to 10 s.
@@ -708,52 +733,48 @@ class RobotClient:
 
         Each call sets the session's contract again: the command timeout, the
         servo generator, the minimum duration and the dynamics feedforward, and in
-        RTI mode the pace limit and the state rate too. The other real-time
-        settings keep their values. Without `pc_ip`, a client that is not connected
-        raises `RuntimeError` and sends nothing.
+        RTI mode the pace limit and the state rate too. It also switches the rate
+        limiter, the start-pose check and real-time gravity compensation on, and
+        sets the tool speed cap back to its start value: a session never inherits
+        them from an earlier one. The other real-time settings keep their values.
+        Without `pc_ip`, a client that is not connected raises `RuntimeError` and
+        sends nothing.
 
         Args:
-            pc_ip: The address the robot sends its state to and accepts commands
-                from. `None` uses this connection's own address on the route to the
-                robot.
+            pc_ip: The IPv4 address the robot sends its state to and accepts
+                commands from. `None` uses this connection's own address on the
+                route to the robot.
             wait: Wait until the robot reports the real-time mode, up to 10 s: RTI
                 without `rate_hz`, SOFT_RTI with it.
                 `None` follows the client's `sync` setting.
             rate_hz: Your command rate in Hz, for SOFT_RTI; `None` for RTI mode. It
                 sets the command timeout to three of your intervals, at most 1 s.
                 Prefer a rate that divides 250 Hz evenly: 125, 50, 25 or 10 Hz.
-                Zero, a negative or a non-finite rate pairs in RTI mode instead, and
-                a wait then times out.
+                Zero, a negative or a non-finite rate is refused.
             transport: `"udp"` or `"tcp"`; `None` means `"udp"`. With `"tcp"` the
                 robot waits for your PC to dial its port 30003 from `pc_ip`, and one
                 stream carries both directions (`RTIClient` dials it). SOFT_RTI only:
                 without `rate_hz` the robot uses UDP.
 
         Raises:
-            CommandRejected: The robot refused it: it is not enabled or not homed,
-                or another client holds control.
+            CommandRejected: The robot refused it: it is not in IDLE mode or in the
+                real-time mode asked for, a PC drives the arm or its session did not
+                stop within 2 s, a value is invalid,
+                it is not enabled or not homed, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
-                not report the mode within 10 s, for example when it was not in IDLE
-                mode.
+                not report the mode within 10 s.
             RobotConnectionError: The client is not connected.
             ValueError: `transport` is neither `"udp"` nor `"tcp"`, or `rate_hz` is
                 not a number. Nothing is sent.
             TypeError: `rate_hz` is not a number. Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly three values; this client
-                always sends three.
-
-        Note:
-            The robot switches only from IDLE mode, or pairs again in the real-time
-            mode it is in. From any other mode it refuses the switch, which only its
-            activity log shows; with `wait` the call times out. The pairing changes
-            anyway, and from EXEC mode every client's queued moves fail with
-            `ABORTED`.
-
-        Warning:
-            Calling it while a stream runs ends the claim at once, without braking:
-            the arm stops as hard as the drives can.
+            REJECTED: A PC drives the arm (a claim is active): `rti_release()`
+                first; a session still stopping is waited for, up to 2 s. Or the
+                robot is in the other real-time mode: `rti_disconnect()` first.
+            BAD_ARGS: `pc_ip` is not an IPv4 address, `rate_hz` is not above 0,
+                `transport` is not `"udp"` or `"tcp"`, or the message did not carry
+                exactly three values.
 
         See also:
             `rti_claim()`, `rti_disconnect()`, `rti_set_command_timeout()`,
@@ -792,7 +813,8 @@ class RobotClient:
         timeout (40 ms in RTI mode, three of your intervals in SOFT_RTI), and so
         must every next one. Otherwise the arm brakes to rest within its limits,
         then the robot latches `RTI_LINK_LOST`, which disables it. The first
-        command is checked against the arm (`rti_set_start_pose_check()`). A stream
+        command is checked against the arm (`rti_set_start_pose_check()`): one too
+        far from it ends the stream the same way, with `RTI_START_POSE`. A stream
         the arm cannot follow ends the same way, with `RTI_POSITION_LIMIT`,
         `RTI_VELOCITY_LIMIT`, `RTI_ACCELERATION_LIMIT`, `RTI_JERK_LIMIT` or
         `RTI_NO_SEND_TIME` (see `RTIClient`).
@@ -884,10 +906,11 @@ class RobotClient:
         """Unpair the PC and switch the robot to IDLE mode.
 
         The robot stops sending state, forgets the PC's address, closes a TCP
-        stream, and switches to IDLE mode at once, from whatever mode it is in. An
-        enabled, homed arm with gravity compensation on is then in freedrive;
-        otherwise every joint holds still. The real-time settings that last across
-        sessions keep their values.
+        stream, and switches to IDLE mode at once. It takes the call in IDLE mode,
+        in a real-time mode and in the error state, and refuses it in every other
+        mode. An enabled, homed arm with gravity compensation on is then in
+        freedrive; otherwise every joint holds still. The real-time settings that
+        last across sessions keep their values.
 
         End a stream first with `rti_release()` and let the arm come to rest.
 
@@ -896,17 +919,16 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: it is in another mode (EXEC, JOG,
+                homing, motors off, flashing), or another client holds control.
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report IDLE mode within 10 s, for example with an error latched.
             RobotConnectionError: The client is not connected.
 
         Warning:
-            It never brakes. Sent while the arm moves, under a stream or in EXEC or
-            JOG mode, the arm coasts in freedrive until friction stops it, or, with
-            gravity compensation off, stops as hard as the drives can. It also ends
-            motors off and firmware flashing (the CAN traffic resumes mid-flash),
-            and it abandons homing.
+            It never brakes. Sent while a stream moves the arm, the arm coasts in
+            freedrive until friction stops it, or, with gravity compensation off,
+            stops as hard as the drives can.
 
         See also:
             `rti_connect()`, `rti_release()`, `enter_idle_mode()`
@@ -942,8 +964,8 @@ class RobotClient:
                 through.
 
         Defaults:
-            On, set each time the robot software starts. It lasts until changed or
-            the robot software restarts; `rti_connect()` does not reset it.
+            On, set each time the robot software starts and at every
+            `rti_connect()`: a session never inherits it switched off.
 
         Raises:
             CommandRejected: Another client holds control.
@@ -957,8 +979,8 @@ class RobotClient:
         Warning:
             Off, nothing limits how fast a command moves the arm: a position step
             jumps at the drives' full authority, and a velocity command has no
-            speed limit. It stays off for every later session, from any PC, until
-            it is switched on or the robot software restarts.
+            speed limit. It stays off until it is switched on or the next
+            `rti_connect()`.
 
         See also:
             `rti_set_start_pose_check()`, `rti_set_servo_generator()`,
@@ -989,8 +1011,9 @@ class RobotClient:
         `rti_set_min_duration()` there.
 
         Args:
-            cutoff_hz: The cutoff in Hz. 0 or below switches the filter off, and so
-                does 125 Hz or above (half the loop rate).
+            cutoff_hz: The cutoff in Hz. 0 switches the filter off, and so does
+                125 Hz or above (half the loop rate). A negative or non-finite value
+                is refused.
 
         Defaults:
             From `config/system.xml` `<rti_defaults><lowpass_cutoff_hz>`, read at
@@ -998,15 +1021,16 @@ class RobotClient:
             `rti_connect()` does not reset it.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `cutoff_hz` is negative or not
+                finite, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `cutoff_hz` is not a number. Nothing is sent.
             TypeError: `cutoff_hz` is not a number. Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly one value; this client
-                always sends one.
+            BAD_ARGS: `cutoff_hz` is negative or not a finite number, or the
+                message did not carry exactly one value.
 
         Note:
             It lasts across sessions, from any PC: switch it off (0) when your
@@ -1032,7 +1056,7 @@ class RobotClient:
         velocity limit (after `rti_set_vel_scale()`); a torque within what the
         joint's real-time torque-rate limit allows in four ticks (16 ms). A first
         command outside that is refused: the arm brakes to rest and the robot
-        latches `RTI_LINK_LOST`. It catches a controller that starts from zeros or
+        latches `RTI_START_POSE`. It catches a controller that starts from zeros or
         from an old pose.
 
         The setting is read when the first command of a claim arrives, so it
@@ -1043,9 +1067,8 @@ class RobotClient:
                 command through.
 
         Defaults:
-            On, set each time the robot software starts. It lasts until changed or
-            the robot software restarts; `rti_connect()` does not reset it. The
-            tolerance, 0.1 rad, is `config/system.xml`
+            On, set each time the robot software starts and at every
+            `rti_connect()`. The tolerance, 0.1 rad, is `config/system.xml`
             `<rti_defaults><start_pose_tol_rad>`, read at start.
 
         Raises:
@@ -1060,8 +1083,8 @@ class RobotClient:
         Warning:
             With the check off, a first command far from the arm, such as all
             zeros, reaches the motors: the arm moves there at its real-time limits.
-            The check stays off for every later session, from any PC, until it is
-            switched on or the robot software restarts.
+            The check stays off until it is switched on or the next
+            `rti_connect()`.
 
         See also:
             `rti_claim()`, `rti_set_rate_limiter()`
@@ -1101,19 +1124,23 @@ class RobotClient:
             Always `None`: the robot's answer carries no data.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: a joint is moving, a PC drives
+                the arm in a real-time session, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
+            REJECTED: A joint is commanded to move faster than 0.5 deg/s
+                (`config/system.xml` `<safety_monitor><hold_still_dps>`), or a PC
+                drives the arm in a real-time session: switch it with the arm at
+                rest, and in a session use `rti_set_gravity_comp()`.
             BAD_ARGS: The value was not true or false (1 / 0); this client always
                 sends one of them.
 
         Warning:
-            The switch is a step in the torque the joints get: switch it while the
-            arm stands still. Off, a real-time torque stream gets no gravity torque
-            from the robot, and the arm sags unless the program sends that torque
-            itself. On, IDLE mode makes an enabled, homed arm move when pushed.
+            The switch is a step in the torque the joints get, which is why the
+            robot takes it only with the arm at rest. On, IDLE mode makes an
+            enabled, homed arm move when pushed.
 
         Note:
             A real-time stream gets gravity compensation only while this switch and
@@ -1251,7 +1278,8 @@ class RobotClient:
         finished tests. The figures are written when the test ends.
 
         Args:
-            joint: The joint to move, 1 for J1; 0 stops a running test.
+            joint: The joint to move, a whole number: 1 for J1; 0 stops a running
+                test.
             amplitude_deg: How far to move, in degrees, up to 15; the sign gives
                 the direction.
             speed_dps: The peak speed, in degrees per second, up to 10.
@@ -1267,14 +1295,16 @@ class RobotClient:
                 enabled, a value is out of range, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
-            ValueError: A value is not a number. Nothing is sent.
+            ValueError: A value is not a number, or `joint` is not a whole number.
+                Nothing is sent.
             TypeError: A value is `None`. Nothing is sent.
 
         Errors:
             BAD_ARGS: `joint` is not 0 to the number of joints; or, for a test,
                 `amplitude_deg` is 0, above 15 degrees or not finite, `speed_dps` is
                 not above 0 and up to 10 deg/s, or `current_ma` is not above 0 and
-                up to the joint's current limit.
+                up to the joint's current limit in force (`set_pid_gains()` may
+                have changed it).
 
         Warning:
             The joint moves by itself, with no check of the safety zones or
@@ -1288,9 +1318,9 @@ class RobotClient:
             The robot can still refuse to start the test after it answered: in the
             first 1.2 s after the robot software starts, while another test, a
             freed joint or the Hall sensor check runs, before the joint has
-            reported its position, with a current above the limit in force, or, on
-            a homed arm, for a move past the joint's soft limits. That
-            refusal reaches only the robot's activity log; `seq` does not change.
+            reported its position, or, on a homed arm, for a move past the joint's
+            soft limits. That refusal reaches only the robot's activity log; `seq`
+            does not change.
 
         See also:
             `free_joint()`, `hall_check()`, `latest_status()`, `wait()`
@@ -1302,7 +1332,8 @@ class RobotClient:
             >>> robot.latest_status()["joint_test"]["state"]
             'done'
         """
-        return self._immediate("joint_test", [int(joint), float(amplitude_deg), float(speed_dps), float(current_ma)])
+        return self._immediate("joint_test", [_whole(joint, "joint"), float(amplitude_deg), float(speed_dps),
+                                              float(current_ma)])
 
     def free_joint(self, joint: int) -> Any:
         """Free one joint so it can be turned by hand.
@@ -1332,7 +1363,7 @@ class RobotClient:
                 is out of range, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
-            ValueError: `joint` is not a number. Nothing is sent.
+            ValueError: `joint` is not a whole number. Nothing is sent.
             TypeError: `joint` is `None`. Nothing is sent.
 
         Errors:
@@ -1357,7 +1388,7 @@ class RobotClient:
             184.2
             >>> robot.free_joint(0)
         """
-        return self._immediate("free_joint", [int(joint)])
+        return self._immediate("free_joint", [_whole(joint, "joint")])
 
     def hall_check(self, on: bool = True) -> Any:
         """Start or stop the Hall sensor check: its joint goes limp.
@@ -1372,8 +1403,9 @@ class RobotClient:
         disabled, homed or not; every other joint keeps its IDLE behaviour.
 
         The robot stops the check by itself on any mode change (homing, a jog, an
-        error, the E-stop) and gives the joint its limits back. It has no time
-        limit: stop it with `hall_check(False)`.
+        error, the E-stop) and gives the joint its limits back, and 2 minutes
+        after the last `hall_check(True)`: calling it again while it runs starts
+        the 2 minutes again. Stop it sooner with `hall_check(False)`.
 
         Args:
             on: `True` starts the check, `False` stops it.
@@ -1584,10 +1616,13 @@ class RobotClient:
         freedrive, homing or the error state. A warning clears once the joint is
         back under half its contact threshold, or at rest.
 
-        The setting lasts until the robot software restarts, also after the
-        program that set it has ended. Without thresholds in the robot XML the
-        reaction stays `"off"`, whatever is asked. `latest_status()` shows the
-        reaction in force in `collision_detection`; the robot's log records a
+        A change lasts while the client that made it holds control. When that
+        client releases control, loses it or disconnects, the reaction returns
+        to its start value, and the robot's log says so. `"warn"` and `"stop"`
+        are refused when nothing can be checked: the safety monitor is off in
+        `config/system.xml`, or the robot XML gives no joint a threshold.
+        `latest_status()` shows the reaction in force in `collision_detection`
+        (`"off"` while the safety monitor is off); the robot's log records a
         switch to a weaker one as a warning.
 
         Args:
@@ -1608,17 +1643,20 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: `mode` is not one of the three
-                words, or another client holds control.
+                words, nothing can be checked, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
+            REJECTED: `"warn"` or `"stop"` while nothing can be checked: the safety
+                monitor is off, or no joint has a threshold in the robot XML.
             BAD_ARGS: `mode` is not `"off"`, `"warn"` or `"stop"`.
 
         Warning:
             With `"off"` or `"warn"` the arm keeps pushing after it hits something,
             with all the force its drives give. Turn the check down only for a move
-            that presses on purpose, and back up right after it.
+            that presses on purpose, and back up right after it; the robot turns it
+            back up itself only when your client leaves control.
 
         Note:
             A part the gripper holds reads as external torque until it is declared
@@ -1714,9 +1752,8 @@ class RobotClient:
                 your controller.
 
         Defaults:
-            On, set each time the robot software starts. It lasts until changed or
-            the robot software restarts; `rti_connect()` and `rti_disconnect()` do
-            not reset it.
+            On, set each time the robot software starts and at every
+            `rti_connect()`; `rti_disconnect()` keeps it.
 
         Raises:
             CommandRejected: Another client holds control.
@@ -1730,8 +1767,8 @@ class RobotClient:
         Warning:
             Off, a torque stream that adds no gravity of its own lets the arm fall,
             and position streams and holds carry the weight on the drives' own
-            position loops alone. It stays off for every later session, from any
-            PC, until it is switched on or the robot software restarts.
+            position loops alone. It stays off until it is switched on or the next
+            `rti_connect()`.
 
         See also:
             `set_gravity_comp()`, `rti_set_dynamics_ff()`
@@ -1772,8 +1809,8 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly one value; this client
-                always sends one.
+            BAD_ARGS: `source` is empty or holds a colon, or the message did not
+                carry exactly one value.
 
         See also:
             `set_inertia_comp()`, `set_coriolis_comp()`, `rti_set_gravity_comp()`
@@ -1802,29 +1839,28 @@ class RobotClient:
         kinematic model on the robot it does nothing, and RTI.log says so.
 
         Args:
-            mps: The cap in metres per second. 0, a negative value or NaN switches
-                it off.
+            mps: The cap in metres per second. 0 switches it off; a negative or
+                non-finite value is refused.
 
         Defaults:
             From the robot XML `<safety><max_tcp_velocity>`, read at start: 0 (off)
-            on PAR6. It lasts until changed or the robot software restarts;
-            `rti_connect()` does not reset it.
+            on PAR6. Every `rti_connect()` sets it back to that value.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `mps` is negative or not finite,
+                or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `mps` is not a number. Nothing is sent.
             TypeError: `mps` is not a number. Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly one value; this client
-                always sends one.
+            BAD_ARGS: `mps` is negative or not a finite number, or the message did
+                not carry exactly one value.
 
         Warning:
             Switching it off removes the only guard on the tool's speed near a
-            singularity, for every later session, from any PC, until it is set
-            again or the robot software restarts.
+            singularity, until it is set again or the next `rti_connect()`.
 
         See also:
             `rti_set_vel_scale()`, `rti_set_rate_limiter()`
@@ -1855,7 +1891,7 @@ class RobotClient:
 
         Args:
             seconds: The longest gap allowed between two commands, in seconds,
-                limited as described. A non-finite value is ignored.
+                above 0 and limited as described.
 
         Defaults:
             Set at every `rti_connect()`: 0.04 s in RTI mode; in SOFT_RTI three of
@@ -1864,15 +1900,16 @@ class RobotClient:
             `<rti_defaults><command_timeout_s>`, 0.04 s, read at start.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `seconds` is not a number above
+                0, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `seconds` is not a number. Nothing is sent.
             TypeError: `seconds` is not a number. Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly one value; this client
-                always sends one.
+            BAD_ARGS: `seconds` is not a finite number above 0, or the message did
+                not carry exactly one value.
 
         See also:
             `rti_connect()`, `rti_claim()`
@@ -1901,9 +1938,9 @@ class RobotClient:
         the arm has no speed in reserve to catch up after a delay.
 
         Args:
-            fraction: The share of the robot XML limit, from 0.01 to 1: a fraction,
-                not a percent. Above 1 counts as 1 and below 0.01 as 0.01; zero, a
-                negative or a non-finite value is ignored.
+            fraction: The share of the robot XML limit, above 0 and at most 1: a
+                fraction, not a percent. Below 0.01 counts as 0.01; zero, a
+                negative, a non-finite value or one above 1 is refused.
 
         Defaults:
             1 (the robot XML limits), set each time the robot software starts. It
@@ -1911,15 +1948,16 @@ class RobotClient:
             does not reset it.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `fraction` is not above 0 and at
+                most 1, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `fraction` is not a number. Nothing is sent.
             TypeError: `fraction` is not a number. Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly one value; this client
-                always sends one.
+            BAD_ARGS: `fraction` is not a number above 0 and at most 1, or the
+                message did not carry exactly one value.
 
         Note:
             It lasts across sessions: set it back to 1 when your program is done,
@@ -1952,21 +1990,22 @@ class RobotClient:
 
         Args:
             multiplier: Command intervals, from 1 to 5 (clamped); 0 switches it
-                off. A negative or non-finite value is ignored.
+                off. A negative or non-finite value is refused.
 
         Defaults:
             Set at every `rti_connect()`: 1.5 in SOFT_RTI, 0 (off) in RTI mode.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `multiplier` is negative or not
+                finite, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `multiplier` is not a number. Nothing is sent.
             TypeError: `multiplier` is not a number. Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly one value; this client
-                always sends one.
+            BAD_ARGS: `multiplier` is negative or not a finite number, or the
+                message did not carry exactly one value.
 
         See also:
             `rti_set_servo_generator()`, `rti_set_pace()`, `rti_set_vel_scale()`
@@ -1992,7 +2031,9 @@ class RobotClient:
 
         Control is released by `release_control()`, when the client disconnects,
         or after 30 s without a command that takes control, with nothing queued
-        and no real-time stream running.
+        and no real-time stream running. When control leaves a client this way
+        or by a takeover, a collision-detection change it made returns to the
+        start value (`set_collision_detection()`).
 
         With the takeover confirmation on (`set_force_confirm()`), a forced take
         from another client waits up to 20 s for someone at the control box:
@@ -2087,7 +2128,8 @@ class RobotClient:
 
         Another client can then take control. It is never refused: a client that
         does not hold control gets `released` false. Moves already queued keep
-        running.
+        running. A collision-detection change this client made returns to its
+        start value.
 
         Returns:
             `{"released": bool, "holder": label or None}`: whether this client held
@@ -2192,8 +2234,8 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
 
         Errors:
-            RECIPE_DIR: The robot could not read the recipe folder or a file in it;
-                the recipes in force stay.
+            RECIPE_DIR: The recipe folder does not exist, or the robot could not
+                read it or a file in it; the recipes in force stay.
 
         Note:
             When the file of the recipe in use is removed and the recipes are
@@ -2263,8 +2305,8 @@ class RobotClient:
         `rti_connect()`.
 
         Args:
-            hz: Packets per second, from 10 to 250 (clamped). 0, a negative or a
-                non-finite value sends every tick again.
+            hz: Packets per second, from 10 to 250 (clamped); 0 sends every tick
+                again. A negative or non-finite value is refused.
 
         Defaults:
             Every tick (250 per second), set each time the robot software starts
@@ -2272,15 +2314,16 @@ class RobotClient:
             keeps the value it finds, so it lasts until changed.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `hz` is negative or not finite,
+                or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `hz` is not a number. Nothing is sent.
             TypeError: `hz` is not a number. Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly one value; this client
-                always sends one.
+            BAD_ARGS: `hz` is negative or not a finite number, or the message did
+                not carry exactly one value.
 
         Note:
             `RTIClient.control()` waits 0.1 s for each packet by default, the very
@@ -2311,7 +2354,7 @@ class RobotClient:
 
         Args:
             factor: The headroom over your target's speed, up to 10 (clamped); 0
-                switches it off. A negative or non-finite value is ignored.
+                switches it off. A negative or non-finite value is refused.
 
         Defaults:
             0 (off), set each time the robot software starts and at every
@@ -2319,15 +2362,16 @@ class RobotClient:
             it finds, so it lasts until changed.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `factor` is negative or not
+                finite, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `factor` is not a number. Nothing is sent.
             TypeError: `factor` is not a number. Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly one value; this client
-                always sends one.
+            BAD_ARGS: `factor` is negative or not a finite number, or the message
+                did not carry exactly one value.
 
         See also:
             `rti_set_vel_scale()`, `rti_set_min_duration()`,
@@ -2349,7 +2393,7 @@ class RobotClient:
         streams while the rate limiter is on. A change takes effect at once: the
         new generator continues from the position and speed the old one reached.
         `rti_connect()` sets the generator again, so call this after it. A gain or
-        a look-ahead that is not finite makes the robot ignore the call.
+        a look-ahead that is not finite is refused, and nothing changes.
 
         Args:
             name: `"passthrough"`: RTI mode only; replays your stamped targets
@@ -2380,7 +2424,8 @@ class RobotClient:
             time the robot software starts and last until changed.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: a number is not finite, or
+                another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `gain`, `lookahead` or `self_lookahead` is not a number.
@@ -2389,8 +2434,8 @@ class RobotClient:
                 Nothing is sent.
 
         Errors:
-            BAD_ARGS: The message did not carry exactly four values; this client
-                always sends four.
+            BAD_ARGS: `name` is empty or holds a colon, a number is not finite, or
+                the message did not carry exactly four values.
 
         Note:
             In RTI mode only `"passthrough"` checks the stream itself (the speed,
@@ -2434,9 +2479,8 @@ class RobotClient:
                 `reload_recipes()` first.
 
         Defaults:
-            `"standard"`, set each time any of the robot's processes starts: the
-            real-time loop, the command executor, the dashboard, the supervisor or
-            the self-collision worker.
+            `"standard"`, set each time the real-time loop starts. The robot's
+            other processes keep the recipe in use when they restart.
 
         Raises:
             CommandRejected: The robot refused it: no recipe file has that name, or
@@ -2474,10 +2518,12 @@ class RobotClient:
         arm is at rest, within 1.5 s.
 
         In any other mode the robot switches to IDLE mode at once, and answers at
-        once. In the error state it has no effect.
+        once; a homing in progress is abandoned, and the arm is then not homed.
+        In the error state it has no effect.
 
         It also discards this client's failures of earlier moves that
-        `wait_idle()` has not reported yet.
+        `wait_idle()` has not reported yet, and its last commands:
+        `wait_motion_complete()` then returns at once.
 
         Args:
             wait: Wait until the arm has stopped: in EXEC mode until braking has
@@ -2511,6 +2557,9 @@ class RobotClient:
         # here: the executor writes those replies before stop's own "ok", so the
         # receiver thread has already recorded them by the time _state_change returns.
         self._conn.take_motion_errors()
+        # ... and the last commands with them (2026-10-24): wait_motion_complete() raised their STOPPED on every call
+        # until the next command.
+        self._last_queued = self._last_gripper_queued = None
 
     def home(self, wait: bool | None = None) -> None:
         """Home the arm: find each joint's reference position.
@@ -2523,9 +2572,8 @@ class RobotClient:
         A failed homing latches an error (`J<n>:HOMING_FAILED` or
         `GRIPPER_HOMING_FAILED`): the robot is then in the error state, disabled
         and not homed. An error during homing ends it the same way. Leaving it
-        with `enter_idle_mode()`, `stop()` or `disable()` abandons it: a joint it
-        had not reached keeps its earlier reference, and the robot stays as homed
-        as it was.
+        with `enter_idle_mode()`, `stop()` or `disable()` abandons it, and the arm
+        is then not homed (`HOMING_ABORTED` in the activity log): home it again.
 
         Args:
             wait: Wait until homing has ended, up to 3 minutes.
@@ -2648,10 +2696,8 @@ class RobotClient:
         robot software restarts.
 
         Args:
-            percent: The share of each joint's speed limit, in %, from 0.1 to 100.
-                A value up to 1 is read as a fraction: `0.5` means 50 % and `1`
-                means 100 %. A value outside the range is clamped to it: 0 or less
-                gives 0.1 %.
+            percent: The share of each joint's speed limit, in %: above 0 and at
+                most 100. `1` means 1 %, and `0.5` half a percent.
 
         Defaults:
             100 %, set each time the robot software starts.
@@ -2660,13 +2706,17 @@ class RobotClient:
             `None`: the robot sends no value back.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `percent` is not above 0 and at
+                most 100, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `percent` cannot be read as a number, for example `"fast"`.
                 Nothing is sent.
             TypeError: `percent` is `None` or another type that is no number.
                 Nothing is sent.
+
+        Errors:
+            BAD_ARGS: `percent` is not a number above 0 and at most 100.
 
         Note:
             Moves along a Cartesian path (straight lines, arcs, circles and splines)
@@ -2708,8 +2758,8 @@ class RobotClient:
 
         Args:
             percent: The blend value: a percent with `"exact_velocity"` (a value
-                outside 0 to 100 is clamped to it), millimetres with the other modes.
-                0 or less means no blending.
+                above 100 counts as 100), millimetres with the other modes. 0 means
+                no blending; a negative value is refused.
 
         Defaults:
             0 (no blending), set each time the robot software starts.
@@ -2718,7 +2768,8 @@ class RobotClient:
             `None`: the robot sends no value back.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: `percent` is negative or not a
+                finite number, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `percent` cannot be read as a number, for example `"some"`.
@@ -2726,10 +2777,13 @@ class RobotClient:
             TypeError: `percent` is `None` or another type that is no number.
                 Nothing is sent.
 
+        Errors:
+            BAD_ARGS: `percent` is negative or not a finite number.
+
         Note:
-            Arcs, circles and splines cannot blend yet: while this value is above 0,
-            each of them fails with `CURVE_BLEND_UNSUPPORTED` unless it passes
-            `blend=0`.
+            Arcs, circles and splines cannot blend yet: they ignore this value, and
+            one that passes its own `blend` above 0 fails with
+            `CURVE_BLEND_UNSUPPORTED`.
 
         See also:
             `set_profile()`, `set_joint_speed()`, `move_joints()`, `move_linear()`
@@ -2963,7 +3017,8 @@ class RobotClient:
         `clear_errors()`. To cancel a program and stay in EXEC mode, use `stop()`.
 
         From JOG mode or a real-time stream the robot switches at once, without
-        braking. Homing in progress is abandoned. It also ends motors off and
+        braking. Homing in progress is abandoned, and the arm is then not homed.
+        It also ends motors off and
         firmware flashing, like their own `release_safety_stop()` and
         `exit_flashing_mode()`. In the error state it has no effect: the robot
         returns to it while an error is latched; call `clear_errors()`.
@@ -3015,6 +3070,7 @@ class RobotClient:
         off the arm: to free something trapped by hand, or to hear whether a noise
         comes from a drive's own firmware. From EXEC mode it switches at once,
         without braking, and a queued program is cancelled as with `disable()`.
+        The gripper's jaws stop where they are.
 
         Args:
             wait: Wait until the robot reports the motors off, up to 10 s.
@@ -3166,7 +3222,7 @@ class RobotClient:
     def jog(self, joint: int, direction: int, speed: float) -> Any:
         """Start jogging one joint: it moves until `jog_stop()` or a limit.
 
-        The joint speeds up to `speed` times its speed limit and keeps moving until
+        The joint speeds up to `speed` % of its speed limit and keeps moving until
         `jog_stop()`. It speeds up and brakes at the jog's acceleration and jerk
         (`set_jog_accel()`, `set_jog_profile()`, `set_jog_jerk_factor()`). Near the
         end of its range it brakes by itself and comes to rest exactly at its joint
@@ -3182,13 +3238,13 @@ class RobotClient:
 
         Args:
             joint: The joint to move, counted from 0: `0` is J1 and `5` is J6 on a
-                six-joint arm. A joint that does not exist is refused.
+                six-joint arm, a whole number. A joint that does not exist is
+                refused.
             direction: `1` for the joint's positive direction, `-1` for its negative
                 one; a larger whole number counts by its sign. `0` stops the jog as
                 `jog_stop()` does.
-            speed: The share of the joint's speed limit, as a fraction from 0 to 1:
-                `0.1` is 10 %. A value above 1 counts as 1, full speed: it is not a
-                percent. 0 or less moves nothing. It must be a finite number.
+            speed: The speed in percent of the joint's speed limit, from 0 to 100:
+                `10` is 10 %. 0 moves nothing.
 
         Returns:
             `None`: the robot sends no value back.
@@ -3198,15 +3254,15 @@ class RobotClient:
                 another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
-            ValueError: `joint`, `direction` or `speed` cannot be read as a number.
-                Nothing is sent.
+            ValueError: `joint`, `direction` or `speed` cannot be read as a number,
+                or `joint` or `direction` is not a whole number. Nothing is sent.
             TypeError: An argument is `None` or another type that is no number.
                 Nothing is sent.
 
         Errors:
             BAD_ARGS: The joint does not exist, the direction is not a whole
-                number, the speed is not a finite number, or the command did not
-                carry exactly these three values.
+                number, the speed is not a number from 0 to 100, or the command did
+                not carry exactly these three values.
 
         Warning:
             A jog has no time limit. The joint keeps moving until `jog_stop()`, a
@@ -3227,11 +3283,11 @@ class RobotClient:
         Examples:
             >>> import time
             >>> robot.enter_jog_mode(wait=True)
-            >>> robot.jog(0, 1, 0.05)
+            >>> robot.jog(0, 1, 5)
             >>> time.sleep(0.5)
             >>> robot.jog_stop()
         """
-        return self._immediate("jog", [int(joint), int(direction), float(speed)])
+        return self._immediate("jog", [_whole(joint, "joint"), _whole(direction, "direction"), float(speed)])
 
     def jog_stop(self) -> Any:
         """Stop jogging: the joint brakes to rest along its path.
@@ -3273,9 +3329,10 @@ class RobotClient:
         (`set_jog_jerk_factor()`). The braking at a limit and after `jog_stop()` is
         planned with the same acceleration.
 
-        The setting is the robot's: it applies at once to every client's jogs and
-        the dashboard's, also to a jog in progress, and mode changes keep it. It
-        lasts until it is changed or the robot software restarts.
+        The setting is the robot's: it applies to every client's jogs and the
+        dashboard's, and mode changes keep it. A jog in progress keeps its ramp
+        until the joint comes to rest. It lasts until it is changed or the robot
+        software restarts.
 
         Args:
             accel_time: Seconds from rest to the joint's full speed. It must be more
@@ -3316,13 +3373,15 @@ class RobotClient:
         - `"trapezoidal"`: the acceleration switches on and off at once. Shorter
           ramps, harder starts and stops.
 
-        The names must be written exactly so, in lower case. The setting is the
-        robot's: it applies at once to every client's jogs and the dashboard's, also
-        to a jog in progress, and mode changes keep it. It lasts until it is changed
-        or the robot software restarts.
+        Letter case does not matter, and `"s_curve"`, `"s-curve"`, `"trapezoid"`
+        and `"trap"` are taken too. The setting is the robot's: it applies to every
+        client's jogs and the dashboard's, and mode changes keep it. A jog in
+        progress keeps its profile until the joint comes to rest. It lasts until it
+        is changed or the robot software restarts.
 
         Args:
-            profile: `"scurve"` or `"trapezoidal"`.
+            profile: `"scurve"` or `"trapezoidal"`, or one of the other spellings
+                above.
 
         Defaults:
             From `config/system.xml` `<jog_defaults>`, read at start: `"scurve"`.
@@ -3331,17 +3390,16 @@ class RobotClient:
             `None`: the robot sends no value back.
 
         Raises:
-            CommandRejected: The robot refused it: the name is neither `"scurve"`
-                nor `"trapezoidal"`, or another client holds control.
+            CommandRejected: The robot refused it: the name is none of the above,
+                or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
-            BAD_ARGS: `profile` is neither `"scurve"` nor `"trapezoidal"`.
+            BAD_ARGS: `profile` is none of the names above.
 
         Note:
-            These are not the names of the queued moves' profiles: `"trapezoid"` and
-            `"s_curve"` are refused here.
+            The queued moves' profiles are another setting, `set_profile()`.
 
         See also:
             `set_jog_jerk_factor()`, `set_jog_accel()`, `set_profile()`
@@ -3361,9 +3419,10 @@ class RobotClient:
         ramps; a lower one smoother, longer ones. With `"trapezoidal"` it has no
         effect.
 
-        The setting is the robot's: it applies at once to every client's jogs and
-        the dashboard's, also to a jog in progress, and mode changes keep it. It
-        lasts until it is changed or the robot software restarts.
+        The setting is the robot's: it applies to every client's jogs and the
+        dashboard's, and mode changes keep it. A jog in progress keeps its jerk
+        until the joint comes to rest. It lasts until it is changed or the robot
+        software restarts.
 
         Args:
             factor: The jerk as a multiple of the acceleration, per second. It must
@@ -3404,10 +3463,10 @@ class RobotClient:
           its own two gains, without an integral term.
 
         The gains are the drives' own (`set_pid_gains()`). It applies in JOG mode
-        only, from the next control tick, also to a jog in progress. The names must
-        be written exactly so, in lower case. The setting is the robot's: it applies
-        to every client's jogs and the dashboard's, and mode changes keep it. It
-        lasts until it is changed or the robot software restarts.
+        only, from the next control tick, also to a jog in progress. Letter case
+        does not matter. The setting is the robot's: it applies to every client's
+        jogs and the dashboard's, and mode changes keep it. It lasts until it is
+        changed or the robot software restarts.
 
         Args:
             mode: `"pid"` or `"pd"`.
@@ -3475,7 +3534,8 @@ class RobotClient:
                 test runs (see Errors), or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
-            ValueError: `joint` or a gain is not a number. Nothing is sent.
+            ValueError: `joint` is not a whole number, or a gain is not a number.
+                Nothing is sent.
             TypeError: `joint` or a gain is `None`. Nothing is sent.
 
         Errors:
@@ -3498,7 +3558,7 @@ class RobotClient:
         Examples:
             >>> robot.set_pid_gains(0, KPP=88, KPV=0.078)
         """
-        payload = {"joint": int(joint)}
+        payload = {"joint": _whole(joint, "joint")}
         payload.update({k: float(v) for k, v in gains.items()})
         return self._immediate("set_pid_gains", payload)
 
@@ -3514,26 +3574,29 @@ class RobotClient:
         calibration.
 
         The call returns at once. The robot then sends the gripper only status
-        requests, for 30 s or until the next gripper command, which ends a
-        calibration still running. So wait before the next gripper command: the
-        gripper's XML gives the time homing waits, `<homing_calibration_wait_s>`.
-        While homing drives the gripper, and during firmware flashing, the
-        calibration waits until they end. Without a CAN gripper the robot ignores
-        it.
+        requests until the gripper reports itself calibrated, but not before the
+        gripper XML's `<homing_calibration_wait_s>` has passed, and for at most
+        30 s. The next gripper command ends a calibration still running, so wait
+        that long before it. The calibration drops the gripper's target: the jaws
+        stay where it leaves them until the next gripper command. While homing
+        drives the gripper, and during firmware flashing, the calibration waits
+        until they end.
 
         Returns:
             `None`. The robot answers before the calibration starts.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: The robot refused it: the robot has no CAN gripper, or
+                another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
+        Errors:
+            NO_GRIPPER: The robot has no CAN gripper.
+
         Warning:
             The jaws open and close fully by themselves and let go of a part they
-            hold. After the 30 s, in firmware mode, the robot sends the gripper its
-            last target again if it had one, and the jaws move back to it without
-            a new command. Keep hands away from the jaws.
+            hold. Keep hands away from the jaws.
 
         See also:
             `home()`, `set_gripper()`, `set_gripper_ctrl_mode()`, `open_gripper()`
@@ -3556,16 +3619,13 @@ class RobotClient:
         that `open_gripper()`, `close_gripper()`, `move_gripper()` and
         `set_gripper()` give it, and reports their position and whether something
         stopped them. In motor mode the robot gives the gripper's motor zero
-        current: the jaws neither move nor hold, the gripper commands do not reach
-        the gripper, and its position and outcome are not updated. A queued
-        gripper command then fails with `GRIPPER_SETTLE_TIMEOUT`, or settles at
-        once without moving when the last reported position is already near its
-        target.
+        current: the jaws neither move nor hold, `set_gripper()` targets do not
+        reach the gripper, and the queued gripper commands are refused with
+        `GRIPPER_MOTOR_MODE`.
 
         Switching to motor mode also drops the gripper's target, so the jaws stay
         still when firmware mode returns. Homing drives the gripper itself in
-        either mode. No status field reports the mode. Without a CAN gripper the
-        robot ignores it.
+        either mode. `latest_status()` reports the mode in `gripper`.
 
         Args:
             mode: `1` for motor mode or `2` for firmware mode.
@@ -3581,14 +3641,15 @@ class RobotClient:
             `None`. The robot answers before the gripper changes mode.
 
         Raises:
-            CommandRejected: The robot refused it: `mode` is not 1 or 2, or
-                another client holds control.
+            CommandRejected: The robot refused it: `mode` is not 1 or 2, the robot
+                has no CAN gripper, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `mode` cannot be read as a whole number, for example the
                 text "firmware". Nothing is sent.
 
         Errors:
+            NO_GRIPPER: The robot has no CAN gripper.
             BAD_ARGS: `mode` is not 1 or 2.
 
         Warning:
@@ -3623,15 +3684,15 @@ class RobotClient:
         ends a calibration in progress, and replaces the target of a queued
         gripper command still under way, which then fails with
         `GRIPPER_SETTLE_TIMEOUT` unless the jaws pass within 5 of its own target.
-        Without a CAN gripper the robot ignores it.
 
         Args:
-            position: The target, from 0 (fully open) to 255 (fully closed) on the
-                gripper's scale; not millimetres.
-            speed: How fast the jaws move, from 0 (slowest) to 255 (fastest) on
-                the gripper's scale.
+            position: The target, a whole number from 0 (fully open) to 255
+                (fully closed) on the gripper's scale; not millimetres.
+            speed: How fast the jaws move, a whole number from 0 (slowest) to 255
+                (fastest) on the gripper's scale.
             current: The gripper motor's current limit while the jaws move and
-                hold, in mA. The robot passes it on unchecked.
+                hold, in mA: a whole number from 1 to the gripper XML's `<Ilim>`
+                (1700 mA for the shipped grippers).
             action: `1` to move to `position` and stay there, or `0` to release
                 the gripper.
 
@@ -3644,16 +3705,17 @@ class RobotClient:
             `None`. The robot answers before the target reaches the gripper.
 
         Raises:
-            CommandRejected: The robot refused it: another client holds control,
-                or (see Errors) it did not get four values.
+            CommandRejected: The robot refused it: a value is outside its range,
+                the robot has no CAN gripper, or another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: A value cannot be read as a whole number, for example the
                 text "open". Nothing is sent.
 
         Errors:
-            BAD_ARGS: The robot did not get exactly four values. This method
-                always sends four, so only a raw client meets it.
+            NO_GRIPPER: The robot has no CAN gripper.
+            BAD_ARGS: A value is outside its range above, or the robot did not get
+                exactly four values (this method always sends four).
 
         Warning:
             The jaws move at once, also while the robot is disabled, and keep
@@ -3692,8 +3754,8 @@ class RobotClient:
                 anything moves. A single list or tuple of the angles works too.
             timeout: Seconds to wait for the move to finish, in sync mode only.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. `ik_solver`, `singularity_strategy` and `samples`
@@ -3757,8 +3819,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -3823,8 +3885,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -3898,8 +3960,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -3974,8 +4036,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4054,8 +4116,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4135,8 +4197,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4214,8 +4276,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4297,8 +4359,8 @@ class RobotClient:
                 is refused. A negative number goes the other way.
             timeout: Seconds to wait for the move to finish, in sync mode only.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4382,8 +4444,8 @@ class RobotClient:
                 is refused. A negative number goes the other way.
             timeout: Seconds to wait for the move to finish, in sync mode only.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4466,8 +4528,8 @@ class RobotClient:
                 is refused. A negative number goes the other way.
             timeout: Seconds to wait for the move to finish, in sync mode only.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4547,8 +4609,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4632,8 +4694,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4716,8 +4778,8 @@ class RobotClient:
             timeout: Seconds to wait for the move to finish, in sync mode only.
             angle_unit: `"rad"` or `"deg"`: the unit of every angle in this call.
             **options: Settings for this move only, overriding the defaults:
-                `speed` and `accel` (a fraction of the limit up to 1, or a percent
-                above 1), `duration` (seconds), `profile`, `jerk`, `ramp_fraction`,
+                `speed`, `accel` and `jerk` (percent of the limit, above 0 and at most
+                100: 1 means 1 %), `duration` (seconds), `profile`, `ramp_fraction`,
                 `blend`, `blend_mode`, `blend_continuity`, `ik_solver`,
                 `singularity_strategy`, `samples` and `dry_run`. A setting left out
                 takes its default. See Per-move settings.
@@ -4884,9 +4946,7 @@ class RobotClient:
         own pending entry: _last_queued is whatever was queued most recently,
         which is frequently a joint move issued right after.
         """
-        cid = self._queued(cmd, args, timeout, options)
-        self._last_gripper_queued = self._last_queued
-        return cid
+        return self._queued(cmd, args, timeout, options, gripper=True)
 
     def open_gripper(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
         """Open the gripper's jaws fully, as a queued command.
@@ -4919,8 +4979,9 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused the command, for example outside
-                EXEC mode, before homing or with an invalid setting. In sync mode
-                also when it fails after it was accepted.
+                EXEC mode, before homing, with an invalid setting, without a CAN
+                gripper or in motor mode. In sync mode also when it fails after it
+                was accepted.
             RobotTimeout: The robot did not accept the command within 5 s. In sync
                 mode also when the jaws did not settle within `timeout`.
             RobotConnectionError: The client is not connected.
@@ -4931,6 +4992,9 @@ class RobotClient:
                 queued after it still run.
             SUPERSEDED: Another gripper command started before this one settled
                 and replaced its target. The commands queued after it still run.
+            NO_GRIPPER: The robot has no CAN gripper; nothing is queued.
+            GRIPPER_MOTOR_MODE: The gripper is in motor mode
+                (`set_gripper_ctrl_mode()`); nothing is queued.
 
         Note:
             The gripper has one target at a time. A gripper command that starts
@@ -4985,8 +5049,9 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused the command, for example outside
-                EXEC mode, before homing or with an invalid setting. In sync mode
-                also when it fails after it was accepted.
+                EXEC mode, before homing, with an invalid setting, without a CAN
+                gripper or in motor mode. In sync mode also when it fails after it
+                was accepted.
             RobotTimeout: The robot did not accept the command within 5 s. In sync
                 mode also when the jaws did not settle within `timeout`.
             RobotConnectionError: The client is not connected.
@@ -4997,6 +5062,9 @@ class RobotClient:
                 queued after it still run.
             SUPERSEDED: Another gripper command started before this one settled
                 and replaced its target. The commands queued after it still run.
+            NO_GRIPPER: The robot has no CAN gripper; nothing is queued.
+            GRIPPER_MOTOR_MODE: The gripper is in motor mode
+                (`set_gripper_ctrl_mode()`); nothing is queued.
 
         Note:
             The gripper has one target at a time. A gripper command that starts
@@ -5096,8 +5164,9 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused the command, for example outside
-                EXEC mode, before homing or with an invalid setting. In sync mode
-                also when it fails after it was accepted.
+                EXEC mode, before homing, with an invalid setting, without a CAN
+                gripper or in motor mode. In sync mode also when it fails after it
+                was accepted.
             RobotTimeout: The robot did not accept the command within 5 s. In sync
                 mode also when the jaws did not settle within `timeout`.
             RobotConnectionError: The client is not connected.
@@ -5106,14 +5175,17 @@ class RobotClient:
 
         Errors:
             GRIPPER_SETTLE_TIMEOUT: The jaws had neither reached the target nor
-                reported an object 5 s after the command started, for example at
-                a low `speed` over a long way; the jaws then still move on. The
-                commands queued after it still run.
+                reported an object in time: 5 s at speed 100 or faster, and longer
+                the lower `speed` is (about 30 s at speed 15). The commands queued
+                after it still run.
             BAD_ARGUMENTS: `position` or `speed` is outside 0 to 255, or `current`
                 is below 1 mA or above the current limit in the gripper's
                 configuration.
             SUPERSEDED: Another gripper command started before this one settled
                 and replaced its target. The commands queued after it still run.
+            NO_GRIPPER: The robot has no CAN gripper; nothing is queued.
+            GRIPPER_MOTOR_MODE: The gripper is in motor mode
+                (`set_gripper_ctrl_mode()`); nothing is queued.
 
         Note:
             The gripper has one target at a time. A gripper command that starts
@@ -5163,7 +5235,10 @@ class RobotClient:
         an earlier command failed or the robot left EXEC mode (`ABORTED`). The
         call reports every such failure since its last call, then forgets them,
         so a program that ran only part of its moves does not go on unnoticed.
-        This client's `stop()` discards the failures not yet reported. A command
+        This client's `stop()` discards the failures not yet reported, and a
+        failure a call already raised (a sync-mode command,
+        `wait_motion_complete()`, `wait_gripper_move_complete()`) is not
+        reported again. A command
         the robot refused when it was sent is not among them: its own call
         raised `CommandRejected`. When the connection is lost, the commands still
         running count as failed, with the code `CONNECTION_LOST`, or
@@ -5213,7 +5288,8 @@ class RobotClient:
         It waits for one command: the last move, delay or gripper command the
         robot accepted from this client. A command the robot refused when it was
         sent does not count. It returns at once when this client has queued
-        nothing yet, or when that command has already finished.
+        nothing yet or called `stop()` since, or when that command has already
+        finished.
 
         It does not wait for the commands queued before it, nor report their
         failures: `wait_idle()` does both. Moves finish in the order they were
@@ -5228,7 +5304,7 @@ class RobotClient:
                 example with `JOINT_LIMIT`, `STOPPED` or `ABORTED`, or the
                 connection was lost first (`CONNECTION_LOST` or `DISCONNECTED`).
                 Its `code` names the failure. Every later call raises it again,
-                until another command is queued.
+                until another command is queued or this client calls `stop()`.
             RobotTimeout: The command had not finished after `timeout`, or 120 s.
 
         See also:
@@ -5386,14 +5462,14 @@ class RobotClient:
                 "<what> timed out".
 
         Raises:
-            RobotTimeout: `predicate` was not true within `timeout`, or the client
-                lost its connection or is not connected.
+            RobotTimeout: `predicate` was not true within `timeout`.
+            RobotConnectionError: The client is not connected, or lost its
+                connection while waiting.
 
         Note:
-            `predicate` gets the client's own status dict, and the client takes
-            in no new status until it returns: keep it short, do not change the
-            dict, and do not send commands from it. An exception it raises ends
-            the wait and reaches the caller.
+            `predicate` gets a copy of the status, and the client takes in no new
+            status until it returns: keep it short, and do not send commands from
+            it. An exception it raises ends the wait and reaches the caller.
 
         See also:
             `wait_mode()`, `latest_status()`, `on_status_change()`
@@ -5404,6 +5480,8 @@ class RobotClient:
             ...            what="wait_resumed")
         """
         if self._conn.wait_status(predicate, timeout) is None:
+            if not self._conn.connected:        # 2026-10-24: a lost connection read as "timed out", at once
+                raise RobotConnectionError(f"{what}: not connected (the connection was lost or closed)")
             raise RobotTimeout(f"{what} timed out")
 
     def wait_enabled(self, timeout: float | None = WAIT_STATE_TIMEOUT) -> None:
@@ -5422,7 +5500,9 @@ class RobotClient:
 
         Raises:
             RobotTimeout: The robot did not report itself enabled within
-                `timeout`, or the client lost its connection or is not connected.
+                `timeout`.
+            RobotConnectionError: The client is not connected, or lost its
+                connection while waiting.
 
         See also:
             `enable()`, `clear_errors()`, `wait()`
@@ -5452,8 +5532,9 @@ class RobotClient:
             timeout: Seconds to wait at most. `None` waits as long as it takes.
 
         Raises:
-            RobotTimeout: The robot did not report `mode` within `timeout`, or the
-                client lost its connection or is not connected.
+            RobotTimeout: The robot did not report `mode` within `timeout`.
+            RobotConnectionError: The client is not connected, or lost its
+                connection while waiting.
 
         See also:
             `wait()`, `latest_status()`, `enter_exec_mode()`, `enter_idle_mode()`
@@ -5486,8 +5567,9 @@ class RobotClient:
                 the arm is not homed. Its `errors` lists the robot's error and
                 warning keys, for example `J3:HOMING_FAILED`.
             RobotTimeout: The arm was not homed within `timeout`, for example
-                because the robot refused or abandoned the homing, or the client
-                lost its connection or is not connected.
+                because the robot refused or abandoned the homing.
+            RobotConnectionError: The client is not connected, or lost its
+                connection while waiting.
 
         Note:
             Right after `home()` on an arm that is already homed, the status can
@@ -5520,8 +5602,9 @@ class RobotClient:
             timeout: Seconds to wait at most. `None` waits as long as it takes.
 
         Raises:
-            RobotTimeout: An error or a warning was still listed after `timeout`,
-                or the client lost its connection or is not connected.
+            RobotTimeout: An error or a warning was still listed after `timeout`.
+            RobotConnectionError: The client is not connected, or lost its
+                connection while waiting.
 
         Note:
             `NOT_HOMED`, listed while the arm is not homed, does not count: it
@@ -5582,8 +5665,15 @@ class RobotClient:
             One angle per joint, in degrees, J1 first.
 
         Raises:
+            CommandRejected: The robot refused it: its control loop is not running,
+                or it is in flashing mode.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: The control loop (RTI) has not run for over 0.5 s, or
+                the robot is in flashing mode, where it reads no drive: the angles
+                in its memory would be old.
 
         See also:
             `get_pose()`, `latest_status()`, `move_joints()`
@@ -5615,9 +5705,16 @@ class RobotClient:
             radians, or degrees with `angle_unit="deg"`.
 
         Raises:
+            CommandRejected: The robot refused it: its control loop is not running,
+                or it is in flashing mode.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `angle_unit` is neither `"rad"` nor `"deg"`.
+
+        Errors:
+            RTI_NOT_RUNNING: The control loop (RTI) has not run for over 0.5 s, or
+                the robot is in flashing mode, where it reads no drive: the pose in
+                its memory would be old.
 
         Note:
             A tool pointing straight down reads `rx` near 180 or -180 degrees, and
@@ -5799,11 +5896,11 @@ class RobotClient:
                 `"rti.dynamics"`, `"rti.selfcheck"`, `"rti.recipe"`,
                 `"rti.incident"`, `"rti.net"`, `"exec"`, `"exec.control"`,
                 `"exec.tcp"`, `"exec.forward"`, `"exec.status"`, `"exec.planner"`,
-                `"exec.stop"`, `"sup"`, `"sup.process"`, `"sup.pcb"`, `"sup.gpio"`,
-                `"sup.can_link"`, `"sup.ui"`, `"gui"`, `"sc"`, `"rec"`, `"config"`,
-                `"filters"`, `"shm"`, `"kin"`, `"proc"`, `"io"`, or the libraries'
-                `"toppra"` and `"can"`. The logging documentation says what each
-                one writes.
+                `"exec.stop"`, `"config"`, `"filters"`, `"shm"`, `"kin"`, `"proc"`,
+                `"io"`, or the libraries' `"toppra"` and `"can"`. The logging
+                documentation says what each one writes. The other processes'
+                loggers (`"sup"` and the ones under it, `"gui"`, `"sc"`, `"rec"`)
+                are refused: this command does not reach those processes.
             level: `"DEBUG"`, `"INFO"`, `"WARNING"` or `"ERROR"`, in any case.
 
         Defaults:
@@ -5814,19 +5911,14 @@ class RobotClient:
             `{"name": name, "level": level}`: the logger and the level now set.
 
         Raises:
-            CommandRejected: The robot refused it: the logger or the level is
-                unknown.
+            CommandRejected: The robot refused it: the logger is unknown or belongs
+                to another process, or the level is unknown.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: `name` is not one of the loggers above, or `level` is not one
                 of the four levels.
-
-        Note:
-            `"DEBUG"` on `"rti"` or `"rti.handler"` writes a line for every packet
-            of a real-time stream, up to 250 a second, from the real-time loop
-            itself. Use it briefly.
 
         See also:
             `capture_telemetry()`, `get_health()`
@@ -6274,7 +6366,7 @@ class RobotClient:
                 Also when another client holds control.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
-            ValueError: `joint` cannot be read as a whole number. Nothing is sent.
+            ValueError: `joint` is not a whole number. Nothing is sent.
             TypeError: `joint` is not a number. Nothing is sent.
 
         Errors:
@@ -6303,7 +6395,7 @@ class RobotClient:
             >>> robot.set_joint_wall(5, frequency_hz=5.0, damping_ratio=0.7)
             >>> robot.set_joint_wall(5, frequency_hz="auto", damping_ratio="auto")
         """
-        return self._immediate("set_joint_wall", [int(joint), dict(fields)])
+        return self._immediate("set_joint_wall", [_whole(joint, "joint"), dict(fields)])
 
     def save_joint_walls(self) -> Any:
         """Save the live freedrive walls into the robot XML.
@@ -6420,7 +6512,8 @@ class RobotClient:
             `True` while the input is on, `False` while it is off.
 
         Raises:
-            CommandRejected: The robot refused it: `pin` is not 1, 2 or 3.
+            CommandRejected: The robot refused it: `pin` is not 1, 2 or 3, or its
+                control loop is not running.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `pin` cannot be read as a whole number, for example
@@ -6431,6 +6524,8 @@ class RobotClient:
         Errors:
             BAD_ARGS: No pin was given (only a raw client can send that).
             BAD_PIN: `pin` is not 1, 2 or 3.
+            RTI_NOT_RUNNING: The control loop (RTI) has not run for over 0.5 s, or
+                the robot is in flashing mode: the level would be old.
 
         See also:
             `set_digital_output()`, `get_hardware()`

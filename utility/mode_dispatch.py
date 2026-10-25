@@ -48,6 +48,7 @@ import time
 import numpy as np
 
 from utility.state_machine import RobotMode
+from utility.activity_log import get_rti_activity_logger, log_activity
 from utility.tick_types import TickContext, TickResult, ControlOutput, SELF_MANAGED
 from utility.kinematics_backend import should_use_pinocchio, write_pose_angles
 from communication.can_message_handlers import (
@@ -400,6 +401,7 @@ class _HomingDispatch:
         self._step_ilim = np.array(motor_config['Ilim'], dtype=float)
 
     def enter(self, ctx, **kwargs):
+        self._ended = False                     # True once the homing finished ('done' / 'failed')
         self._homing_ctrl.enter(
             ctx.Motor, ctx.joint_num,
             self._load_motor_configs,
@@ -421,6 +423,8 @@ class _HomingDispatch:
 
     def step(self, ctx):
         result = self._homing_ctrl.step(ctx.Motor, ctx.Joint, ctx.shared_data)
+        if result in ('done', 'failed'):
+            self._ended = True
 
         mc = self._motor_config
         homing_status = ctx.shared_data.rti['homing_status']
@@ -454,6 +458,19 @@ class _HomingDispatch:
 
     def exit(self, ctx):
         self._homing_ctrl.exit(ctx.Motor, ctx.joint_num)
+        if not getattr(self, "_ended", True):
+            # Interrupted (2026-10-24, user: "Not homed: re-home"): Stop, Disable or a mode change ended the homing
+            # before it finished. Every joint kept a valid reference (its old one or its new one), but the flags
+            # disagreed — homed_state HOMED, homing_status RUNNING for the joints that had started — so an interrupted
+            # homing counts as a failed one, as an error during homing already did (utility/error_checks.py).
+            ctx.shared_data.homed_state.set("NOT HOMED")
+            ctx.shared_data.rti["homing_status"][:] = 0
+            if "joint_homed" in ctx.shared_data.rti:
+                ctx.shared_data.rti["joint_homed"][:] = 0
+            logging.getLogger("rti.homing").warning("homing interrupted before it finished: the robot is not homed")
+            log_activity(get_rti_activity_logger(), "RTI", "warning", "HOMING_ABORTED",
+                         message="the homing was interrupted before it finished")
+        self._ended = True
         write_motor_config_to_shared(
             ctx.shared_data, ctx.joint_num,
             KPP=self._motor_config['KPP'],

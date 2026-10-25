@@ -359,7 +359,10 @@ class JogHandler:
         if self._want_on and not moving_same and abs(self._sv) <= _REST:
             self._start_session()
             moving_same = True
-        if self._limits_dirty and self._has_session:
+        if self._limits_dirty and self._has_session and abs(self._sv) <= _REST:
+            # New ramp settings (accel time, jerk factor, profile) take effect at rest (2026-10-24): a longer ramp
+            # applied mid-jog lengthened the stopping distance the session had planned with, and could carry the
+            # joint past its soft limit.
             self._refresh_limits()
 
         # 2. the free length along the ray: the nearer of the soft limits and the self-collision limit

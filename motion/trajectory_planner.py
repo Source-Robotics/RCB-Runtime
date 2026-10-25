@@ -306,7 +306,18 @@ class TrajectoryPlanner(Thread):
     GRIPPER_CLOSE_POS = 254
     GRIPPER_DEFAULT_SPEED = 100
     GRIPPER_DEFAULT_CURRENT = 200
-    GRIPPER_SETTLE_TIMEOUT_S = 5.0  # generous margin over a typical full-stroke time
+    GRIPPER_SETTLE_TIMEOUT_S = 5.0  # generous margin over a typical full-stroke time — at the default speed (100)
+    # The settle time scales with the speed (2026-10-24): the gripper firmware maps speed 0-255 onto 500-60000 encoder
+    # ticks/s (STEPFOC common.h), so a full stroke at speed 15 or less outlasted the fixed 5 s although the jaws were
+    # fine. _gripper_settle_timeout() stretches the 5 s by how much slower than speed 100 the command runs.
+    GRIPPER_TICKS_S_AT_0, GRIPPER_TICKS_S_AT_255 = 500.0, 60000.0
+
+    @classmethod
+    def _gripper_settle_timeout(cls, speed):
+        def ticks_s(s):
+            return cls.GRIPPER_TICKS_S_AT_0 + (cls.GRIPPER_TICKS_S_AT_255 - cls.GRIPPER_TICKS_S_AT_0) * s / 255.0
+        slower = ticks_s(cls.GRIPPER_DEFAULT_SPEED) / ticks_s(max(0, min(255, int(speed))))
+        return cls.GRIPPER_SETTLE_TIMEOUT_S * max(1.0, slower)
 
     # Gripper completion is decided by THREE independent criteria, not one.
     # `gripper_object_detection != 0` alone was the original rule and it is the
@@ -479,7 +490,7 @@ class TrajectoryPlanner(Thread):
     # ------------------------------------------------------------------ #
 
     def set_speed(self, pct):
-        """pct in 1..100 (percent of full speed)."""
+        """pct: percent of full speed, above 0 and at most 100 (checked by the executor)."""
         self._speed_scale = float(np.clip(pct / 100.0, 1e-3, 1.0))
 
     def set_blend(self, pct):
@@ -2032,7 +2043,7 @@ class TrajectoryPlanner(Thread):
             blend_dists.append((d_before, d_after))
 
         opts = self._cmd_options(chain[0])
-        jerk_factor = RUCKIG_JERK_FACTOR * float(opts.jerk if opts.jerk is not None else 1.0)
+        jerk_factor = RUCKIG_JERK_FACTOR * (self._jerk_scale_for(opts) or 1.0)
         result = plan_ruckig_corner_chain(
             waypoints_rad, self._max_vel,
             self._max_accel * self._accel_scale_for(opts), self._dt, blend_dists,
@@ -2040,7 +2051,7 @@ class TrajectoryPlanner(Thread):
             # Same percentage semantics as jerk_factor above: `jerk` scales the budget,
             # whichever source states it. None here keeps the old derivation.
             max_jerk=(None if self._max_jerk is None
-                      else self._max_jerk * float(opts.jerk if opts.jerk is not None else 1.0)))
+                      else self._max_jerk * (self._jerk_scale_for(opts) or 1.0)))
 
         timed = TimedJointPath(positions=result.positions,
                                velocities=result.velocities,
@@ -2346,10 +2357,8 @@ class TrajectoryPlanner(Thread):
     def _speed_scale_for(self, options):
         if options.speed is None:
             return self._speed_scale
-        speed = float(options.speed)
-        # Per-command speed accepts either API style: 0.4 = 40%, 40 = 40%.
-        scale = speed if speed <= 1.0 else speed / 100.0
-        return float(np.clip(scale, 1e-3, 1.0))
+        # Percent (MotionOptions checked 0 < p <= 100): 40 = 40 %, 0.4 = 0.4 % (command protocol 2, 2026-10-24).
+        return float(np.clip(float(options.speed) / 100.0, 1e-3, 1.0))
 
     def _accel_scale_for(self, options):
         """`accel` as a fraction of the acceleration limit — the `a` of a (speed, accel, duration) joint move.
@@ -2363,9 +2372,12 @@ class TrajectoryPlanner(Thread):
         """
         if options.accel is None:
             return 1.0
-        a = float(options.accel)
-        scale = a if a <= 1.0 else a / 100.0        # accepts 0.25 or 25
-        return float(np.clip(scale, 1e-3, 1.0))
+        return float(np.clip(float(options.accel) / 100.0, 1e-3, 1.0))   # percent, as speed
+
+    @staticmethod
+    def _jerk_scale_for(options):
+        """`jerk` as a scale of the jerk budget (it is percent in MotionOptions), or None when not set."""
+        return None if options.jerk is None else float(options.jerk) / 100.0
 
     def _scale_for_duration(self, options, natural_duration_s, speed_scale):
         """Re-scale so the move takes exactly `duration` seconds — the `t` of a (speed, accel, duration) joint move.
@@ -2414,7 +2426,7 @@ class TrajectoryPlanner(Thread):
 
     def _sample_joint_path(self, path, cid, options, start_vel=None, end_vel=None):
         profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
-        time_parameterizer = make_time_parameterizer(profile, options.ramp_fraction, options.jerk,
+        time_parameterizer = make_time_parameterizer(profile, options.ramp_fraction, self._jerk_scale_for(options),
                                                      max_jerk=self._max_jerk)
         max_accel = self._max_accel * self._accel_scale_for(options)
         speed_scale = self._speed_scale_for(options)
@@ -2443,7 +2455,7 @@ class TrajectoryPlanner(Thread):
         the caller applies it to self._last_exit_speed only after confirming the
         batch actually sent, same as self._last_endpoint."""
         profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
-        time_parameterizer = make_time_parameterizer(profile, options.ramp_fraction, options.jerk,
+        time_parameterizer = make_time_parameterizer(profile, options.ramp_fraction, self._jerk_scale_for(options),
                                                      max_jerk=self._max_jerk)
         path = self._path_builder.joint_line_from_degrees(start, args)
         target = path.target
@@ -3043,7 +3055,7 @@ class TrajectoryPlanner(Thread):
         sddot_max = float(np.min(alim / worst))
 
         parameterizer = make_time_parameterizer(profile, options.ramp_fraction,
-                                                options.jerk, max_jerk=self._max_jerk)
+                                                self._jerk_scale_for(options), max_jerk=self._max_jerk)
         if options.duration is not None:
             probe = parameterizer.parameterize(
                 JointPath(start=np.zeros(1), target=np.array([total])),
@@ -3664,7 +3676,7 @@ class TrajectoryPlanner(Thread):
         # (cid, deadline, commanded target, consecutive-nonzero count). The target
         # is kept because two of the three completion criteria need it: distance
         # to it, and which DIRECTION we are travelling.
-        self._pending_gripper = [cid, time.monotonic() + self.GRIPPER_SETTLE_TIMEOUT_S,
+        self._pending_gripper = [cid, time.monotonic() + self._gripper_settle_timeout(speed),
                                  int(position), 0]
 
     def _poll_gripper_completions(self):
@@ -3706,12 +3718,14 @@ class TrajectoryPlanner(Thread):
             # gripper_result() claim "object detected" on a move that simply
             # travelled to its target. Reaching the target with no believable
             # object is exactly what code 3 means, so say that instead.
-            outcome = obj if self._code_matches_direction(obj, target, position) else 3
+            # Code 0 ("still moving") is no outcome either (2026-10-24): the firmware reports 3 only within 5 encoder
+            # ticks, so a poll inside the 5-unit band forwarded 0 and wait_released_part() failed an open that arrived.
+            outcome = obj if obj != 0 and self._code_matches_direction(obj, target, position) else 3
             self._finish_gripper(cid, outcome,
                                  f"position {position} within "
-                                 f"{self.GRIPPER_POSITION_TOLERANCE} of {target}"
+                                 f"{self.GRIPPER_POSITION_TOLERANCE} of {target}, code {outcome}"
                                  + ("" if outcome == obj
-                                    else f" (ignored inconsistent object_detection={obj})"))
+                                    else f" (the gripper's code {obj} not taken)"))
             return
 
         # --- 2. debounced, direction-checked status code ------------------------

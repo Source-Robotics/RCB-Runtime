@@ -17,7 +17,10 @@ functions, importable by both the executor and (later) tests without side effect
 # command, a new optional argument, a new reply field is NOT a new version (an older client never sends or reads them).
 # robotclient/version.py keeps the client's copy (pinned equal by dummy_test_scripts/test_protocol_versions.py); the
 # executor publishes it in every status message, and a client refuses an executor whose number differs.
-PROTOCOL_VERSION = 1
+# 2 (2026-10-24, user: "yes, percent + protocol 2"): every share of a limit is a percent, 0 < p <= 100 (jog 0-100) — a
+# move's speed / accel / jerk, set_joint_speed, jog's speed. Under 1 a value <= 1 was a fraction, so "1 %" ran at 100 %;
+# a client and a robot of different numbers refuse each other at connect instead of misreading a speed.
+PROTOCOL_VERSION = 2
 
 # The commands whose arguments carry pose ANGLES (2026-10-21, with versioning V5). Pose angles changed their meaning
 # on 2026-10-21 (R = Rx(rx) Ry(ry) Rz(rz)), and a client from before then sends no "protocol" key: the executor refuses
@@ -243,7 +246,10 @@ COMMAND_RULES = {
     # The other three act on an already-paired session and RTI validates the sub-state,
     # so they stay mode-agnostic: a release/disconnect must work even mid-error, which is
     # exactly when you most need to hand control back.
-    "rti_connect":    (IMMEDIATE, None, "ENABLED", True),
+    # 2026-10-24 (the "refuse at the executor" rule of 2026-10-23): from IDLE or its own RTI mode only. From EXEC it
+    # aborted every client's program while RTI refused the mode and played on; from JOG / HOMING / ... RTI refused the
+    # mode but the pairing, the PC address and the transport changed anyway.
+    "rti_connect":    (IMMEDIATE, ["IDLE", "RTI", "SOFT_RTI"], "ENABLED", True),
     # BOTH RTI contracts. Gating on "RTI" alone made SOFT_RTI enterable but unusable --
     # the same "a legal transition is not a reachable one" failure as FLASHING (2026-08-04),
     # and the SECOND copy of it: the identical gate in RTI.py's _handle_rti_claim was fixed
@@ -251,7 +257,10 @@ COMMAND_RULES = {
     # together. Found on hardware, first bring-up run.
     "rti_claim":      (IMMEDIATE, ["RTI", "SOFT_RTI"], "ENABLED", True),
     "rti_release":    (IMMEDIATE, None, None, False),
-    "rti_disconnect": (IMMEDIATE, None, None, False),
+    # 2026-10-24: in IDLE, the RTI modes or the error state only (a mid-error disconnect still works). From any mode it
+    # switched to IDLE at once — it ended a safety stop or a firmware flash, abandoned a homing, and let the arm coast
+    # out of EXEC.
+    "rti_disconnect": (IMMEDIATE, ["IDLE", "RTI", "SOFT_RTI", "ACTIVE_ERROR"], None, False),
     # Safety-layer toggles (plan §11c). Settable any time; they only take effect on the
     # NEXT claim for the start-pose check, immediately for the rate limiter.
     "rti_set_rate_limiter":     (IMMEDIATE, None, None, False),

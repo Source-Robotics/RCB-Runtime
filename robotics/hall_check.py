@@ -25,6 +25,9 @@ HALL_CHECK_TRIGGER = 3       # matches neither pin level: the drive stays in its
 LIMIT_REPEATS = 2            # each limits frame sent twice (the CAN library swallows a dropped frame)
 RESEND_TICKS = 125           # the zero limit re-sent every ~0.5 s at 250 Hz (a reconnect reload would restore the limit)
 SETTLE_TICKS = 3             # the first replies carry the pin from the drive's LAST Hall session: ignore them
+# 2 min at 250 Hz without a renewal (hall_check:1 again): the joint is held again (2026-10-24, as free_joint's — a
+# client that died mid-check left J6 limp until a mode change).
+TIMEOUT_TICKS = 30000
 
 
 def hall_joint_index(has_hall_sensor, joint_num):
@@ -53,6 +56,7 @@ class HallCheck:
         self.log = log
         self.active = False
         self._ticks = 0
+        self._since_renewal = 0
         self._prev_pin = -1
         ctx.hall_check_joint = -1
         self._publish_off()
@@ -74,6 +78,7 @@ class HallCheck:
         if self.joint is None:
             return "this robot has no joint with <has_hall_sensor>1"
         if self.active:
+            self._since_renewal = 0             # renewed: another TIMEOUT_TICKS
             return None
         if not idle or mode_pending:
             return "only in IDLE (enabled or not, homed or not)"
@@ -82,6 +87,7 @@ class HallCheck:
         self._send_limits(0)                    # BEFORE the first Hall command (this tick's dispatch)
         self.motors[self.joint].additional_pin2 = None
         self._ticks = 0
+        self._since_renewal = 0
         self._prev_pin = -1
         self._publish_off()
         self.rti["hall_check_joint"][0] = self.joint + 1
@@ -111,6 +117,10 @@ class HallCheck:
             self.stop("the robot left IDLE or a mode change was requested")
             return
         self._ticks += 1
+        self._since_renewal += 1
+        if self._since_renewal >= TIMEOUT_TICKS:
+            self.stop("2 minutes without a renewal")
+            return
         if self._ticks % RESEND_TICKS == 0:
             self.motors[self.joint].Send_Limits(Velocity_limit=int(self.velocity_limit[self.joint]), Current_limit=0)
         if self._ticks <= SETTLE_TICKS:

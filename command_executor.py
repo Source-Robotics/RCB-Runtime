@@ -25,6 +25,7 @@ License: GNU General Public License v3.0
 Contact: petar@source-robotics.com
 """
 
+import ipaddress
 import json
 import logging
 logger = logging.getLogger("exec")  # docs/logging.md "Logger names"
@@ -412,8 +413,10 @@ def control_holder():
 
 
 def _claim_control(conn, force=False):
-    """Take or refresh ownership. Returns (ok, message_if_refused)."""
+    """Take or refresh ownership. Returns (ok, message_if_refused). A client that loses control here (a forced or an
+    idle takeover) has its collision-detection change undone (2026-10-24), outside the lock: that sends to RTI."""
     global _owner_conn, _owner_label, _owner_since, _owner_last
+    lost = None
     with _owner_lock:
         if _owner_conn is not None and _owner_conn is not conn:
             if not force and not _owner_stale_locked():
@@ -424,13 +427,15 @@ def _claim_control(conn, force=False):
                                f"take_control(force=True) to take it now.")
             log_control.warning("%s TOOK control from %s (%s)", _client_origin(conn),
                                 _client_origin(_owner_conn), "forced" if force else "previous holder idle")
+            lost = _owner_conn
         if _owner_conn is not conn:
             _owner_conn = conn
             _owner_label = _client_label(conn)
             _owner_since = time.time()
             log_control.info("control acquired by %s", _client_origin(conn))
         _owner_last = time.time()
-        return True, None
+    _restore_collision(lost, "control taken over")
+    return True, None
 
 
 # --- Physical confirmation for a FORCED takeover (arbitration plan 4.4) -----------------
@@ -571,7 +576,8 @@ def _release_control(conn, why):
         log_control.info("control released by %s (%s)", _client_origin(conn), why)
         _owner_conn = None
         _owner_label = None
-        return True
+    _restore_collision(conn, why)           # outside the owner lock: it sends to RTI
+    return True
 pending_client = {}             # command id -> conn (queued commands awaiting completion)
 _pending_lock = threading.Lock()
 
@@ -664,9 +670,17 @@ def _reject_unsupported_per_command_options(option_overrides):
     details = "; ".join(f"{key}: {_UNSUPPORTED_PER_COMMAND_OPTIONS[key]}" for key in bad)
     raise ValueError(details)
 
+_CURVE_COMMANDS = ("move_arc", "move_circle", "move_spline")     # and their relative forms (prefix match)
+
+
 def _build_queued_command(cid, cmd, args, option_overrides):
     _reject_unsupported_per_command_options(option_overrides)
-    options = MotionOptions.from_dict(option_overrides, _get_motion_defaults())
+    defaults = _get_motion_defaults()
+    if cmd.startswith(_CURVE_COMMANDS) and "blend" not in (option_overrides or {}):
+        # A curve takes no blend yet; the session's default (set_blending) is for the other moves (2026-10-24: it made
+        # every curve fail CURVE_BLEND_UNSUPPORTED). A blend asked for on the curve itself is still refused.
+        defaults = replace(defaults, blend=0.0)
+    options = MotionOptions.from_dict(option_overrides, defaults)
     return QueuedCommand.build(cid, _next_command_seq(), cmd, args, options)
 
 
@@ -775,12 +789,47 @@ def read_live_state():
 # ack ok" shape shared by enable/disable/home/clear_errors/pause/resume/
 # enter_exec_mode, so those don't need one-off functions.
 # ========================================================================== #
+# RTI's loop tick as the status watcher last saw it change (2026-10-24): with RTI stopped, get_joints / get_pose /
+# get_digital_input answered the last values in shared memory, with no sign they were old.
+RTI_STALE_S = 0.5
+_rti_tick = {"value": None, "at": 0.0}
+
+
+def _note_rti_tick():
+    tick = int(shared_data.rti["loop_tick"][0])
+    if tick != _rti_tick["value"]:
+        _rti_tick["value"], _rti_tick["at"] = tick, time.monotonic()
+
+
+def _measured_values_stale():
+    """Why the measured values in shared memory are stale, or None. Unknown before the status watcher's first look."""
+    if _rti_tick["value"] is not None and time.monotonic() - _rti_tick["at"] > RTI_STALE_S:
+        return f"RTI is not running: its loop has not ticked for over {RTI_STALE_S:g} s, so the values would be stale"
+    if shared_data.robot_mode.get() == "FLASHING":
+        return "the robot is in flashing mode: RTI reads no drive, so the values would be stale"
+    return None
+
+
+def _refuse_stale(cid, conn, command):
+    """Answer RTI_NOT_RUNNING and return True when the measured values are stale."""
+    why = _measured_values_stale()
+    if why is None:
+        return False
+    _log_exec_reject(cid, "RTI_NOT_RUNNING", why, command=command)
+    reply(conn, {"id": cid, "status": "error", "code": "RTI_NOT_RUNNING", "message": why})
+    return True
+
+
 def _handle_get_joints(args, cid, conn):
+    if _refuse_stale(cid, conn, "get_joints"):
+        return
     data = np.rad2deg(shared_data.joint['joint_position'][:JOINT_NUM]).tolist()
     reply(conn, {"id": cid, "status": "ok", "data": data})
 
 
 def _handle_get_pose(args, cid, conn):
+    if _refuse_stale(cid, conn, "get_pose"):
+        return
     # The angles from the measured MATRIX with this process's own converter (2026-10-21), not RTI's 6-vector: what
     # get_pose returns is then always what move_pose / move_linear / is_reachable here parse, whichever RTI runs
     # (RTI's 6-vector is for the dashboard and telemetry). R = Rx(rx) Ry(ry) Rz(rz), utility/kinematics_backend.py.
@@ -933,6 +982,8 @@ def _handle_reload_recipes(args, cid, conn):
     memory (RecipeManager.reload_from_texts) and never scans the directory in its loop. Unreadable directory ->
     refused (RECIPE_DIR); a bad file inside is skipped by RTI with a log line, as reload() always did."""
     try:
+        if not DATA_RECIPE_DIR.is_dir():           # a glob of a missing folder raises nothing (2026-10-24: "ok")
+            raise FileNotFoundError(f"no recipe folder {DATA_RECIPE_DIR}")
         files = sorted(DATA_RECIPE_DIR.glob("*.xml"))
         texts = {f.name: f.read_text(encoding="utf-8", errors="replace") for f in files}
     except OSError as e:
@@ -966,6 +1017,12 @@ def _handle_set_payload(args, cid, conn):
 
 
 # --- diagnostics (2026-10-15; docs/logging.md "Runtime log levels", "Health", "Captures") -------------------------
+def _other_process_logger(name):
+    """A logger of a process set_log_level does not reach (2026-10-24: "ok", and nothing changed)."""
+    n = str(name or "").strip()
+    return any(n == p or n.startswith(p + ".") for p in ("sup", "gui", "sc", "rec"))
+
+
 def _handle_set_log_level(args, cid, conn):
     """set_log_level [name, level] — one logger's level in the executor AND in RTI (forwarded), no restart. Open to
     every client (it moves nothing). The names: utility/logger_setup.NAMES (+ toppra / can); the levels DEBUG / INFO /
@@ -973,7 +1030,9 @@ def _handle_set_log_level(args, cid, conn):
     the GUI's itself)."""
     name = args[0] if isinstance(args, (list, tuple)) and len(args) >= 1 else None
     level = args[1] if isinstance(args, (list, tuple)) and len(args) >= 2 else None
-    ok, why = apply_log_level(name, level)
+    ok, why = apply_log_level(name, level) if not _other_process_logger(name) else (False, (
+        f"{str(name).strip()!r} logs in another process (the supervisor, the dashboard, the self-collision worker or "
+        f"the recorder); set_log_level sets the executor's and RTI's loggers"))
     if not ok:
         _log_exec_reject(cid, "BAD_ARGS", why, command=_fmt_command("set_log_level", [name, level]))
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": why})
@@ -1245,16 +1304,27 @@ def _handle_save_joint_walls(args, cid, conn):
 
 
 def _handle_set_joint_speed(args, cid, conn):
-    pct = float(args[0]) if args else 100.0
-    _set_motion_defaults(speed=pct)
-    _planner.set_speed(pct)
+    """The session's default speed in percent, above 0 and at most 100: 1 is 1 % (command protocol 2, 2026-10-24 —
+    a value <= 1 was a fraction, so asking for "1 %" ran at 100 %). MotionOptions checks it."""
+    try:
+        _set_motion_defaults(speed=float(args[0]) if args else 100.0)
+    except (TypeError, ValueError) as e:
+        _log_exec_reject(cid, "BAD_ARGS", str(e), command=_fmt_command("set_joint_speed", args))
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": str(e)})
+    _planner.set_speed(_get_motion_defaults().speed)
     reply(conn, {"id": cid, "status": "ok"})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
                  command=_fmt_command("set_joint_speed", args))
 
 
 def _handle_set_blending(args, cid, conn):
-    pct = float(args[0]) if args else 0.0
+    try:
+        pct = float(args[0]) if args else 0.0
+        if not (math.isfinite(pct) and pct >= 0.0):
+            raise ValueError(f"the blend must be a number of 0 or more; got {args[0]!r}")
+    except (TypeError, ValueError) as e:
+        _log_exec_reject(cid, "BAD_ARGS", str(e), command=_fmt_command("set_blending", args))
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": str(e)})
     _set_motion_defaults(blend=pct)
     _planner.set_blend(pct)
     reply(conn, {"id": cid, "status": "ok"})
@@ -1368,6 +1438,14 @@ STOP_CONFIRM_S = 1.5
 
 
 def _handle_stop(args, cid, conn):
+    _stop_motion(cid)
+    reply(conn, {"id": cid, "status": "ok"})
+    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="stop")
+
+
+def _stop_motion(cid):
+    """stop()'s work: the queued motion dropped and failed STOPPED, the gripper held, the arm braked (EXEC: along the
+    path, then held; elsewhere IDLE). Also a disconnect's (_stop_if_left_moving)."""
     in_exec = shared_data.robot_mode.get() == "EXEC"
     with _abort_gate():                    # a command being queued right now lands before this, never after
         _planner.flush()                   # drop queued motion + reset endpoint; a new stop epoch + its fence to RTI
@@ -1380,8 +1458,36 @@ def _handle_stop(args, cid, conn):
         send_to_rti(f"exec_stop:{epoch}" if in_exec else "set_mode:IDLE", cid, "TCP")
     if in_exec:
         _confirm_exec_stop(epoch, cid)
-    reply(conn, {"id": cid, "status": "ok"})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="stop")
+
+
+def _stop_if_left_moving(conn, who):
+    """The control holder disconnected with its moves still running: stop the arm (2026-10-24, user: "Stop the arm" —
+    its queued moves played to the end with nobody connected). A program that wants its moves to finish calls
+    wait_idle() before disconnecting. Called before the holder's control is released."""
+    with _owner_lock:
+        holder = _owner_conn is conn
+    with _pending_lock:
+        running = any(c is conn for c in pending_client.values())
+    if not (holder and running):
+        return
+    why = f"{who} disconnected with its moves still running: the arm stops"
+    log_stop.warning(why)
+    log_activity(_exec_activity_logger, "EXEC", "warning", "STOPPED_ON_DISCONNECT", message=why)
+    _stop_motion(None)
+
+
+# TCP keepalive on every client connection (2026-10-24): a network that dies silently (a cable pulled, no reset) was
+# noticed only when a send failed — minutes of retransmission, or never with nothing to send — and the dead
+# connection kept control. Probes after 5 s idle, every 2 s, 3 lost: a dead peer is found in about 11 s.
+KEEPALIVE_IDLE_S, KEEPALIVE_INTERVAL_S, KEEPALIVE_PROBES = 5, 2, 3
+
+
+def _keepalive(sock):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, value in (("TCP_KEEPIDLE", KEEPALIVE_IDLE_S), ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S),
+                       ("TCP_KEEPCNT", KEEPALIVE_PROBES)):
+        if hasattr(socket, opt):            # Linux; elsewhere the system's own timing
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), value)
 
 
 def _confirm_exec_stop(epoch, cid):
@@ -1443,6 +1549,8 @@ def _handle_get_digital_input(args, cid, conn):
                           command=_fmt_command("get_digital_input", args))
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_PIN",
                             "message": f"input pin must be 1-3, got {args[0]}"})
+    if _refuse_stale(cid, conn, _fmt_command("get_digital_input", args)):
+        return
     reply(conn, {"id": cid, "status": "ok", "data": bool(shared_data.gpio_states[idx])})
 
 
@@ -1516,6 +1624,93 @@ def _arg_positive(v):
     return repr(f)
 
 
+# The RTI setters' values (2026-10-24, findings triage rti 4-6): RTI refused a bad value only in its own log while the
+# client got "ok" — and rti_set_tcp_vel_limit turned a negative value or NaN into no cap at all (max(0.0, nan) is 0.0).
+def _finite_or_raise(v, what):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(what) from None
+    if not math.isfinite(f):
+        raise ValueError(what)
+    return f
+
+
+def _arg_nonneg(v):
+    """A finite number of 0 or more."""
+    f = _finite_or_raise(v, "a number of 0 or more")
+    if f < 0:
+        raise ValueError("a number of 0 or more")
+    return repr(f)
+
+
+def _arg_unit_share(v):
+    """A share above 0 and at most 1 (rti_set_vel_scale)."""
+    f = _finite_or_raise(v, "a number above 0 and at most 1")
+    if not 0 < f <= 1:
+        raise ValueError("a number above 0 and at most 1")
+    return repr(f)
+
+
+def _arg_opt_finite(v):
+    """Empty (keep the current value) or a finite number: rti_set_servo_generator's gain and lookaheads."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return ""
+    return repr(_finite_or_raise(v, "a finite number, or empty"))
+
+
+def _arg_opt_rate(v):
+    """rti_connect's command rate: empty (hard RTI) or a rate in Hz above 0. RTI paired a bad rate as hard RTI."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return ""
+    f = _finite_or_raise(v, "a rate in Hz above 0, or empty")
+    if f <= 0:
+        raise ValueError("a rate in Hz above 0, or empty")
+    return repr(f)
+
+
+def _arg_name(v):
+    """A name: text, not empty, without ':' (RTI's wire format splits on it)."""
+    s = "" if v is None else str(v).strip()
+    if not s or ":" in s:
+        raise ValueError("a name (text without ':')")
+    return s
+
+
+def _arg_ipv4(v):
+    """The PC's IPv4 address (rti_connect; RTI's wire format splits on ':')."""
+    try:
+        return str(ipaddress.IPv4Address(str(v).strip()))
+    except ValueError:
+        raise ValueError("the PC's IPv4 address") from None
+
+
+def _arg_transport(v):
+    """rti_connect's transport: empty (UDP), "udp" or "tcp"."""
+    s = "" if v is None else str(v).strip().lower()
+    if s not in ("", "udp", "tcp"):
+        raise ValueError('"udp", "tcp" or empty')
+    return s
+
+
+def _arg_byte(v):
+    """A gripper position or speed: a whole number 0-255 (2026-10-24: set_gripper sent `& 0xFF`, so 256 was 0)."""
+    f = _finite_or_raise(v, "a whole number 0-255")
+    if not (f == int(f) and 0 <= int(f) <= 255):
+        raise ValueError("a whole number 0-255")
+    return str(int(f))
+
+
+def _arg_gripper_current(v):
+    """set_gripper's current: a whole number of mA, 1 to the gripper XML's <Ilim> (2026-10-24: -1 reached the drive as
+    65535 mA — the firmware takes it as its current limit)."""
+    cap = int(cfg.get('gripper_Ilim') or 0)
+    f = _finite_or_raise(v, f"a current of 1-{cap} mA")
+    if not (f == int(f) and 1 <= int(f) <= cap):
+        raise ValueError(f"a current of 1-{cap} mA (the gripper XML's <Ilim>)")
+    return str(int(f))
+
+
 def _arg_one_of(*allowed):
     def check(v):
         if str(v).strip() not in allowed:
@@ -1563,18 +1758,22 @@ def _arg_whole(v):
     return str(int(f))
 
 
-def _arg_finite(v):
-    """Any finite number (2026-10-24: a jog speed of NaN ran the joint at FULL speed — RTI's clamp
-    max(0, min(1, nan)) is 1)."""
+def _arg_jog_percent(v):
+    """jog's speed: percent of the joint's speed limit, 0 to 100 (command protocol 2, 2026-10-24: it was a fraction
+    0-1). RTI's jog_set keeps its fraction, so it is passed on divided by 100. A NaN ran the joint at FULL speed until
+    2026-10-24 (RTI's clamp max(0, min(1, nan)) is 1)."""
     try:
         f = float(v)
     except (TypeError, ValueError):
-        raise ValueError("a finite number") from None
-    if not math.isfinite(f):
-        raise ValueError("a finite number")
-    return repr(f)
+        raise ValueError("a percent from 0 to 100") from None
+    if not (math.isfinite(f) and 0.0 <= f <= 100.0):
+        raise ValueError("a percent from 0 to 100")
+    return repr(f / 100.0)
 
 
+# Each joint's current limit as the drive has it now (2026-10-24): set_pid_gains changes it, and joint_test checked
+# against the start-up value while RTI checks the live one — an "ok" here, refused silently there.
+_live_ilim = [float(v) for v in cfg['motor_Ilim'][:JOINT_NUM]]
 _JOINT_TEST_MAX_DEG = 15.0          # robotics/joint_test.py MAX_AMPLITUDE_DEG / MAX_SPEED_DPS
 _JOINT_TEST_MAX_DPS = 10.0
 
@@ -1595,9 +1794,9 @@ def _handle_joint_test(args, cid, conn):
     if not 0 <= j <= JOINT_NUM:
         return bad(f"joint_test: joint {j} — expected 1-{JOINT_NUM}, or 0 to stop")
     if j and not (all(math.isfinite(x) for x in (a, v, c)) and 0 < abs(a) <= _JOINT_TEST_MAX_DEG
-                  and 0 < v <= _JOINT_TEST_MAX_DPS and 0 < c <= float(cfg['motor_Ilim'][j - 1])):
+                  and 0 < v <= _JOINT_TEST_MAX_DPS and 0 < c <= _live_ilim[j - 1]):
         return bad(f"joint_test: amplitude 0-{_JOINT_TEST_MAX_DEG:g} deg, speed 0-{_JOINT_TEST_MAX_DPS:g} deg/s, "
-                   f"current up to J{j}'s limit ({float(cfg['motor_Ilim'][j - 1]):.0f} mA)")
+                   f"current up to J{j}'s limit ({_live_ilim[j - 1]:.0f} mA)")
     send_to_rti(f"joint_test:{j}:{a!r}:{v!r}:{c!r}", cid, "TCP")
     reply(conn, {"id": cid, "status": "ok"})
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
@@ -1625,14 +1824,33 @@ _jog_conn = None
 
 
 def _handle_jog(args, cid, conn):
-    """jog [joint, direction, speed] -> RTI jog_set (each value checked: _arg_jog_joint, _arg_whole, _arg_finite)."""
+    """jog [joint, direction, speed %] -> RTI jog_set (each value checked: _arg_jog_joint, _arg_whole,
+    _arg_jog_percent)."""
     global _jog_conn
     _jog_conn = conn
-    return _forward_fmt("jog_set", "jog", 3, (_arg_jog_joint, _arg_whole, _arg_finite))(args, cid, conn)
+    return _forward_fmt("jog_set", "jog", 3, (_arg_jog_joint, _arg_whole, _arg_jog_percent))(args, cid, conn)
 
 
 _JOG_PROFILES = ("trapezoidal", "scurve")       # robotics/jog.py _PROFILE_TO_IDX (pinned by test_exec_command_args)
 _JOG_CONTROL_MODES = ("pid", "pd")              # robotics/jog.py _CONTROL_TO_IDX
+# The jog's names in any case, with the usual spellings (2026-10-24: "SCurve" or "trapezoid" were BAD_ARGS, unlike
+# set_profile's).
+_JOG_PROFILE_SPELLINGS = {"trapezoidal": "trapezoidal", "trapezoid": "trapezoidal", "trap": "trapezoidal",
+                          "scurve": "scurve", "s_curve": "scurve", "s-curve": "scurve"}
+
+
+def _arg_jog_profile(v):
+    name = _JOG_PROFILE_SPELLINGS.get(str(v).strip().lower())
+    if name is None:
+        raise ValueError("one of " + ", ".join(_JOG_PROFILES))
+    return name
+
+
+def _arg_jog_control_mode(v):
+    name = str(v).strip().lower()
+    if name not in _JOG_CONTROL_MODES:
+        raise ValueError("one of " + ", ".join(_JOG_CONTROL_MODES))
+    return name
 
 
 def _forward_fmt(prefix, cmd_name, argc, checks=None):
@@ -1658,6 +1876,38 @@ def _forward_fmt(prefix, cmd_name, argc, checks=None):
         log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
                      command=_fmt_command(cmd_name, args))
     return handler
+
+
+def _gripper_only(handler, cmd_name):
+    """Refuse a gripper command on a robot without a CAN gripper (2026-10-24: answered "ok" and nothing happened)."""
+    def checked(args, cid, conn):
+        if not _HAS_CAN_GRIPPER:
+            why = f"{cmd_name}: this robot has no CAN gripper (the active gripper XML's <CAN_gripper> is not 1)"
+            _log_exec_reject(cid, "NO_GRIPPER", why, command=cmd_name)
+            return reply(conn, {"id": cid, "status": "error", "code": "NO_GRIPPER", "message": why})
+        return handler(args, cid, conn)
+    return checked
+
+
+_QUEUED_GRIPPER_COMMANDS = ("open_gripper", "close_gripper", "move_gripper")
+
+
+def _queued_gripper_problem():
+    """(code, why) when a queued gripper command cannot run, else None (2026-10-24): without a CAN gripper it waited
+    out its 5 s on shared memory nothing writes; in motor mode RTI sends the gripper no target, so it failed after 5 s
+    or "settled" at once on a stale position."""
+    if not _HAS_CAN_GRIPPER:
+        return "NO_GRIPPER", "this robot has no CAN gripper (the active gripper XML's <CAN_gripper> is not 1)"
+    if int(shared_data.rti['gripper_ctrl_mode'][0]) == 1:
+        return "GRIPPER_MOTOR_MODE", "the gripper is in motor mode: set_gripper_ctrl_mode(2) first"
+    return None
+
+
+def _gripper_status():
+    g = shared_data.gripper
+    return {"mode": {1: "motor", 2: "firmware"}.get(int(shared_data.rti['gripper_ctrl_mode'][0]), "unknown"),
+            "calibrated": bool(int(g['gripper_calibrated'][0])), "position": int(g['gripper_position'][0]),
+            "code": int(g['gripper_object_detection'][0])}
 
 
 def _hall_check_status(rti):
@@ -1733,9 +1983,12 @@ def _handle_set_pid_gains(args, cid, conn):
         return reply(conn, {"id": cid, "status": "error", "code": "REJECTED", "message": msg})
     payload = {"msg": "set_pid_gains", "joint": joint, **gains}
     send_payload_to_rti(payload, cid, "TCP")
+    if "Ilim" in gains:
+        _live_ilim[joint] = float(gains["Ilim"])          # joint_test checks against what the drive has now
     reply(conn, {"id": cid, "status": "ok"})
+    # The gains themselves in the activity log (2026-10-24: only the joint was recorded).
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                 command=_fmt_command("set_pid_gains", [payload["joint"]]))
+                 command=_fmt_command("set_pid_gains", [payload["joint"], gains]))
 
 
 def _bool_arg(args, cid, conn, command, *, required):
@@ -1855,6 +2108,107 @@ def _handle_take_control(args, cid, conn):
     _complete_takeover(cid, conn, force)
 
 
+RTI_STOP_WAIT_S = 2.0       # the longest rti_connect waits for a stopping RTI session (braking + its 0.5 s hold)
+
+
+def _rti_stopping():
+    """True while an RTI session brakes to rest or holds after its stop (sub-state 3 / 4, in an RTI mode)."""
+    try:
+        return (shared_data.robot_mode.get() in _RTI_MODES
+                and float(shared_data.rti["rti_substate"][0]) >= _RTI_DRIVING_MIN + 1.0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def _handle_rti_connect(args, cid, conn):
+    """rti_connect [pc_ip, rate or "", transport] — refused while a PC drives the arm (2026-10-24: it dropped the
+    claim and held the measured pose at once, a hard stop from speed) and from the other RTI mode (RTI refused that
+    mode change, but the pairing changed anyway). The protocol rule already limits it to IDLE / RTI / SOFT_RTI."""
+    want = "SOFT_RTI" if len(args) >= 2 and str(args[1]).strip() else "RTI"
+    # A session that is stopping (after rti_release(), RTIClient.stop() or a lost link) ends by itself within its
+    # braking + hold: wait for it rather than refuse (2026-10-25: api_tests/41 re-paired right after a release and was
+    # refused). Only control that is still ACTIVE refuses at once.
+    deadline = time.monotonic() + RTI_STOP_WAIT_S
+    while _rti_stopping() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    mode = shared_data.robot_mode.get()
+    why = None
+    if _rti_stopping():
+        why = f"the RTI session is still stopping after {RTI_STOP_WAIT_S:g} s: try again once it has stopped"
+    elif _rti_driving():
+        why = "a PC is driving the arm (an RTI session's control is active): rti_release() first"
+    elif mode in _RTI_MODES and mode != want:
+        why = f"the robot is in {mode}; rti_connect for {want} needs IDLE: rti_disconnect() first"
+    if why is not None:
+        _log_exec_reject(cid, "REJECTED", why, command=_fmt_command("rti_connect", args))
+        return reply(conn, {"id": cid, "status": "error", "code": "REJECTED", "message": why})
+    return _forward_fmt("rti_connect", "rti_connect", 3, (_arg_ipv4, _arg_opt_rate, _arg_transport))(args, cid, conn)
+
+
+_GRAVITY_STILL_RAD_S = math.radians(float(_sys["safety_monitor"].get("hold_still_dps", 0.5)))
+
+
+def _handle_set_gravity_comp(args, cid, conn):
+    """set_gravity_comp [on] — refused while a joint is commanded to move or a PC drives the arm in RTI (2026-10-24,
+    user: "Refuse while moving / torque"): the switch acts at once, so mid-move the position loops had to catch the
+    weight, and in an RTI torque stream nothing caught it. RTI does not publish the stream type, so every RTI session
+    with control counts; a PC uses rti_set_gravity_comp for its own session."""
+    moving = bool(np.any(np.abs(shared_data.joint['joint_speed_commanded'][:JOINT_NUM]) > _GRAVITY_STILL_RAD_S))
+    why = ("a joint is commanded to move: switch it with the arm at rest" if moving else
+           "a PC drives the arm in RTI: use rti_set_gravity_comp() for the session" if _rti_driving() else None)
+    if why is not None:
+        _log_exec_reject(cid, "REJECTED", f"set_gravity_comp: {why}", command=_fmt_command("set_gravity_comp", args))
+        return reply(conn, {"id": cid, "status": "error", "code": "REJECTED", "message": f"set_gravity_comp: {why}"})
+    return _forward_fmt("gravity_comp", "set_gravity_comp", 1, (_arg_switch,))(args, cid, conn)
+
+
+# Collision detection (2026-10-24, user: "Back when the client leaves"): a change lasts while the client that made it
+# holds control; when it releases control, loses it or disconnects, the reaction returns to system.xml's start value —
+# a program that switched it off and crashed left every later program and the jogging unchecked until RTI restarted.
+_COLLISION_START = str(_sys["safety_monitor"].get("collision", "warn"))
+_COLLISION_MONITOR_ON = bool(_sys["safety_monitor"].get("enabled", 1))
+_collision_by = None         # the connection whose change is in force, until it leaves
+
+
+def _collision_checkable():
+    """None when collision detection can check something, else why not: the monitor is switched off in system.xml, or
+    the robot XML has no <collision_torque_nm> / <contact_torque_nm> above 0 (the monitor then checks nothing)."""
+    if not _COLLISION_MONITOR_ON:
+        return "the safety monitor is off in system.xml (<safety_monitor><enabled>)"
+    nm = [float(v or 0) for v in (cfg.get('collision_torque_nm') or [])] + \
+         [float(v or 0) for v in (cfg.get('contact_torque_nm') or [])]
+    if not any(v > 0 for v in nm):
+        return "the robot XML gives no joint a <collision_torque_nm> or <contact_torque_nm>"
+    return None
+
+
+def _handle_set_collision_detection(args, cid, conn):
+    """set_collision_detection ["off" | "warn" | "stop"] — "warn" / "stop" refused when nothing can be checked
+    (2026-10-24: "ok", and the robot then reported "off"). Its client's change is undone when it leaves."""
+    global _collision_by
+    word = str(args[0]).strip().lower() if len(args) == 1 else None
+    why = _collision_checkable() if word in ("warn", "stop") else None
+    if why is not None:
+        _log_exec_reject(cid, "REJECTED", f"set_collision_detection: {why}",
+                         command=_fmt_command("set_collision_detection", args))
+        return reply(conn, {"id": cid, "status": "error", "code": "REJECTED",
+                            "message": f"set_collision_detection: nothing can be checked — {why}"})
+    _forward_fmt("collision_detection", "set_collision_detection", 1, (_arg_one_of("off", "warn", "stop"),))(
+        args, cid, conn)
+    if word in ("off", "warn", "stop"):
+        _collision_by = None if word == _COLLISION_START else conn
+
+
+def _restore_collision(conn, why):
+    """The client that changed collision detection left control: back to the start value (RTI logs the change)."""
+    global _collision_by
+    if conn is None or _collision_by is not conn:
+        return
+    _collision_by = None
+    send_to_rti(f"collision_detection:{_COLLISION_START}", None, "TCP")
+    log_control.warning("collision detection back to %r: %s (%s)", _COLLISION_START, why, _client_origin(conn))
+
+
 def _handle_release_control(args, cid, conn):
     """release_control() — give up control. Always allowed, never refused."""
     released = _release_control(conn, "explicit release")
@@ -1913,10 +2267,10 @@ IMMEDIATE_HANDLERS = {
     "jog":          _handle_jog,
     "jog_stop":         _forward_to_rti("jog_stop", "jog_stop"),
     "set_jog_accel":        _forward_fmt("jog_accel", "set_jog_accel", 1, (_arg_positive,)),
-    "set_jog_profile":      _forward_fmt("jog_profile", "set_jog_profile", 1, (_arg_one_of(*_JOG_PROFILES),)),
+    "set_jog_profile":      _forward_fmt("jog_profile", "set_jog_profile", 1, (_arg_jog_profile,)),
     "set_jog_jerk_factor":  _forward_fmt("jog_jerk_factor", "set_jog_jerk_factor", 1, (_arg_positive,)),
-    "set_jog_control_mode": _forward_fmt("jog_control_mode", "set_jog_control_mode", 1, (_arg_one_of(*_JOG_CONTROL_MODES),)),
-    "set_gravity_comp":     _forward_fmt("gravity_comp", "set_gravity_comp", 1, (_arg_switch,)),
+    "set_jog_control_mode": _forward_fmt("jog_control_mode", "set_jog_control_mode", 1, (_arg_jog_control_mode,)),
+    "set_gravity_comp":     _handle_set_gravity_comp,      # refused while moving / an RTI session drives
     "set_friction_comp":    _forward_fmt("friction_comp", "set_friction_comp", 1, (_arg_switch,)),
     "set_inertia_comp":     _forward_fmt("inertia_comp", "set_inertia_comp", 1, (_arg_switch,)),
     "set_can_read_first":   _forward_fmt("can_read_first", "set_can_read_first", 1, (_arg_switch,)),   # TODO/can_tx_timing_plan.md option B
@@ -1925,9 +2279,9 @@ IMMEDIATE_HANDLERS = {
     "joint_test":       _handle_joint_test,             # robotics/joint_test.py (IDLE + ENABLED)
     "set_coriolis_comp":    _forward_fmt("coriolis_comp", "set_coriolis_comp", 1, (_arg_switch,)),
     "set_friction_ff":      _forward_fmt("friction_ff", "set_friction_ff", 1, (_arg_switch,)),   # utility/friction_model.py
-    # collision detection's reaction (utility/safety_monitor.py; until RTI restarts — a PC program that pushes on purpose)
-    "set_collision_detection": _forward_fmt("collision_detection", "set_collision_detection", 1,
-                                        (_arg_one_of("off", "warn", "stop"),)),
+    # collision detection's reaction (utility/safety_monitor.py; a PC program that pushes on purpose): while its client
+    # holds control, then back to system.xml's start value (2026-10-24)
+    "set_collision_detection": _handle_set_collision_detection,
     "set_pid_gains":    _handle_set_pid_gains,
     # --- RTI mode handshake (TODO/RTI_mode_plan.md §4d). The UDP setpoint stream
     # bypasses this process entirely and goes straight to RTI's socket; only the
@@ -1938,32 +2292,38 @@ IMMEDIATE_HANDLERS = {
     # every existing caller) or "tcp". _forward_fmt validates EXACT arity, so the client
     # always sends all three fields rather than a variable-length call — a variable-length
     # rti_connect is how SOFT_RTI was made unreachable on its first hardware run.
-    "rti_connect":      _forward_fmt("rti_connect", "rti_connect", 3),
+    "rti_connect":      _handle_rti_connect,       # checked (2026-10-24): the IP, the rate, the transport
     "rti_claim":        _forward_to_rti("rti_claim", "rti_claim"),
     "rti_release":      _forward_to_rti("rti_release", "rti_release"),
     "rti_disconnect":   _forward_to_rti("rti_disconnect", "rti_disconnect"),
     # Strict switches (2026-10-24): RTI reads only "1" as on, so a raw JSON "true" switched these protections OFF.
     "rti_set_rate_limiter":     _forward_fmt("rti_set_rate_limiter", "rti_set_rate_limiter", 1, (_arg_switch,)),
     "rti_set_gravity_comp":     _forward_fmt("rti_set_gravity_comp", "rti_set_gravity_comp", 1, (_arg_switch,)),
-    "rti_set_dynamics_ff":      _forward_fmt("rti_set_dynamics_ff", "rti_set_dynamics_ff", 1),
-    "rti_set_tcp_vel_limit":    _forward_fmt("rti_set_tcp_vel_limit", "rti_set_tcp_vel_limit", 1),
-    "rti_set_command_timeout":  _forward_fmt("rti_set_command_timeout", "rti_set_command_timeout", 1),
-    "rti_set_vel_scale":        _forward_fmt("rti_set_vel_scale", "rti_set_vel_scale", 1),
-    "rti_set_servo_generator":  _forward_fmt("rti_set_servo_generator", "rti_set_servo_generator", 4),
-    "rti_set_pace":             _forward_fmt("rti_set_pace", "rti_set_pace", 1),
-    "rti_set_state_rate":       _forward_fmt("rti_set_state_rate", "rti_set_state_rate", 1),
+    # Values checked here (2026-10-24); RTI checks them again (and refuses what depends on its session, in its log).
+    "rti_set_dynamics_ff":      _forward_fmt("rti_set_dynamics_ff", "rti_set_dynamics_ff", 1, (_arg_name,)),
+    "rti_set_tcp_vel_limit":    _forward_fmt("rti_set_tcp_vel_limit", "rti_set_tcp_vel_limit", 1, (_arg_nonneg,)),
+    "rti_set_command_timeout":  _forward_fmt("rti_set_command_timeout", "rti_set_command_timeout", 1, (_arg_positive,)),
+    "rti_set_vel_scale":        _forward_fmt("rti_set_vel_scale", "rti_set_vel_scale", 1, (_arg_unit_share,)),
+    "rti_set_servo_generator":  _forward_fmt("rti_set_servo_generator", "rti_set_servo_generator", 4,
+                                             (_arg_name, _arg_opt_finite, _arg_opt_finite, _arg_opt_finite)),
+    "rti_set_pace":             _forward_fmt("rti_set_pace", "rti_set_pace", 1, (_arg_nonneg,)),
+    "rti_set_state_rate":       _forward_fmt("rti_set_state_rate", "rti_set_state_rate", 1, (_arg_nonneg,)),  # 0: every tick
     "reload_recipes":           _handle_reload_recipes,     # reads the files here, RTI parses from memory
     "take_control":             _handle_take_control,
     "release_control":          _handle_release_control,
     "set_force_confirm":        _handle_set_force_confirm,
-    "rti_set_min_duration":     _forward_fmt("rti_set_min_duration", "rti_set_min_duration", 1),
+    "rti_set_min_duration":     _forward_fmt("rti_set_min_duration", "rti_set_min_duration", 1, (_arg_nonneg,)),
     "set_recipe":               _forward_fmt("set_recipe", "set_recipe", 1, (_arg_recipe,)),
     "rti_set_start_pose_check": _forward_fmt("rti_set_start_pose_check",
                                              "rti_set_start_pose_check", 1, (_arg_switch,)),
-    "rti_set_lowpass":  _forward_fmt("rti_set_lowpass", "rti_set_lowpass", 1),
-    "calibrate_gripper": _forward_to_rti("gripper_calibrate", "calibrate_gripper"),
-    "set_gripper_ctrl_mode": _forward_fmt("gripper_ctrl_mode", "set_gripper_ctrl_mode", 1, (_arg_one_of("1", "2"),)),
-    "set_gripper":       _forward_fmt("gripper_set", "set_gripper", 4),
+    "rti_set_lowpass":  _forward_fmt("rti_set_lowpass", "rti_set_lowpass", 1, (_arg_nonneg,)),
+    # The gripper's commands: refused without a CAN gripper; set_gripper's values checked (2026-10-24)
+    "calibrate_gripper": _gripper_only(_forward_to_rti("gripper_calibrate", "calibrate_gripper"), "calibrate_gripper"),
+    "set_gripper_ctrl_mode": _gripper_only(_forward_fmt("gripper_ctrl_mode", "set_gripper_ctrl_mode", 1,
+                                                        (_arg_one_of("1", "2"),)), "set_gripper_ctrl_mode"),
+    "set_gripper":       _gripper_only(_forward_fmt("gripper_set", "set_gripper", 4,
+                                                    (_arg_byte, _arg_byte, _arg_gripper_current, _arg_switch)),
+                                       "set_gripper"),
 }
 
 
@@ -1973,7 +2333,20 @@ def handle_immediate(cmd, msg, cid, conn):
         _log_exec_reject(cid, "UNHANDLED", f"immediate command '{cmd}' not handled", command=cmd)
         return reply(conn, {"id": cid, "status": "error", "code": "UNHANDLED",
                             "message": f"immediate command '{cmd}' not handled"})
-    handler(msg.get("args", []) or [], cid, conn)
+    args = msg.get("args", []) or []
+    # One guard for every handler (2026-10-24): an exception used to leave dispatch into handle_client, which dropped
+    # the connection — and with it control — instead of answering (a raw client's text where a number belongs).
+    try:
+        handler(args, cid, conn)
+    except (TypeError, ValueError, IndexError, KeyError) as e:
+        why = f"{cmd}: an argument could not be read ({type(e).__name__}: {e})"
+        _log_exec_reject(cid, "BAD_ARGS", why, command=_fmt_command(cmd, args if isinstance(args, list) else [args]))
+        reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": why})
+    except Exception as e:                     # noqa: BLE001 — answered and logged; the connection stays
+        logger.exception(f"{cmd} failed")
+        why = f"{cmd} failed on the robot ({type(e).__name__}: {e})"
+        _log_exec_reject(cid, "INTERNAL", why, command=cmd)
+        reply(conn, {"id": cid, "status": "error", "code": "INTERNAL", "message": why})
 
 
 def _fail_pending(code, message):
@@ -2083,7 +2456,9 @@ def current_status():
         "friction_ff": bool(shared_data.rti["friction_ff_enabled"][0] > 0.5),
         # Collision detection's reaction in force: "off" | "warn" | "stop" (system.xml <safety_monitor><collision> at
         # RTI's start; set_collision_detection changes it until RTI restarts; "off" also when nothing can be checked).
-        "collision_detection": ("off", "warn", "stop")[min(2, max(0, int(shared_data.rti["collision_mode"][0])))],
+        # "off" also while system.xml switches the safety monitor off: then nothing is checked (2026-10-24).
+        "collision_detection": (("off", "warn", "stop")[min(2, max(0, int(shared_data.rti["collision_mode"][0])))]
+                                if _COLLISION_MONITOR_ON else "off"),
         # RTI's CAN tick order: True = read first, send early (option B; start state system.xml <can_read_first>, ON),
         # False = the old order — also while homing, which always uses it (set_can_read_first switches it).
         "can_read_first": bool(shared_data.rti["can_read_first"][0] > 0.5),
@@ -2102,6 +2477,10 @@ def current_status():
         "payload": {"mass": float(shared_data.rti["payload_mass"][0]),
                     "com": [float(shared_data.rti["payload_com_x"][0]), float(shared_data.rti["payload_com_y"][0]),
                             float(shared_data.rti["payload_com_z"][0])]},
+        # The gripper (2026-10-24; None without a CAN gripper): its control mode ("motor" / "firmware"), whether the jaws
+        # are calibrated, their position (0 open .. 255 closed) and the gripper's code (0 moving, 1 / 2 an object while
+        # opening / closing, 3 at the target).
+        "gripper": _gripper_status() if _HAS_CAN_GRIPPER else None,
     }
     evt.update(_planner_status())
     return evt
@@ -2153,6 +2532,7 @@ def status_watcher():
     fw_check_failed = False
     log_status.info(f"watcher running ({STATUS_POLL_HZ:.0f} Hz check, push-on-change)")
     while True:
+        _note_rti_tick()
         evt = current_status()
         mode = evt.get("mode")
         if last_mode == "EXEC" and mode != "EXEC":
@@ -2261,6 +2641,11 @@ def dispatch(msg, conn):
 
 def _submit_queued(cmd, args, msg, cid, conn):
     """A queued command's check -> register -> queue -> ack. dispatch() holds _abort_gate() around it."""
+    if cmd in _QUEUED_GRIPPER_COMMANDS:
+        problem = _queued_gripper_problem()
+        if problem is not None:
+            _log_exec_reject(cid, problem[0], problem[1], command=_fmt_command(cmd, args))
+            return reply(conn, {"id": cid, "status": "error", "code": problem[0], "message": problem[1]})
     aborted = _planner.abort_info() if _planner is not None else None
     if aborted is not None:
         why = (f"motion is aborted: command {aborted['cid']} failed ({aborted['code']})"
@@ -2305,9 +2690,10 @@ def handle_client(conn, addr):
         # connection's entry when the same host reconnected.
         active_clients[conn] = conn
     log_tcp.info(f"client connected {ip}:{port}")
-    reply(conn, current_status())   # snapshot so the client isn't blind until first change
     try:
-        for line in _read_lines(conn):
+        _keepalive(conn)
+        reply(conn, current_status())   # snapshot so the client isn't blind until first change (inside the try: a
+        for line in _read_lines(conn):  # failure here still closes and forgets the connection, 2026-10-24)
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError as e:
@@ -2321,6 +2707,7 @@ def handle_client(conn, addr):
     finally:
         with _clients_lock:
             active_clients.pop(conn, None)
+        _stop_if_left_moving(conn, f"{ip}:{port}")
         # A dropped TCP connection must never hold the robot hostage.
         _release_control(conn, "disconnected")
         global _jog_conn

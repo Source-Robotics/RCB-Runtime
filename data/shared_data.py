@@ -505,7 +505,8 @@ def setup(joints: int = 6, force_reinit: bool = False):
 
     # ========================= Active data recipe =========================
     active_recipe = SharedString("active_recipe", 64)
-    active_recipe.set("standard")   # default recipe — override from GUI
+    if active_recipe.created or not active_recipe.get():
+        active_recipe.set("standard")   # the default for a new segment only; RTI sets it at its own start (2026-10-24)
 
     # Signal flag: GUI sets to "1" after uploading a new recipe XML file;
     # RTI calls recipe_mgr.reload() and clears it back to "0".

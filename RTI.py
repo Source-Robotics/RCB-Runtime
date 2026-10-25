@@ -517,7 +517,10 @@ def main():
     _gripper_err_prev = [False]          # the error pass's last error_active: an error latching holds the jaws
     # Calibrate state machine. After Send_gripper_calibrate fires, the bus must be
     # held with *empty* Send_gripper_data_pack() polls — resuming the full data
-    # pack mid-calibration cancels it. We don't try to auto-detect completion
+    # pack mid-calibration cancels it. Its end (2026-10-24, as homing's robotics/homing/gripper.py): the gripper's
+    # calibrated bit, read only after the gripper's own <homing_calibration_wait_s> (the firmware keeps the old bit
+    # while it recalibrates); it used to run out the 30 s and then resend the old target, so the jaws moved by
+    # themselves. Before that change: we didn't try to auto-detect completion
     # The user interrupts the state by clicking Open/Close/Goto/Stop, which aborts the calibration via the
     # gripper_set handler. The hard timeout is a safety backstop only.
     st._gripper_calibrate_pending = False
@@ -527,6 +530,7 @@ def main():
     # when homing gives it back. See the handover block in the superloop.
     st._gripper_was_owned = False
     _GRIPPER_CALIBRATE_MAX_TICKS = max(1, round(30.0 / delta_t))  # safety timeout
+    _GRIPPER_CALIBRATE_MIN_TICKS = max(1, round(float(cfg.get('gripper_homing_calibration_wait_s') or 2.0) / delta_t))
 
 
     # ==========================================================================
@@ -815,6 +819,9 @@ def main():
     # fresh process always starts from "no PC paired".
     shared_data.rti["rti_substate"][0] = 0
     shared_data.rti["control_success_rate"][0] = 0
+    # The telemetry recipe starts from "standard" with RTI (2026-10-24: every process's setup() reset it, so a
+    # dashboard restart or a worker respawn switched a PC's recipe back mid-session; setup() now sets it only new).
+    shared_data.active_recipe.set("standard")
     shared_data.rti["rti_consecutive_misses"][0] = 0
     shared_data.rti["rti_worst_consecutive_misses"][0] = 0
     shared_data.rti["rti_tx_bytes_per_s"][0] = 0
@@ -1643,6 +1650,10 @@ def main():
     def _handle_gripper_calibrate(cmd_msg, cmd_dict):
         if active_CAN_gripper:
             st._gripper_calibrate_pending = True
+            # No target after the calibration (2026-10-24): the old one was sent again once it ended, so the jaws
+            # moved without a command. The firmware ends its calibration idle; empty polls keep it so.
+            _gripper_fw_state['action'] = 0
+            _gripper_fw_state['_idle_repeats'] = 0
 
 
     def _handle_gripper_ctrl_mode(cmd_msg, cmd_dict):
@@ -1763,6 +1774,7 @@ def main():
         log_handler.info("Paired with %s over %s", pc_ip, st.rti_transport.upper())
 
         st.rti_pc_ip = pc_ip
+        rti_handler.reset_safety_switches()      # the user, 2026-10-24: never inherited from an earlier session
         rti_handler.connect_pc((pc_ip, RTI_PORT_SENDER),
                                current_tick=int(shared_data.rti["loop_tick"][0]))
         _want = RobotMode.SOFT_RTI if rate_hz is not None else RobotMode.RTI
@@ -2770,10 +2782,8 @@ def main():
         else:
             rti_udp_data, rti_udp_count = drain_rti_udp(
                 RTI_socket_receive, allowed_ip=st.rti_pc_ip, allowed_port=None)
-            if rti_udp_data is not None:
-                # Process data. Lazy %s, not an f-string: this runs every streaming tick and the root
-                # logger is at INFO, so the packet's repr is never built unless DEBUG is on (hot-path rule).
-                log_handler.debug("Received valid RTI data: %s", rti_udp_data)
+            # No log line per packet (2026-10-24): set_log_level("rti.handler", "DEBUG") turned one on for every
+            # streaming tick, inside the loop — up to 250 records a second through RTI's bounded log queue.
 
         # Update per-tick TickContext fields (attribute swap, no allocation)
         # The handler sends its state packet through ctx.socket_sender.sendto() and must not
@@ -2896,6 +2906,10 @@ def main():
                 log_activity(_rti_activity_logger, "RTI", "info", "MODE_CHANGE", id=st.pending_mode_request_id,
                              message=f"{_from_mode} → {st.current_mode}")
 
+                if new_mode == RobotMode.SAFETY_STOP:
+                    # The motors off hold the jaws too (2026-10-24: the user's "freeze it also" named safety_stop()).
+                    _freeze_gripper("motors off")
+
                 # Apply the streaming contract BEFORE enter(). Both RTI modes share one
                 # handler, so the mode is the only thing that says which contract this session
                 # runs under — timeout, generator, pacing. Set before enter() so claim_control()
@@ -2989,7 +3003,12 @@ def main():
                 # or the safety timeout fires.
                 Motor[joint_num].Send_gripper_data_pack()
                 st._gripper_calibrate_ticks += 1
-                if st._gripper_calibrate_ticks > _GRIPPER_CALIBRATE_MAX_TICKS:
+                if (st._gripper_calibrate_ticks >= _GRIPPER_CALIBRATE_MIN_TICKS
+                        and int(getattr(Motor[joint_num], 'gripper_calibrated', 0) or 0) == 1):
+                    log_gripper.info("firmware calibration done after %.1f s",
+                                     st._gripper_calibrate_ticks * delta_t)
+                    st._gripper_calibrate_running = False
+                elif st._gripper_calibrate_ticks > _GRIPPER_CALIBRATE_MAX_TICKS:
                     log_gripper.warning("firmware calibration timed out")
                     st._gripper_calibrate_running = False
             else:

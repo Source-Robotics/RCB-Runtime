@@ -652,7 +652,7 @@ def _jog_start(joint_idx, direction):
     # jogging with no way for its own button to end it.
     if _ctl_view["other"]:
         return
-    speed = _jog_state['speed_pct']
+    speed = _jog_state['speed_pct'] * 100.0          # the slider's fraction; jog() takes percent (protocol 2)
     _exec(lambda r: r.jog(joint_idx, direction, speed), "jog_set")
 
 def _jog_stop():
@@ -793,7 +793,7 @@ with ui.card().classes("w-full mb-2") as _jog_card:
         if _ctl_view["other"]:
             return          # start/continue is gated; the stop above and on_end never are
         direction = 1 if x > 0 else -1
-        speed_pct = min(abs(x), 1.0)
+        speed_pct = min(abs(x), 1.0) * 100.0          # jog() takes percent (command protocol 2)
         _exec(lambda r: r.jog(joint_idx, direction, speed_pct), "jog_set")
 
     ui.separator()
@@ -994,7 +994,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
 
                 ui.separator().props("vertical")
                 ui.label("Cur (mA):").classes("text-sm text-gray-500")
-                _gr_cur_slider = ui.slider(min=0, max=1500, value=200).classes("w-40")
+                _gr_cur_slider = ui.slider(min=1, max=1500, value=200).classes("w-40")   # set_gripper: 1 mA up (2026-10-24)
                 _gr_cur_label  = ui.label("200").classes("text-sm font-mono w-12")
                 def _on_gr_cur(e):
                     _gripper_cmd_state['current'] = int(e.args)

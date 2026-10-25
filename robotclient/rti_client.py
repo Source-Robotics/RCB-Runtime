@@ -315,7 +315,8 @@ class RTIClient:
 
     When commands stop coming or a stream breaks a limit, the arm brakes to
     rest within its limits, then the robot latches an error and disables:
-    `RTI_LINK_LOST`, `RTI_NO_SEND_TIME`, or per joint `RTI_POSITION_LIMIT`,
+    `RTI_LINK_LOST`, `RTI_START_POSE` (a first command too far from the arm),
+    `RTI_NO_SEND_TIME`, or per joint `RTI_POSITION_LIMIT`,
     `RTI_VELOCITY_LIMIT`, `RTI_ACCELERATION_LIMIT` or `RTI_JERK_LIMIT`. Its
     state stream then ends, and `control()` raises `ControlLost`.
 

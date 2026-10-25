@@ -214,6 +214,7 @@ def check_hall(ctx, ui):
                           3.0, 0.1)
         if started is None:
             return result(st, FAIL, "the robot did not start the Hall check", hints=["logs/RTI.log"])
+        robot.hall_check(True)          # renews the check's 2 minutes for the wait below (2026-10-24)
         first = ui.wait(f"{name} is limp now (hold the gripper if its weight could turn it). Turn {name} SLOWLY by "
                         "hand through its magnet and a little past it",
                         lambda: (lambda h: h if h.get("changes", 0) >= 2 else None)(_hall(ctx)), HALL_TIMEOUT_S,
@@ -232,6 +233,7 @@ def check_hall(ctx, ui):
                                 f"{_fmt(first.get('edge_deg'))})", value=first)]
         if ui.confirm(f"Check that it triggers at the same place? Turn {name} back past the magnet, then through it "
                       "again the SAME way as before."):
+            robot.hall_check(True)      # renewed again: the question above may have taken a while
             again = ui.wait(f"Turn {name} back past the magnet, then through it again the same way",
                             lambda: (lambda h: h if h.get("changes", 0) >= 6 else None)(_hall(ctx)), HALL_TIMEOUT_S,
                             0.1)

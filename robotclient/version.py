@@ -24,7 +24,7 @@ from .exceptions import VersionMismatch, VersionWarning
 
 __version__ = "0.10.0"
 
-PROTOCOL_VERSION = 1        # the command protocol (newline JSON over TCP to the executor)
+PROTOCOL_VERSION = 2        # the command protocol (newline JSON over TCP to the executor); 2: speeds in percent
 RTI_PROTOCOL_VERSION = 1    # the RTI command packet
 TELEMETRY_FORMAT = 1        # the state / telemetry packets ("tag:v,v,...")
 

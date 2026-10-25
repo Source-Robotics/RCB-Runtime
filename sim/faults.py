@@ -648,8 +648,8 @@ def motors_off_with_error(ctx, notes):
 
 
 def gripper_hold(ctx, notes):
-    """stop(), disable() and an error hold the gripper's jaws where they are (2026-10-24, user: a stop "should freeze it
-    also"): the jaws close from open (the simulated ones take ~0.85 s for the stroke), 0.3 s later the stop comes; the
+    """stop(), disable(), safety_stop() and an error hold the gripper's jaws where they are (2026-10-24, user: a stop
+    "should freeze it also"): the jaws close from open (the simulated ones take ~0.85 s for the stroke), 0.3 s later the stop comes; the
     jaws' target becomes where they are, and they stay there instead of closing on."""
     r = ctx.robot()
     g = 6                                                # the gripper's node
@@ -660,7 +660,7 @@ def gripper_hold(ctx, notes):
         def state():
             n = ctx.nodes()[g]
             return int(n["g_target"]), int(n["g_position"])
-        for how in ("stop", "disable", "error"):
+        for how in ("stop", "disable", "safety_stop", "error"):
             ctx.ready(r)
             r.set_gripper(1, 255, 300, 1)                # open, and wait until open
             if not _wait(lambda: abs(state()[1] - 1) <= 3, 3.0):
@@ -677,6 +677,8 @@ def gripper_hold(ctx, notes):
                 r.stop(wait=True)
             elif how == "disable":
                 r.disable(wait=True)
+            elif how == "safety_stop":
+                r.safety_stop(wait=True)                 # motors off (2026-10-24: missed by the first freeze)
             else:
                 ctx.sim(cmd="fault", node=1, kind="driver")
                 _wait(lambda: r.status().get("err") == 1, 2.0)
@@ -686,6 +688,8 @@ def gripper_hold(ctx, notes):
             notes.append(f"{how}: closing, at {moving_at} when stopped; at {pos} with their target {target} 0.6 s later "
                          f"({'held' if held else 'NOT held' if moving_at > 20 else 'not closing when stopped'})")
             ok = ok and held
+            if how == "safety_stop":
+                r.release_safety_stop(wait=True)
             if how == "error":
                 ctx.sim(cmd="fault", node=1, kind="clear")
                 time.sleep(0.2)

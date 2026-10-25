@@ -199,7 +199,7 @@ def main():
     ap.add_argument("--holds", default="0.1,0.3,0.6,1.0,2.0", help="seconds held before the release")
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--deg", type=float, default=50.0, help="J1's travel (J5: a fifth of it)")
-    ap.add_argument("--speed", type=float, default=0.6, help="the move's speed (a fraction; J1 peaks near 60 deg/s)")
+    ap.add_argument("--speed", type=float, default=60.0, help="the move's speed (percent; J1 peaks near 60 deg/s)")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--reanalyse", metavar="RUN_DIR")
     args = ap.parse_args()

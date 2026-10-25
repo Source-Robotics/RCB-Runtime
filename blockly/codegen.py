@@ -17,9 +17,9 @@ spinning a core). `rt` is blockly/runtime.py; the points table is written in as 
 starts at 0.
 
 Units: blocks show mm and degrees; the API takes metres and radians for a pose (degrees for joints). `rt.pose()`
-converts; a relative move's mm are written as metres here. Speeds are written as FRACTIONS (50 % -> speed=0.5): the
-executor reads a per-command speed <= 1.0 as a fraction and anything above as a percent (motion/trajectory_planner.py
-`_speed_scale_for`), so "1 %" written as speed=1 would run at 100 %.
+converts; a relative move's mm are written as metres here. Speeds are written as the block's percent (50 % ->
+speed=50): every speed is a percent since command protocol 2 (2026-10-24; until then a value <= 1 was a fraction, and
+the blocks wrote 50 % as speed=0.5).
 
 Value kinds (a socket names the kinds it takes, and Blockly's own connection checks use the same names):
     Number, Boolean, String, Any (a variable)    Joints (deg list), Pose (m/rad list), Point (a {joints_deg, pose} dict)
@@ -486,8 +486,8 @@ def _option(block, field, allowed):
 
 
 def _speed(block):
-    """The block's speed as the FRACTION the executor reads (see the module docstring)."""
-    return repr(_number(block, "SPEED", "the speed", 1, 100) / 100.0)
+    """The block's speed in percent, as the executor reads it (see the module docstring)."""
+    return repr(float(_number(block, "SPEED", "the speed", 1, 100)))
 
 
 def _visit(block, ctx):

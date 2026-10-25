@@ -379,7 +379,7 @@ class DryRunRobotClient(RobotClient):
         return True
 
 
-    def on_error(self, fn: Callable[[str], None]) -> None:
+    def on_error(self, fn: Callable[[dict], None]) -> None:
         self._on_error = fn
 
     def on_status_change(self, fn: Callable[[dict], None]) -> None:
@@ -392,10 +392,13 @@ class DryRunRobotClient(RobotClient):
         self._on_motion_error = fn
 
 
-    def _queued(self, command, args=None, timeout=DEFAULT_MOVE_TIMEOUT, options=None):
-        del timeout
+    def _queued(self, command, args=None, timeout=DEFAULT_MOVE_TIMEOUT, options=None, gripper=False):
+        del timeout, gripper          # the base client's _queued_gripper passes it (2026-10-24); nothing waits here
         command_id = generate_id()
-        resolved = replace(MotionOptions.from_dict(options, self._defaults), dry_run=False)
+        defaults = self._defaults
+        if command.startswith(("move_arc", "move_circle", "move_spline")) and "blend" not in (options or {}):
+            defaults = replace(defaults, blend=0.0)      # as the executor: a curve ignores the session blend (2026-10-24)
+        resolved = replace(MotionOptions.from_dict(options, defaults), dry_run=False)
         queued = QueuedCommand.build(command_id, self._next_seq, command, args or [], resolved)
         self._next_seq += 1
         self._planner.enqueue(queued)

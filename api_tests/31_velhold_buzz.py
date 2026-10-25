@@ -173,7 +173,7 @@ def main():
                 robot.set_gravity_comp(True); time.sleep(0.3)
                 try:
                     robot.enter_jog_mode(); time.sleep(0.3)
-                    robot.jog(j, 1, 0.15); time.sleep(0.35)
+                    robot.jog(j, 1, 15); time.sleep(0.35)
                     robot.jog_stop(); time.sleep(0.3)
                     robot.enter_idle_mode(); time.sleep(0.3)
                 except Exception as exc:
