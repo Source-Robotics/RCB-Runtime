@@ -575,6 +575,7 @@ def main():
     # system.xml says <can_read_first>1 (the default since 2026-10-12, §9.11; below, once the meter exists),
     # `can_read_first:1|0` at runtime.
     first_frame_wait = FirstFrameWait(_CAN_IF)
+    first_frame_wait.open()                 # here, once: never inside a tick (the runtime switch only flips it)
     # Option B's CAN read: python-can's receive without its per-frame select() and Message object, on the same socket
     # (hardware/can_hardware.FastCanReader, 2026-10-12).
     fast_can_reader = FastCanReader(communication1)
@@ -1452,7 +1453,8 @@ def main():
         if len(parts) != 2:
             return
         if not first_frame_wait.set_enabled(parts[1].strip() == "1"):
-            _answer_refusal("RTI_REFUSED", "read-first stays off: its socket did not open (RTI.log says why)")
+            _answer_refusal("RTI_REFUSED", "read-first stays off: its socket did not open at RTI's start (RTI.log "
+                                           "says why)")
 
     def _handle_coriolis_comp(cmd_msg, cmd_dict):
         _dynamics_switch(cmd_msg, 'coriolis_comp_enabled', "Coriolis")
@@ -1860,7 +1862,8 @@ def main():
                      getattr(st.current_mode, "value", st.current_mode))
             return
         if rti_handler.sub_state != 'connected':
-            _refused(log_handler, "rti_claim rejected — sub_state is '%s'", rti_handler.sub_state)
+            _refused(log_handler, "rti_claim rejected — the session is %s; a claim needs a paired PC and no claim "
+                     "active", rti_handler.sub_state or "not paired (rti_connect() first)")
             return
         # Seed the rate limiter from the live arm, so its first output ramps from where the
         # robot actually is rather than from 0 rad.
@@ -2161,7 +2164,8 @@ def main():
         the PC's UDP sender is already dead. If neither arrives the timeout covers it.
         """
         if not rti_handler.request_release():
-            _refused(log_handler, "rti_release ignored — sub_state is '%s'", rti_handler.sub_state)
+            _refused(log_handler, "rti_release ignored — no claim is active (the session is %s)",
+                     rti_handler.sub_state or "not paired")
 
 
     def _handle_rti_disconnect(cmd_msg, cmd_dict):

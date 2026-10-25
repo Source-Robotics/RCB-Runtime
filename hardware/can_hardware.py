@@ -318,9 +318,18 @@ def open_first_frame_socket(interface="can0", can_ids=FIRST_FRAME_IDS):
 class FirstFrameWait:
     """Off until set_enabled(True) (RTI's `can_read_first:1`, option B — whose switch this object's state is). Per
     tick: prepare() before the commands are queued, then wait() right after — or skip() on a tick that queued none
-    (HOMING / FLASHING)."""
+    (HOMING / FLASHING).
+
+    The socket is opened ONCE, by open() at RTI's start before the loop, and kept for the whole run (2026-10-25): opening
+    a raw CAN socket (its filter, its bind) and closing it wait for the kernel's network lock, and the runtime switch
+    (`can_read_first:1|0`) is handled inside a tick — where that wait stalled the loop 8-44 ms whenever another process
+    held the lock (utility/loop_delay.py, the meter's same mistake). set_enabled() only flips the switch."""
 
     DRAIN_MAX = 512
+    # The socket's receive buffer, small: while the switch is off nothing reads it, so J1's echoes pile up until it is
+    # full; the first prepare() after switching on throws them away — a few dozen frames, not the default buffer's
+    # hundreds (~2 ms of reads in one tick). Also bounds the backlog a homing leaves (HOMING skips the waiter).
+    RCVBUF_BYTES = 16384
 
     def __init__(self, interface="can0", timeout_s=0.001, open_socket=open_first_frame_socket):
         self.interface = interface
@@ -334,18 +343,30 @@ class FirstFrameWait:
         self.wait_sum = 0.0
         self.wait_max = 0.0
 
+    def open(self):
+        """At RTI's start, before the loop: open the socket for the whole run (never inside a tick). True when open; a
+        socket that cannot open is an ERROR, and the switch then stays OFF (the old tick order)."""
+        try:
+            sock = self._open(self.interface)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.RCVBUF_BYTES)
+            sock.settimeout(self.timeout_s)
+        except OSError as e:
+            self._sock = None
+            logger.error(f"read-first: cannot open a socket on {self.interface}: {e} — stays OFF (the old tick order)")
+            return False
+        self._sock = sock
+        return True
+
     def set_enabled(self, on):
-        """Cold path (a command): open / close the socket, log the change and, when switching off, the waits."""
+        """Cold path (a command, handled inside a tick): flip the switch, log the change and, when switching off, the
+        waits. Opens and closes NOTHING (open() did, at start). False: refused — the socket did not open at start."""
         on = bool(on)
         if on == self.enabled:
             return True
         if on:
-            try:
-                self._sock = self._open(self.interface)
-                self._sock.settimeout(self.timeout_s)
-            except OSError as e:
-                self._sock = None
-                logger.error(f"read-first: cannot open a socket on {self.interface}: {e} — stays OFF (the old tick order)")
+            if self._sock is None:
+                logger.error(f"read-first: its socket on {self.interface} did not open at RTI's start — stays OFF (the "
+                             f"old tick order)")
                 return False
             self.waits = self.timeouts = 0
             self.wait_sum = self.wait_max = 0.0
@@ -357,12 +378,7 @@ class FirstFrameWait:
         mean = self.wait_sum / self.waits * 1e3 if self.waits else 0.0
         logger.info(f"read-first OFF after {self.waits} waits: mean {mean:.3f} ms, max {self.wait_max * 1e3:.3f} ms, "
                     f"{self.timeouts} timed out")
-        try:
-            self._sock.close()
-        except (OSError, AttributeError):
-            pass
-        self._sock = None
-        return True
+        return True                          # the socket stays open (closing it would wait for the network lock)
 
     def prepare(self):
         """Before the tick's commands are queued: throw away every echo already there, so the next frame the socket

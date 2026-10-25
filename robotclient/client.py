@@ -1309,8 +1309,8 @@ class RobotClient:
 
         Errors:
             BAD_ARGS: A raw client sent a value other than true / false or 1 / 0.
-            RTI_REFUSED: The read-first socket did not open (RTI.log says why): the old
-                tick order stays.
+            RTI_REFUSED: The read-first socket did not open when the robot software
+                started (RTI.log says why): the old tick order stays.
             RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
                 responding. The command may still have taken effect.
 

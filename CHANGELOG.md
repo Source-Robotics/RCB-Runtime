@@ -13,6 +13,14 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+### Fixed
+
+- Switching the read-first tick order at runtime (`set_can_read_first()`) no longer opens or closes a socket inside
+  the control loop, where it could stall the loop like the loop-delay measurement did: the socket is opened once when
+  the robot software starts. If it could not open then, the switch is refused (`RTI_REFUSED`).
+- `rti_claim()` and `rti_release()` refused with no PC paired said "sub_state is 'None'"; they now say the session
+  is not paired (`rti_connect()` first).
+
 ## [1.1.0] - 2026-10-25
 
 ### Added
