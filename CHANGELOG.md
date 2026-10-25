@@ -13,6 +13,34 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+### Added
+
+- `RTI_REFUSED` (6026): the real-time controller refused a command; the message gives its reason.
+
+### Changed
+
+- Every command the robot passes to its real-time controller (58 of them: `enable`, `home`, the mode changes,
+  `stop`, the jog, gripper and real-time settings, `hall_check`, `free_joint`, `joint_test`, `set_payload`,
+  `set_recipe`, the reloads, ...) now replies with the controller's own answer. A refusal raises `CommandRejected`
+  with its code and reason (`MODE_REJECTED`, `ENABLE_REJECTED`, `HALL_CHECK_REFUSED`, `FREE_JOINT_REFUSED`,
+  `JOINT_TEST_REFUSED`, `RTI_REFUSED`); until now the reply was "ok" and the refusal reached only the activity log.
+  No answer within 1 s raises `RTI_NOT_RUNNING`. These replies take about one control tick longer (4 to 8 ms).
+  Asking for the mode the robot is already in is still answered "ok".
+
+- The test recordings in `temp_data` (what the measurement scripts in `api_tests` save) are kept to 500 MB together,
+  down from 1 GB; the oldest runs are deleted first. On a Pi with a larger SD card, set
+  `utility/housekeeping.RECORDINGS_BUDGET_BYTES` back to 1 GB.
+- The control loop's delay per joint is measured on request instead of live: the dashboard's RT Diagnostics card has
+  a Measure button (3 s), and `tools/loop_delay.py` does the same in a terminal. A separate process records the CAN
+  bus and reads the control loop's own timing; the control loop does nothing for it.
+
+### Fixed
+
+- Single control-loop ticks of 8 to 44 ms that latched LOOP_CRITICAL and disabled the arm, now and then and at
+  random: the live loop-delay measurement switched a CAN socket filter inside the control loop, and that call waits
+  for the operating system's network lock whenever anything else holds it. A Wi-Fi reconnect was the usual trigger.
+  The control loop makes no such call any more.
+
 ## [1.0.0] - 2026-10-25
 
 ### Added

@@ -1179,7 +1179,38 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 ui.label("")
                 can_age_peak_label = ui.label("—")
 
-            # The control loop's delay per joint (2026-10-12, utility/loop_delay_meter.py, RTI writes it 5x a second).
+            # The control loop's delay per joint, ON REQUEST (2026-10-25): the button runs tools/loop_delay.py, which
+            # records the bus with candump and RTI's read times from its trace — RTI does nothing for it. Until then RTI
+            # measured it live (utility/loop_delay_meter.py) and its socket-filter switches stalled the tick now and then.
+            _LOOP_DELAY_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "loop_delay.py")
+            _LOOP_DELAY_S = 3
+
+            def _loop_delay_text(res):
+                if not res.get("ok"):
+                    return f"cannot measure: {res.get('error', 'no answer')}"
+                parts = [f"{name} {s['med']:.1f}/{s['max']:.1f}" if s.get("n") else f"{name} —"
+                         for name, s in res["joints"].items()]
+                return ("   ".join(parts) + f"   (median / max, {res['ticks']} ticks, "
+                        f"{res['measured_utc'][11:19]} UTC, order: {res['order']})")
+
+            async def _measure_loop_delay():
+                loop_delay_button.disable()
+                loop_delay_label.text = f"measuring for {_LOOP_DELAY_S} s ..."
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        sys.executable, _LOOP_DELAY_TOOL, "--seconds", str(_LOOP_DELAY_S), "--json",
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    out, err = await asyncio.wait_for(proc.communicate(), timeout=_LOOP_DELAY_S + 20)
+                    text = out.decode(errors="replace").strip()
+                    res = json.loads(text.splitlines()[-1]) if text else {
+                        "ok": False, "error": err.decode(errors="replace").strip()[-200:] or "no output"}
+                except Exception as exc:
+                    res = {"ok": False, "error": str(exc)}
+                finally:
+                    loop_delay_button.enable()
+                loop_delay_label.text = _loop_delay_text(res)
+
             with ui.row().classes("items-center gap-1 no-wrap mt-2 font-mono text-sm"):
                 ui.label("Loop delay (ms)")
                 with ui.icon("help_outline").classes("text-gray-400 cursor-help text-sm"):
@@ -1189,8 +1220,14 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                         ui.label(
                             "Per joint: from the moment the joint's CAN reply (its position, speed, current) "
                             "arrives to the moment the CAN command RTI computed from that reply leaves. Measured "
-                            "live: RTI's CAN read timestamps every reply, a read-only socket sees our own "
-                            "commands leave; sampled 5 times a second, median / max of the last ~5 s.")
+                            f"when you press Measure, never on its own: for {_LOOP_DELAY_S} s a separate process "
+                            "records the CAN bus (candump: the replies and our commands with the kernel's times) "
+                            "and RTI's CAN read times from its trace; median / max over those ticks. RTI does "
+                            "nothing for it (tools/loop_delay.py; the same from a terminal).")
+                        ui.label("Until 2026-10-25 RTI measured this live and switched a CAN socket filter "
+                                 "inside its tick; that call waits for the kernel's network lock, so a network "
+                                 "change elsewhere (a Wi-Fi reconnect) stalled the loop 8-44 ms now and then "
+                                 "(LOOP_CRITICAL).").classes("italic")
                         ui.label("Normal tick order: ~7.8 ms. The reply arrives while RTI sleeps, is read in "
                                  "the next tick, used by the tick after that, and that command leaves only when "
                                  "RTI sleeps again — about two ticks.")
@@ -1204,8 +1241,10 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                             "depend on it (measured: 66 / 68 unchanged with option B).").classes("italic")
                         ui.label("A max one tick (~4 ms) above the median = a reply that came after RTI's read "
                                  "now and then; often = load on the Pi.")
+                loop_delay_button = ui.button(f"Measure ({_LOOP_DELAY_S} s)", icon="timer",
+                                              on_click=_measure_loop_delay).props("color=grey outline size=sm")
                 loop_delay_order_label = ui.label("—").classes("text-gray-500 ml-2")
-            loop_delay_label = ui.label("—").classes("font-mono text-sm")
+            loop_delay_label = ui.label("not measured — press Measure").classes("font-mono text-sm")
 
             with ui.row().classes("mt-2 gap-2"):
                 ui.button("Reset Loop Stats (peaks)", icon="restart_alt",
@@ -4022,11 +4061,6 @@ def update_tables():
         # is old and the bus view is otherwise current.
         can_age_min_label.text  = f"min {_cage_min:.2f}"
         can_age_peak_label.text = f"{shared_data.rti['can_frame_age_peak'][0]*1e3:.2f}"
-        _ld = shared_data.rti['loop_delay'] * 1e3
-        _ldm = shared_data.rti['loop_delay_max'] * 1e3
-        loop_delay_label.text = "   ".join(
-            f"J{j + 1} {_ld[j]:.1f}/{_ldm[j]:.1f}" if _ld[j] == _ld[j] else f"J{j + 1} —"      # NaN: not measured yet
-            for j in range(_ld.size)) + "   (median / max)"
         loop_delay_order_label.text = ("order: option B (read first)" if shared_data.rti['can_read_first'][0] > 0.5
                                        else "order: normal")
         # Colour the live value: green = current, amber = drifting, red = acting on the past.

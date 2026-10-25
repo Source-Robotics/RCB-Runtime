@@ -533,9 +533,8 @@ class RobotClient:
         """Enable the robot, so that it can home and move.
 
         The robot accepts it in any mode. While an error is latched, a pressed
-        E-stop included, the robot refuses to enable and stays disabled. That
-        refusal reaches only the robot's activity log: the call returns normally,
-        and with `wait` it raises `RobotTimeout` after 10 s. Call `clear_errors()`
+        E-stop included, the robot refuses to enable and stays disabled: the
+        call raises `CommandRejected` (`ENABLE_REJECTED`). Call `clear_errors()`
         first.
 
         In IDLE mode, on a homed arm with gravity compensation on (as at every
@@ -547,10 +546,17 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report itself enabled within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            ENABLE_REJECTED: An error is latched (a pressed E-stop included) or a safety
+                violation is active: the robot stays disabled. `clear_errors()` first.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `disable()`, `clear_errors()`, `home()`
@@ -582,9 +588,14 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
+            CommandRejected: RTI refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report itself disabled within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             It also ends motors off and firmware flashing, whichever client sends
@@ -619,9 +630,14 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
+            CommandRejected: RTI refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, an
                 error was still latched after 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             A fault that is still present can be missing from the status for up to
@@ -643,18 +659,25 @@ class RobotClient:
 
         In EXEC mode the robot plays the moves a program queues, in the order they
         were sent. On entry it holds the arm where it is. Calling it in EXEC mode
-        changes nothing (the robot's activity log shows a refused mode change).
+        changes nothing.
 
         Args:
             wait: Wait until the robot reports EXEC mode, up to 10 s.
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: The robot refused it: it is not in IDLE or EXEC mode,
-                not enabled or not homed, or another client holds control.
+            CommandRejected: The robot refused it: it is not in IDLE or EXEC mode, not
+                enabled or not homed, or another client holds control. Or RTI refused it
+                or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report EXEC mode within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            MODE_REJECTED: RTI refused EXEC: an error is latched, or the arm is not
+                enabled or not homed. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `enter_idle_mode()`, `stop()`, `move_joints()`
@@ -759,8 +782,9 @@ class RobotClient:
         Raises:
             CommandRejected: The robot refused it: it is not in IDLE mode or in the
                 real-time mode asked for, a PC drives the arm or its session did not
-                stop within 2 s, a value is invalid,
-                it is not enabled or not homed, or another client holds control.
+                stop within 2 s, a value is invalid, it is not enabled or not homed, or
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report the mode within 10 s.
             RobotConnectionError: The client is not connected.
@@ -775,6 +799,12 @@ class RobotClient:
             BAD_ARGS: `pc_ip` is not an IPv4 address, `rate_hz` is not above 0,
                 `transport` is not `"udp"` or `"tcp"`, or the message did not carry
                 exactly three values.
+            MODE_REJECTED: RTI refused RTI / SOFT_RTI mode: an error is latched, or the
+                arm is not enabled or not homed. The message says why.
+            RTI_REFUSED: The message reached RTI without your PC's address. The message
+                says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `rti_claim()`, `rti_disconnect()`, `rti_set_command_timeout()`,
@@ -827,11 +857,19 @@ class RobotClient:
         control of the robot (`take_control()`) does not expire.
 
         Raises:
-            CommandRejected: The robot refused it: it is not in a real-time mode
-                (for example right after `rti_connect()` without `wait`), not
-                enabled or not homed, or another client holds control.
+            CommandRejected: The robot refused it: it is not in a real-time mode (for
+                example right after `rti_connect()` without `wait`), not enabled or not
+                homed, or another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_REFUSED: No claim: an error is latched, the robot is not in an RTI mode,
+                the PC is not paired or a claim is active already, or the rate limiter
+                cannot start. The message says which.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             From the claim on, the arm follows your PC's commands. Keep the space
@@ -875,9 +913,16 @@ class RobotClient:
         it.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_REFUSED: No session to release: no claim is active. The message says
+                why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `rti_claim()`, `rti_disconnect()`
@@ -920,10 +965,15 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: it is in another mode (EXEC, JOG,
-                homing, motors off, flashing), or another client holds control.
+                homing, motors off, flashing), or another client holds control. Or RTI
+                refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report IDLE mode within 10 s, for example with an error latched.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             It never brakes. Sent while a stream moves the arm, the arm coasts in
@@ -968,13 +1018,16 @@ class RobotClient:
             `rti_connect()`: a session never inherits it switched off.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: The value is not true or false (1 / 0), or the message did
                 not carry exactly one value; this client always sends one.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             Off, nothing limits how fast a command moves the arm: a position step
@@ -1022,7 +1075,8 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: `cutoff_hz` is negative or not
-                finite, or another client holds control.
+                finite, or another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `cutoff_hz` is not a number. Nothing is sent.
@@ -1031,6 +1085,10 @@ class RobotClient:
         Errors:
             BAD_ARGS: `cutoff_hz` is negative or not a finite number, or the
                 message did not carry exactly one value.
+            RTI_REFUSED: RTI could not use the value. The message says why; the setting
+                in force stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             It lasts across sessions, from any PC: switch it off (0) when your
@@ -1072,13 +1130,16 @@ class RobotClient:
             `<rti_defaults><start_pose_tol_rad>`, read at start.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: The value is not true or false (1 / 0), or the message did
                 not carry exactly one value; this client always sends one.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             With the check off, a first command far from the arm, such as all
@@ -1124,8 +1185,9 @@ class RobotClient:
             Always `None`: the robot's answer carries no data.
 
         Raises:
-            CommandRejected: The robot refused it: a joint is moving, a PC drives
-                the arm in a real-time session, or another client holds control.
+            CommandRejected: The robot refused it: a joint is moving, a PC drives the
+                arm in a real-time session, or another client holds control. Or RTI
+                refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
@@ -1136,6 +1198,8 @@ class RobotClient:
                 rest, and in a session use `rti_set_gravity_comp()`.
             BAD_ARGS: The value was not true or false (1 / 0); this client always
                 sends one of them.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             The switch is a step in the torque the joints get, which is why the
@@ -1186,13 +1250,16 @@ class RobotClient:
             Always `None`: the robot's answer carries no data.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: The value was not true or false (1 / 0); this client always
                 sends one of them.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             Off, the drives' own position control makes the accelerating torque, so
@@ -1235,12 +1302,17 @@ class RobotClient:
             `None`: the robot sends no data back.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: A raw client sent a value other than true / false or 1 / 0.
+            RTI_REFUSED: The read-first socket did not open (RTI.log says why): the old
+                tick order stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             When the robot cannot open the CAN socket it needs to read first, it
@@ -1292,7 +1364,8 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: it is not in IDLE mode or not
-                enabled, a value is out of range, or another client holds control.
+                enabled, a value is out of range, or another client holds control. Or
+                RTI refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: A value is not a number, or `joint` is not a whole number.
@@ -1305,6 +1378,13 @@ class RobotClient:
                 not above 0 and up to 10 deg/s, or `current_ma` is not above 0 and
                 up to the joint's current limit in force (`set_pid_gains()` may
                 have changed it).
+            JOINT_TEST_REFUSED: The test cannot start: the robot software started less
+                than 1.2 s ago, another test, a freed joint or the Hall sensor check
+                runs, the joint has not reported its position yet, or, on a homed arm,
+                the move would pass the joint's soft limits. The message says why; `seq`
+                does not change.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             The joint moves by itself, with no check of the safety zones or
@@ -1313,14 +1393,6 @@ class RobotClient:
             and nothing is checked. Only the 2-degree tracking limit and the
             current limit stop a running test. The other joints hold still
             meanwhile. Keep the space clear and a hand on the E-stop.
-
-        Note:
-            The robot can still refuse to start the test after it answered: in the
-            first 1.2 s after the robot software starts, while another test, a
-            freed joint or the Hall sensor check runs, before the joint has
-            reported its position, or, on a homed arm, for a move past the joint's
-            soft limits. That refusal reaches only the robot's activity log; `seq`
-            does not change.
 
         See also:
             `free_joint()`, `hall_check()`, `latest_status()`, `wait()`
@@ -1359,8 +1431,9 @@ class RobotClient:
             `None`: the robot sends no data back.
 
         Raises:
-            CommandRejected: The robot refused it: it is not in IDLE mode, `joint`
-                is out of range, or another client holds control.
+            CommandRejected: The robot refused it: it is not in IDLE mode, `joint` is
+                out of range, or another client holds control. Or RTI refused it or did
+                not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `joint` is not a whole number. Nothing is sent.
@@ -1368,16 +1441,15 @@ class RobotClient:
 
         Errors:
             BAD_ARGS: `joint` is not a whole number from 0 to the number of joints.
+            FREE_JOINT_REFUSED: The joint cannot be freed: the robot software started
+                less than 1.2 s ago, or the Hall sensor check or a test move runs. The
+                message says why; the status field stays 0.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             A freed joint holds nothing. A joint that carries the arm's weight,
             such as J2 or J3, falls at once unless someone supports the arm.
-
-        Note:
-            The robot can still refuse to free the joint after it answered: in the
-            first 1.2 s after the robot software starts, or while the Hall sensor
-            check or a test move runs. That refusal reaches only the robot's
-            activity log; the status field stays 0.
 
         See also:
             `joint_test()`, `hall_check()`, `get_joints()`
@@ -1414,23 +1486,23 @@ class RobotClient:
             `None`: the robot sends no data back.
 
         Raises:
-            CommandRejected: The robot refused it: it is not in IDLE mode, or
-                another client holds control.
+            CommandRejected: The robot refused it: it is not in IDLE mode, or another
+                client holds control. Or RTI refused it or did not answer within 1 s
+                (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: A raw client sent a value other than true / false or 1 / 0.
+            HALL_CHECK_REFUSED: The check cannot start: the arm has no Hall sensor
+                joint, the robot software started less than 1.2 s ago, or a joint is
+                free or a test move runs. The message says why; `joint` stays 0.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             The joint holds nothing while the check runs: a load off its axis turns
             it by itself. Support the tool first.
-
-        Note:
-            The robot can still refuse to start the check after it answered: on an
-            arm without a Hall sensor joint, in the first 1.2 s after the robot
-            software starts, or while a joint is free or a test move runs. That
-            refusal reaches only the robot's activity log; `joint` stays 0.
 
         See also:
             `free_joint()`, `joint_test()`, `latest_status()`
@@ -1471,13 +1543,16 @@ class RobotClient:
             Always `None`: the robot's answer carries no data.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: The value was not true or false (1 / 0); this client always
                 sends one of them.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             The torque is small at normal speeds; it grows with the square of the
@@ -1526,13 +1601,16 @@ class RobotClient:
             Always `None`: the robot's answer carries no data.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: The value was not true or false (1 / 0); this client always
                 sends one of them.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             It ships off: measured on the arm, it did not make the joints follow
@@ -1581,13 +1659,16 @@ class RobotClient:
             Always `None`: the robot's answer carries no data.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: The value was not true or false (1 / 0); this client always
                 sends one of them.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `set_gravity_comp()`, `set_friction_ff()`, `get_joint_walls()`
@@ -1642,8 +1723,9 @@ class RobotClient:
             Always `None`: the robot's answer carries no data.
 
         Raises:
-            CommandRejected: The robot refused it: `mode` is not one of the three
-                words, nothing can be checked, or another client holds control.
+            CommandRejected: The robot refused it: `mode` is not one of the three words,
+                nothing can be checked, or another client holds control. Or RTI refused
+                it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
@@ -1651,6 +1733,9 @@ class RobotClient:
             REJECTED: `"warn"` or `"stop"` while nothing can be checked: the safety
                 monitor is off, or no joint has a threshold in the robot XML.
             BAD_ARGS: `mode` is not `"off"`, `"warn"` or `"stop"`.
+            RTI_REFUSED: RTI could not read the reaction. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             With `"off"` or `"warn"` the arm keeps pushing after it hits something,
@@ -1705,9 +1790,9 @@ class RobotClient:
             asked for, in kilograms and metres, and the robot's maximum.
 
         Raises:
-            CommandRejected: The robot refused it, for example before homing, with
-                a payload out of bounds (`PAYLOAD_LIMIT`), or because another client
-                holds control.
+            CommandRejected: The robot refused it, for example before homing, with a
+                payload out of bounds (`PAYLOAD_LIMIT`), or because another client holds
+                control. Or RTI refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `mass_kg` or a value in `com_m` is not a number. Nothing is
@@ -1719,6 +1804,10 @@ class RobotClient:
             PAYLOAD_LIMIT: The mass is below 0 or above `<max_payload_kg>`, a value
                 is not finite, `com_m` does not hold exactly three numbers, or the
                 centre of mass is more than 0.5 m from the tool centre point.
+            RTI_REFUSED: RTI refused the payload. The message says why; the payload in
+                force stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             Declare what the gripper really holds, and call `set_payload(0)` once it
@@ -1756,13 +1845,16 @@ class RobotClient:
             `rti_connect()`; `rti_disconnect()` keeps it.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: The value is not true or false (1 / 0), or the message did
                 not carry exactly one value; this client always sends one.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             Off, a torque stream that adds no gravity of its own lets the arm fall,
@@ -1804,13 +1896,18 @@ class RobotClient:
             `"stream"`, set at every `rti_connect()`.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: `source` is empty or holds a colon, or the message did not
                 carry exactly one value.
+            RTI_REFUSED: RTI could not use the value. The message says why; the setting
+                in force stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `set_inertia_comp()`, `set_coriolis_comp()`, `rti_set_gravity_comp()`
@@ -1847,8 +1944,9 @@ class RobotClient:
             on PAR6. Every `rti_connect()` sets it back to that value.
 
         Raises:
-            CommandRejected: The robot refused it: `mps` is negative or not finite,
-                or another client holds control.
+            CommandRejected: The robot refused it: `mps` is negative or not finite, or
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `mps` is not a number. Nothing is sent.
@@ -1857,6 +1955,10 @@ class RobotClient:
         Errors:
             BAD_ARGS: `mps` is negative or not a finite number, or the message did
                 not carry exactly one value.
+            RTI_REFUSED: RTI could not use the value. The message says why; the setting
+                in force stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             Switching it off removes the only guard on the tool's speed near a
@@ -1900,8 +2002,9 @@ class RobotClient:
             `<rti_defaults><command_timeout_s>`, 0.04 s, read at start.
 
         Raises:
-            CommandRejected: The robot refused it: `seconds` is not a number above
-                0, or another client holds control.
+            CommandRejected: The robot refused it: `seconds` is not a number above 0, or
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `seconds` is not a number. Nothing is sent.
@@ -1910,6 +2013,10 @@ class RobotClient:
         Errors:
             BAD_ARGS: `seconds` is not a finite number above 0, or the message did
                 not carry exactly one value.
+            RTI_REFUSED: RTI could not use the value. The message says why; the setting
+                in force stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `rti_connect()`, `rti_claim()`
@@ -1948,8 +2055,9 @@ class RobotClient:
             does not reset it.
 
         Raises:
-            CommandRejected: The robot refused it: `fraction` is not above 0 and at
-                most 1, or another client holds control.
+            CommandRejected: The robot refused it: `fraction` is not above 0 and at most
+                1, or another client holds control. Or RTI refused it or did not answer
+                within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `fraction` is not a number. Nothing is sent.
@@ -1958,6 +2066,10 @@ class RobotClient:
         Errors:
             BAD_ARGS: `fraction` is not a number above 0 and at most 1, or the
                 message did not carry exactly one value.
+            RTI_REFUSED: RTI could not use the value. The message says why; the setting
+                in force stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             It lasts across sessions: set it back to 1 when your program is done,
@@ -1997,7 +2109,8 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: `multiplier` is negative or not
-                finite, or another client holds control.
+                finite, or another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `multiplier` is not a number. Nothing is sent.
@@ -2006,6 +2119,10 @@ class RobotClient:
         Errors:
             BAD_ARGS: `multiplier` is negative or not a finite number, or the
                 message did not carry exactly one value.
+            RTI_REFUSED: RTI could not use the value. The message says why; the setting
+                in force stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `rti_set_servo_generator()`, `rti_set_pace()`, `rti_set_vel_scale()`
@@ -2229,13 +2346,18 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: the folder could not be read, or
-                another client holds control.
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             RECIPE_DIR: The recipe folder does not exist, or the robot could not
                 read it or a file in it; the recipes in force stay.
+            RTI_REFUSED: RTI could not use the recipes the robot read. The message says
+                why; the recipes in force stay.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             When the file of the recipe in use is removed and the recipes are
@@ -2265,7 +2387,8 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: the file is invalid, or another
-                client holds control.
+                client holds control. Or RTI refused it or did not answer within 1 s
+                (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
@@ -2274,6 +2397,10 @@ class RobotClient:
                 newer robot software, or sets an invalid filter, such as an unknown
                 type, a median filter with an even window or an exponential filter
                 without a time constant. The message says where.
+            RTI_REFUSED: RTI could not use the filters the robot read. The message says
+                why; the filters in force stay.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             Every filter starts again, so the filtered values, and what the robot
@@ -2314,8 +2441,9 @@ class RobotClient:
             keeps the value it finds, so it lasts until changed.
 
         Raises:
-            CommandRejected: The robot refused it: `hz` is negative or not finite,
-                or another client holds control.
+            CommandRejected: The robot refused it: `hz` is negative or not finite, or
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `hz` is not a number. Nothing is sent.
@@ -2324,6 +2452,11 @@ class RobotClient:
         Errors:
             BAD_ARGS: `hz` is negative or not a finite number, or the message did
                 not carry exactly one value.
+            RTI_REFUSED: In RTI mode (hard RTI) the state stream follows your packets:
+                give `rti_connect()` a `rate_hz` (SOFT_RTI) to throttle it. Or RTI could
+                not use the value. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             `RTIClient.control()` waits 0.1 s for each packet by default, the very
@@ -2362,8 +2495,9 @@ class RobotClient:
             it finds, so it lasts until changed.
 
         Raises:
-            CommandRejected: The robot refused it: `factor` is negative or not
-                finite, or another client holds control.
+            CommandRejected: The robot refused it: `factor` is negative or not finite,
+                or another client holds control. Or RTI refused it or did not answer
+                within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `factor` is not a number. Nothing is sent.
@@ -2372,6 +2506,10 @@ class RobotClient:
         Errors:
             BAD_ARGS: `factor` is negative or not a finite number, or the message
                 did not carry exactly one value.
+            RTI_REFUSED: RTI could not use the value. The message says why; the setting
+                in force stays.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `rti_set_vel_scale()`, `rti_set_min_duration()`,
@@ -2424,8 +2562,9 @@ class RobotClient:
             time the robot software starts and last until changed.
 
         Raises:
-            CommandRejected: The robot refused it: a number is not finite, or
-                another client holds control.
+            CommandRejected: The robot refused it: a number is not finite, or another
+                client holds control. Or RTI refused it or did not answer within 1 s
+                (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `gain`, `lookahead` or `self_lookahead` is not a number.
@@ -2436,6 +2575,10 @@ class RobotClient:
         Errors:
             BAD_ARGS: `name` is empty or holds a colon, a number is not finite, or
                 the message did not carry exactly four values.
+            RTI_REFUSED: `"passthrough"` in SOFT_RTI (it needs a send time with every
+                target), or RTI could not use a value. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             In RTI mode only `"passthrough"` checks the stream itself (the speed,
@@ -2484,12 +2627,16 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: no recipe file has that name, or
-                another client holds control.
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: No recipe file of that name is on the robot.
+            RTI_REFUSED: RTI does not know the recipe. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             The real-time loop checks the name again, in lower case, against the
@@ -2531,9 +2678,16 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
+            CommandRejected: RTI refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, the
                 arm had not stopped within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_REFUSED: RTI could not read the stop it was sent: a fault, not something
+                a program causes. RTI.log has the details.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             Every client can send it. Outside EXEC mode it does not brake: from JOG
@@ -2581,12 +2735,19 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: it is not in IDLE mode or not
-                enabled, or another client holds control.
+                enabled, or another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             HomingFailed: With `wait`, homing failed. It names the robot's error
                 keys.
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
                 homing had not ended after 3 minutes.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            MODE_REJECTED: RTI refused HOMING, for example while an error is latched
+                (`clear_errors()` first). The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             The arm moves by itself to every joint's endstop. Keep the space around
@@ -2636,10 +2797,15 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: The robot is not in EXEC mode.
+            CommandRejected: The robot is not in EXEC mode. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report the program paused within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `resume()`, `stop()`
@@ -2665,11 +2831,16 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: The robot refused it: it is not in EXEC mode, or
-                another client holds control.
+            CommandRejected: The robot refused it: it is not in EXEC mode, or another
+                client holds control. Or RTI refused it or did not answer within 1 s
+                (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
                 still reported the pause after 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `pause()`, `stop()`
@@ -2946,14 +3117,18 @@ class RobotClient:
             `None`: the robot sends no value back.
 
         Raises:
-            CommandRejected: The robot refused it: the name is not a policy, or
-                another client holds control.
+            CommandRejected: The robot refused it: the name is not a policy, or another
+                client holds control. Or RTI refused it or did not answer within 1 s
+                (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: No policy was given (only a raw client can send that).
             BAD_POLICY: `policy` is not `"commanded"`, `"settled"` or `"strict"`.
+            RTI_REFUSED: RTI could not use the policy. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             `completion_policy` given as a per-move setting is refused with
@@ -2980,19 +3155,25 @@ class RobotClient:
         """Switch to JOG mode, where `jog()` moves one joint at a time.
 
         In JOG mode a joint moves while `jog()` asks for it, and `jog_stop()`
-        stops it. Nothing moves on entry. Calling it in JOG mode changes nothing
-        (the robot's activity log shows a refused mode change).
+        stops it. Nothing moves on entry. Calling it in JOG mode changes nothing.
 
         Args:
             wait: Wait until the robot reports JOG mode, up to 10 s.
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: The robot refused it: it is not in IDLE or JOG mode,
-                not enabled or not homed, or another client holds control.
+            CommandRejected: The robot refused it: it is not in IDLE or JOG mode, not
+                enabled or not homed, or another client holds control. Or RTI refused it
+                or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report JOG mode within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            MODE_REJECTED: RTI refused JOG: an error is latched, or the arm is not
+                enabled or not homed. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `jog()`, `jog_stop()`, `enter_idle_mode()`
@@ -3032,10 +3213,15 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: Another client holds control.
+            CommandRejected: Another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report IDLE mode within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             From JOG mode or a real-time stream at speed the arm does not brake: in
@@ -3077,9 +3263,16 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
+            CommandRejected: RTI refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report the motors off within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            MODE_REJECTED: RTI refused SAFETY_STOP from the mode it is in. The message
+                says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             The arm falls under its own weight. Support it, or park it, first.
@@ -3109,12 +3302,17 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: The robot refused it: the motors are not off, or
-                another client holds control.
+            CommandRejected: The robot refused it: the motors are not off, or another
+                client holds control. Or RTI refused it or did not answer within 1 s
+                (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report IDLE mode within 10 s, for example with an error still
                 latched.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `safety_stop()`, `clear_errors()`
@@ -3150,13 +3348,20 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: The robot refused it: it is not in IDLE mode or the
-                error state, or another client holds control.
+            CommandRejected: The robot refused it: it is not in IDLE mode or the error
+                state, or another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report flashing mode within 10 s.
             RobotConnectionError: The client is not connected.
             ValueError: Neither `parked_confirmed` nor `force` is true. Nothing is
                 sent.
+
+        Errors:
+            MODE_REJECTED: RTI refused FLASHING: nobody claimed the arm can go limp
+                safely, or the mode it is in does not allow it. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             The motors stop holding the arm. Park or support it first.
@@ -3202,10 +3407,15 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: it is not in flashing mode, or
-                another client holds control.
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report IDLE mode within 10 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `enter_flashing_mode()`, `home()`
@@ -3251,7 +3461,8 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it, for example outside JOG mode, or
-                another client holds control.
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `joint`, `direction` or `speed` cannot be read as a number,
@@ -3263,6 +3474,8 @@ class RobotClient:
             BAD_ARGS: The joint does not exist, the direction is not a whole
                 number, the speed is not a number from 0 to 100, or the command did
                 not carry exactly these three values.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             A jog has no time limit. The joint keeps moving until `jog_stop()`, a
@@ -3305,8 +3518,13 @@ class RobotClient:
             `None`: the robot sends no value back.
 
         Raises:
+            CommandRejected: RTI refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `jog()`, `stop()`, `enter_idle_mode()`
@@ -3345,8 +3563,9 @@ class RobotClient:
             `None`: the robot sends no value back.
 
         Raises:
-            CommandRejected: The robot refused it: `accel_time` is not more than 0
-                or not finite, or another client holds control.
+            CommandRejected: The robot refused it: `accel_time` is not more than 0 or
+                not finite, or another client holds control. Or RTI refused it or did
+                not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `accel_time` cannot be read as a number. Nothing is sent.
@@ -3355,6 +3574,8 @@ class RobotClient:
 
         Errors:
             BAD_ARGS: `accel_time` is not a finite number above 0.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `set_jog_profile()`, `set_jog_jerk_factor()`, `jog()`
@@ -3390,13 +3611,17 @@ class RobotClient:
             `None`: the robot sends no value back.
 
         Raises:
-            CommandRejected: The robot refused it: the name is none of the above,
-                or another client holds control.
+            CommandRejected: The robot refused it: the name is none of the above, or
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: `profile` is none of the names above.
+            RTI_REFUSED: RTI could not use the name. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Note:
             The queued moves' profiles are another setting, `set_profile()`.
@@ -3435,8 +3660,9 @@ class RobotClient:
             `None`: the robot sends no value back.
 
         Raises:
-            CommandRejected: The robot refused it: `factor` is not more than 0 or
-                not finite, or another client holds control.
+            CommandRejected: The robot refused it: `factor` is not more than 0 or not
+                finite, or another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `factor` cannot be read as a number. Nothing is sent.
@@ -3445,6 +3671,8 @@ class RobotClient:
 
         Errors:
             BAD_ARGS: `factor` is not a finite number above 0.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `set_jog_profile()`, `set_jog_accel()`, `jog()`
@@ -3479,12 +3707,16 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: the name is neither `"pid"` nor
-                `"pd"`, or another client holds control.
+                `"pd"`, or another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: `mode` is neither `"pid"` nor `"pd"`.
+            RTI_REFUSED: RTI could not use the name. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `set_pid_gains()`, `set_jog_profile()`, `jog()`
@@ -3530,8 +3762,9 @@ class RobotClient:
             `None`: the robot sends no data back.
 
         Raises:
-            CommandRejected: The robot refused it: a value is wrong, homing or a
-                test runs (see Errors), or another client holds control.
+            CommandRejected: The robot refused it: a value is wrong, homing or a test
+                runs (see Errors), or another client holds control. Or RTI refused it or
+                did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `joint` is not a whole number, or a gain is not a number.
@@ -3546,6 +3779,8 @@ class RobotClient:
             REJECTED: The robot is homing, or the Hall sensor check, a freed joint
                 or a joint test runs: each relies on the joint's current limit,
                 which this command sets.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             A gain can make the joint oscillate or run away, and a low `Ilim` lets
@@ -3587,12 +3822,15 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: the robot has no CAN gripper, or
-                another client holds control.
+                another client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             NO_GRIPPER: The robot has no CAN gripper.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             The jaws open and close fully by themselves and let go of a part they
@@ -3641,8 +3879,9 @@ class RobotClient:
             `None`. The robot answers before the gripper changes mode.
 
         Raises:
-            CommandRejected: The robot refused it: `mode` is not 1 or 2, the robot
-                has no CAN gripper, or another client holds control.
+            CommandRejected: The robot refused it: `mode` is not 1 or 2, the robot has
+                no CAN gripper, or another client holds control. Or RTI refused it or
+                did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `mode` cannot be read as a whole number, for example the
@@ -3651,6 +3890,9 @@ class RobotClient:
         Errors:
             NO_GRIPPER: The robot has no CAN gripper.
             BAD_ARGS: `mode` is not 1 or 2.
+            RTI_REFUSED: RTI could not read the mode. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             Motor mode takes the current off the gripper's motor: the jaws stop
@@ -3705,8 +3947,9 @@ class RobotClient:
             `None`. The robot answers before the target reaches the gripper.
 
         Raises:
-            CommandRejected: The robot refused it: a value is outside its range,
-                the robot has no CAN gripper, or another client holds control.
+            CommandRejected: The robot refused it: a value is outside its range, the
+                robot has no CAN gripper, or another client holds control. Or RTI
+                refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: A value cannot be read as a whole number, for example the
@@ -3716,6 +3959,9 @@ class RobotClient:
             NO_GRIPPER: The robot has no CAN gripper.
             BAD_ARGS: A value is outside its range above, or the robot did not get
                 exactly four values (this method always sends four).
+            RTI_REFUSED: RTI could not read the values. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             The jaws move at once, also while the robot is disabled, and keep
@@ -5491,8 +5737,8 @@ class RobotClient:
         enable it with `enable()`, or call `enable(wait=True)` to do both. It
         returns at once when the robot is already enabled.
 
-        While an error is latched, the robot refuses to enable and says so only
-        in its activity log: this call then runs into its timeout. Call
+        While an error is latched, the robot refuses to enable (`enable()` raises
+        `CommandRejected`): this call then runs into its timeout. Call
         `clear_errors()` first.
 
         Args:
@@ -5911,14 +6157,18 @@ class RobotClient:
             `{"name": name, "level": level}`: the logger and the level now set.
 
         Raises:
-            CommandRejected: The robot refused it: the logger is unknown or belongs
-                to another process, or the level is unknown.
+            CommandRejected: The robot refused it: the logger is unknown or belongs to
+                another process, or the level is unknown. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             BAD_ARGS: `name` is not one of the loggers above, or `level` is not one
                 of the four levels.
+            RTI_REFUSED: RTI has no such logger or level. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         See also:
             `capture_telemetry()`, `get_health()`
@@ -6223,8 +6473,9 @@ class RobotClient:
             The zones now in force, as `get_zones()` returns them.
 
         Raises:
-            CommandRejected: The robot refused it: the cell file or a tool sphere is
-                not valid (`ZONE_CONFIG`), or another client holds control.
+            CommandRejected: The robot refused it: the cell file or a tool sphere is not
+                valid (`ZONE_CONFIG`), or another client holds control. Or RTI refused
+                it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
@@ -6241,6 +6492,10 @@ class RobotClient:
                 or a tool sphere in the gripper XML is not four numbers with a
                 radius of at least 0. The message names the file, the zone and the
                 reason.
+            RTI_REFUSED: RTI could not use the zones the robot read. The message says
+                why; the zones in force stay.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             Zones are not a safety-rated function, and they check only the tool
@@ -6362,8 +6617,9 @@ class RobotClient:
             The walls now in force, as `get_joint_walls()` returns them.
 
         Raises:
-            CommandRejected: The robot refused it; the code says why (see Errors).
-                Also when another client holds control.
+            CommandRejected: The robot refused it; the code says why (see Errors). Also
+                when another client holds control. Or RTI refused it or did not answer
+                within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
             ValueError: `joint` is not a whole number. Nothing is sent.
@@ -6382,6 +6638,10 @@ class RobotClient:
                 `config/system.xml` `<haptic_walls>` (`<enabled>` or
                 `<joint_walls>` is 0), or the robot has no inertia for the joint.
                 Nothing changes.
+            RTI_REFUSED: RTI could not use the wall settings. The message says why; the
+                walls in force stay.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
 
         Warning:
             A wall pushes with up to its max torque: let go of a joint deep inside

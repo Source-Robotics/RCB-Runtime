@@ -112,6 +112,12 @@ class SimDrive:
         self.trip_ms = None                     # S4: when the watchdog last tripped from a clear state
         self.wd_time_ms = 0                     # 0 = off (the firmware's EEPROM default)
         self.wd_action = 0
+        # What a reboot did, recorded by the drive itself (2026-10-25): the scenario reads this instead of polling for
+        # the moment between the wipe and RTI's reload, which RTI closes in ~0.1 s (a race the test lost on 10-25).
+        self.boots = 0                          # reboots since the simulator started
+        self.wd_at_boot = None                  # the watchdog time right after the last reboot (0: wiped)
+        self.wd_writes = 0                      # watchdog writes since the last boot (or the start)
+        self.limit_writes = 0                   # limit writes since the last boot (or the start)
         self._wd_last = 0
         self._wd_reset = True                   # common.h: watchdog_reset = 1 at power-up
         self.hall_pin = 1                       # HIGH = no magnet (S2: a magnet window)
@@ -148,6 +154,9 @@ class SimDrive:
         self.estop_error = self.watchdog_error = False
         self.fault = None
         self.trip_ms = None
+        self.boots += 1
+        self.wd_at_boot = self.wd_time_ms
+        self.wd_writes = self.limit_writes = 0
 
     # ------------------------------------------------------------------------------------------------ the watchdog
     def _watchdog(self, ms):
@@ -254,9 +263,11 @@ class SimDrive:
         elif cmd == IN_WATCHDOG and len(data) >= 5:
             self.wd_time_ms = _from(data[0:4])
             self.wd_action = data[4]
+            self.wd_writes += 1
         elif cmd == IN_LIMITS and len(data) == 8:
             self.velocity_limit = struct.unpack(">f", data[0:4])[0]
             self.current_limit = struct.unpack(">f", data[4:8])[0]
+            self.limit_writes += 1
         elif cmd == IN_CLEAR:
             self.estop_error = self.watchdog_error = False
             self.mode = IDLE

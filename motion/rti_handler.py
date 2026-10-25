@@ -379,6 +379,15 @@ START_TRQ_TOL_FRACTION = 0.25    # first torque command <= 25% of one tick of to
 
 
 class RTIModeHandler:
+    # Called with the reason when a setting below is REFUSED (the old value kept): RTI.py sets it, so the command's
+    # answer to the executor is RTI_REFUSED with that reason (2026-10-25). A clamp is no refusal. None: nothing.
+    on_refuse = None
+
+    def _refuse_setting(self, fmt, *args):
+        """A setting refused, the old value kept: the warning as before, and the reason to on_refuse."""
+        logger.warning(fmt, *args)
+        if self.on_refuse is not None:
+            self.on_refuse(fmt % args if args else fmt)
     """RTI mode handler. One instance, created once before the RT loop."""
 
     def __init__(self, joint_num, clock_mode=CLOCK_ROBOT, delta_t=0.01,
@@ -2493,7 +2502,7 @@ class RTIModeHandler:
         inertia / Coriolis switches still apply on top. An unknown name is refused and leaves the source unchanged."""
         key = str(name).strip().lower()
         if key not in DYNAMICS_FF_SOURCES:
-            logger.warning("rti_set_dynamics_ff refused: %r — known: %s; source stays %r",
+            self._refuse_setting("rti_set_dynamics_ff refused: %r — known: %s; source stays %r",
                            name, ", ".join(DYNAMICS_FF_SOURCES), self.dynamics_ff_source)
             return False
         self.dynamics_ff_source = key
@@ -2663,10 +2672,10 @@ class RTIModeHandler:
         try:
             requested = float(multiplier)
         except (TypeError, ValueError):
-            logger.warning("Minimum duration refused: not a number: %r", multiplier)
+            self._refuse_setting("Minimum duration refused: not a number: %r", multiplier)
             return
         if not np.isfinite(requested) or requested < 0.0:
-            logger.warning("Minimum duration refused: %r is not a non-negative finite "
+            self._refuse_setting("Minimum duration refused: %r is not a non-negative finite "
                            "multiple", multiplier)
             return
         if requested == 0.0:
@@ -2716,14 +2725,14 @@ class RTIModeHandler:
         # and in hard RTI the PC closes the loop every tick, so a reduced state rate silently
         # breaks the one guarantee that contract makes. Same reasoning as refusing TCP there.
         if not self.soft_mode:
-            logger.warning("rti_set_state_rate is refused in hard RTI: you close the "
+            self._refuse_setting("rti_set_state_rate is refused in hard RTI: you close the "
                            "loop every tick, so you need state every tick. Reconnect with "
                            "a rate_hz for SOFT_RTI if you want to throttle it.")
             return
         try:
             v = float(hz)
         except (TypeError, ValueError):
-            logger.warning("state rate: not a number: %r", hz)
+            self._refuse_setting("state rate: not a number: %r", hz)
             return
         if not np.isfinite(v) or v <= 0.0:
             self._state_every = 1
@@ -2768,10 +2777,10 @@ class RTIModeHandler:
         try:
             requested = float(factor)
         except (TypeError, ValueError):
-            logger.warning("Velocity pacing refused: not a number: %r", factor)
+            self._refuse_setting("Velocity pacing refused: not a number: %r", factor)
             return
         if not np.isfinite(requested) or requested < 0.0:
-            logger.warning("Velocity pacing refused: %r is not a non-negative finite "
+            self._refuse_setting("Velocity pacing refused: %r is not a non-negative finite "
                            "factor", factor)
             return
         if requested == 0.0:
@@ -2813,11 +2822,11 @@ class RTIModeHandler:
         """
         key = str(name).strip().lower()
         if key not in SERVO_GENERATORS:
-            logger.warning("Servo generator refused: %r is not one of %s",
+            self._refuse_setting("Servo generator refused: %r is not one of %s",
                            name, ", ".join(SERVO_GENERATORS))
             return
         if key == SERVO_PASSTHROUGH and self.soft_mode:
-            logger.warning("Servo generator 'passthrough' refused in SOFT_RTI: it replays a target EVERY tick "
+            self._refuse_setting("Servo generator 'passthrough' refused in SOFT_RTI: it replays a target EVERY tick "
                            "(hard RTI); sparse targets need a generator that fills in between them.")
             return
         if key == SERVO_TRACKER and self.rate_limit_enabled is False:
@@ -2835,17 +2844,17 @@ class RTIModeHandler:
             except (TypeError, ValueError):
                 finite = False
             if not finite:
-                logger.warning("Servo generator refused: %s %r is not a finite number", label, value)
+                self._refuse_setting("Servo generator refused: %s %r is not a finite number", label, value)
                 return
 
         if gain is not None:
             try:
                 g = float(gain)
             except (TypeError, ValueError):
-                logger.warning("Servo generator: gain is not a number: %r", gain)
+                self._refuse_setting("Servo generator: gain is not a number: %r", gain)
                 return
             if not np.isfinite(g):
-                logger.warning("Servo generator: gain %r is not finite", gain)
+                self._refuse_setting("Servo generator: gain %r is not finite", gain)
                 return
             clamped = min(max(g, TRACKER_GAIN_MIN), TRACKER_GAIN_MAX)
             if clamped != g:
@@ -2866,11 +2875,11 @@ class RTIModeHandler:
             try:
                 la = float(lookahead)
             except (TypeError, ValueError):
-                logger.warning("Servo generator: lookahead is not a number: %r",
+                self._refuse_setting("Servo generator: lookahead is not a number: %r",
                                lookahead)
                 return
             if not np.isfinite(la):
-                logger.warning("Servo generator: lookahead %r is not finite", lookahead)
+                self._refuse_setting("Servo generator: lookahead %r is not finite", lookahead)
                 return
             self.tracker_lookahead = min(max(la, 0.0), TRACKER_LOOKAHEAD_MAX)
 
@@ -2878,11 +2887,11 @@ class RTIModeHandler:
             try:
                 sl = float(self_lookahead)
             except (TypeError, ValueError):
-                logger.warning("Servo generator: self_lookahead is not a number: %r",
+                self._refuse_setting("Servo generator: self_lookahead is not a number: %r",
                                self_lookahead)
                 return
             if not np.isfinite(sl):
-                logger.warning("Servo generator: self_lookahead %r is not finite",
+                self._refuse_setting("Servo generator: self_lookahead %r is not finite",
                                self_lookahead)
                 return
             self.tracker_self_lookahead = min(max(sl, 0.0), TRACKER_LOOKAHEAD_MAX)
@@ -2946,10 +2955,10 @@ class RTIModeHandler:
         try:
             requested = float(seconds)
         except (TypeError, ValueError):
-            logger.warning("Command timeout refused: not a number: %r", seconds)
+            self._refuse_setting("Command timeout refused: not a number: %r", seconds)
             return None
         if not np.isfinite(requested):
-            logger.warning("Command timeout refused: %r is not finite", seconds)
+            self._refuse_setting("Command timeout refused: %r is not finite", seconds)
             return None
 
         floor = 2.0 * self.delta_t
@@ -3009,10 +3018,10 @@ class RTIModeHandler:
         try:
             requested = float(fraction)
         except (TypeError, ValueError):
-            logger.warning("Velocity scale refused: not a number: %r", fraction)
+            self._refuse_setting("Velocity scale refused: not a number: %r", fraction)
             return
         if not np.isfinite(requested) or requested <= 0.0:
-            logger.warning("Velocity scale refused: %r is not a positive finite "
+            self._refuse_setting("Velocity scale refused: %r is not a positive finite "
                            "fraction", fraction)
             return
 
@@ -3062,10 +3071,10 @@ class RTIModeHandler:
         try:
             v = float(mps)
         except (TypeError, ValueError):
-            logger.warning("TCP velocity limit refused: not a number: %r", mps)
+            self._refuse_setting("TCP velocity limit refused: not a number: %r", mps)
             return
         if not (np.isfinite(v) and v >= 0.0):        # 2026-10-24: max(0.0, nan) and a negative value meant no cap
-            logger.warning("TCP velocity limit refused: %r is not a number of 0 or more (0 = no cap)", mps)
+            self._refuse_setting("TCP velocity limit refused: %r is not a number of 0 or more (0 = no cap)", mps)
             return
         self.tcp_vel_limit = v
         logger.info("TCP velocity limit %s",
@@ -3113,7 +3122,7 @@ class RTIModeHandler:
         """
         cutoff = float(cutoff_hz)
         if not np.isfinite(cutoff):                  # 2026-10-24: NaN passed both checks below into butter()
-            logger.warning("Low-pass cutoff refused: %r is not a number", cutoff_hz)
+            self._refuse_setting("Low-pass cutoff refused: %r is not a number", cutoff_hz)
             return
         nyquist = 0.5 / self.delta_t
         if cutoff <= 0.0:

@@ -2,7 +2,7 @@
 """What on the SD card can go, and (with --apply) deleting it — the caches nothing else limits (2026-10-15).
 
 The robot's own files are bounded where they are written (docs/logging.md "Rotation and limits"; the test
-recordings' 1 GB budget is kept by the supervisor). Two things on this box grow with nobody limiting them:
+recordings' 500 MB budget is kept by the supervisor). Two things on this box grow with nobody limiting them:
 
   * VS Code's remote server (~/.vscode-server): every VS Code update downloads a new server build (~600 MB) and new
     extension versions; the old ones stay. VS Code decides what it needs, so this tool deletes only what no process

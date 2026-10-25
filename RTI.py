@@ -87,7 +87,6 @@ from utility.gc_pauses import GcPauseMonitor, freeze_startup
 from hardware.can_hardware import start_can_interface, place_can_path, FirstFrameWait, FastCanReader
 from config.cpu_cores import CAN_CPU_CORE, GENERAL_CPU_CORES
 from utility.can_reply_monitor import CanReplyMonitor
-from utility.loop_delay_meter import LoopDelayMeter
 
 # ==========================================================================
 # Hardware
@@ -104,7 +103,7 @@ from hardware.can_hardware import scan_can_bus, initialize_can_communication
 # ==========================================================================
 # Networking
 # ==========================================================================
-from config.networking import RT_CPU_CORE, zmq_listener, zmq_sender_setup, udp_socket_receive_setup, udp_socket_send_setup, broadcast_udp_telemetry, init_rti_receive_socket, drain_rti_udp, RTI_PORT_SENDER, init_rti_tcp_listener, accept_rti_tcp, drain_rti_tcp, send_rti_tcp, drain_rti_tcp_backlog
+from config.networking import RT_CPU_CORE, zmq_listener, zmq_sender_setup, zmq_answer_sender_setup, udp_socket_receive_setup, udp_socket_send_setup, broadcast_udp_telemetry, init_rti_receive_socket, drain_rti_udp, RTI_PORT_SENDER, init_rti_tcp_listener, accept_rti_tcp, drain_rti_tcp, send_rti_tcp, drain_rti_tcp_backlog
 from communication.can_message_handlers import receive_and_process_can_messages, handle_polling_and_overrides, update_can_connection_status, drain_can_discard
 from communication.can_message_handlers import send_gripper_commands, send_motor_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
 from utility.kt_init import resolve_and_preload_kt
@@ -185,6 +184,7 @@ class LoopState:
         # mode and pending mode request (handlers write, the loop consumes)
         "current_mode", "pending_mode_request", "pending_mode_force", "pending_mode_assertion", "pending_mode_rate_hz",
         "command_id", "pending_mode_request_id",          # the activity log's command ids (2026-10-15)
+        "answer_token", "answer_id", "answer_refusal",    # the answer to the executor's command (2026-10-25)
         # errors
         "latched_errors", "error_metadata", "clear_error_countdown", "homing_failures",
         # loop statistics ring
@@ -395,6 +395,9 @@ def main():
 
     # --- Setup ZMQ response sender
     status_socket = zmq_sender_setup()
+    # RTI's answers to the executor's commands (2026-10-25: ok, or why it refused) — to the executor's checkpoint
+    # listener, the way the EXEC handler's checkpoints go (config/networking.zmq_answer_sender_setup).
+    answer_socket = zmq_answer_sender_setup()
 
     # --- RTI socket receive ---
     RTI_socket_receive = udp_socket_receive_setup()
@@ -575,11 +578,10 @@ def main():
     # Option B's CAN read: python-can's receive without its per-frame select() and Message object, on the same socket
     # (hardware/can_hardware.FastCanReader, 2026-10-12).
     fast_can_reader = FastCanReader(communication1)
-    # The control loop's delay per joint (a reply -> the command computed from it), sampled live for the GUI's RT
-    # Diagnostics (2026-10-12, utility/loop_delay_meter.py): a read-only socket that sees our own frames leave.
-    loop_delay_meter = LoopDelayMeter(joint_num, interface=_CAN_IF)
-    shared_data.rti["loop_delay"][:] = np.nan          # not measured yet (the GUI shows a dash)
-    shared_data.rti["loop_delay_max"][:] = np.nan
+    # The control loop's delay per joint is measured on request OUTSIDE RTI (tools/loop_delay.py, 2026-10-25): the live
+    # meter that sat here switched a CAN socket filter inside the tick, and setsockopt(CAN_RAW_FILTER) waits for the
+    # kernel's network lock (rtnl_lock) whenever another process holds it — 8-44 ms single-tick stalls, LOOP_CRITICAL.
+    # Never call a socket set-up (setsockopt of a CAN filter, bind, close) in the tick (utility/loop_delay.py).
     if _sys['can_read_first']:
         first_frame_wait.set_enabled(True)      # logs "[CAN] read-first ON"; a socket that cannot open: the old order
     else:
@@ -788,6 +790,10 @@ def main():
     # change RTI makes on its own (start-up done, an error, homing finished) keeps a null id.
     st.command_id = None
     st.pending_mode_request_id = None
+    # The command taken this tick when the executor asked for RTI's answer (its "answer" token, 2026-10-25): its id,
+    # and the first refusal recorded while it is handled — (code, message), None = accepted. Answered at the end of
+    # the tick (_send_answer, after the mode change it may have asked for). None when no answer was asked for.
+    st.answer_token = st.answer_id = st.answer_refusal = None
     # Set alongside pending_mode_request by "set_mode:<MODE>:PARKED|FORCE". Only
     # maintenance modes (FLASHING) read these. There is no automatic test for "can
     # this pose survive losing torque", so entry requires an explicit operator
@@ -903,8 +909,6 @@ def main():
     # read too often (2026-10-12, utility/can_reply_monitor.py). The read in tick k holds the answers to tick k-1's
     # commands (they go out while RTI sleeps), so the monitor is told whether the PREVIOUS tick sent them.
     _can_reply_buf = [0] * joint_num
-    _can_reply_time = np.full(joint_num, np.nan)        # each joint's newest data reply's arrival (the loop-delay meter)
-    _loop_delay_published = -1
     can_reply_monitor = CanReplyMonitor(joint_num, delta_t)
     _can_sent_prev = False
     _can_sent_now = False         # option B reads before the first dispatch has set it
@@ -1286,6 +1290,47 @@ def main():
     # see TODO/exec_mode_implementation_checklist.md for the equivalence notes.
     # ==========================================================================
 
+    # ==========================================================================
+    # RTI's answer to a command from the executor (2026-10-25; user: "Every command passed to RTI"). The executor
+    # adds an "answer" token and waits (up to 1 s, then RTI_NOT_RUNNING); RTI answers at the end of the tick it took
+    # the command in: ok, or the FIRST refusal recorded meanwhile — a handler's (its activity code, or RTI_REFUSED with
+    # the reason it logs), a setting rti_handler refused (on_refuse), or the mode change the command asked for
+    # (MODE_REJECTED). The dashboard's and the supervisor's own commands carry no token and get no answer.
+    # ==========================================================================
+    def _answer_refusal(code, message):
+        """The command taken this tick is refused: its answer (the first refusal wins). Nothing without a token."""
+        if st.answer_token is not None and st.answer_refusal is None:
+            st.answer_refusal = (str(code), str(message))
+
+    def _refused(log, fmt, *args, level="warning", code="RTI_REFUSED"):
+        """A command refused or ignored by its handler: the log line as before, and the refusal as its answer."""
+        getattr(log, level)(fmt, *args)
+        _answer_refusal(code, fmt % args if args else fmt)
+
+    def _send_answer():
+        """End of the tick: answer the command taken this tick (cold: one tick per command the executor sent)."""
+        token, refusal = st.answer_token, st.answer_refusal
+        st.answer_token = st.answer_id = st.answer_refusal = None
+        answer = ({"answer": token, "status": "ok"} if refusal is None else
+                  {"answer": token, "status": "error", "code": refusal[0], "message": refusal[1]})
+        try:
+            answer_socket.send_json(answer, zmq.NOBLOCK)
+        except zmq.Again:
+            log_handler.warning("answer to the executor not sent (it is not draining): it will report RTI_NOT_RUNNING")
+
+    def _answer_unknown(cmd_msg):
+        _answer_refusal("RTI_REFUSED", f"RTI does not know the command {cmd_msg!r}")
+
+    def _answer_failed(cmd_msg):
+        _answer_refusal("INTERNAL", f"RTI's handler for {cmd_msg!r} failed — the command was ignored "
+                                    f"(RTI.log has the traceback)")
+
+    def _answer_mode_rejected(current, requested, reason):
+        _answer_refusal("MODE_REJECTED", f"{getattr(current, 'value', current)} → "
+                                         f"{getattr(requested, 'value', requested)}: {reason}")
+
+    rti_handler.on_refuse = lambda why: _answer_refusal("RTI_REFUSED", why)
+
     def _handle_enable(cmd_msg, cmd_dict):
         _errors_active = bool(shared_data.rti['error_active'][0])
         _safety_active = bool(shared_data.rti['safety_violation'][0])
@@ -1299,6 +1344,7 @@ def main():
         else:
             shared_data.robot_state.set(f"ENABLE_REJECTED:{reason}")
             log_activity(_rti_activity_logger, "RTI", "warning", "ENABLE_REJECTED", id=st.command_id, message=reason)
+            _answer_refusal("ENABLE_REJECTED", reason)
 
 
     def _handle_disable(cmd_msg, cmd_dict):
@@ -1363,7 +1409,7 @@ def main():
         A switch to a weaker reaction is a WARNING in RTI.log (a protection switched off)."""
         parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
         if len(parts) != 2 or parts[1].strip() not in _COLLISION_MODE_CODE:
-            log_safety.warning(f"collision_detection: {cmd_msg!r} is not off | warn | stop — ignored")
+            _refused(log_safety, f"collision_detection: {cmd_msg!r} is not off | warn | stop — ignored")
             return
         old = _COLLISION_MODE_NAME[int(shared_data.rti['collision_mode'][0])]
         new = safety_monitor.set_collision_mode(parts[1].strip())
@@ -1405,7 +1451,8 @@ def main():
         parts = cmd_msg.split(":", 1)        # see _handle_gravity_comp for why this is guarded
         if len(parts) != 2:
             return
-        first_frame_wait.set_enabled(parts[1].strip() == "1")
+        if not first_frame_wait.set_enabled(parts[1].strip() == "1"):
+            _answer_refusal("RTI_REFUSED", "read-first stays off: its socket did not open (RTI.log says why)")
 
     def _handle_coriolis_comp(cmd_msg, cmd_dict):
         _dynamics_switch(cmd_msg, 'coriolis_comp_enabled', "Coriolis")
@@ -1426,6 +1473,7 @@ def main():
             if why:
                 log_homing.warning(f"Hall check refused: {why}")
                 log_activity(_rti_activity_logger, "RTI", "warning", "HALL_CHECK_REFUSED", id=st.command_id, message=why)
+                _answer_refusal("HALL_CHECK_REFUSED", why)
             elif hall_check.active:
                 log_activity(_rti_activity_logger, "RTI", "info", "HALL_CHECK", id=st.command_id,
                              message=f"J{hall_check.joint + 1} limp: Hall sensor check ON")
@@ -1459,6 +1507,7 @@ def main():
         if why:
             log_homing.warning(f"Free joint refused: {why}")
             log_activity(_rti_activity_logger, "RTI", "warning", "FREE_JOINT_REFUSED", id=st.command_id, message=why)
+            _answer_refusal("FREE_JOINT_REFUSED", why)
         elif not renewing:
             log_activity(_rti_activity_logger, "RTI", "info", "FREE_JOINT", id=st.command_id,
                          message=f"J{n} free for hand turning (current limit 0)")
@@ -1486,6 +1535,7 @@ def main():
         if why:
             log_homing.warning(f"Joint test refused: {why}")
             log_activity(_rti_activity_logger, "RTI", "warning", "JOINT_TEST_REFUSED", id=st.command_id, message=why)
+            _answer_refusal("JOINT_TEST_REFUSED", why)
         else:
             log_activity(_rti_activity_logger, "RTI", "info", "JOINT_TEST", id=st.command_id,
                          message=f"J{n} test move {a:+.1f} deg at {v:.1f} deg/s, {c:.0f} mA")
@@ -1562,7 +1612,7 @@ def main():
                 try:
                     _jog.set_profile(parts[1].strip())
                 except ValueError as exc:
-                    logger.warning("jog_profile: %s", exc)
+                    _refused(logger, "jog_profile: %s", exc)
 
 
     def _handle_jog_jerk_factor(cmd_msg, cmd_dict):
@@ -1581,7 +1631,7 @@ def main():
                 try:
                     _jog.set_control_mode(parts[1].strip())
                 except ValueError as exc:
-                    logger.warning("jog_control_mode: %s", exc)
+                    _refused(logger, "jog_control_mode: %s", exc)
 
 
     def _handle_exec_pause(cmd_msg, cmd_dict):
@@ -1604,7 +1654,7 @@ def main():
         try:
             epoch = int(parts[1])
         except (IndexError, ValueError):
-            log_exec.warning("exec_stop without a valid epoch: %r", cmd_msg)
+            _refused(log_exec, "exec_stop without a valid epoch: %r", cmd_msg)
             return
         _exec = MODE_HANDLERS.get(RobotMode.EXEC)
         if st.current_mode == RobotMode.EXEC and _exec is not None:
@@ -1622,7 +1672,7 @@ def main():
             try:
                 _exec.set_completion_policy(parts[1].strip())
             except ValueError as exc:
-                log_exec.warning("exec_completion_policy: %s", exc)
+                _refused(log_exec, "exec_completion_policy: %s", exc)
 
 
     def _handle_gripper_set(cmd_msg, cmd_dict):
@@ -1644,7 +1694,7 @@ def main():
                     st._gripper_calibrate_running = False
                     st._gripper_calibrate_pending = False
             except ValueError as exc:
-                log_gripper.warning("gripper_set: bad payload %s", exc)
+                _refused(log_gripper, "gripper_set: bad payload %s", exc)
 
 
     def _handle_gripper_calibrate(cmd_msg, cmd_dict):
@@ -1670,7 +1720,7 @@ def main():
                 if _new_mode == 1:
                     _gripper_fw_state['action'] = 0
         except ValueError as exc:
-            log_gripper.warning("gripper_ctrl_mode: bad payload %s", exc)
+            _refused(log_gripper, "gripper_ctrl_mode: bad payload %s", exc)
 
 
     def _handle_set_pid_gains(cmd_msg, cmd_dict):
@@ -1727,7 +1777,7 @@ def main():
 
         parts = cmd_msg.split(":")      # see _handle_gravity_comp for why this is guarded
         if len(parts) < 2 or not parts[1].strip():
-            log_handler.warning("rti_connect missing pc_ip")
+            _refused(log_handler, "rti_connect missing pc_ip")
             return
         pc_ip = parts[1].strip()
 
@@ -1800,17 +1850,17 @@ def main():
         explicitly recovered (plan §3 / §15).
         """
         if bool(shared_data.rti['error_active'][0]):
-            log_handler.warning("rti_claim rejected — error latched, clear errors first")
+            _refused(log_handler, "rti_claim rejected — error latched, clear errors first")
             return
         # BOTH RTI contracts. Gating on RobotMode.RTI alone would make SOFT_RTI enterable but
         # unusable — the exact "a legal transition is not a reachable one" failure that made
         # FLASHING unreachable on 2026-08-04, arriving from the other direction.
         if st.current_mode not in (RobotMode.RTI, RobotMode.SOFT_RTI):
-            log_handler.warning("rti_claim rejected — mode is %s, not an RTI mode",
-                           st.current_mode)
+            _refused(log_handler, "rti_claim rejected — mode is %s, not an RTI mode",
+                     getattr(st.current_mode, "value", st.current_mode))
             return
         if rti_handler.sub_state != 'connected':
-            log_handler.warning("rti_claim rejected — sub_state is '%s'", rti_handler.sub_state)
+            _refused(log_handler, "rti_claim rejected — sub_state is '%s'", rti_handler.sub_state)
             return
         # Seed the rate limiter from the live arm, so its first output ramps from where the
         # robot actually is rather than from 0 rad.
@@ -1821,7 +1871,7 @@ def main():
         if not rti_handler.claim_control(
                 current_tick=int(shared_data.rti["loop_tick"][0]),
                 measured_pos=shared_data.joint['joint_position'][:joint_num]):
-            log_handler.warning("rti_claim rejected — see the error above")
+            _refused(log_handler, "rti_claim rejected — the rate limiter cannot start (RTI.log says why)")
 
 
     def _handle_rti_set_rate_limiter(cmd_msg, cmd_dict):
@@ -1838,7 +1888,7 @@ def main():
             try:
                 rti_handler.set_tcp_velocity_limit(float(parts[1].strip()))
             except ValueError:
-                log_handler.warning("rti_set_tcp_vel_limit: not a number: %r", parts[1])
+                _refused(log_handler, "rti_set_tcp_vel_limit: not a number: %r", parts[1])
 
 
     def _handle_rti_set_command_timeout(cmd_msg, cmd_dict):
@@ -1852,7 +1902,7 @@ def main():
             try:
                 rti_handler.set_command_timeout(float(parts[1].strip()))
             except ValueError:
-                log_handler.warning("rti_set_command_timeout: not a number: %r", parts[1])
+                _refused(log_handler, "rti_set_command_timeout: not a number: %r", parts[1])
 
 
     def _handle_rti_set_vel_scale(cmd_msg, cmd_dict):
@@ -1862,7 +1912,7 @@ def main():
             try:
                 rti_handler.set_vel_scale(float(parts[1].strip()))
             except ValueError:
-                log_handler.warning("rti_set_vel_scale: not a number: %r", parts[1])
+                _refused(log_handler, "rti_set_vel_scale: not a number: %r", parts[1])
 
 
     def _handle_rti_set_min_duration(cmd_msg, cmd_dict):
@@ -1876,7 +1926,7 @@ def main():
             try:
                 rti_handler.set_min_duration(float(parts[1].strip()))
             except ValueError:
-                log_handler.warning("rti_set_min_duration: not a number: %r", parts[1])
+                _refused(log_handler, "rti_set_min_duration: not a number: %r", parts[1])
 
 
     def _handle_reload_zones(cmd_msg, cmd_dict):
@@ -1889,12 +1939,13 @@ def main():
         """
         wire = cmd_dict.get("setup") if isinstance(cmd_dict, dict) else None
         if not isinstance(wire, dict):
-            log_safety.error("reload_zones without a setup (send it through command_executor) — zones unchanged")
+            _refused(log_safety, "reload_zones without a setup (send it through command_executor) — zones unchanged",
+                     level="error")
             return
         try:
             setup = read_XML2.zone_setup_from_wire(wire)
         except (ValueError, KeyError, TypeError) as e:
-            log_safety.error(f"reload_zones refused, zones unchanged: {e}")
+            _refused(log_safety, f"reload_zones refused, zones unchanged: {e}", level="error")
             return
         safety_monitor.set_zones(setup['zones'], setup['tool_spheres'], haptic=setup['haptic'])
         haptic_walls.set_policy(setup['haptic'])
@@ -1916,7 +1967,7 @@ def main():
         robot XML is written only by save_joint_walls, so an RTI restart goes back to the file."""
         specs = cmd_dict.get("specs")
         if not isinstance(specs, list) or len(specs) != joint_num:
-            log_safety.warning(f"set_joint_walls: need {joint_num} specs, got {specs!r:.120}")
+            _refused(log_safety, f"set_joint_walls: need {joint_num} specs, got {specs!r:.120}")
             return
         _wall_specs[:] = [read_XML2.wall_spec(s if isinstance(s, dict) else None, f"set_joint_walls J{i + 1}")
                           for i, s in enumerate(specs)]
@@ -1935,7 +1986,8 @@ def main():
         """
         texts = cmd_dict.get("recipes") if isinstance(cmd_dict, dict) else None
         if not isinstance(texts, dict):
-            log_recipe.error("reload_recipes without the files' text (send it through command_executor) — recipes unchanged")
+            _refused(log_recipe, "reload_recipes without the files' text (send it through command_executor) — recipes "
+                     "unchanged", level="error")
             return
         recipe_mgr.reload_from_texts(texts)
         log_recipe.info(f"recipes reloaded from {len(texts)} file(s) sent by command_executor")
@@ -1950,12 +2002,13 @@ def main():
         """
         config = cmd_dict.get("config") if isinstance(cmd_dict, dict) else None
         if not isinstance(config, dict):
-            log_filters.error("reload_filters without a spec table (send it through command_executor) — filters unchanged")
+            _refused(log_filters, "reload_filters without a spec table (send it through command_executor) — filters "
+                     "unchanged", level="error")
             return
         try:
             banks = build_filter_banks(config, joint_num, delta_t)
         except (ValueError, KeyError, TypeError) as e:
-            log_filters.error(f"reload refused, filters unchanged: {e}")
+            _refused(log_filters, f"reload refused, filters unchanged: {e}", level="error")
             return
         st.filter_banks = banks
         log_filters.info("hot-reloaded from the table command_executor parsed (config/filters.xml)")
@@ -1972,7 +2025,7 @@ def main():
             log_dynamics.info(f"payload: {msg}")
             log_activity(_rti_activity_logger, "RTI", "info", "PAYLOAD_CHANGED", id=st.command_id, message=msg)
         else:
-            log_dynamics.warning(f"payload: set_payload refused: {msg}")
+            _refused(log_dynamics, f"payload: set_payload refused: {msg}")
 
 
     def _handle_set_log_level(cmd_msg, cmd_dict):
@@ -1980,7 +2033,10 @@ def main():
         it; utility/logger_setup.apply_log_level). Cold; not persisted."""
         parts = cmd_msg.split(":", 2)
         ok, text = apply_log_level(parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
-        (logger.info if ok else logger.warning)(f"log level: {text}")
+        if ok:
+            logger.info(f"log level: {text}")
+        else:
+            _refused(logger, f"log level: {text}")
 
 
     def _handle_rti_set_state_rate(cmd_msg, cmd_dict):
@@ -1995,7 +2051,7 @@ def main():
             try:
                 rti_handler.set_state_rate(float(parts[1].strip()))
             except ValueError:
-                log_handler.warning("rti_set_state_rate: not a number: %r", parts[1])
+                _refused(log_handler, "rti_set_state_rate: not a number: %r", parts[1])
 
 
     def _handle_rti_set_pace(cmd_msg, cmd_dict):
@@ -2010,7 +2066,7 @@ def main():
             try:
                 rti_handler.set_pace(float(parts[1].strip()))
             except ValueError:
-                log_handler.warning("rti_set_pace: not a number: %r", parts[1])
+                _refused(log_handler, "rti_set_pace: not a number: %r", parts[1])
 
 
     def _handle_rti_set_servo_generator(cmd_msg, cmd_dict):
@@ -2032,7 +2088,7 @@ def main():
             if len(parts) > 4 and parts[4].strip():
                 self_lookahead = float(parts[4].strip())
         except ValueError:
-            log_handler.warning("rti_set_servo_generator: bad numeric payload: %r", cmd_msg)
+            _refused(log_handler, "rti_set_servo_generator: bad numeric payload: %r", cmd_msg)
             return
         rti_handler.set_servo_generator(parts[1].strip(), gain=gain, lookahead=lookahead,
                                         self_lookahead=self_lookahead)
@@ -2074,8 +2130,7 @@ def main():
         known = recipe_mgr.names          # a @property, NOT a method — calling it raised
                                           # TypeError and killed the RT loop (see below)
         if name not in known:
-            log_recipe.warning("set_recipe refused: %r is not a known recipe. Available: %s",
-                           name, ", ".join(known))
+            _refused(log_recipe, "set_recipe refused: %r is not a known recipe. Available: %s", name, ", ".join(known))
             return
         shared_data.active_recipe.set(name)
         log_recipe.info("Active recipe -> %s", name)
@@ -2096,7 +2151,7 @@ def main():
         try:
             rti_handler.set_lowpass_filter(float(parts[1].strip()))
         except ValueError as exc:
-            log_handler.warning("rti_set_lowpass: bad payload %s", exc)
+            _refused(log_handler, "rti_set_lowpass: bad payload %s", exc)
 
 
     def _handle_rti_release(cmd_msg, cmd_dict):
@@ -2106,7 +2161,7 @@ def main():
         the PC's UDP sender is already dead. If neither arrives the timeout covers it.
         """
         if not rti_handler.request_release():
-            log_handler.warning("rti_release ignored — sub_state is '%s'", rti_handler.sub_state)
+            _refused(log_handler, "rti_release ignored — sub_state is '%s'", rti_handler.sub_state)
 
 
     def _handle_rti_disconnect(cmd_msg, cmd_dict):
@@ -2216,11 +2271,8 @@ def main():
                 node_error_bits=node_error_bits,
                 frame_age_out=_can_age_buf,
                 data_reply_count_out=_can_reply_buf,
-                reply_time_out=_can_reply_time,
                 receive=fast_can_reader.receive_can_messages if _read_first else None,
             )
-        loop_delay_meter.on_read(_tick_now, _can_reply_time, _read_first,
-                                 st.current_mode != RobotMode.HOMING and st.current_mode != RobotMode.FLASHING)
         can_reply_monitor.step(_can_reply_buf, _tick_now, _can_sent_prev and not _bus_silent)
         _can_sent_prev = _can_sent_now
         # [0]=worst, [1]=best age among the frames read this tick. Both published: the SPREAD is
@@ -2694,8 +2746,12 @@ def main():
                 _cmd_dict = json.loads(command)
                 _cmd_msg = _cmd_dict.get("msg", "").lower()
                 _handler = RTI_COMMAND_HANDLERS.get(_rti_command_key(_cmd_msg))
+                st.answer_token = _cmd_dict.get("answer")      # the executor waits for RTI's answer (2026-10-25)
+                st.answer_id, st.answer_refusal = _cmd_dict.get("id"), None
             except (json.JSONDecodeError, AttributeError):
                 pass  # Non-JSON or unexpected format — not a mode command
+            if _handler is None and st.answer_token is not None:
+                _answer_unknown(_cmd_msg)                       # the messages are built outside the loop body
             if _handler is not None:
                 # THE HANDLER CALL IS ISOLATED, and this is a safety property rather than
                 # tidiness. Before 2026-08-21 an exception in ANY of the ~30 command handlers
@@ -2716,6 +2772,7 @@ def main():
                     logger.critical("Command handler RAISED on %r — command IGNORED, the "
                                     "control loop continues.\n%s",
                                     _cmd_msg, traceback.format_exc())
+                    _answer_failed(_cmd_msg)
                 if st.pending_mode_request is not None and st.pending_mode_request is not _mode_request_before:
                     st.pending_mode_request_id = st.command_id      # this command asked for the mode change
                 st.command_id = None
@@ -2928,23 +2985,24 @@ def main():
                 log_mode.warning(f"Request '{st.pending_mode_request}' rejected: {reason}")
                 log_activity(_rti_activity_logger, "RTI", "warning", "MODE_REJECTED", id=st.pending_mode_request_id,
                              message=f"{st.current_mode} → {st.pending_mode_request}: {reason}")
+                # ...answered as refused, unless the arm is already in the mode asked for (enter_exec_mode() in EXEC,
+                # safety_stop() while stopped): that request wanted nothing that is not already so — ok, as before.
+                if st.pending_mode_request_id is not None and st.pending_mode_request_id == st.answer_id \
+                        and st.pending_mode_request != st.current_mode:
+                    _answer_mode_rejected(st.current_mode, st.pending_mode_request, reason)
             st.pending_mode_request = None
             st.pending_mode_request_id = None
             st.pending_mode_force = False
             st.pending_mode_assertion = ""
             st.pending_mode_rate_hz = None
+        if st.answer_token is not None:          # the executor asked: ok, or the first refusal (this tick's command)
+            _send_answer()
         _profile_last = _profile_mark(_profile_last, "mode_state")
 
 
         # ==========================================================================
         # Mode dispatch — each handler sends its own CAN commands
         # ==========================================================================
-        loop_delay_meter.before_dispatch(_tick_now, _read_first,
-                                         st.current_mode != RobotMode.HOMING and st.current_mode != RobotMode.FLASHING)
-        if loop_delay_meter.samples != _loop_delay_published:          # a sample finished: publish (5 times a second)
-            _loop_delay_published = loop_delay_meter.samples
-            shared_data.rti["loop_delay"][:joint_num] = loop_delay_meter.median
-            shared_data.rti["loop_delay_max"][:joint_num] = loop_delay_meter.maximum
         shared_data.rti["can_read_first"][0] = _read_first
         rti_handler.defer_state = _read_first   # option B: the state packet after the send (flush_state, below)
         if first_frame_wait.enabled:

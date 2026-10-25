@@ -39,6 +39,7 @@ import socket
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
+import itertools
 import threading
 import time
 from queue import Queue, Full
@@ -607,25 +608,163 @@ def reply(conn, obj):
         log_tcp.error(f"send to client failed: {e}")
 
 
-def send_to_rti(msg_str, cid, source):
+def send_to_rti(msg_str, cid, source, answer=None):
     """Forward a command to RTI in its existing wire format: {"msg","id","source"} — plus "origin", who sent it
-    (2026-10-15), so RTI's activity entries for the command name the client too."""
-    payload = json.dumps({"msg": msg_str, "id": cid, "source": source, "origin": origin_of(cid)})
+    (2026-10-15), so RTI's activity entries for the command name the client too. `answer`: the token RTI answers with
+    (ask_rti, 2026-10-25); None = no answer wanted (the executor's own messages: a disconnect's stop, ...)."""
+    out = {"msg": msg_str, "id": cid, "source": source, "origin": origin_of(cid)}
+    if answer is not None:
+        out["answer"] = answer
+    payload = json.dumps(out)
     with _rti_send_lock:
         _rti_sock.send_string(payload)
     log_forward.info(f"forwarded '{msg_str}' (id={cid})")
 
 
-def send_payload_to_rti(payload, cid, source):
+def send_payload_to_rti(payload, cid, source, answer=None):
     """Forward a full command dict (not just a msg string) to RTI, merging id/source in.
 
     Needed by set_pid_gains, whose RTI handler reads its joint + gain fields off the command
     dict rather than parsing a colon string. `payload` must carry the "msg" key itself.
+    `answer`: as send_to_rti's.
     """
-    out = json.dumps({**payload, "id": cid, "source": source, "origin": origin_of(cid)})
+    extra = {} if answer is None else {"answer": answer}
+    out = json.dumps({**payload, "id": cid, "source": source, "origin": origin_of(cid), **extra})
     with _rti_send_lock:
         _rti_sock.send_string(out)
     log_forward.info(f"forwarded '{payload.get('msg')}' (id={cid})")
+
+
+# ========================================================================== #
+# RTI's answer (2026-10-25; user: "Every command passed to RTI", no answer within 1 s -> "An error: RTI_NOT_RUNNING",
+# RTI's log-only refusals -> "One new code RTI_REFUSED + reason"). A command the executor passes to RTI carries an
+# "answer" token; RTI answers at the end of the tick it took the command in — ok, or the first refusal recorded meanwhile
+# (its code and reason) — on ZMQ_EXEC_STATUS_SOCKET, which the checkpoint listener hands to deliver_rti_answer(). The
+# client's reply is that answer: before, it was "ok" as soon as the command was sent, and RTI's refusal reached only the
+# activity log. RTI takes one command per tick, so the wait is about a tick (4-8 ms).
+# ========================================================================== #
+RTI_ANSWER_TIMEOUT_S = 1.0
+# The codes RTI can refuse each command with — what its handlers record (RTI.py _answer_refusal / _refused,
+# rti_handler._refuse_setting) and MODE_REJECTED where the command asks for a mode change. Read by the documentation
+# (tools/sync_runtime._handler_codes) and test_docstrings J next to each handler's own codes; test_rti_answers derives
+# them from RTI's handlers and fails when this table disagrees. Every command here can also answer RTI_NOT_RUNNING (no
+# answer in time, ask_rti) and, from a handler that raised, INTERNAL. Commands that RTI never refuses are absent.
+RTI_ANSWER_CODES = {
+    "enable": ("ENABLE_REJECTED",),
+    "enter_exec_mode": ("MODE_REJECTED",),
+    "enter_flashing_mode": ("MODE_REJECTED",),
+    "enter_jog_mode": ("MODE_REJECTED",),
+    "free_joint": ("FREE_JOINT_REFUSED",),
+    "hall_check": ("HALL_CHECK_REFUSED",),
+    "home": ("MODE_REJECTED",),
+    "joint_test": ("JOINT_TEST_REFUSED",),
+    "reload_filters": ("RTI_REFUSED",),
+    "reload_recipes": ("RTI_REFUSED",),
+    "reload_zones": ("RTI_REFUSED",),
+    "rti_claim": ("RTI_REFUSED",),
+    "rti_connect": ("MODE_REJECTED", "RTI_REFUSED"),
+    "rti_release": ("RTI_REFUSED",),
+    "rti_set_command_timeout": ("RTI_REFUSED",),
+    "rti_set_dynamics_ff": ("RTI_REFUSED",),
+    "rti_set_lowpass": ("RTI_REFUSED",),
+    "rti_set_min_duration": ("RTI_REFUSED",),
+    "rti_set_pace": ("RTI_REFUSED",),
+    "rti_set_servo_generator": ("RTI_REFUSED",),
+    "rti_set_state_rate": ("RTI_REFUSED",),
+    "rti_set_tcp_vel_limit": ("RTI_REFUSED",),
+    "rti_set_vel_scale": ("RTI_REFUSED",),
+    "safety_stop": ("MODE_REJECTED",),
+    "set_can_read_first": ("RTI_REFUSED",),
+    "set_collision_detection": ("RTI_REFUSED",),
+    "set_completion_policy": ("RTI_REFUSED",),
+    "set_gripper": ("RTI_REFUSED",),
+    "set_gripper_ctrl_mode": ("RTI_REFUSED",),
+    "set_jog_control_mode": ("RTI_REFUSED",),
+    "set_jog_profile": ("RTI_REFUSED",),
+    "set_joint_wall": ("RTI_REFUSED",),
+    "set_log_level": ("RTI_REFUSED",),
+    "set_payload": ("RTI_REFUSED",),
+    "set_recipe": ("RTI_REFUSED",),
+    "stop": ("RTI_REFUSED",),
+}
+_answer_seq = itertools.count(1)
+_ANSWER_PREFIX = f"{_os.getpid()}-"        # a token of an executor that restarted is never mistaken for a new one
+_answers: dict = {}                         # token -> [threading.Event, the answer dict or None]
+_answers_lock = threading.Lock()
+
+
+def _ask_rti(message, cid):
+    """Send one command to RTI with an answer token: `message` is RTI's colon string, or a payload dict carrying "msg"
+    (send_payload_to_rti). -> the waiter for _rti_answer(); register first, so an answer can never come too early."""
+    token = f"{_ANSWER_PREFIX}{next(_answer_seq)}"
+    waiter = [threading.Event(), None, token]
+    with _answers_lock:
+        _answers[token] = waiter
+    if isinstance(message, dict):
+        send_payload_to_rti(message, cid, "TCP", answer=token)
+    else:
+        send_to_rti(message, cid, "TCP", answer=token)
+    return waiter
+
+
+def _rti_answer(waiter):
+    """Wait for RTI's answer to a command sent by _ask_rti: None = accepted; else {"code", "message"} — RTI's refusal,
+    or RTI_NOT_RUNNING when nothing came within RTI_ANSWER_TIMEOUT_S."""
+    try:
+        if not waiter[0].wait(RTI_ANSWER_TIMEOUT_S):
+            return {"code": "RTI_NOT_RUNNING",
+                    "message": f"RTI did not answer within {RTI_ANSWER_TIMEOUT_S:g} s — it is not running or not "
+                               f"responding; the command may not have taken effect"}
+    finally:
+        with _answers_lock:
+            _answers.pop(waiter[2], None)
+    answer = waiter[1] or {}
+    if answer.get("status") == "ok":
+        return None
+    return {"code": str(answer.get("code") or "RTI_REFUSED"), "message": str(answer.get("message") or "")}
+
+
+def ask_rti(message, cid):
+    """Send one command to RTI and wait for its answer: None = accepted, else {"code", "message"}."""
+    return _rti_answer(_ask_rti(message, cid))
+
+
+def deliver_rti_answer(answer):
+    """The checkpoint listener's hand-off: RTI's answer {"answer": token, "status", ...} to the command waiting for it.
+    False when nobody waits (it came after RTI_ANSWER_TIMEOUT_S): dropped."""
+    with _answers_lock:
+        waiter = _answers.get(answer.get("answer"))
+    if waiter is None:
+        logger.info(f"RTI's answer {answer.get('answer')} came after the wait ended: {answer.get('status')}")
+        return False
+    waiter[1] = answer
+    waiter[0].set()
+    return True
+
+
+def _reply_answer(conn, cid, command, refusal, data=None):
+    """Reply with RTI's verdict: ok (with `data`) and the activity log's CMD_EXECUTED, or the refusal (logged as a
+    rejected command). -> True when accepted."""
+    if refusal is not None:
+        _log_exec_reject(cid, refusal["code"], refusal["message"], command=command)
+        reply(conn, {"id": cid, "status": "error", "code": refusal["code"], "message": refusal["message"]})
+        return False
+    out = {"id": cid, "status": "ok"}
+    if data is not None:
+        out["data"] = data
+    reply(conn, out)
+    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command=command)
+    return True
+
+
+def _answered(conn, cid, command, *messages, data=None):
+    """Pass `messages` to RTI one at a time, each waiting for RTI's answer, and reply with the outcome: ok (with
+    `data`), or the first refusal (the rest not sent). -> True when RTI accepted every one."""
+    for message in messages:
+        refusal = ask_rti(message, cid)
+        if refusal is not None:
+            return _reply_answer(conn, cid, command, refusal)
+    return _reply_answer(conn, cid, command, None, data)
 
 
 def _next_command_seq():
@@ -951,11 +1090,10 @@ def _handle_reload_zones(args, cid, conn):
         _planner.set_zones(setup["zones"], setup["tool_spheres"])
     # The parsed, validated setup travels WITH the command (2026-10-04): RTI rebuilds its zones from it
     # (config.xml_parser.zone_setup_from_wire) and reads no file in its loop.
-    send_payload_to_rti({"msg": "reload_zones", "setup": zones_summary(setup)}, cid, "TCP")
-    logger.info(f"zones reloaded: cell '{setup['cell']}', "
-                 f"{sum(z['enabled'] for z in setup['zones'])} of {len(setup['zones'])} zones enabled")
-    reply(conn, {"id": cid, "status": "ok", "data": zones_summary(setup)})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="reload_zones")
+    if _answered(conn, cid, "reload_zones", {"msg": "reload_zones", "setup": zones_summary(setup)},
+                 data=zones_summary(setup)):
+        logger.info(f"zones reloaded: cell '{setup['cell']}', "
+                    f"{sum(z['enabled'] for z in setup['zones'])} of {len(setup['zones'])} zones enabled")
 
 
 def _handle_reload_filters(args, cid, conn):
@@ -970,11 +1108,9 @@ def _handle_reload_filters(args, cid, conn):
         _log_exec_reject(cid, "FILTER_CONFIG", str(e), command="reload_filters")
         return reply(conn, {"id": cid, "status": "error", "code": "FILTER_CONFIG",
                             "message": f"{FILTER_CONFIG_PATH.name}: {e} — the filters in force are unchanged"})
-    send_payload_to_rti({"msg": "reload_filters", "config": config}, cid, "TCP")
     kinds = {sig: sorted({sp.get("kind", "none") for sp in specs}) for sig, specs in config.items()}
-    logger.info(f"filters parsed and sent to RTI: {kinds}")
-    reply(conn, {"id": cid, "status": "ok", "data": {"signals": kinds}})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="reload_filters")
+    if _answered(conn, cid, "reload_filters", {"msg": "reload_filters", "config": config}, data={"signals": kinds}):
+        logger.info(f"filters parsed, RTI rebuilt them: {kinds}")
 
 
 def _handle_reload_recipes(args, cid, conn):
@@ -989,10 +1125,9 @@ def _handle_reload_recipes(args, cid, conn):
     except OSError as e:
         _log_exec_reject(cid, "RECIPE_DIR", str(e), command="reload_recipes")
         return reply(conn, {"id": cid, "status": "error", "code": "RECIPE_DIR", "message": str(e)})
-    send_payload_to_rti({"msg": "reload_recipes", "recipes": texts}, cid, "TCP")
-    logger.info(f"{len(texts)} recipe file(s) read and sent to RTI: {sorted(texts)}")
-    reply(conn, {"id": cid, "status": "ok", "data": {"files": sorted(texts)}})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="reload_recipes")
+    if _answered(conn, cid, "reload_recipes", {"msg": "reload_recipes", "recipes": texts},
+                 data={"files": sorted(texts)}):
+        logger.info(f"{len(texts)} recipe file(s) read, RTI reloaded them: {sorted(texts)}")
 
 
 def _handle_set_payload(args, cid, conn):
@@ -1009,11 +1144,9 @@ def _handle_set_payload(args, cid, conn):
         _log_exec_reject(cid, "PAYLOAD_LIMIT", why, command=_fmt_command("set_payload", list(args) if isinstance(args, (list, tuple)) else []))
         return reply(conn, {"id": cid, "status": "error", "code": "PAYLOAD_LIMIT", "message": why})
     payload = {"msg": "set_payload", "mass": float(mass), "com": [float(v) for v in com]}
-    send_payload_to_rti(payload, cid, "TCP")
-    reply(conn, {"id": cid, "status": "ok", "data": {"mass": payload["mass"], "com": payload["com"],
-                                                     "max_payload_kg": float(cfg['safety']['max_payload_kg'])}})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                 command=_fmt_command("set_payload", [payload["mass"], payload["com"]]))
+    _answered(conn, cid, _fmt_command("set_payload", [payload["mass"], payload["com"]]), payload,
+              data={"mass": payload["mass"], "com": payload["com"],
+                    "max_payload_kg": float(cfg['safety']['max_payload_kg'])})
 
 
 # --- diagnostics (2026-10-15; docs/logging.md "Runtime log levels", "Health", "Captures") -------------------------
@@ -1038,10 +1171,9 @@ def _handle_set_log_level(args, cid, conn):
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": why})
     name, level = str(name).strip(), str(level).strip().upper()
     log_control.info("log level %s -> %s (%s)", name, level, _client_origin(conn))
-    send_to_rti(f"set_log_level:{name}:{level}", cid, "TCP")      # RTI applies the same to its own copy of the logger
-    reply(conn, {"id": cid, "status": "ok", "data": {"name": name, "level": level}})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                 command=_fmt_command("set_log_level", [name, level]))
+    # RTI applies the same to its own copy of the logger
+    _answered(conn, cid, _fmt_command("set_log_level", [name, level]), f"set_log_level:{name}:{level}",
+              data={"name": name, "level": level})
 
 
 _capture_request_str = None
@@ -1279,11 +1411,10 @@ def _handle_set_joint_wall(args, cid, conn):
             _log_exec_reject(cid, "WALL_OFF", msg, command=_fmt_command("set_joint_wall", args))
             return reply(conn, {"id": cid, "status": "error", "code": "WALL_OFF", "message": msg})
         _walls["specs"] = specs
-        send_payload_to_rti({"msg": "set_joint_walls", "specs": specs}, cid, "TCP")
+        waiter = _ask_rti({"msg": "set_joint_walls", "specs": specs}, cid)      # answered outside the walls lock
         data = _walls_reply(specs)
-    logger.info(f"J{joint} freedrive wall set live: {spec}")
-    reply(conn, {"id": cid, "status": "ok", "data": data})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="set_joint_wall")
+    if _reply_answer(conn, cid, "set_joint_wall", _rti_answer(waiter), data):
+        logger.info(f"J{joint} freedrive wall set live: {spec}")
 
 
 def _handle_save_joint_walls(args, cid, conn):
@@ -1378,19 +1509,14 @@ def _handle_set_completion_policy(args, cid, conn):
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_POLICY",
                             "message": "policy must be commanded, settled, or strict"})
     _set_motion_defaults(completion_policy=policy)
-    send_to_rti(f"exec_completion_policy:{policy}", cid, "TCP")
-    reply(conn, {"id": cid, "status": "ok"})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                 command=_fmt_command("set_completion_policy", args))
+    _answered(conn, cid, _fmt_command("set_completion_policy", args), f"exec_completion_policy:{policy}")
 
 
 def _handle_clear_errors(args, cid, conn):
     """Clear RTI's error latch AND the motion abort: one recovery path for both."""
     if _planner is not None:
         _planner.clear_abort()
-    send_to_rti("clear_errors", cid, "TCP")
-    reply(conn, {"id": cid, "status": "ok"})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="clear_errors")
+    _answered(conn, cid, "clear_errors", "clear_errors")
 
 
 # Commands that take RTI out of EXEC (RTI.py: disable -> IDLE, home -> HOMING, the rest by name).
@@ -1438,26 +1564,31 @@ STOP_CONFIRM_S = 1.5
 
 
 def _handle_stop(args, cid, conn):
-    _stop_motion(cid)
-    reply(conn, {"id": cid, "status": "ok"})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command="stop")
+    answers = [_rti_answer(w) for w in _stop_motion(cid, ask=True)]       # every waiter collected
+    _reply_answer(conn, cid, "stop", next((a for a in answers if a is not None), None))
 
 
-def _stop_motion(cid):
+def _stop_motion(cid, ask=False):
     """stop()'s work: the queued motion dropped and failed STOPPED, the gripper held, the arm braked (EXEC: along the
-    path, then held; elsewhere IDLE). Also a disconnect's (_stop_if_left_moving)."""
+    path, then held; elsewhere IDLE). Also a disconnect's (_stop_if_left_moving). With `ask` (stop()) RTI answers each
+    message: -> their waiters (_rti_answer), sent inside the abort gate, waited for by the caller outside it."""
     in_exec = shared_data.robot_mode.get() == "EXEC"
+    waiters = []
     with _abort_gate():                    # a command being queued right now lands before this, never after
         _planner.flush()                   # drop queued motion + reset endpoint; a new stop epoch + its fence to RTI
         _fail_pending("STOPPED", "motion stopped")
-        # The gripper stops too (2026-10-24, user: a stop "should freeze it also"): RTI holds the jaws where they are.
-        send_to_rti("gripper_hold", cid, "TCP")
         epoch = _planner.epoch
+        # The gripper stops too (2026-10-24, user: a stop "should freeze it also"): RTI holds the jaws where they are.
         # In EXEC: brake along the path, drop the program up to the fence, hold there (still in EXEC). Elsewhere
         # (JOG, RTI, ...): IDLE as before.
-        send_to_rti(f"exec_stop:{epoch}" if in_exec else "set_mode:IDLE", cid, "TCP")
+        for message in ("gripper_hold", f"exec_stop:{epoch}" if in_exec else "set_mode:IDLE"):
+            if ask:
+                waiters.append(_ask_rti(message, cid))
+            else:
+                send_to_rti(message, cid, "TCP")
     if in_exec:
         _confirm_exec_stop(epoch, cid)
+    return waiters
 
 
 def _stop_if_left_moving(conn, who):
@@ -1558,9 +1689,7 @@ def _forward_to_rti(rti_msg, cmd_name=None):
     """Build a handler that forwards a FIXED rti_msg to RTI as-is and acks ok."""
     display_name = cmd_name or rti_msg
     def handler(args, cid, conn):
-        send_to_rti(rti_msg, cid, "TCP")
-        reply(conn, {"id": cid, "status": "ok"})
-        log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid, command=display_name)
+        _answered(conn, cid, display_name, rti_msg)
     return handler
 
 
@@ -1582,22 +1711,15 @@ def _handle_enter_flashing_mode(args, cid, conn):
     skipped, so anything unrecognised falls back to the safer PARKED wording
     rather than FORCE.
     """
-    if not args:
-        send_to_rti("set_mode:FLASHING", cid, "TCP")   # RTI will refuse it
-        reply(conn, {"id": cid, "status": "ok"})
-        log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                     command="enter_flashing_mode (NO ASSERTION — will be refused)")
+    if not args:                            # RTI refuses it: MODE_REJECTED (no claim that the arm is safe limp)
+        _answered(conn, cid, "enter_flashing_mode (NO ASSERTION)", "set_mode:FLASHING")
         return
     # Strict identity, not truthiness: bool("nonsense") is True, so a plain
     # bool() here would let a malformed argument select the LEAST safe path.
     # Only a literal True/1 means FORCE; everything else degrades to PARKED.
     force = args[0] is True or args[0] == 1
-    send_to_rti("set_mode:FLASHING:FORCE" if force else "set_mode:FLASHING:PARKED",
-                cid, "TCP")
-    reply(conn, {"id": cid, "status": "ok"})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                 command="enter_flashing_mode " + ("(FORCED, NOT PARKED)" if force
-                                                   else "(operator confirmed PARKED)"))
+    _answered(conn, cid, "enter_flashing_mode " + ("(FORCED, NOT PARKED)" if force else "(operator confirmed PARKED)"),
+              "set_mode:FLASHING:FORCE" if force else "set_mode:FLASHING:PARKED")
 
 
 # Value checks for _forward_fmt (2026-10-13, api_tests/72 against the simulated robot). Each takes the argument and
@@ -1797,10 +1919,7 @@ def _handle_joint_test(args, cid, conn):
                   and 0 < v <= _JOINT_TEST_MAX_DPS and 0 < c <= _live_ilim[j - 1]):
         return bad(f"joint_test: amplitude 0-{_JOINT_TEST_MAX_DEG:g} deg, speed 0-{_JOINT_TEST_MAX_DPS:g} deg/s, "
                    f"current up to J{j}'s limit ({_live_ilim[j - 1]:.0f} mA)")
-    send_to_rti(f"joint_test:{j}:{a!r}:{v!r}:{c!r}", cid, "TCP")
-    reply(conn, {"id": cid, "status": "ok"})
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                 command=_fmt_command("joint_test", [j, a, v, c]))
+    _answered(conn, cid, _fmt_command("joint_test", [j, a, v, c]), f"joint_test:{j}:{a!r}:{v!r}:{c!r}")
 
 
 def _joint_test_status(rti):
@@ -1871,10 +1990,7 @@ def _forward_fmt(prefix, cmd_name, argc, checks=None):
                 _log_exec_reject(cid, "BAD_ARGS", msg, command=cmd_name)
                 return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
         rti_msg = ":".join([prefix] + [str(a) for a in args])
-        send_to_rti(rti_msg, cid, "TCP")
-        reply(conn, {"id": cid, "status": "ok"})
-        log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                     command=_fmt_command(cmd_name, args))
+        _answered(conn, cid, _fmt_command(cmd_name, args), rti_msg)
     return handler
 
 
@@ -1982,13 +2098,11 @@ def _handle_set_pid_gains(args, cid, conn):
         _log_exec_reject(cid, "REJECTED", msg, command="set_pid_gains")
         return reply(conn, {"id": cid, "status": "error", "code": "REJECTED", "message": msg})
     payload = {"msg": "set_pid_gains", "joint": joint, **gains}
-    send_payload_to_rti(payload, cid, "TCP")
-    if "Ilim" in gains:
+    refusal = ask_rti(payload, cid)
+    if refusal is None and "Ilim" in gains:
         _live_ilim[joint] = float(gains["Ilim"])          # joint_test checks against what the drive has now
-    reply(conn, {"id": cid, "status": "ok"})
     # The gains themselves in the activity log (2026-10-24: only the joint was recorded).
-    log_activity(_exec_activity_logger, "EXEC", "info", "CMD_EXECUTED", id=cid,
-                 command=_fmt_command("set_pid_gains", [payload["joint"], gains]))
+    _reply_answer(conn, cid, _fmt_command("set_pid_gains", [payload["joint"], gains]), refusal)
 
 
 def _bool_arg(args, cid, conn, command, *, required):
@@ -2373,6 +2487,9 @@ def checkpoint_listener():
             logger.error(f"checkpoint recv error: {e}")
             continue
 
+        if "answer" in status:             # RTI's answer to a command passed to it (2026-10-25)
+            deliver_rti_answer(status)
+            continue
         cid = status.get("checkpoint_id")
         with _pending_lock:
             conn = pending_client.pop(cid, None)

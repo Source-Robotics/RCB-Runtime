@@ -60,8 +60,9 @@ def _cap_running_out_logs(processes, max_bytes=OUT_LOG_MAX_BYTES, keep=OUT_LOG_K
 
 
 def _check_recordings_budget(now=None, root=TEMP_DATA_DIR, budget=RECORDINGS_BUDGET_BYTES):
-    """Once an hour (the first monitor pass too): the test recordings in temp_data together at most `budget` (1 GB),
-    the oldest runs deleted first (utility/housekeeping.enforce_budget; user, 2026-10-15). Returns the deleted run
+    """Once an hour (the first monitor pass too): the test recordings in temp_data together at most `budget`
+    (500 MB, utility/housekeeping.RECORDINGS_BUDGET_BYTES), the oldest runs deleted first
+    (utility/housekeeping.enforce_budget; user, 2026-10-15). Returns the deleted run
     keys. Never raises: housekeeping must not take the supervisor down."""
     now = time.monotonic() if now is None else now
     if now - _last_budget_check[0] < BUDGET_CHECK_S:

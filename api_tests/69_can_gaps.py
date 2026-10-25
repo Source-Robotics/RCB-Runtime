@@ -86,12 +86,11 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _tracking_common import Capture, robot_enabled  # noqa: E402
 from config.cpu_cores import GENERAL_CPU_CORES  # noqa: E402
+from utility.loop_delay import (CMD_DATA_PACK_1, CMD_DATA_PACK_PD, JOINT_NODES, RESP_DATA_PACK_1,  # noqa: E402
+                                _stats, candump_gaps, loop_delay_per_joint, node_frames, parse_candump,
+                                tick_anchor)
 
 RECIPE = "can_gaps"
-CMD_DATA_PACK_1 = 2               # RTI -> drive (Spectral_BLDC SEND_DATA_PACK_1_ID)
-CMD_DATA_PACK_PD = 4              # RTI -> drive (SEND_DATA_PACK_PD_ID)
-RESP_DATA_PACK_1 = 3              # drive -> RTI: position 24 b, speed 24 b, current 16 b, big-endian signed
-JOINT_NODES = 6                   # CAN nodes 0..5 = J1..J6
 KINDS = ("passthrough", "exec", "passthrough_rf", "exec_rf")   # 'planner' (101 bytes) is refused since 2026-10-12;
 #   '_rf': option B (read first, send early) ON for the block; option A's '_wait' blocks retired 2026-10-12
 DEFAULT_ORDER = "passthrough,passthrough_rf,exec,exec_rf,passthrough,passthrough_rf,exec,exec_rf"
@@ -110,37 +109,6 @@ EXC_W = 25                        # half width (ticks) of the running median the
 
 
 # ----------------------------------------------------------------------------- reading the recordings (pure)
-def parse_candump(lines):
-    """candump -L lines -> sorted arrays: t (s, CLOCK_REALTIME — when our CAN driver handled the frame), node, cmd,
-    pos (the 24-bit position of a data pack or its reply; NaN otherwise)."""
-    t, node, cmd, pos = [], [], [], []
-    for ln in lines:
-        ln = ln.strip() if isinstance(ln, str) else ln.decode(errors="replace").strip()
-        if not ln.startswith("("):
-            continue
-        try:
-            ts, _iface, frame = ln.split()
-            cid_hex, data_hex = frame.split("#", 1)
-            cid = int(cid_hex, 16)
-            data = b"" if data_hex.startswith("R") else bytes.fromhex(data_hex)
-            tt = float(ts.strip("()"))
-        except ValueError:
-            continue
-        if cid > 0x7FF:
-            continue
-        c = (cid >> 1) & 0x3F
-        p = np.nan
-        if c in (CMD_DATA_PACK_1, CMD_DATA_PACK_PD, RESP_DATA_PACK_1) and len(data) == 8:
-            p = int.from_bytes(data[0:3], "big", signed=True)
-        t.append(tt)
-        node.append((cid >> 7) & 0xF)
-        cmd.append(c)
-        pos.append(p)
-    o = np.argsort(np.asarray(t), kind="stable")
-    return {"t": np.asarray(t, float)[o], "node": np.asarray(node, int)[o], "cmd": np.asarray(cmd, int)[o],
-            "pos": np.asarray(pos, float)[o]}
-
-
 def to_rows(packets, joint_num=6):
     """Telemetry packets of the `can_gaps` recipe -> arrays ordered by tick (other recipes' packets dropped)."""
     from robotclient.rti_client import parse_state_packet
@@ -258,11 +226,6 @@ def running_median(x, w=EXC_W):
         return x
     pad = np.pad(x, (w, w), mode="edge")
     return np.median(np.lib.stride_tricks.sliding_window_view(pad, 2 * w + 1), axis=1)
-
-
-def node_frames(c, node, cmds):
-    m = (c["node"] == node) & np.isin(c["cmd"], cmds)
-    return c["t"][m], c["pos"][m]
 
 
 def burst_at(c, starts, i):
@@ -385,15 +348,6 @@ def classify(runs, d, c, ts, tx_t, rx_t, dt):
     return out
 
 
-def _stats(x):
-    x = np.asarray(x, float)
-    x = x[np.isfinite(x)]
-    if x.size == 0:
-        return {"n": 0}
-    return {"n": int(x.size), "med": float(np.median(x)), "p99": float(np.percentile(x, 99)), "max": float(np.max(x)),
-            "min": float(np.min(x))}
-
-
 def can_metrics(c, w0, w1):
     """The bus in [w0, w1) (CLOCK_REALTIME)."""
     m = (c["t"] >= w0) & (c["t"] < w1)
@@ -424,24 +378,6 @@ def can_metrics(c, w0, w1):
     return {"frames": int(m.sum()), "nodes": nodes, "j1_resp_ms": _stats(resp),
             "exchange_ms": _stats([(b[1] - b[0]) * 1e3 for b in bs]), "pause_ms": _stats(pauses),
             "pauses_over": int(np.sum(pauses > STALL_MS)), "host_stalls": stalls}
-
-
-def candump_gaps(c, w0, w1, min_ms=8.0):
-    """[(t0, t1)]: stretches of the window with no frame at all in the log. The bus is never that quiet while RTI
-    runs (a frame every ~0.1-0.3 ms) — such a gap is candump missing frames, not the bus: excluded from the counts."""
-    t = c["t"][(c["t"] >= w0) & (c["t"] < w1)]
-    g = np.diff(t)
-    i = np.flatnonzero(g > min_ms * 1e-3)
-    return [(float(t[k]), float(t[k + 1])) for k in i]
-
-
-def tick_anchor(read_t, ts):
-    """Where each row's commands are looked for from: its CAN read (`can_read_t`) where recorded, else its clock reading.
-    A tick's commands leave after its own read and before the next one in both orders; the clock reading (the history
-    entry's stamp) does not: with option B's send-early order (2026-10-12, §9.10) the entry is made AFTER the commands
-    left, so J1's / J2's went out before it and the first command after it was the NEXT tick's (J1 / J2 read 100 %
-    late and 7.8 ms of loop delay, while by content J1's was 3.8)."""
-    return np.where(np.isfinite(read_t) & (read_t > 0), read_t, ts)
 
 
 def tick_commands(tc, ts):
@@ -513,34 +449,6 @@ def reply_freshness(c, read_t, tick, ts, gaps=()):
                             "missed_pct": 100.0 * missed / valid.sum() if valid.sum() else np.nan,
                             "margin_ms": float(np.median(rel)) if rel.size else np.nan,
                             "age_ms": _stats(age), "age_p5": float(np.percentile(age, 5)) if age.size else np.nan}
-    return out
-
-
-def loop_delay_per_joint(c, ts, read_t, tick, lag, gaps=()):
-    """Per joint, by TIME alone (no motion needed — every joint gets a command and answers every tick): the newest
-    reply before RTI's read in row k -> the first command to that joint after row k+lag's READ (the tick's own command:
-    the frames leave after it in both orders — at RTI's sleep in the old order, after dispatch in option B; the clock
-    reading is no anchor since option B makes the history entry after the send, 2026-10-12). lag 1 in the old order (row k's reply feeds tick k+1's command), 0 in option B. A pair
-    is used only when the ticks are consecutive and that command came before the following row's stamp (it is really
-    that tick's). ts / read_t in CLOCK_REALTIME. -> {"J1": stats, ...} in ms."""
-    ok = np.isfinite(read_t) & (read_t > 0) & np.isfinite(ts)
-    for g0, g1 in gaps:                       # a read or a command inside a candump gap cannot be judged
-        ok &= ~((read_t > g0) & (read_t < g1 + 0.005)) & ~((ts > g0 - 0.005) & (ts < g1 + 0.005))
-    anchor = tick_anchor(read_t, ts)          # the tick's read (see tick_anchor)
-    n = tick.size
-    out = {}
-    for j in range(JOINT_NODES):
-        tc = node_frames(c, j, (CMD_DATA_PACK_1, CMD_DATA_PACK_PD))[0]
-        tr = node_frames(c, j, (RESP_DATA_PACK_1,))[0]
-        if tc.size == 0 or tr.size == 0 or n <= lag + 1:
-            continue
-        ir = np.searchsorted(tr, read_t, "right") - 1             # the newest reply before each read
-        ic = np.searchsorted(tc, anchor, "right")                 # the first command after each tick's read
-        rep = np.where(ir >= 0, tr[np.clip(ir, 0, None)], np.nan)
-        cmd = np.where(ic < tc.size, tc[np.clip(ic, None, tc.size - 1)], np.nan)
-        k = np.arange(n - lag - 1)
-        good = ok[k] & ok[k + lag] & ((tick[k + lag] - tick[k]) == lag) & (cmd[k + lag] < anchor[k + lag + 1])
-        out[f"J{j + 1}"] = _stats((cmd[k + lag][good] - rep[k][good]) * 1e3)
     return out
 
 

@@ -737,9 +737,9 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # negative = overlap) while it is within the MONITOR margin on the measured pose, +inf otherwise. Written by the
     # collision worker; RTI's monitor keeps what was already within the margin when an active mode began and
     # stops only if a pair gets closer than that, or another pair comes within the margin.
-    # The control loop's delay per joint (2026-10-12, utility/loop_delay_meter.py): a reply's arrival -> the departure of
-    # the command computed from it [s], median / max of the last ~5 s; NaN until measured. can_read_first: 1 while
-    # RTI runs option B's tick order (read first, send early), 0 in the normal order.
+    # can_read_first: 1 while RTI runs option B's tick order (read first, send early), 0 in the normal order (also
+    # read by tools/loop_delay.py, the on-request loop delay; RTI's live loop_delay / loop_delay_max fields went
+    # 2026-10-25 with the meter that stalled the tick).
     # The Hall sensor check (robotics/hall_check.py, 2026-10-13): hall_check_joint = the limp joint's number (1-based)
     # while the check runs, 0 = off; hall_check_pin = its Hall pin (0 / 1), -1 = not read yet; hall_check_changes = pin
     # changes seen; hall_check_edge_deg = the joint's angle (deg) at the last change to 0 / to 1 (NaN = none yet).
@@ -747,7 +747,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # joint_test (robotics/joint_test.py, 2026-10-18): a test move's joint, state, amplitude, moved, max error, peak
     # current, end error, seq (RESULT_FIELDS there).
     for name, count in [("sc_pair_gaps", 49), ("jog_ref", joint_num), ("jog_dir", joint_num),
-                        ("loop_delay", joint_num), ("loop_delay_max", joint_num), ("can_read_first", 1),
+                        ("can_read_first", 1),
                         ("hall_check_joint", 1), ("hall_check_pin", 1), ("hall_check_changes", 1),
                         ("hall_check_edge_deg", 2), ("free_joint", 1), ("joint_test", 8)]:
         shm, arr = _attach_or_create(name, np.float64, count)

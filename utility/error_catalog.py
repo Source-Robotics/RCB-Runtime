@@ -477,10 +477,17 @@ CATALOG = {
                              "The gripper is in motor mode, where the robot sends it no target, so a gripper move "
                              "cannot run.", _REFUSED,
                              "Switch it to firmware mode with set_gripper_ctrl_mode(2), then send the command again."),
-    "RTI_NOT_RUNNING": _e(6025, "Measured values unavailable",
+    "RTI_NOT_RUNNING": _e(6025, "RTI not running or not answering",
                           "RTI is not running, or the robot is in flashing mode, so the measured values in the robot's "
-                          "memory are old.", _REFUSED,
+                          "memory are old; or RTI did not answer a command passed to it within 1 s (every such "
+                          "command waits for RTI's answer).",
+                          "The command is refused. A command passed to RTI may still have taken effect.",
                           "Check the robot service and RTI.log (Logs tab), or leave flashing mode, then ask again."),
+    "RTI_REFUSED": _e(6026, "Refused by RTI",
+                      "The real-time controller (RTI) refused the command in its current state or could not read "
+                      "it. The message gives RTI's reason, for example a setting not allowed in this real-time mode, "
+                      "a name it does not know, or a file it could not use.", _REFUSED,
+                      "Do what the message says, then send the command again."),
     "CONTROL_HELD": _e(6101, "Control held by another client", "Another client holds control of the robot.",
                        _REFUSED,
                        "Release control on that client, or take control. A forced takeover asks for confirmation "

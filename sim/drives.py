@@ -111,6 +111,7 @@ def drive_state(d, f, ms):
             "silent": f.silent(ms), "dropped": f.dropped, "frames": d.frames, "gripper": d.gripper, "stop": d.stop,
             "g_target": d.g_target, "g_position": d.g_position, "g_activated": d.g_activated, "g_action": d.g_action,
             "g_calibrated": d.g_calibrated,
+            "boots": d.boots, "wd_at_boot": d.wd_at_boot, "wd_writes": d.wd_writes, "limit_writes": d.limit_writes,
             "physics": {k: v for k, v in (("push", d.push_until_ms > ms), ("runaway", d.runaway_until_ms > ms),
                                           ("lag", d.lag_until_ms > ms), ("buzz", d.buzz_until_ms > ms),
                                           ("block", d.block_until_ms > ms)) if v}}

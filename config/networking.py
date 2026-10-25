@@ -186,6 +186,18 @@ def zmq_sender_setup():
 
     return status_socket
 
+
+def zmq_answer_sender_setup():
+    """RTI's answers to the executor's commands (2026-10-25): {"answer": token, "status": "ok" | "error", "code",
+    "message"} PUSHed to ZMQ_EXEC_STATUS_SOCKET, where the executor's checkpoint listener PULLs — the path the EXEC
+    handler's checkpoints already take, no new port or socket path. Off RTI's core (background_zmq_context); LINGER 0
+    like the other PUSH sockets: an answer is worthless once RTI stops."""
+    ctx = background_zmq_context()
+    sock = ctx.socket(zmq.PUSH)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.connect(ZMQ_EXEC_STATUS_SOCKET)
+    return sock
+
 def udp_socket_receive_setup():
     """Initialize and return the UDP receive socket (RTI commands from PC)."""
     RTI_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

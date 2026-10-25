@@ -9,10 +9,10 @@
     (milliseconds — acceptable for a file that holds crashes and thread dumps).
   * prune_folders — keep the newest `keep` run folders of a tool (tools/sim_run.py, tools/arm_smoke.py).
   * enforce_budget — the test recordings in temp_data (RECORDING_DIRS: what the api_tests measurement scripts save,
-    one file or folder per run) together at most RECORDINGS_BUDGET_BYTES (1 GB, user 2026-10-15): the oldest runs
+    one file or folder per run) together at most RECORDINGS_BUDGET_BYTES (500 MB, see there): the oldest runs
     deleted first, a run's files together (the same "YYYYMMDD_HHMMSS" name start). The supervisor checks once an
     hour. Only these folders: reference data (calibration, the self-collision fits, motor-tuning baselines, the arm
-    table, the firmware cache) is never in the list. dummy_test_scripts/test_housekeeping_budget.py keeps every
+    table, the firmware cache) is never in the list. dummy_test_scripts/test_disk_limits.py keeps every
     api_test that writes into temp_data either in RECORDING_DIRS or in KEPT_DIRS.
 """
 from __future__ import annotations
@@ -45,7 +45,9 @@ KEPT_DIRS = {"calibration": "the arms' calibration-screw readings (api_tests/65)
              "nets": "tools/run_nets.py: one log per net, overwritten each run",
              "quality": "tools/quality.py: baselines, overwritten",
              "coverage": "tools/quality.py: the last coverage report, overwritten"}
-RECORDINGS_BUDGET_BYTES = 1_000_000_000
+# 500 MB since 2026-10-25 (user: the 15 GB SD card filled up); 1 GB from 2026-10-15. On a Pi with a larger card
+# (32 GB or more) set it back to 1_000_000_000 — the only place the number lives (supervisor, disk_cleanup read it).
+RECORDINGS_BUDGET_BYTES = 500_000_000
 _RUN_STAMP = re.compile(r"^(?:[a-z]+_)?(\d{8}_\d{6})")
 
 def _shift(path, keep):

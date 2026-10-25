@@ -231,25 +231,29 @@ def reply_loss(ctx, notes):
 
 def drive_reboot(ctx, notes):
     """J4's drive reboots (0.15 s without power: its config gone): RTI's reconnect reload must re-send it — the
-    watchdog 100 ms and J4's current limit back on the drive — and nothing latches (a short stale only)."""
+    watchdog 100 ms and J4's current limit back on the drive — and nothing latches (a short stale only).
+    The drive records the reboot itself (2026-10-25): it booted with its watchdog wiped (wd_at_boot 0) and RTI wrote
+    the watchdog and the limits again since (wd_writes / limit_writes since that boot). Polling for the wiped config
+    raced RTI's reload (~0.1 s after the drive answered): the 50 ms poll came after it on 2026-10-25."""
     r = ctx.robot()
     ctx.ready(r)
     before = ctx.nodes()[3]
     mark = ctx.activity_mark()
     ctx.sim(cmd="reboot", node=3, ms=150)
     _wait(lambda: not ctx.nodes()[3]["silent"], 1.0)
-    after_boot = ctx.nodes()[3]
     restored = _wait(lambda: ctx.nodes()[3]["wd_time_ms"] == before["wd_time_ms"]
                      and ctx.nodes()[3]["current_limit"] == before["current_limit"], 2.0)
     now = ctx.nodes()[3]
     st = r.status()
     errs = ctx.joint_errors(mark, 4)
-    notes.append(f"right after the reboot: watchdog {after_boot['wd_time_ms']} ms, current limit "
-                 f"{after_boot['current_limit']:.0f}; after RTI's reload: {now['wd_time_ms']} ms, "
-                 f"{now['current_limit']:.0f} mA (before: {before['wd_time_ms']} ms, {before['current_limit']:.0f}); "
-                 f"err={st.get('err')} {errs or ''}")
+    rebooted = now["boots"] == before["boots"] + 1 and now["wd_at_boot"] == 0
+    reloaded = now["wd_writes"] >= 1 and now["limit_writes"] >= 1
+    notes.append(f"rebooted: {now['boots'] - before['boots']} boot(s), its watchdog at boot {now['wd_at_boot']} ms; "
+                 f"RTI's reload since: {now['wd_writes']} watchdog / {now['limit_writes']} limit write(s); now "
+                 f"{now['wd_time_ms']} ms, {now['current_limit']:.0f} mA (before: {before['wd_time_ms']} ms, "
+                 f"{before['current_limit']:.0f}); err={st.get('err')} {errs or ''}")
     r.disconnect()
-    return after_boot["wd_time_ms"] == 0 and bool(restored) and st.get("err") == 0 and not errs
+    return rebooted and reloaded and bool(restored) and st.get("err") == 0 and not errs
 
 
 def executor_lost(ctx, notes):
