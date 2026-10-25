@@ -13,6 +13,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-25
+
 ### Added
 
 - `RTI_REFUSED` (6026): the real-time controller refused a command; the message gives its reason.
