@@ -13,6 +13,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-25
+
 ### Fixed
 
 - Switching the read-first tick order at runtime (`set_can_read_first()`) no longer opens or closes a socket inside
