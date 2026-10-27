@@ -31,6 +31,7 @@ from utility.logger_setup import setup_logging          # noqa: E402
 setup_logging(str(GUI_LOG), log_to_console=True)
 
 from gui_command_sender import ExecCommandSender, GUI_IDLE_RELEASE_S, auto_release_due
+from gui_joint_tcp_rows import joint_tcp_rows
 from config.xml_parser import load_system_config, load_full_robot_config
 from config.system_config import publish_static_system_info, publish_memory_info, publish_disk_info
 from project_paths import SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, ACTIVITY_RTI_LOG, ACTIVITY_EXEC_LOG, ACTIVITY_REC_LOG, CONFIG_DIR
@@ -169,12 +170,20 @@ def _on_exec_error(label, exc):
 _exec_sender = ExecCommandSender(on_error=_on_exec_error)
 
 
-# When this dashboard last sent the executor anything. The dashboard is ONE permanent connection,
-# so without an idle release a single click would own the robot until the executor's 30 s timeout —
+# When this page last sent the executor anything. Each NiceGUI script-mode page has its own sender
+# connection, so without an idle release a single click would own the robot until the executor's 30 s timeout —
 # long enough to make every script started after "Clear Errors, Enable" fail with CONTROL_HELD
 # (three times in one session, 2026-09-30). See auto_release_due() for exactly when it lets go.
 _gui_last_cmd = [time.monotonic()]
 _gui_release_sent = [False]
+
+
+def _page_sender():
+    """Recover this page's executor channel even if an old socket disconnects after reconnect."""
+    global _exec_sender
+    if _exec_sender.closed:
+        _exec_sender = ExecCommandSender(on_error=_on_exec_error)
+    return _exec_sender
 
 
 def _exec(fn, label=""):
@@ -182,15 +191,15 @@ def _exec(fn, label=""):
     if label != "release_control":
         _gui_last_cmd[0] = time.monotonic()
         _gui_release_sent[0] = False
-    _exec_sender.submit(fn, label=label)
+    _page_sender().submit(fn, label=label)
 
 
 # ─────────────────────────────────────────────────────────────
 # Control ownership (TODO/control_arbitration_plan.md §4.3)
 # ─────────────────────────────────────────────────────────────
-# The executor decides who holds control, per TCP CONNECTION. This dashboard is ONE connection
-# (the sender's RobotClient) shared by every browser tab, so it is one holder: whoever clicks
-# Enable or jogs first claims control for all of them, and it frees itself after 30 s idle.
+# The executor decides who holds control, per TCP CONNECTION. NiceGUI runs this script for each
+# browser page, so each page has its own sender/RobotClient and its own control view. A page that
+# claims control frees it after 5 s idle; another page appears as another client to the executor.
 # That is display-level only — the executor enforces regardless of what is greyed here.
 #
 # Written by _refresh_control_state() on a timer, read by handlers. Stale by up to the timer
@@ -231,7 +240,7 @@ async def handle_take_control():
         _gui_toasts.put(("This dashboard now holds control.", "positive"))
     # Own thread, NOT the ordered queue: this can block for the whole confirmation window,
     # and Disable / jog-stop must never sit behind it.
-    _exec_sender.submit_async(_take, "take_control")
+    _page_sender().submit_async(_take, "take_control")
 
 
 def handle_release_control():
@@ -253,7 +262,7 @@ def handle_clear_errors():
     therefore see two clears in a row — harmless, the second only restarts the settle wait.
     """
     shared_data.clear_error_signal.set("1")
-    _exec_sender.submit(lambda r: r.clear_errors(wait=False), "clear_errors")
+    _page_sender().submit(lambda r: r.clear_errors(wait=False), "clear_errors")
 
 def handle_reset_loop_stats():
     """Signal RTI to zero the since-start loop-timing peaks (max period/exec/jitter,
@@ -651,9 +660,10 @@ def _jog_start(joint_idx, direction):
     # receiving the mouse-up because control changed hands mid-press would leave the arm
     # jogging with no way for its own button to end it.
     if _ctl_view["other"]:
-        return
+        return False
     speed = _jog_state['speed_pct'] * 100.0          # the slider's fraction; jog() takes percent (protocol 2)
     _exec(lambda r: r.jog(joint_idx, direction, speed), "jog_set")
+    return True
 
 def _jog_stop():
     _exec(lambda r: r.jog_stop(), "jog_stop")
@@ -732,8 +742,8 @@ with ui.card().classes("w-full mb-2") as _jog_card:
     _jog_btn_pressed = {'active': False}
 
     def _jog_button_down(joint_idx, direction):
-        _jog_btn_pressed['active'] = True
-        _jog_start(joint_idx, direction)
+        if _jog_start(joint_idx, direction):
+            _jog_btn_pressed['active'] = True
 
     def _jog_button_up():
         if _jog_btn_pressed['active']:
@@ -789,9 +799,9 @@ with ui.card().classes("w-full mb-2") as _jog_card:
             _joystick_active[0] = False
             _exec(lambda r: r.jog_stop(), "jog_stop")
             return
-        _joystick_active[0] = True
         if _ctl_view["other"]:
             return          # start/continue is gated; the stop above and on_end never are
+        _joystick_active[0] = True
         direction = 1 if x > 0 else -1
         speed_pct = min(abs(x), 1.0) * 100.0          # jog() takes percent (command protocol 2)
         _exec(lambda r: r.jog(joint_idx, direction, speed_pct), "jog_set")
@@ -897,12 +907,12 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                               'action': 0,
                               'last_dir': 0}  # +1 closing, -1 opening (set on each move)
 
-        def _send_gripper_cmd(position):
+        def _send_gripper_cmd(position, label="gripper_set"):
             s = _gripper_cmd_state
             # Snapshot the fields NOW — the worker runs the call later and the shared state
             # dict is mutated by _gr_move/_gr_stop, so a captured dict could send stale values.
             pos, spd, cur, act = int(position), s['speed'], s['current'], s['action']
-            _exec(lambda r: r.set_gripper(pos, spd, cur, act), "gripper_set")
+            _exec(lambda r: r.set_gripper(pos, spd, cur, act), label)
 
         def _gr_move(pos):
             # Open/Close pass 1/254; Goto passes the slider's tracked value.
@@ -925,7 +935,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             # and then holds the bus quiet with empty polls.
             _gripper_cmd_state['last_dir'] = 0
             _gripper_cmd_state['action'] = 0
-            _send_gripper_cmd(_gripper_cmd_state['position'])
+            _send_gripper_cmd(_gripper_cmd_state['position'], "gripper_stop")
 
         def _gr_stop():
             # HALT IN PLACE — hold the jaws exactly where they are.
@@ -947,7 +957,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 return
             _gripper_cmd_state['last_dir'] = 0
             _gripper_cmd_state['action'] = 1
-            _send_gripper_cmd(here)
+            _send_gripper_cmd(here, "gripper_stop")
 
         def _on_gripper_ctrl_mode(e):
             mode = 2 if e.value == 'firmware' else 1
@@ -1411,7 +1421,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 from gui_hall_check import add_hall_check_card
                 from robotics.hall_check import hall_joint_index
                 refresh_hall_card = add_hall_check_card(
-                    shared_data, _exec_sender.submit,
+                    shared_data, lambda fn, label: _page_sender().submit(fn, label),
                     hall_joint_index(_xml_cfg["has_hall_sensor"], int(_sys_cfg["joint_num"])))
             except Exception:
                 logger.exception("Hall sensor check card unavailable")
@@ -1530,7 +1540,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                          fmt_time=display_time.fmt_precise,      # one time format in every tab
                          zone_name=display_time.zone_name,
                          # runtime log levels (2026-10-15): RTI + the executor through set_log_level
-                         level_fn=lambda name, level: _exec_sender.submit(
+                         level_fn=lambda name, level: _page_sender().submit(
                              lambda r, n=name, lv=level: r.set_log_level(n, lv), label="set_log_level"))
         except Exception:
             logger.exception("Logs tab unavailable")
@@ -1542,9 +1552,9 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             from gui_incidents_tab import add_incidents_tab
             add_incidents_tab(is_visible=lambda: _active_tab_name(tabs.value) == 'Recordings',
                               fmt_time=display_time.fmt_precise,
-                              capture_fn=lambda seconds, name: _exec_sender.submit(
+                              capture_fn=lambda seconds, name: _page_sender().submit(
                                   lambda r, s=seconds, n=name: r.capture_telemetry(s, n), label="capture_telemetry"),
-                              stop_fn=lambda: _exec_sender.submit(lambda r: r.stop_capture(), label="stop_capture"),
+                              stop_fn=lambda: _page_sender().submit(lambda r: r.stop_capture(), label="stop_capture"),
                               joint_num=int(_sys_cfg["joint_num"]))
         except Exception:
             logger.exception("Recordings tab unavailable")
@@ -1871,7 +1881,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
     with ui.tab_panel(tab_walls):
         from gui_walls_tab import add_walls_tab
         add_walls_tab(_exec, shared_data, JOINTS, is_visible=lambda: _active_tab_name(tabs.value) == 'Walls',
-                      poll_fn=lambda fn, label: _exec_sender.submit(fn, label=label))   # not "activity"
+                      poll_fn=lambda fn, label: _page_sender().submit(fn, label=label))   # not "activity"
 
     # ─── Plots ────────────────────────────────────────────────
     with ui.tab_panel(tab_plots):
@@ -3798,29 +3808,9 @@ def update_tables():
 
     # ── Joints & TCP tab ──────────────────────────────────────
     if _tab == 'Joints & TCP':
-        joint_table.rows = [{
-            'j':       f'J{i+1}',
-            'homed':   'YES' if shared_data.rti['joint_homed'][i] else 'NO',
-            'pos':     fmt(_ang(shared_data.joint['joint_position'][i])),
-            'spd':     fmt(_ang(shared_data.joint['joint_speed'][i])),
-            'trq':     fmt(shared_data.joint['joint_torque'][i]),
-            'acc':     fmt(_ang(shared_data.joint['joint_acceleration'][i])),
-            'jrk':     fmt(_ang(shared_data.joint['joint_jerk'][i])),
-            'pos_cmd': fmt(_ang(shared_data.joint['joint_position_commanded'][i])),
-            'spd_cmd': fmt(_ang(shared_data.joint['joint_speed_commanded'][i])),
-            'trq_cmd': fmt(shared_data.joint['joint_torque_commanded'][i]),
-            'trq_ext': fmt(shared_data.tcp['torque_external'][i]),
-        } for i in range(JOINTS)]
+        joint_table.rows, tcp_table.rows = joint_tcp_rows(
+            shared_data, JOINTS, fmt, _ang, _ang_tcp)
         joint_table.update()
-
-        tcp_table.rows = [{
-            'axis':      lbl,
-            'pose':      fmt(_ang_tcp(shared_data.tcp['robot_pose'][i], i)),
-            'spd':       fmt(_ang_tcp(shared_data.tcp['TCP_speed'][i], i)),
-            'force_ext': fmt(shared_data.tcp['force_external'][i]),
-            'pose_cmd':  fmt(_ang_tcp(shared_data.tcp['TCP_pose_commanded'][i], i)),
-            'spd_cmd':   fmt(_ang_tcp(shared_data.tcp['TCP_speed_commanded'][i], i)),
-        } for i, lbl in enumerate(["X", "Y", "Z", "RX", "RY", "RZ"])]
         tcp_table.update()
 
     # ── Motor tab ─────────────────────────────────────────────
@@ -4649,7 +4639,22 @@ async def _connect_plot_crosshair():
 
 async def _on_connect():
     await asyncio.sleep(0.3)   # let the browser finish mounting Vue components
+    _page_sender()             # a browser that dropped mid-jog reconnects with a fresh channel
     update_tables()
+
+
+def _on_disconnect():
+    """Stop a lost page's jog via the executor's per-connection cleanup.
+
+    Its sender is page-local in NiceGUI script mode. Aborting closes only this
+    page's TCP connection, and the executor stops a jog only when that connection
+    sent the latest jog command. Other pages' jogs and ordinary queued programmes
+    keep their own connections.
+    """
+    if _jog_btn_pressed['active'] or _joystick_active[0]:
+        _jog_btn_pressed['active'] = False
+        _joystick_active[0] = False
+        _exec_sender.abort()
 
 async def _on_tab_change():
     # The Plots charts only mount when their tab is shown, so link the synced
@@ -4684,7 +4689,7 @@ def _refresh_control_state():
                             jog_active=bool(_jog_btn_pressed['active'] or _joystick_active[0]),
                             rti_active=rti_active):
             _gui_release_sent[0] = True
-            _exec_sender.submit(lambda r: r.release_control(), label="release_control")
+            _page_sender().submit(lambda r: r.release_control(), label="release_control")
     key = (st["connected"], st["holder"], st["mine"])
     if key == _ctl_last[0]:
         return
@@ -4723,7 +4728,8 @@ def _drain_exec_toasts():
 
 
 tabs.on_value_change(_on_tab_change)
-app.on_connect(_on_connect)
+ui.context.client.on_connect(_on_connect)
+ui.context.client.on_disconnect(_on_disconnect)
 ui.timer(TABLE_REFRESH_S, update_tables)   # tables/status — calm, readable
 ui.timer(PLOT_REFRESH_S, refresh_plots)    # plots — smooth, independent rate
 ui.timer(1.0, refresh_processes)           # slow panel (System Info tab)

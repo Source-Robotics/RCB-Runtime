@@ -19,14 +19,15 @@ This module has no NiceGUI dependency so it can be unit-tested without a UI.
 """
 import logging
 logger = logging.getLogger("gui")  # docs/logging.md "Logger names"
-import queue
 import threading
+from collections import deque
 
 from robotclient import RobotClient
 from robotclient.constants import DEFAULT_PORT
 
 _QUEUE_MAX = 256          # bound the backlog so a wedged executor can't grow it without limit
 _POLL_TIMEOUT = 0.5       # s; how often the idle worker re-checks the stop flag
+_STOP_LABELS = frozenset({"jog_stop", "gripper_stop", "stop", "disable", "safety_stop"})
 
 
 # How long the DASHBOARD may sit idle holding control before it lets go. The executor's own idle
@@ -67,19 +68,48 @@ class ExecCommandSender:
         self._on_error = on_error or (lambda label, exc: None)
         self._robot = robot if robot is not None else RobotClient(name="dashboard")   # its name in the activity log
         self._connected = False
-        self._q = queue.Queue(maxsize=_QUEUE_MAX)
+        self._pending = deque()
+        self._pending_cv = threading.Condition()
+        self._queue_max = _QUEUE_MAX
         self._stop = threading.Event()
         self._worker = threading.Thread(target=self._run, name="gui-exec-sender", daemon=True)
         self._worker.start()
 
     def submit(self, fn, label=""):
-        """Queue fn(robot) for the worker. Never blocks meaningfully, never raises into the
-        caller. If the backlog is full (executor wedged), the command is dropped and reported."""
-        try:
-            self._q.put_nowait((fn, label))
-        except queue.Full:
+        """Queue fn(robot) without blocking the UI.
+
+        Stops discard stale pending actions and follow any command already in flight.
+        Other commands still use the bounded FIFO and report a full backlog.
+        """
+        full = False
+        closed = False
+        superseded = 0
+        with self._pending_cv:
+            if self._stop.is_set():
+                closed = True
+            elif label in _STOP_LABELS:
+                kept = deque()
+                for pending_fn, pending_label in self._pending:
+                    if pending_label in _STOP_LABELS and pending_label != label:
+                        kept.append((pending_fn, pending_label))
+                    elif pending_label not in _STOP_LABELS:
+                        superseded += 1
+                self._pending = kept
+                self._pending.append((fn, label))
+                self._pending_cv.notify()
+            elif len(self._pending) >= self._queue_max:
+                full = True
+            else:
+                self._pending.append((fn, label))
+                self._pending_cv.notify()
+        if full:
             logger.warning("command '%s' dropped: sender backlog full", label)
             self._on_error(label, RuntimeError("command sender backlog full"))
+        if closed:
+            self._on_error(label, RuntimeError("command sender closed"))
+        if superseded:
+            logger.warning("%d queued GUI command(s) superseded by '%s'", superseded, label)
+            self._on_error("sender", RuntimeError(f"{superseded} queued command(s) superseded by {label}"))
 
     def submit_async(self, fn, label=""):
         """Run fn(robot) on its OWN thread, outside the ordered queue.
@@ -96,6 +126,8 @@ class ExecCommandSender:
         precisely so a stop can never overtake the start that preceded it.
         """
         def _one():
+            if self._stop.is_set():
+                return
             if not (self._connected and self._robot.connected):
                 self._on_error(label, RuntimeError("command_executor unreachable"))
                 return
@@ -132,6 +164,25 @@ class ExecCommandSender:
 
     def close(self):
         self._stop.set()
+        with self._pending_cv:
+            self._pending_cv.notify_all()
+
+    @property
+    def closed(self):
+        return self._stop.is_set()
+
+    def abort(self):
+        """End this page's channel at once, cancelling pending sends.
+
+        Used when a browser disappears mid-jog. Closing its TCP connection lets
+        the executor stop only a jog that this connection actually started.
+        A reconnect gets a new sender; no queued jog can revive after the close.
+        """
+        self._stop.set()
+        with self._pending_cv:
+            self._pending.clear()
+            self._pending_cv.notify_all()
+        self._robot.disconnect()
 
     # -- worker internals --------------------------------------------------------------------
     def _ensure_connected(self):
@@ -148,13 +199,20 @@ class ExecCommandSender:
 
     def _run(self):
         while not self._stop.is_set():
-            try:
-                fn, label = self._q.get(timeout=_POLL_TIMEOUT)
-            except queue.Empty:
-                continue
+            with self._pending_cv:
+                if not self._pending and not self._stop.is_set():
+                    self._pending_cv.wait(timeout=_POLL_TIMEOUT)
+                if self._stop.is_set():
+                    break
+                if not self._pending:
+                    continue
+                fn, label = self._pending.popleft()
             if not self._ensure_connected():
                 self._on_error(label, RuntimeError("command_executor unreachable"))
                 continue
+            if self._stop.is_set():
+                self._robot.disconnect()        # abort may have raced a slow connect
+                break
             try:
                 fn(self._robot)
             except Exception as exc:                    # rejection, timeout, dropped socket
