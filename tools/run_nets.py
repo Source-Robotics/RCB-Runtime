@@ -4,6 +4,8 @@
     .venv/bin/python tools/run_nets.py                 # everything (refuses while the robot is ENABLED)
     .venv/bin/python tools/run_nets.py --only haptic   # nets whose file name contains "haptic"
     .venv/bin/python tools/run_nets.py --list          # what would run, and which source modules no net imports
+    .venv/bin/python tools/run_nets.py --changed       # only the nets the uncommitted changes touch (see 8.)
+    .venv/bin/python tools/run_nets.py --changed v1.1.1 --list   # ...those since a tag / commit, listed with why
     .venv/bin/python tools/run_nets.py --update-ruff-baseline   # accept today's ruff findings as the baseline
 
 WHY (2026-10-02, TODO/refactor_plan.md Phase 0): 58 nets existed and nothing ran them together, so "nothing
@@ -29,6 +31,12 @@ RULES IT ENFORCES
   7. (2026-10-16) Every process it starts is capped at MEM_CAP_MB of address space (RLIMIT_AS, set on the runner and
      inherited): a net that allocates without bound gets a MemoryError instead of running the Pi out of memory
      (that day a mutant allocated ~3 GB; the Pi — 4 GB, no swap — stalled RTI 194 s). --mem-cap-mb 0 = no cap.
+  8. (2026-10-27, user: "we are testing and simulating waaaay too much") --changed [REF] runs only the nets a change
+     touches: the .py files changed against REF (default HEAD: the uncommitted changes; untracked files included),
+     then every module that imports one of them, directly or through other modules (the import graph of the tree),
+     and the nets that import any of those or read a changed file's source by its path or file name (the nets that
+     lift RTI.py's functions, for one). The full suite still runs once at push (the pre-push hook). The nets
+     themselves are not tracked by git: run a net you changed with --only.
 
 Exit code 0 only when every net and every check pass. The summary is also written to temp_data/nets/last_run.txt.
 """
@@ -221,6 +229,95 @@ def coverage_map(nets):
     return [m for m in mods if not any(i == m or i.startswith(m + ".") for i in imported)]
 
 
+_SKIP_DIRS = {".venv", ".git", "temp_data", "logs", "dummy_test_scripts", "__pycache__", "node_modules"}
+
+
+def changed_sources(ref="HEAD"):
+    """The .py files (repo-relative) changed against `ref` — the index and the working tree — plus untracked ones."""
+    def git(*a):
+        r = subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit(f"git {' '.join(a)}: {r.stderr.strip()}")
+        return r.stdout.split()
+    files = set(git("diff", "--name-only", ref)) | set(git("ls-files", "--others", "--exclude-standard"))
+    return sorted(f for f in files if f.endswith(".py"))
+
+
+def _module_of(rel):
+    """'utility/safety_monitor.py' -> 'utility.safety_monitor'; a package's __init__.py -> the package."""
+    mod = rel[:-3].replace(os.sep, ".")
+    return mod[:-len(".__init__")] if mod.endswith(".__init__") else mod
+
+
+def _imports_of(path):
+    """Every module name a file imports (static): `import a.b` -> a.b; `from a import b` -> a and a.b."""
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        return set()
+    out = set()
+    for x in ast.walk(tree):
+        if isinstance(x, ast.Import):
+            out.update(a.name for a in x.names)
+        elif isinstance(x, ast.ImportFrom) and x.module:
+            out.add(x.module)
+            out.update(f"{x.module}.{a.name}" for a in x.names)
+    return out
+
+
+def _code_strings(path):
+    """The string constants a file's CODE uses — its docstrings left out ("Run: tools/run_nets.py --only x" in every
+    net's docstring is no read of run_nets.py), comments are not in the tree anyway."""
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        return []
+    docs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body \
+                and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant):
+            docs.add(id(node.body[0].value))
+    return [x.value for x in ast.walk(tree)
+            if isinstance(x, ast.Constant) and isinstance(x.value, str) and id(x) not in docs]
+
+
+def affected_nets(changed, nets):
+    """The nets `changed` (repo-relative .py paths) can affect -> [(net, why)]. A changed module, every module that
+    imports one (transitively), and the nets importing any of those or naming a changed file (its path, or its file
+    name unless that is __init__.py). A changed tools/ module also matches its bare name (tools put tools/ on
+    sys.path and `import name`)."""
+    graph = {}
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+        for f in filenames:
+            if f.endswith(".py"):
+                rel = os.path.relpath(os.path.join(dirpath, f), ROOT)
+                graph[_module_of(rel)] = _imports_of(os.path.join(dirpath, f))
+
+    def names(mods):
+        return set(mods) | {m.rsplit(".", 1)[-1] for m in mods if m.startswith("tools.")}
+
+    hit = names(_module_of(c) for c in changed)
+    grew = True
+    while grew:                                           # who imports a hit module, transitively
+        grew = False
+        for mod, imps in graph.items():
+            if mod not in hit and imps & hit:
+                hit.add(mod)
+                grew = True
+    texts = [(c, os.path.basename(c)) for c in changed]
+    out = []
+    for n in nets:
+        strings = _code_strings(n)
+        via = sorted(_imports_of(n) & hit)
+        named = [c for c, base in texts
+                 if any(c in s or (base != "__init__.py" and base in s) for s in strings)]
+        if via or named:
+            out.append((n, ("imports " + ", ".join(via[:3]) + (" ..." if len(via) > 3 else "")) if via
+                        else "reads " + ", ".join(named[:3])))
+    return out
+
+
 def apply_memory_cap(mb):
     """Cap this process's address space at `mb` MB (0 / None: no cap); every child inherits it. Returns the cap in
     bytes, or None."""
@@ -238,6 +335,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--only", help="run only nets whose file name contains this")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--changed", nargs="?", const="HEAD", metavar="REF",
+                    help="run only the nets the .py files changed against REF touch (default HEAD: the uncommitted "
+                         "changes); with --list, which and why")
     ap.add_argument("--timeout", type=float, default=1200.0, help="seconds per net (default 1200)")
     ap.add_argument("--no-ruff", action="store_true")
     ap.add_argument("--update-ruff-baseline", action="store_true")
@@ -255,6 +355,20 @@ def main():
         args.update_ruff_baseline = True
     nets = list_nets(args.only)
     all_nets = list_nets(None)
+    partial = bool(args.only) or args.changed is not None     # no catalog, no coverage ratchet for a partial run
+    if args.changed is not None:
+        changed = changed_sources(args.changed)
+        picked = affected_nets(changed, nets)
+        print(f"--changed {args.changed}: {len(changed)} changed .py file(s): {', '.join(changed) or 'none'}")
+        for n, why in picked:
+            print(f"  {os.path.basename(n):40s} {why}")
+        print(f"-> {len(picked)} of {len(all_nets)} nets\n")
+        nets = [n for n, _ in picked]
+        if args.list:
+            return 0
+        if not nets:
+            print("nothing to run")
+            return 0
     if args.list:
         for n in nets:
             print("  " + os.path.basename(n))
@@ -289,7 +403,7 @@ def main():
     t_nets = time.perf_counter() - t_all
     ruff = None if args.no_ruff else ruff_check(args.update_ruff_baseline)
     static = None if args.no_static else quality.static_checks(args.update_baselines)
-    cov = quality.coverage_finish(args.update_baselines, ratchet=not args.only) if args.coverage else None
+    cov = quality.coverage_finish(args.update_baselines, ratchet=not partial) if args.coverage else None
     aud = quality.audit() if args.audit else None
     failed = [r for r in results if not r["ok"]]
     flaky = [r["net"] for r in results if r.get("flaky")]
@@ -312,7 +426,7 @@ def main():
             lines.append(f"  DROP {pth}: {was} % -> {now} %")
     if aud is not None:
         lines.append(f"audit: {'OK' if aud['ok'] else 'WARN'} — {aud['why']} (report only)")
-    if not args.only:
+    if not partial:
         lines.append("catalog: " + os.path.relpath(quality.write_catalog(results, static, cov, ruff), ROOT))
     unc = coverage_map(all_nets)
     lines.append(f"source modules no net imports ({len(unc)}): " + ", ".join(unc))

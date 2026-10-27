@@ -54,10 +54,18 @@ WHAT IT CHECKS (per-joint keys are "J1:KEY".."J6:KEY", the joint's 1-based numbe
                   motion (a "position deviates from path" stop).
   TCP_OVERSPEED   filtered TCP translational speed above <safety><max_tcp_velocity> x margin. Inactive
                   while that limit is 0 (it ships 0) and until the check is switched on.
-  These three have a MODE in <safety_monitor> (2026-10-01): "off", "warn" or "stop" (legacy 0/1 = off/stop).
+  COMMAND_JUMP    (2026-10-27, TODO/command_checks_plan.md item 1) what the robot COMMANDS, not what the arm does:
+                  in EXEC / JOG / RTI / SOFT_RTI each tick the commanded speed, the speed its position step implies,
+                  the step of the speed (acceleration) and the commanded position against the robot XML's
+                  <joint_velocity_limit> / <joint_acceleration_limit> x <command_check_margin> and the soft limits +
+                  the tolerance. Every mode plans within those ceilings, so a command beyond them is a bug of ours (a
+                  jump), caught one tick after it left. Only a value the MODE computed counts (rti['command_valid'],
+                  written by utility/mode_dispatch): a stream of speeds or torques commands no position. Homing (its
+                  own CAN frames) is not checked yet (user, 2026-10-27).
+  These four have a MODE in <safety_monitor> (2026-10-01): "off", "warn" or "stop" (legacy 0/1 = off/stop).
   "warn" is for switching a check on before its thresholds are measured (user decision, shipped for
-  overspeed and tracking): a trip is a live "<key>_WARNING" — J{i}:OVERSPEED_WARNING, J{i}:TRACKING_WARNING,
-  TCP_OVERSPEED_WARNING — logged with the value, and when it clears the PEAK of the excursion is logged;
+  overspeed, tracking and the command check): a trip is a live "<key>_WARNING" — J{i}:OVERSPEED_WARNING,
+  J{i}:TRACKING_WARNING, TCP_OVERSPEED_WARNING, J{i}:COMMAND_JUMP_WARNING — logged with the value, and when it clears the PEAK of the excursion is logged;
   nothing stops. Once normal use shows no false warnings, switch the check to "stop".
   HOLD_OSCILLATION_WARNING  (2026-10-06) a joint commanded to stand still whose MOTOR CURRENT keeps swinging
                   fast: the drive fighting itself — the audible whine of a joint with too-high PID gains (J3 on
@@ -152,16 +160,20 @@ HOLD_OSC_EMA_S = 0.1            # s: the averaging of the high-passed current's 
 CONTACT_WARNING = "CONTACT_WARNING"
 COLLISION = "COLLISION"
 COLLISION_WARNING = "COLLISION_WARNING"
+COMMAND_JUMP = "COMMAND_JUMP"
+COMMAND_JUMP_WARNING = "COMMAND_JUMP_WARNING"
 COLLISION_BASELINE_TAU_S = 0.1  # s: at rest the baseline follows the external torque estimate with this time constant
 OBSERVER_SETTLE_S = 0.1         # s: no collision check this long after the observer (re)starts (5 of its time constants)
 MONITOR_KEYS = frozenset({OUT_OF_RANGE, BEYOND_ENDSTOP, OVERSPEED, TRACKING, TCP_OVERSPEED, ZONE_VIOLATION,
-                          HARD_LIMIT, JOINT_WALL, SELF_COLLISION, COLLISION})
+                          HARD_LIMIT, JOINT_WALL, SELF_COLLISION, COLLISION, COMMAND_JUMP})
 
 EXEMPT_MODES = frozenset({RobotMode.HOMING, RobotMode.FLASHING, RobotMode.BOOTING, RobotMode.SAFETY_STOP})
 TRACKING_MODES = frozenset({RobotMode.EXEC})
 # Collision detection runs where the ROBOT drives the arm (user decision 2026-10-16) — not in freedrive / hand guiding /
 # impedance, where a hand or a contact is the point.
 COLLISION_MODES = frozenset({RobotMode.EXEC, RobotMode.JOG, RobotMode.RTI, RobotMode.SOFT_RTI})
+# The command check (2026-10-27) runs where a mode COMPUTES the command; elsewhere the commanded value is the measured one.
+COMMAND_MODES = COLLISION_MODES
 # The robot commands NO motion in these: IDLE holds gravity torque (freedrive) or zero velocity, ACTIVE_ERROR
 # holds zero velocity. A soft limit passed here was passed by a hand — warn, do not stop (2026-10-01).
 PASSIVE_MODES = frozenset({RobotMode.IDLE, RobotMode.ACTIVE_ERROR})
@@ -197,7 +209,8 @@ class SafetyMonitor:
                  tolerance_rad, endstop_tolerance_rad, tracking_limit_rad, tcp_limit, policy,
                  tcp_pose=None, zones=(), tool_spheres=(), haptic=None, joint_walls=None,
                  i_meas=None, v_cmd=None, hold_osc_ma=None, sc=None, sc_policy=None,
-                 t_ext=None, contact_nm=None, collision_nm=None, ext_observer=None):
+                 t_ext=None, contact_nm=None, collision_nm=None, ext_observer=None,
+                 acc_ceiling=None, cmd_valid=None):
         n = int(joint_num)
         self.n = n
         # Fixed VIEWS of the live shared-memory arrays: reading them allocates nothing.
@@ -298,6 +311,34 @@ class SafetyMonitor:
         self._k_wall = [joint_key(i, JOINT_WALL) for i in range(n)]
         self._k_wallw = [joint_key(i, JOINT_WALL_WARNING) for i in range(n)]
         self._k_pb = list(self._k_hard)                          # per joint: the passive-bound error key
+        # The command check (2026-10-27; user: "warn first, stop later", the hardware ceilings x margin, homing left out):
+        # its trips are the ceilings x <command_check_margin>; cmd_valid = rti['command_valid'] ([0] the commanded
+        # position, [1] the commanded speed came from the mode this tick). Without cmd_valid / v_cmd it is off.
+        acc = np.full(n, np.inf) if acc_ceiling is None else f(acc_ceiling)
+        acc = np.where(np.isfinite(acc) & (acc > 0), acc, np.inf)
+        # .get: a policy from before 2026-10-27 (a test's own) has no command check -> off
+        self._cc_margin = float(policy.get("command_check_margin", 1.2))
+        self._cc_vtrip = self._v_ceiling * self._cc_margin
+        self._cc_atrip = acc * self._cc_margin
+        self._valid = cmd_valid
+        self.command_mode = (check_mode(policy.get("command_check", "off")) if cmd_valid is not None
+                             and v_cmd is not None else "off")
+        self.check_command = self.command_mode != "off"
+        self._inv_dt = 1.0 / float(dt)
+        self._inv_tol = 1.0 / max(tol, 1e-6)
+        self._cc_q, self._cc_v, self._cc_vnow, self._cc_t = z(np.float64), z(np.float64), z(np.float64), z(np.float64)
+        # this tick's ratios value / trip (> 1: beyond): the commanded speed, the speed the position step implies, the
+        # acceleration, the position past the soft limits + tolerance; their maximum per joint
+        self._cc_rv, self._cc_rq, self._cc_ra, self._cc_rp = z(np.float64), z(np.float64), z(np.float64), z(np.float64)
+        self._cc_r = z(np.float64)
+        self._cc_have = self._cc_vhave = 0          # a previous position / speed to step from (0 = start afresh)
+        self._cc_pv = self._cc_vv = False           # what the mode commanded last tick (a change starts afresh)
+        self._a_cc = np.ones(n, dtype=bool)         # armed: no excursion live (fires once per excursion)
+        self._cc_hit = z(bool)
+        self._pk_cc = z(np.float64)
+        self._cc_warned = False
+        self._k_cc = [joint_key(i, COMMAND_JUMP) for i in range(n)]
+        self._k_ccw = [joint_key(i, COMMAND_JUMP_WARNING) for i in range(n)]
         # HOLD_OSCILLATION_WARNING: fixed views of the motor currents (mA, joints only) and the commanded joint speeds;
         # the per-joint threshold (robot XML, mA; 0 / NaN = that joint unchecked).
         self._i, self._vc = i_meas, v_cmd
@@ -493,7 +534,8 @@ class SafetyMonitor:
             f"IDLE/ACTIVE_ERROR), freedrive bounds {self._pb_text() if self.check_passive_bound else 'off'}, "
             f"beyond-endstop {self.check_endstop}, overspeed {self.speed_mode if self.check_speed else 'off'}, "
             f"tracking {self.tracking_mode if self.check_tracking else 'off'}, "
-            f"TCP speed {self.tcp_mode if self.check_tcp else 'off'}, hold oscillation {self._hold_osc_text()}, "
+            f"TCP speed {self.tcp_mode if self.check_tcp else 'off'}, command check {self.command_mode} (x "
+            f"{self._cc_margin:g} the ceilings), hold oscillation {self._hold_osc_text()}, "
             f"self-collision {self.sc_mode if self.check_self_collision else 'off'} (from the worker), "
             f"collision {self._collision_text()}, "
             f"zones {self.check_zones} ({len(self._zones)} enabled, "
@@ -534,6 +576,9 @@ class SafetyMonitor:
         self._sc_c, self._sc_armed, self._sc_live, self._sc_stale = 0, True, False, False
         self._sc_rebase = True
         self._collision_reset()
+        self._cc_have = self._cc_vhave = 0
+        self._a_cc.fill(True)
+        self._cc_warned = False
         if self.warnings:
             self.warnings.clear()
 
@@ -655,6 +700,11 @@ class SafetyMonitor:
                 fired = self._self_collision_step(fired)
         if self.check_collision:
             fired = self._collision_step(fired, mode)
+        if self.check_command:
+            if mode in COMMAND_MODES:
+                fired = self._command_step(fired)
+            elif self._cc_have or self._cc_vhave or self._cc_warned:
+                self._command_idle()
         if self.check_tcp:
             t = self._tcp
             s = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]) ** 0.5
@@ -687,6 +737,130 @@ class SafetyMonitor:
         if self.check_zones:
             fired = self._step_zones(fired, mode in PASSIVE_MODES)
         return tuple(fired) if fired else _NONE
+
+    def _command_step(self, fired):
+        """The command check, one tick in COMMAND_MODES (no allocation): the four ratios value / trip (> 1 = beyond)
+        — the commanded speed, the speed the position step implies, the speed's step (acceleration), the position past
+        the soft limits + tolerance — and their worst per joint fires once per excursion, re-armed back under."""
+        pv = self._valid[0] >= 0.5
+        vv = self._valid[1] >= 0.5
+        if pv != self._cc_pv or vv != self._cc_vv:          # what the mode commands changed: start afresh
+            self._cc_pv, self._cc_vv = pv, vv
+            self._cc_have = self._cc_vhave = 0
+        r, t = self._cc_r, self._cc_t
+        r.fill(0.0)
+        had_q = self._cc_have
+        if vv:                                              # the commanded speed
+            np.abs(self._vc, out=t)
+            np.divide(t, self._cc_vtrip, out=self._cc_rv)
+            np.maximum(r, self._cc_rv, out=r)
+            self._cc_vnow[:] = self._vc
+        else:
+            self._cc_rv.fill(0.0)
+        if pv:
+            qc = self._qc
+            if had_q:                                       # the speed the position step implies (a jump)
+                np.subtract(qc, self._cc_q, out=t)
+                np.multiply(t, self._inv_dt, out=t)
+                if not vv:
+                    self._cc_vnow[:] = t
+                np.abs(t, out=t)
+                np.divide(t, self._cc_vtrip, out=self._cc_rq)
+                np.maximum(r, self._cc_rq, out=r)
+            else:
+                self._cc_rq.fill(0.0)
+            # the position past the soft limits + the tolerance (OUT_OF_RANGE's trip points): 1 + past / tolerance
+            np.subtract(self._lim_lo, qc, out=t)
+            np.subtract(qc, self._lim_hi, out=self._cc_rp)
+            np.maximum(t, self._cc_rp, out=t)
+            np.greater(t, 0.0, out=self._cc_hit)
+            np.multiply(t, self._inv_tol, out=self._cc_rp)
+            np.add(self._cc_rp, 1.0, out=self._cc_rp)
+            np.multiply(self._cc_rp, self._cc_hit, out=self._cc_rp)
+            np.maximum(r, self._cc_rp, out=r)
+            self._cc_q[:] = qc
+            self._cc_have = 1
+        else:
+            self._cc_rq.fill(0.0)
+            self._cc_rp.fill(0.0)
+        if vv or (pv and had_q):
+            if self._cc_vhave:                              # the speed's step: the acceleration
+                np.subtract(self._cc_vnow, self._cc_v, out=t)
+                np.abs(t, out=t)
+                np.multiply(t, self._inv_dt, out=t)
+                np.divide(t, self._cc_atrip, out=self._cc_ra)
+                np.maximum(r, self._cc_ra, out=r)
+            else:
+                self._cc_ra.fill(0.0)
+            self._cc_v[:] = self._cc_vnow
+            self._cc_vhave = 1
+        else:
+            self._cc_ra.fill(0.0)
+            self._cc_vhave = 0
+        np.greater(r, 1.0, out=self._cc_hit)                # beyond ...
+        np.logical_and(self._cc_hit, self._a_cc, out=self._b5)
+        if self._b5.any():                                  # ... and armed: fire
+            fired = self._command_fire(fired)
+        np.logical_not(self._cc_hit, out=self._cc_hit)
+        np.logical_or(self._a_cc, self._cc_hit, out=self._a_cc)     # back under: re-armed
+        if self._cc_warned:
+            self._cc_warned = self._command_track()
+        return fired
+
+    def _command_idle(self):
+        """Out of COMMAND_MODES: nothing to judge — start afresh next time; a live warning clears (its peak logged)."""
+        self._cc_have = self._cc_vhave = 0
+        self._cc_r.fill(0.0)
+        self._a_cc.fill(True)
+        if self._cc_warned:
+            self._cc_warned = self._command_track()
+
+    def _command_fire(self, fired):
+        """Cold: per joint beyond its trip and armed, which of the four it was and by how much; a live warning (warn) or
+        the latched error (stop). The rest of this tick's work is unaffected."""
+        kinds = (("commanded speed", self._cc_rv, self._cc_vtrip, "deg/s"),
+                 ("speed of the commanded position step", self._cc_rq, self._cc_vtrip, "deg/s"),
+                 ("commanded acceleration", self._cc_ra, self._cc_atrip, "deg/s^2"),
+                 ("commanded position", self._cc_rp, None, "deg"))
+        for i in np.flatnonzero(self._b5):
+            self._a_cc[i] = False
+            what, ratio, trip, unit = max(kinds, key=lambda k: k[1][i])
+            if trip is None:
+                detail = (f"{what} {np.degrees(self._cc_q[i]):.2f} deg, outside the soft limits + tolerance "
+                          f"[{np.degrees(self._lim_lo[i]):.2f}, {np.degrees(self._lim_hi[i]):.2f}] deg")
+            else:
+                detail = (f"{what} {np.degrees(ratio[i] * trip[i]):.1f} {unit}, above {np.degrees(trip[i]):.1f} {unit} "
+                          f"(the ceiling {np.degrees(trip[i] / self._cc_margin):.1f} x {self._cc_margin:g})")
+            if self.command_mode == "warn":
+                key = self._k_ccw[i]
+                self.warnings.add(key)
+                self.details[key] = detail
+                self._pk_cc[i] = self._cc_r[i]
+                self._cc_warned = True
+                logger.warning(f"J{i + 1} COMMAND_JUMP (warn): {detail} — no stop (warn mode)")
+            else:
+                fired = fired if fired is not None else []
+                fired.append(self._k_cc[i])
+                self.details[self._k_cc[i]] = detail
+                logger.error(f"J{i + 1} COMMAND_JUMP: {detail}")
+        return fired
+
+    def _command_track(self):
+        """While a COMMAND_JUMP_WARNING is live: its peak (x its trip); cleared once re-armed, the peak logged. Returns
+        whether any is still live."""
+        live = False
+        for i in range(self.n):
+            key = self._k_ccw[i]
+            if key not in self.warnings:
+                continue
+            if self._cc_r[i] > self._pk_cc[i]:
+                self._pk_cc[i] = self._cc_r[i]
+            if self._a_cc[i]:
+                self.warnings.discard(key)
+                logger.info(f"J{i + 1} commands back within the limits; the jump peaked at {self._pk_cc[i]:.2f} x its trip")
+            else:
+                live = True
+        return live
 
     def _hold_osc_step(self):
         """HOLD_OSCILLATION_WARNING, one tick, allocation-free: the motor current high-passed (first order), its

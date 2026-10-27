@@ -249,6 +249,13 @@
         <tcp_speed>off</tcp_speed>
         <tcp_speed_margin>1.1</tcp_speed_margin>
         <tcp_speed_sustain_s>0.020</tcp_speed_sustain_s>
+        <!-- COMMAND_JUMP (2026-10-27): what the robot COMMANDS, not what the arm does — in EXEC / JOG / RTI /
+             SOFT_RTI each tick the commanded speed, the speed its position step implies, its acceleration and the
+             commanded position, against the robot XML's <joint_velocity_limit> / <joint_acceleration_limit> x margin
+             and the soft limits + tolerance. Every mode plans within those, so a command beyond them is a bug of
+             ours (a jump). Homing is not checked. Shipped warn: switch to stop once normal use shows no warnings. -->
+        <command_check>warn</command_check>
+        <command_check_margin>1.2</command_check_margin>
         <!-- ZONE_VIOLATION / ZONE_WARNING: the measured TCP and tool spheres against the zones of
              <active_cell> (none = nothing to check). Trips past the zone's surface + this tolerance
              (metres; the zone's margin is for the planner's prevention, not counted here).

@@ -739,7 +739,9 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # stops only if a pair gets closer than that, or another pair comes within the margin.
     # can_read_first: 1 while RTI runs option B's tick order (read first, send early), 0 in the normal order (also
     # read by tools/loop_delay.py, the on-request loop delay; RTI's live loop_delay / loop_delay_max fields went
-    # 2026-10-25 with the meter that stalled the tick).
+    # 2026-10-25 with the meter that stalled the tick). command_valid (2026-10-27, utility/mode_dispatch): 1 when this
+    # tick's commanded [0] position / [1] speed came from the mode (0 = the fallback: the measured value) — the safety
+    # monitor's command check judges only those.
     # The Hall sensor check (robotics/hall_check.py, 2026-10-13): hall_check_joint = the limp joint's number (1-based)
     # while the check runs, 0 = off; hall_check_pin = its Hall pin (0 / 1), -1 = not read yet; hall_check_changes = pin
     # changes seen; hall_check_edge_deg = the joint's angle (deg) at the last change to 0 / to 1 (NaN = none yet).
@@ -747,7 +749,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # joint_test (robotics/joint_test.py, 2026-10-18): a test move's joint, state, amplitude, moved, max error, peak
     # current, end error, seq (RESULT_FIELDS there).
     for name, count in [("sc_pair_gaps", 49), ("jog_ref", joint_num), ("jog_dir", joint_num),
-                        ("can_read_first", 1),
+                        ("can_read_first", 1), ("command_valid", 2),
                         ("hall_check_joint", 1), ("hall_check_pin", 1), ("hall_check_changes", 1),
                         ("hall_check_edge_deg", 2), ("free_joint", 1), ("joint_test", 8)]:
         shm, arr = _attach_or_create(name, np.float64, count)

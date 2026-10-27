@@ -131,6 +131,16 @@ CATALOG = {
                            "The check runs in warn-only mode.", _WARN,
                            "If this was normal motion, raise <tracking_limit_deg> for the joint before the check is "
                            "set to stop."),
+    "COMMAND_JUMP": _e(1207, "Commanded motion beyond the limits",
+                       "What the robot commanded a joint jumped beyond its speed or acceleration limit times the margin,"
+                       " or past its soft limits. Every mode plans within those limits, so this is a fault in the "
+                       "robot's software; RTI.log names the value.", _HARD,
+                       "Send RTI.log and the support bundle to the developers. Clear errors, then enable the robot."),
+    "COMMAND_JUMP_WARNING": _e(1208, "Commanded motion beyond the limits",
+                               "What the robot commanded a joint jumped beyond its speed or acceleration limit times "
+                               "the margin, or past its soft limits. The check runs in warn-only mode.", _WARN,
+                               "Send RTI.log (it has the value and the peak) to the developers before the check is "
+                               "set to stop."),
     "ZONE_VIOLATION": _e(1301, "Safety zone violated",
                          "The tool or a tool sphere left an allowed zone or entered a forbidden zone of the active "
                          "cell. The message names the zone.",

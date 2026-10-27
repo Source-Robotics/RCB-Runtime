@@ -135,6 +135,11 @@ def _commit_joint_state(ctx, output):
     """
     n = ctx.joint_num
     j = ctx.shared_data.joint
+    # Which commanded values the MODE computed this tick (the rest is the fallback below): the safety monitor's command
+    # check judges only these (2026-10-27) — a stream of speeds or torques commands no position.
+    valid = ctx.shared_data.rti['command_valid']
+    valid[0] = output.pos_rad is not None
+    valid[1] = output.vel_rad is not None
 
     # _commanded (post-clamp) — fallback to measured / 0
     j['joint_position_commanded'][:n] = (
@@ -618,6 +623,7 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
             # Homing owns its own CAN sends, so the dispatch pipeline sent nothing this tick.
             # Mark it rather than leaving the previous tick's values looking current.
             ctx.shared_data.rti['motor_pack_mode_sent'][0] = float('nan')
+            ctx.shared_data.rti['command_valid'].fill(0.0)       # homing: the command check judges nothing
             return result
 
         _add_dynamics_ff(ctx, output)
@@ -638,6 +644,7 @@ def dispatch_step(handler: Any, ctx: TickContext) -> TickResult:
     if output is SELF_MANAGED:
         # As above: nothing went through the dispatch pipeline this tick.
         ctx.shared_data.rti['motor_pack_mode_sent'][0] = float('nan')
+        ctx.shared_data.rti['command_valid'].fill(0.0)
         _mode_profile_record(samples)
         return result
 

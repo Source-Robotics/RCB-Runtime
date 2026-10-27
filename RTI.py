@@ -1175,6 +1175,8 @@ def main():
         # itself so the check waits while it (re)starts
         t_ext=shared_data.tcp['torque_external'][:joint_num],
         contact_nm=cfg['contact_torque_nm'], collision_nm=cfg['collision_torque_nm'], ext_observer=ext_observer,
+        # the command check (2026-10-27): the acceleration ceilings, and which commanded values the mode computed
+        acc_ceiling=cfg['joint_acceleration_limit'], cmd_valid=shared_data.rti['command_valid'],
     )
     _COLLISION_MODE_CODE = {"off": 0.0, "warn": 1.0, "stop": 2.0}
     _COLLISION_MODE_NAME = {0: "off", 1: "warn", 2: "stop"}

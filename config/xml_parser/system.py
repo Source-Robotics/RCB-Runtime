@@ -354,6 +354,11 @@ _SAFETY_MONITOR_FALLBACK = {
     "tcp_speed":            "off",
     "tcp_speed_margin":     1.1,
     "tcp_speed_sustain_s":  0.020,
+    # The command check (2026-10-27): what the robot COMMANDS in EXEC / JOG / RTI / SOFT_RTI against the robot XML's
+    # speed / acceleration ceilings x margin and the soft limits — a jump only a bug of ours makes. Shipped warn (user:
+    # "warn first, stop later").
+    "command_check":        "warn",
+    "command_check_margin": 1.2,
     # Safety zones (utility/zones.py). On by default: with no <active_cell> there are no zones, so
     # this costs nothing until a cell is chosen. The tolerance is how far past the zone's own surface
     # (its margin NOT counted — the margin is for prevention) the measured pose may go before a trip.
@@ -385,6 +390,7 @@ _SAFETY_MONITOR_BOUNDS = {
     "tracking_sustain_s":   (0.001, 0.5),
     "tcp_speed_margin":     (1.0, 3.0),
     "tcp_speed_sustain_s":  (0.001, 0.25),
+    "command_check_margin": (1.0, 3.0),      # below 1.0 a move planned at a ceiling would trip
     "zones":                (0, 1),
     "zone_tolerance":       (0.0, 0.05),     # metres; 0 trips on the surface itself
     "hold_oscillation_hz":  (5.0, 100.0),    # under 5 Hz a hand's push and the hold's settling count; 125 Hz is Nyquist

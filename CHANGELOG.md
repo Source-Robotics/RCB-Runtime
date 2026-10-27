@@ -13,6 +13,16 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+### Added
+
+- The command check: in EXEC, JOG, RTI and SOFT_RTI the robot checks what it commands each tick — the commanded
+  speed, the speed of each position step, the acceleration and the position — against the robot's speed and
+  acceleration limits times a margin (1.2) and the soft limits. Every mode plans within those limits, so a command
+  beyond them is a fault in the robot's software. It ships warning-only (`COMMAND_JUMP_WARNING`, 1208); set
+  `<safety_monitor><command_check>` in `config/system.xml` to `stop` (`COMMAND_JUMP`, 1207) once normal use shows no
+  warnings. Homing is not checked.
+- `tools/run_nets.py --changed [REF]` runs only the tests a change touches.
+
 ## [1.1.1] - 2026-10-25
 
 ### Fixed
