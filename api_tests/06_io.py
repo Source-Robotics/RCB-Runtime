@@ -112,7 +112,7 @@ def _pos():
     return int(_gripper_shm()['gripper_position'][0])
 
 
-_DETECT_MEANING = {0: "moving", 1: "object while opening", 2: "object while closing",
+_DETECT_MEANING = {0: "moving", 1: "object while closing", 2: "object while opening",   # the firmware's (2026-11-15)
                    3: "reached target, no object"}
 
 

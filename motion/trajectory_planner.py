@@ -3694,7 +3694,7 @@ class TrajectoryPlanner(Thread):
           2. DEBOUNCED + DIRECTION-CHECKED code. Nonzero for GRIPPER_DEBOUNCE_TICKS
              consecutive polls (one glitched frame cannot complete a command), AND
              consistent with the direction of travel: on this gripper 1 = fully
-             open and 254 = fully closed, so "object while opening" (1) is only
+             open and 254 = fully closed, so "object while opening" (2) is only
              believable when the target is MORE OPEN than where we are. A stale
              code from the opposite direction is rejected — which is exactly the
              failure the unverified reset behaviour would produce.
