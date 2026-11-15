@@ -61,6 +61,7 @@ def resolve_and_preload_kt(
             retries=_KT_FETCH_RETRIES,
             rounds=_KT_FETCH_ROUNDS,
             settle_s=_KT_FETCH_SETTLE_S,
+            tolerance=_sys.get('kt_tolerance', 0.3),      # system.xml <kt_tolerance> (2026-11-15)
         )
         for _i in range(joint_num):
             logger.info(f"Kt: J{_i+1} Kt = {motor_kt[_i]:.6f} ({_kt_sources[_i]})")

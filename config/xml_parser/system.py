@@ -23,6 +23,13 @@ DRIVE_WATCHDOG_DEFAULT_MS = 100
 DRIVE_WATCHDOG_MIN_MS = 80
 DRIVE_WATCHDOG_MAX_MS = 1000
 
+# <kt_tolerance> (2026-11-15, user: ±30 %): how far a drive's own Kt may be from the robot XML's before RTI keeps the
+# XML value. A fraction. The drives reported up to +20 % on 2026-11-07 (J5 0.219 against 0.183); the band is for a
+# value a reflash or recalibration made wild, not for those.
+KT_TOLERANCE_DEFAULT = 0.3
+KT_TOLERANCE_MIN = 0.05
+KT_TOLERANCE_MAX = 1.0
+
 
 def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> dict:
     """
@@ -73,6 +80,17 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
     kt_source = root.findtext("kt_source", default="auto").strip().lower()
     if kt_source not in ("auto", "xml"):
         kt_source = "auto"
+    # <kt_tolerance>: with kt_source auto, a drive's Kt outside the XML's ±this keeps the XML value (a warning names it).
+    # Missing -> the default; not a number in [MIN, MAX] -> the default with a warning.
+    _ktt_text = (root.findtext("kt_tolerance") or str(KT_TOLERANCE_DEFAULT)).strip()
+    try:
+        kt_tolerance = float(_ktt_text)
+    except ValueError:
+        kt_tolerance = float("nan")
+    if not KT_TOLERANCE_MIN <= kt_tolerance <= KT_TOLERANCE_MAX:      # NaN fails it too
+        logger.warning(f"system.xml <kt_tolerance>{_ktt_text!r} is not a fraction in "
+                       f"{KT_TOLERANCE_MIN}..{KT_TOLERANCE_MAX} — using {KT_TOLERANCE_DEFAULT}")
+        kt_tolerance = KT_TOLERANCE_DEFAULT
 
     jog_defaults = _parse_jog_defaults(root.find("jog_defaults"))
     rti_defaults = _parse_rti_defaults(root.find("rti_defaults"))
@@ -134,6 +152,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         "joint_num":      joint_num,
         "active_gripper": active_gripper,
         "kt_source":      kt_source,
+        "kt_tolerance":   kt_tolerance,
         "realtime_required": realtime_required,
         "can_read_first": can_read_first,
         "drive_watchdog_ms": drive_watchdog_ms,

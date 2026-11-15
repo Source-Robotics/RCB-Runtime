@@ -846,8 +846,8 @@ class RobotClient:
         command is checked against the arm (`rti_set_start_pose_check()`): one too
         far from it ends the stream the same way, with `RTI_START_POSE`. A stream
         the arm cannot follow ends the same way, with `RTI_POSITION_LIMIT`,
-        `RTI_VELOCITY_LIMIT`, `RTI_ACCELERATION_LIMIT`, `RTI_JERK_LIMIT` or
-        `RTI_NO_SEND_TIME` (see `RTIClient`).
+        `RTI_VELOCITY_LIMIT`, `RTI_ACCELERATION_LIMIT`, `RTI_JERK_LIMIT`,
+        `RTI_NO_SEND_TIME` or `RTI_BAD_VALUE` (see `RTIClient`).
 
         The robot answers at once and never reports whether the claim took. It
         ignores a claim while an error is latched, while the session is not paired

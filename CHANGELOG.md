@@ -64,6 +64,19 @@ What changed in each version of the RCB runtime. The newest version is at the to
   - by hand: skipping while a joint is being freed skips that joint alone; a joint turned but never held still is not
     reported as an encoder fault; the question says what the other joints do meanwhile (hold, float in freedrive, or
     limp when the arm is disabled).
+- An RTI command packet with a value that is not a number (NaN or infinite) ended the robot's control loop, and J2
+  and J3 sagged until the drives braked. It is now refused like the other stream checks: the arm brakes to rest along
+  its path and `RTI_BAD_VALUE` (6207) latches.
+- A joint current beyond what the drive frame carries (±32767 mA, for example a torque given in the wrong unit) was
+  sent wrapped around: full current in the opposite direction. Every joint's current is now kept within its `<Ilim>`
+  in the robot XML (the drive's own cap, so normal motion is unchanged), with a warning; a current that is not a
+  number is sent as 0 mA instead of ending the control loop.
+- A CAN error frame (for example a bus-off) was counted as a reply from J1. Error, remote and extended frames are now
+  ignored by the reply handling.
+- A drive's torque constant (Kt, read at start with `kt_source` auto) was used whatever it was, NaN included. A value
+  further than `<kt_tolerance>` (new in `config/system.xml`, 0.3 = ±30 %) from the robot XML's Kt now keeps the XML
+  value, and the start-up log names the joint.
+- A voltage limit above 60000 mV (the most a drive accepts) is clamped to it instead of reaching the drive.
 
 ## [1.1.1] - 2026-10-25
 

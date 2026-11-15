@@ -31,6 +31,10 @@
          xml  : always use the Kt values from the robot XML, skip CAN fetch.
          ==================================================================== -->
     <kt_source>auto</kt_source>
+    <!-- With kt_source auto: a drive's Kt further than this fraction from the robot XML's is not used — the XML value
+         stays and a warning names the joint (2026-11-15). Kt scales every torque the runtime sends and estimates; a
+         reflash or recalibration can change what a drive reports. 0.05 .. 1.0. -->
+    <kt_tolerance>0.3</kt_tolerance>
 
     <!-- Real-time scheduling is REQUIRED (1): RTI refuses to start when SCHED_FIFO 99 on its core is not
          available, instead of logging "DEGRADED" and running a 4 ms control loop without guarantees

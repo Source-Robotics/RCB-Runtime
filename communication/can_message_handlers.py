@@ -14,6 +14,7 @@ License: GNU General Public License v3.0
 Contact: petar@source-robotics.com
 """
 import logging
+import math
 import time
 import numpy as np
 from config.xml_parser import clamp_voltage_limit
@@ -742,7 +743,12 @@ def receive_and_process_can_messages(communication, Motor, Motor_data, Gripper_d
         if message is None:
             break       # socket drained — nothing more waiting this tick
 
-        if msg_ID is not None:
+        # An error, remote or extended frame is no drive's reply (2026-11-15). The socket delivers the bus's error
+        # frames, and their id bits read as a node and a command (a bus-off, 0x040, as node 0's Hall reply): they were
+        # counted as J1's replies, and with Spectral_BLDC 1.21 (its UnpackData returns early on them) the dispatch
+        # below would act on J1's previous frame. Skipped before any accounting; the bus errors themselves show in the
+        # interface's counters (hardware/can_health.py).
+        if msg_ID is not None and not (message.is_error_frame or message.is_remote_frame or message.is_extended_id):
             _age = _now - message.timestamp
             if _age > _age_max:
                 _age_max = _age
@@ -1026,7 +1032,7 @@ def _read_kt_for_node(motors, communication, node_id, timeout_s, retries):
 
             motors[rx_node_id].UnpackData(message, msg_ID)
             kt_can = motors[rx_node_id].Kt
-            if kt_can is None or kt_can <= 0:
+            if kt_can is None or not math.isfinite(kt_can) or kt_can <= 0:     # NaN passed `<= 0` (2026-11-15)
                 log_startup.warning(
                     f"Kt: Node {node_id} returned invalid Kt={kt_can}; "
                     "keeping fallback value"
@@ -1040,7 +1046,7 @@ def _read_kt_for_node(motors, communication, node_id, timeout_s, retries):
 
 def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
                       gripper_idx=None, gripper_kt_xml=None, retries=3,
-                      rounds=2, settle_s=0.2):
+                      rounds=2, settle_s=0.2, tolerance=None):
     """
     Request Kt from every arm motor over CAN and collect the responses.
     Optionally also fetches Kt from a CAN gripper motor.
@@ -1062,6 +1068,9 @@ def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
     retries         : int                 — number of request attempts per node
     rounds          : int                 — number of missing-node sweeps
     settle_s        : float               — delay before retrying missing nodes
+    tolerance       : float or None       — a Kt further than this fraction from its XML value keeps
+                                            the XML value, with a warning (system.xml <kt_tolerance>);
+                                            None accepts any finite positive Kt
 
     Returns
     -------
@@ -1092,11 +1101,12 @@ def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
         still_missing = []
         for i in pending_nodes:
             kt_can = _read_kt_for_node(motors, communication, i, timeout_s, retries)
-            if kt_can is not None:
+            if kt_can is None:
+                still_missing.append(i)
+            elif _kt_plausible(kt_can, kt_final[i], tolerance, f"J{i + 1}"):
                 kt_final[i] = kt_can
                 kt_sources[i] = 'CAN'
-            else:
-                still_missing.append(i)
+            # an answer outside the band is still an answer: no retry, the XML value stays
         pending_nodes = still_missing
 
     if pending_nodes:
@@ -1119,11 +1129,27 @@ def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
                 motors, communication, gripper_idx, timeout_s, retries
             )
             if kt_can is not None:
-                gripper_kt = kt_can
-                gripper_kt_src = 'CAN'
+                if _kt_plausible(kt_can, gripper_kt_xml, tolerance, "the gripper"):
+                    gripper_kt = kt_can
+                    gripper_kt_src = 'CAN'
                 break
 
     return kt_final, kt_sources, gripper_kt, gripper_kt_src
+
+
+def _kt_plausible(kt_can, kt_xml, tolerance, label):
+    """True when a drive's Kt is within ±tolerance (a fraction) of the robot XML's (2026-11-15). Kt scales RTI's
+    Nm-to-mA factor, gravity compensation and the external-torque estimate, and a reflash or recalibration can change
+    what a drive reports. No tolerance, or no usable XML Kt to compare with, accepts the value as before."""
+    if tolerance is None or kt_xml is None or not math.isfinite(kt_xml) or kt_xml <= 0:
+        return True
+    off = kt_can / kt_xml - 1.0
+    if abs(off) <= tolerance:
+        return True
+    log_startup.warning(f"Kt: {label} reported Kt = {kt_can:.6f}, {100 * off:+.0f} % from the robot XML's "
+                        f"{kt_xml:.6f} (allowed ±{100 * tolerance:.0f} %, <kt_tolerance> in config/system.xml) — "
+                        "the XML value is used")
+    return False
 
 
 # ==========================================================================

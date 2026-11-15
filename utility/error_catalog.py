@@ -534,6 +534,11 @@ CATALOG = {
                            "own timing and needs it.", _STREAM,
                            "Keep send times on in the client (the default), or use SOFT_RTI for a sender without "
                            "them. " + _AGAIN_RTI),
+    "RTI_BAD_VALUE": _e(6207, "PC packet with a value that is not a number",
+                        "A command packet from the PC carried a value that is not a finite number (NaN or "
+                        "infinite).", _STREAM,
+                        "Check the PC program's targets, torques and feedforward before sending them. "
+                        + _AGAIN_RTI),
 
     # ---------------------------------------------------------------- 7xxx configuration files
     "ZONE_CONFIG": _e(7001, "Cell file unreadable", "The safety-zone cell file could not be read.",

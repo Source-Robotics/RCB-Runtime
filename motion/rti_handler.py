@@ -31,6 +31,7 @@ instance is reused and its channel fields are re-pointed per tick.
 """
 
 import logging
+import math
 
 import numpy as np
 try:                          # np.clip's own ufunc without its Python wrapper: the same arithmetic, ~2 us less a call
@@ -1983,6 +1984,16 @@ class RTIModeHandler:
                      "default), or use SOFT_RTI (rti_connect with a rate) for a sender without them.")
         self._begin_stop('stopping_error', errors=("RTI_NO_SEND_TIME",))
 
+    def _refuse_bad_value(self):
+        """Cold path: a command packet with a value that is not a finite number (NaN or infinite) — a controlled stop,
+        then RTI_BAD_VALUE (once: the stop has begun, later packets are not read). Outside an active session the
+        packet is only dropped (the caller returns False either way)."""
+        if self.sub_state != 'control_active':
+            return
+        logger.error("RTI command packet with a value that is not a number (NaN or infinite) — refused, braking to "
+                     "rest. Check the PC program's targets, torques and feedforward before sending them.")
+        self._begin_stop('stopping_error', errors=("RTI_BAD_VALUE",))
+
     def _refuse_command(self, q, v, a, jerk, bad_pos, bad_v, bad_a, bad_j):
         """Cold path: name each offending joint, log it, begin the controlled stop with the error keys."""
         keys, why = [], []
@@ -3210,6 +3221,14 @@ class RTIModeHandler:
         # velocity / torque / stop packets, take a packet either way. A stamp that is not finite reads as None.
         if not self.soft_mode and cmd_type == CMD_JOINT_POSITION and _ts is None:
             self._refuse_unstamped()
+            return False
+        # NOT A NUMBER (2026-11-15). A NaN or infinite value in a command packet (a client bug) went on into the drive
+        # conversion, where int() raised inside the loop: RTI ended and J2/J3 sagged until the drives' watchdog
+        # braked them. Refused like the strict checks: a controlled stop, then RTI_BAD_VALUE. One sum catches any
+        # NaN or infinity in either array (NaN + x = NaN, inf - inf = NaN). A stop packet's values are never read, so
+        # a stop is never refused for them.
+        if cmd_type != CMD_STOP and not math.isfinite(payload.sum() + feedforward.sum()):
+            self._refuse_bad_value()
             return False
         self._rx_applied += 1
         self.seq_rx_last = seq

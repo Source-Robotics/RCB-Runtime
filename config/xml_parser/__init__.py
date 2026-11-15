@@ -48,7 +48,8 @@ from config.xml_parser.homing import (  # noqa: F401
 from config.xml_parser.robot import (  # noqa: F401
     load_software_joint_limits, get_safety_config, _DERIVED_ACCEL_TIME_S, _DERIVED_JERK_FACTOR,
     _DERIVED_TRQ_RATE_PER_TAU, _fill_motion_limit_defaults, _MODE_LIMIT_MAP, _fill_mode_limit_defaults,
-    DEFAULT_VOLTAGE_LIMIT_MV, MIN_VOLTAGE_LIMIT_MV, clamp_voltage_limit, _voltage_limit_or_default, _nonneg,
+    DEFAULT_VOLTAGE_LIMIT_MV, MIN_VOLTAGE_LIMIT_MV, MAX_VOLTAGE_LIMIT_MV, clamp_voltage_limit,
+    _voltage_limit_or_default, _nonneg,
     load_full_robot_config,
 )
 from config.xml_parser.validate import (  # noqa: F401
@@ -64,6 +65,7 @@ __all__ = [
     "ET",
     "HAPTIC_REFERENCE_MASS",
     "HAPTIC_STABLE",
+    "MAX_VOLTAGE_LIMIT_MV",
     "MIN_VOLTAGE_LIMIT_MV",
     "Path",
     "WALL_FILTER_MAX_MS",

@@ -203,16 +203,21 @@ DEFAULT_VOLTAGE_LIMIT_MV = 6000.0
 # value or a robotclient call could still ask for less.
 MIN_VOLTAGE_LIMIT_MV = 6000.0
 
+# Ceiling (2026-11-15): drive firmware 109+ takes 0..60000 mV over CAN, and Spectral_BLDC 1.21 raises inside the send on
+# more — a set_pid_gains value above it would have ended RTI at the next configuration send (the reconnect reload).
+MAX_VOLTAGE_LIMIT_MV = 60000.0
+
 
 def clamp_voltage_limit(value: float | np.ndarray) -> float | np.ndarray:
     """The single definition of the voltage-limit rule, used by every path that can set one.
 
     0 passes through untouched — it tells the driver to use VBUS, so it is a mode, not a limit.
     Any other value (including negatives) is clamped UP to MIN_VOLTAGE_LIMIT_MV, because an
-    under-limited motor cannot hold or move properly. Accepts a scalar or an array.
+    under-limited motor cannot hold or move properly, and DOWN to MAX_VOLTAGE_LIMIT_MV, the most a
+    drive accepts. Accepts a scalar or an array.
     """
     arr = np.asarray(value, dtype=float)
-    out = np.where(arr == 0.0, 0.0, np.maximum(arr, MIN_VOLTAGE_LIMIT_MV))
+    out = np.where(arr == 0.0, 0.0, np.clip(arr, MIN_VOLTAGE_LIMIT_MV, MAX_VOLTAGE_LIMIT_MV))
     return float(out) if out.ndim == 0 else out
 
 
@@ -223,8 +228,8 @@ def _voltage_limit_or_default(value: float | np.ndarray) -> float | np.ndarray:
     filled = np.where(np.isnan(arr), DEFAULT_VOLTAGE_LIMIT_MV, arr)
     clamped = np.asarray(clamp_voltage_limit(filled), dtype=float)
     if np.any(clamped != filled):
-        logger.warning("robot XML voltage_limit below the %.0f mV floor (and not the 0 = use-VBUS "
-                        "sentinel) — clamped up.", MIN_VOLTAGE_LIMIT_MV)
+        logger.warning("robot XML voltage_limit outside %.0f..%.0f mV (and not the 0 = use-VBUS "
+                        "sentinel) — clamped into it.", MIN_VOLTAGE_LIMIT_MV, MAX_VOLTAGE_LIMIT_MV)
     return float(clamped) if clamped.ndim == 0 else clamped
 
 

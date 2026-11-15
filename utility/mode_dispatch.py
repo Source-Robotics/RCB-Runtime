@@ -42,6 +42,7 @@ from typing import Any
 
 import logging
 logger = logging.getLogger("rti.loop")  # docs/logging.md "Logger names"
+import math
 import os
 import time
 
@@ -70,7 +71,16 @@ _motor_pos_buf       = None  # float64 buffer for converted positions (ticks)
 _motor_vel_buf       = None  # float64 buffer for converted speeds    (ticks/s)
 _motor_curr_buf      = None  # float64 buffer for converted currents  (mA)
 _torque_to_mA_factor = None  # per-joint scaling: trq_nm * factor → motor mA
+_current_ceiling_mA  = None  # per joint: the robot XML's <Ilim> at start (mA), at most WIRE_CURRENT_MAX_MA
+_curr_abs_buf        = None  # float64 scratch: |current| per joint
+_curr_ok_mask        = None  # bool scratch: |current| <= its ceiling (False for NaN / inf)
+_curr_clamped        = None  # per joint: this excursion is logged already (re-armed once back inside)
+_curr_clamp_any      = False
 _tick_ok             = TickResult()
+
+# The drive frame carries a current as a signed 16-bit number (mA). Spectral_BLDC 1.20 wrapped a larger value
+# (40000 mA went out as -25536: full current the wrong way); 1.21 raises inside the send instead.
+WIRE_CURRENT_MAX_MA = 32767.0
 # Preallocated per the hot-path allocation rule — FLASHING claims the gripper
 # channel so RTI's gripper send block stays silent too.
 _tick_flashing       = TickResult(gripper_owned=True)
@@ -239,11 +249,63 @@ def _to_motor_space(ctx, output):
 
     if output.trq_nm is not None:
         np.multiply(output.trq_nm[:n], _torque_to_mA_factor[:n], out=_motor_curr_buf[:n])
+        # Every joint's current stays within its robot-XML <Ilim> (the drive caps there anyway, so normal motion is
+        # unchanged), and a value that is not a number is sent as 0 instead of ending RTI in int() (2026-11-15).
+        # Allocation-free here; an out-of-range tick goes to the cold helper.
+        np.abs(_motor_curr_buf[:n], out=_curr_abs_buf[:n])
+        np.less_equal(_curr_abs_buf[:n], _current_ceiling_mA[:n], out=_curr_ok_mask[:n])
+        if not _curr_ok_mask[:n].all():
+            _clamp_currents(n)
+        elif _curr_clamp_any:
+            _clamp_rearm()
         curr_out = _motor_curr_buf
     else:
         curr_out = None
 
     return pos_out, vel_out, curr_out
+
+
+def _clamp_currents(n):
+    """Cold path of _to_motor_space: a joint's current is beyond its ceiling or not a number. Clamped to the ceiling
+    (its sign kept), or 0 when it is not a number; each joint is logged once per excursion."""
+    global _curr_clamp_any
+    for i in range(n):
+        c = float(_motor_curr_buf[i])
+        lim = float(_current_ceiling_mA[i])
+        if not math.isfinite(c):
+            _motor_curr_buf[i] = 0.0
+            if not _curr_clamped[i]:
+                logger.critical("J%d: the commanded current is not a number (%s) — sent as 0 mA instead. A bug "
+                                "upstream of the drive conversion; RTI keeps running.", i + 1, c)
+        elif abs(c) > lim:
+            _motor_curr_buf[i] = lim if c > 0.0 else -lim
+            if not _curr_clamped[i]:
+                logger.warning("J%d: the commanded current %.0f mA is beyond the joint's limit — clamped to %.0f mA "
+                               "(the robot XML's <Ilim>; logged once until it is back inside).", i + 1, c, lim)
+        else:
+            _curr_clamped[i] = False
+            continue
+        _curr_clamped[i] = True
+    _curr_clamp_any = any(_curr_clamped)
+
+
+def _clamp_rearm():
+    """Every joint is back inside its ceiling: the next excursion is logged again."""
+    global _curr_clamp_any
+    for i in range(len(_curr_clamped)):
+        _curr_clamped[i] = False
+    _curr_clamp_any = False
+
+
+def _current_ceilings(ilim, joint_num):
+    """Per joint the robot XML's <Ilim> (mA), never above WIRE_CURRENT_MAX_MA; a missing or non-positive value gets
+    the wire's maximum (the wrap guard alone; the drive's own limit stays the cap)."""
+    out = np.full(joint_num, WIRE_CURRENT_MAX_MA, dtype=np.float64)
+    for i in range(joint_num):
+        v = float(ilim[i]) if ilim is not None and i < len(ilim) else math.nan
+        if math.isfinite(v) and v > 0.0:
+            out[i] = min(v, WIRE_CURRENT_MAX_MA)
+    return out
 
 
 def _record_sent(ctx, pos_buf, vel_buf, curr_buf, mode):
@@ -718,12 +780,20 @@ def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn:
     _dyn_buffers(joint_num)                        # the inertia / Coriolis feedforward's buffers, before the loop
     global _zeros_rad, _motor_pos_buf, _motor_vel_buf, _motor_curr_buf, _torque_to_mA_factor
     global _output_vel_zero, _output_torque_zero, _idle_trq_buf
+    global _current_ceiling_mA, _curr_abs_buf, _curr_ok_mask, _curr_clamped, _curr_clamp_any
 
     _zeros_rad      = np.zeros(joint_num, dtype=np.float64)
     _idle_trq_buf   = np.zeros(joint_num, dtype=np.float64)
     _motor_pos_buf  = np.zeros(joint_num, dtype=np.float64)
     _motor_vel_buf  = np.zeros(joint_num, dtype=np.float64)
     _motor_curr_buf = np.zeros(joint_num, dtype=np.float64)
+    # The current ceiling: the robot XML's <Ilim> as loaded (a copy — set_pid_gains changes the live limit below it,
+    # never above: the executor refuses more than the XML's).
+    _current_ceiling_mA = _current_ceilings(motor_config.get('Ilim') if motor_config else None, joint_num)
+    _curr_abs_buf   = np.zeros(joint_num, dtype=np.float64)
+    _curr_ok_mask   = np.zeros(joint_num, dtype=bool)
+    _curr_clamped   = [False] * joint_num
+    _curr_clamp_any = False
     _output_vel_zero    = ControlOutput(vel_rad=_zeros_rad)
     _output_torque_zero = ControlOutput(trq_nm=_zeros_rad)
 
