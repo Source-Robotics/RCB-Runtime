@@ -17,7 +17,7 @@ keywords = ["robotics", "robot-arm", "CAN", "real-time", "raspberry-pi", "contro
 dependencies = [
     "Spectral_BLDC",
     "SourceRoboticsToolbox",
-    "roboticstoolbox-python-source-robotics",
+    "roboticstoolbox-python",
     "spatialmath-python",
     "pin",
     "numpy",

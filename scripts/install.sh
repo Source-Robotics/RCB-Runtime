@@ -72,8 +72,13 @@ source "${VENV_DIR}/bin/activate"
 say "Installing Python tooling"
 python -m pip install --upgrade pip wheel
 
+say "Removing the old robotics-toolbox fork, if this .venv has it"
+# (2026-11-15) The fork and the official package write the same roboticstoolbox/ folder: installing over the fork
+# leaves its files behind, and removing it later deletes files the new one needs.
+python -m pip uninstall -y roboticstoolbox-python-source-robotics || true
+
 say "Verifying required binary wheels are available"
-RTB_REQUIREMENT="$(grep '^roboticstoolbox-python-source-robotics==' "${REQUIREMENTS}")"
+RTB_REQUIREMENT="$(grep '^roboticstoolbox-python==' "${REQUIREMENTS}")"
 python -m pip install --only-binary=:all: --no-deps "${RTB_REQUIREMENT}"
 
 say "Installing Python dependencies from requirements.txt"

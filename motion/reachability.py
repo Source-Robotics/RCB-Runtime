@@ -32,6 +32,7 @@ from typing import Any, Callable
 import numpy as np
 
 from motion.ik_config import DEFAULT_IK_CONFIG
+from robotics.robot_kinematics import ik_lm
 
 REACH_STARTS = 128      # 4x the most any of 300 reachable poses needed
 _START_SEED = 2026
@@ -94,13 +95,14 @@ def find_reachable(robot: Any, target: np.ndarray, near: np.ndarray, low: np.nda
     near_ref = np.clip(near, low, high)
     best, best_dist = None, np.inf
     for i in range(starts.shape[0] + 1):
-        # rtb's Robot.ik_LM returns a plain tuple (q, success, iterations, searches, residual).
-        sol = robot.ik_LM(target, q0=near if i == 0 else starts[i - 1],
+        # The robot's cached IK chain, either toolbox version's result (robotics/robot_kinematics.ik_lm, 2026-11-15:
+        # `sol[1]` on roboticstoolbox 1.5's IKSolution raised IndexError, and up to 129 starts rebuilt the chain each).
+        q_sol, ok = ik_lm(robot, target, q0=near if i == 0 else starts[i - 1],
                           ilimit=DEFAULT_IK_CONFIG.ilimit, slimit=1, tol=_LM_TOL, joint_limits=False,
                           k=DEFAULT_IK_CONFIG.lm_k, method=DEFAULT_IK_CONFIG.lm_method)
-        if not sol[1]:
+        if not ok:
             continue
-        q = _wrap_into_limits(np.asarray(sol[0], dtype=np.float64), near_ref, low, high)
+        q = _wrap_into_limits(np.asarray(q_sol, dtype=np.float64), near_ref, low, high)
         if np.any(q < low - _LIMIT_SLACK) or np.any(q > high + _LIMIT_SLACK) or not _pose_ok(robot, q, target):
             continue
         if accept is not None and not accept(q):

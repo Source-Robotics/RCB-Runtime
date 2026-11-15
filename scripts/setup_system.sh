@@ -131,7 +131,7 @@ if real; then
         miss "it is Python ${PY_VER:-?}, not 3.11 (every pin was verified on 3.11)"
         fix "README 'Python 3.11, not 3.12' (the deadsnakes PPA), then ./scripts/install.sh"
     fi
-    MODULES="numpy scipy can zmq nicegui psutil roboticstoolbox spatialmath pinocchio coal ruckig toppra Spectral_BLDC SourceRoboticsToolbox lgpio gpiozero distro serial PIL adafruit_ssd1306 board busio"
+    MODULES="numpy scipy can zmq nicegui psutil roboticstoolbox roboticstoolbox._frne_c roboticstoolbox._fknm_c spatialmath pinocchio coal ruckig toppra Spectral_BLDC SourceRoboticsToolbox lgpio gpiozero distro serial PIL adafruit_ssd1306 board busio"
     AS_USER=()
     [ "$(id -u)" = "0" ] && AS_USER=(sudo -u "$RUN_USER" -H)
     BAD="$("${AS_USER[@]}" "$ROBOT_PY" - "$MODULES" 2>/dev/null <<'PY'

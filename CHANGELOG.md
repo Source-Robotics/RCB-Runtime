@@ -44,6 +44,11 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Changed
 
+- The robotics toolbox is the official `roboticstoolbox-python` 1.5.0 (with `spatialmath-python` 1.1.19) instead of
+  our fork `roboticstoolbox-python-source-robotics` 1.3.0.post2. Both install the same `roboticstoolbox` package:
+  `scripts/install.sh` removes the fork first. The robot's live numbers (gravity, feedforward, kinematics) come from
+  Pinocchio and do not change. The reachability search (`is_reachable`, block programs' pose moves, dry runs) reads
+  either toolbox's IK result and keeps the robot's IK chain instead of rebuilding it at every solve.
 - The first-run check waits up to 15 s for the dashboard to let go of control (it holds it for 5 s after the last
   click, for example on Enable) instead of skipping the step at once.
 
@@ -81,6 +86,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
   system kept its own list of which codes are warnings, and it lacked this one. The list now comes from the error
   catalog, so every code documented as a warning is one.
 - A voltage limit above 60000 mV (the most a drive accepts) is clamped to it instead of reaching the drive.
+- With the IK engine set to `roboticstoolbox` (not the default), a failed solve came back as an answer — up to 65 cm
+  off the target — because the fork reports success as 0 / 1, which the check missed. It is now a failure.
 
 ## [1.1.1] - 2026-10-25
 

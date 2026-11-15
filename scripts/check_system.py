@@ -176,6 +176,10 @@ def check_imports() -> None:
         "PIL": True,
         "Spectral_BLDC": True,
         "roboticstoolbox": True,
+        # roboticstoolbox 1.5 falls back to slow pure Python, without a warning, when its compiled parts do not
+        # load (2026-11-15): import them by name so a bad wheel fails here.
+        "roboticstoolbox._frne_c": True,
+        "roboticstoolbox._fknm_c": True,
         "spatialmath": True,
         "pinocchio": False,
         # Added 2026-08-08. All three were missing here, so this check passed installs that

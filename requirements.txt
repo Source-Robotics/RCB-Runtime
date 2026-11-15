@@ -29,10 +29,21 @@ Spectral_BLDC==1.20                              # Spectral BLDC motor driver (C
 SourceRoboticsToolbox==1.3                       # Source Robotics Toolbox
 
 # ── Robotics / kinematics / dynamics ─────────────────────────────────────────
-# NOTE: custom robotics-toolbox FORK; imports as `roboticstoolbox`, NOT the
-# upstream 'roboticstoolbox-python'.
-roboticstoolbox-python-source-robotics==1.3.0.post2
-spatialmath-python==1.1.16
+# The official robotics toolbox (imports as `roboticstoolbox`). It replaced our fork
+# roboticstoolbox-python-source-robotics 1.3.0.post2 on 2026-11-15; never install both:
+# they write the same roboticstoolbox/ folder (scripts/install.sh removes the fork first).
+roboticstoolbox-python==1.5.0
+spatialmath-python==1.1.19                       # 1.5 needs >= 1.1.18
+# What 1.5 imports in EVERY robot process (RTI included: `import roboticstoolbox` loads its URDF models, which import
+# xacrodoc -> xacro, rospkg) plus its data and graph packages — pinned at what the Pi installed on 2026-11-15, so a
+# fresh install cannot pull a newer release that stops RTI from starting.
+spatialgeometry==1.4.2
+rtb-data==2.0.0
+pgraph-python==1.0.0
+xacrodoc==2.0.2
+xacro==2.1.1
+rospkg==1.6.3
+catkin-pkg==1.1.1
 pin==3.9.0                                       # Pinocchio — default FK/Jacobian backend
 cmeel-urdfdom==4.0.1                             # ABI match for pin==3.9.0 (liburdfdom_sensor.so.4.0)
 cmeel-tinyxml2==10.0.0                           # ABI match for pin==3.9.0 (libtinyxml2.so.10)

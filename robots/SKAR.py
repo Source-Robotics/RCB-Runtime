@@ -217,7 +217,7 @@ if __name__ == "__main__":
     # Initialize robot with default gripper
     par6 = SKAR(symbolic=False, gripper_name="Flange")
     print("Initial configuration (Flange):")
-    print(par6.dynamics_list())
+    par6.dynamics_list()          # it prints the table itself and returns None (mypy, roboticstoolbox 1.5)
     print(par6)
     print("flange")
     rne_test = par6.rne(q=par6.qs,qd=[0,0,0,0], qdd=[0,0,0,0])
@@ -226,7 +226,7 @@ if __name__ == "__main__":
     """
     par6 = SKAR(symbolic=False, gripper_name="SSG48")
     print("\nAfter switching to SSG48:")
-    print(par6.dynamics_list())
+    par6.dynamics_list()          # it prints the table itself and returns None (mypy, roboticstoolbox 1.5)
     print(par6)
     print("ssg48")
     rne_test = par6.rne(q=par6.qs,qd=[0,0,0,0], qdd=[0,0,0,0])
@@ -242,12 +242,13 @@ if __name__ == "__main__":
     
 
 
-# Payload has an error where it replaces the mass of the last link
-# NOTE Payload will be added to the COM of the end effector / last link
-# NOTE Setting payload(0) will remove the mass from end effector / last link
+# Since roboticstoolbox 1.5, payload(m, p) ADDS a point mass m at p (in the last link's frame) to the last link:
+# mass, centre of mass and inertia are combined. A second call replaces the first payload; payload(0) restores the
+# link's own values. (Our earlier toolbox fork replaced the link's mass instead.) The runtime does not use it:
+# utility/payload.py combines the part with the gripper's body itself.
 """
-robot.payload(m = (payload + m1), p = [-lc1, 0, 0]) 
-print(f"gravload is",robot.gravload([0]))
-robot.payload(m = m1, p = [-lc1, 0, 0])
-print(f"gravload is",robot.gravload([0]))
+robot.payload(m=payload, p=[-lc1, 0, 0])
+print(f"gravload is", robot.gravload([0]))
+robot.payload(0)
+print(f"gravload is", robot.gravload([0]))
 """

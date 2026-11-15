@@ -7,8 +7,10 @@ the gripper XML declares — stays what it is; the part is ADDED to it (parallel
 dynamics models are rebuilt from the edited link: the gravity feedforward in every mode, the freedrive walls'
 effective inertia and the zone walls' inverse mass. set_payload(0) brings the gripper alone back.
 
-NOT rtb's Dynamics.payload(): that REPLACES link 6's mass and COM with the point mass, and link 6 here IS the
-gripper — the gripper would vanish from the model the moment a part was declared.
+NOT the toolbox's Dynamics.payload(): our earlier toolbox fork's REPLACED link 6's mass and COM with the point mass,
+and link 6 here IS the gripper — the gripper would vanish from the model the moment a part was declared. Since
+roboticstoolbox 1.5 (2026-11-15) payload() adds a point mass; the combination stays here, in one place, with the
+part's own inertia.
 
 Rebuilding the three Pinocchio dynamics models costs ~1.1 ms warm (measured on the Pi; the first build at
 start-up pays the import), so the RTI command handler does it in place — a cold path, no file I/O, one late tick

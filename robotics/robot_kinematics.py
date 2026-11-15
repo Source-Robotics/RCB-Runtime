@@ -73,6 +73,29 @@ def get_tcp_pose_rpy(robot, joint_position):
 # Inverse Kinematics
 # ==========================================================================
 
+def ik_lm(robot, target, **kwargs):
+    """The toolbox's Levenberg-Marquardt IK through the robot's IK chain, built once per robot object (2026-11-15).
+    Returns (q, success).
+
+    The chain (robot.ets()) is what robot.ik_LM solves on; roboticstoolbox 1.5 rebuilds it at every robot.ik_LM call
+    (~0.5 ms on a PC, the solve itself ~5 us), our earlier fork kept it. It changes only with the robot's geometry:
+    a gripper change builds a new robot object (utility/robot_factory.create_robot) with its own chain; nothing in
+    the runtime sets robot.tool / base or edits links' kinematics on a live robot (if you ever do:
+    `del robot._rcb_ik_chain`). One robot object is used by one thread.
+
+    Both result shapes are read: 1.5's IKSolution (.q, .success) and the fork's tuple (q, success, ...) — whose
+    success is an int 0 / 1, which calculate_inverse_kinematics missed (a failed solve came back as an answer, up to
+    65 cm off: TODO/reference/rtb_baseline_fork_2026-11-15.json)."""
+    chain = getattr(robot, "_rcb_ik_chain", None)
+    if chain is None:
+        chain = robot.ets()
+        robot._rcb_ik_chain = chain
+    sol = chain.ik_LM(target, **kwargs)
+    if hasattr(sol, "success"):
+        return sol.q, bool(sol.success)
+    return sol[0], bool(sol[1])
+
+
 def calculate_inverse_kinematics(robot, target_pose, q0=None, method='chan',
                                  ilimit=25, slimit=25, k=0.1, tol=1e-4):
     """
@@ -92,24 +115,8 @@ def calculate_inverse_kinematics(robot, target_pose, q0=None, method='chan',
         np.array: Joint positions solution, or None if failed
     """
     try:
-        solution = robot.ik_LM(
-            target_pose,
-            q0=q0,
-            ilimit=ilimit,
-            slimit=slimit,
-            k=k,
-            method=method,
-            tol=tol
-        )
-        if hasattr(solution, 'success') and not bool(solution.success):
-            return None
-        if hasattr(solution, 'q'):
-            return solution.q
-        if isinstance(solution, (tuple, list)) and solution:
-            if len(solution) > 1 and isinstance(solution[1], (bool, np.bool_)) and not bool(solution[1]):
-                return None
-            return solution[0]
-        return solution
+        q, success = ik_lm(robot, target_pose, q0=q0, ilimit=ilimit, slimit=slimit, k=k, method=method, tol=tol)
+        return q if success else None
     except Exception as e:
         logger.warning(f"IK failed: {e}")   # was a print: a real warning hidden in stdout (2026-10-15)
         return None
