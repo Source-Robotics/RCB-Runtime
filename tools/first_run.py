@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The first-run check from the command line (2026-10-18, TODO/first_run_plan.md P1): a guided verification that a
-robot was built and wired correctly. Stages 0-2 move nothing; stage 3 moves each joint a few degrees.
+robot was built and wired correctly. Stages 0-2 move nothing; stage 3 moves each joint a few degrees; stage 4 homes
+the arm; stage 5 moves the homed arm (2026-10-27, P3).
 
     S0  the Pi and the configuration     the Pi's setup, the robot / gripper XMLs, the PCB version, the robot service
     S1  power and CAN                    every drive answers, the CAN bus, firmware, supply voltage, temperatures, faults
@@ -9,15 +10,25 @@ robot was built and wired correctly. Stages 0-2 move nothing; stage 3 moves each
     S3  small test moves                 the arm ENABLED, homed or not: each joint moves a few degrees and back,
                                          slowly, its force limited; you say which way it went (--by-hand: you turn
                                          each joint yourself instead, one at a time limp)
+    S4  homing                           the arm ENABLED: the normal homing; a failure is explained with what to check
+    S5  the homed arm                    each joint turns a visible amount and back (you judge how far; its friction
+                                         against the robot XML's model and a quiet hold are measured), the gripper
+                                         closes and opens, a slow J1 move is stopped part-way
 
     cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/first_run.py                 # every stage
     cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/first_run.py --stages 3
     cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/first_run.py --list          # the steps
+    cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/first_run.py --bundle no     # no support-bundle question
 
-Run it on the robot's Pi (stage 0 reads its files) with the arm DISABLED for stage 2 and ENABLED for stage 3 (each
-waits for it; nothing is homed). Ctrl-C while it
+Run it on the robot's Pi (stage 0 reads its files; stage 5 reads shared memory) with the arm DISABLED for stages 1-2
+and ENABLED for stages 3-5 (each waits for it). Ctrl-C while it
 waits for you skips that step; Ctrl-C at a question stops the run (the report keeps what was done). The report:
-temp_data/first_run/<UTC>/report.txt + report.json. Exit 0 = no FAIL, 1 = a FAIL, 2 = stopped early.
+temp_data/first_run/<UTC>/report.txt + report.json, and — when asked for (--bundle ask / yes) — the support bundle
+support_<UTC>.zip next to them (first_run/bundle.py: the report, logs, incident recordings, configuration; it needs
+the arm DISABLED). Exit 0 = no FAIL, 1 = a FAIL, 2 = stopped early.
+
+The dashboard's First run tab (gui_first_run_tab.py, 2026-10-27) runs this same program with --ui json: the UI contract
+as JSON lines on stdin / stdout (first_run/json_ui.py), every other output on stderr.
 """
 from __future__ import annotations
 
@@ -31,7 +42,8 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from first_run import core, report, stage0                               # noqa: E402
+from first_run import bundle, core, report, stage0                       # noqa: E402
+from first_run.json_ui import JsonUI                                      # noqa: E402
 from first_run.steps import BY_HAND, STEPS                                # noqa: E402
 from utility.code_version import describe as describe_code                # noqa: E402
 
@@ -137,6 +149,27 @@ def select_steps(stages, by_hand=False):
     return steps
 
 
+def _goodbye(ctx, disconnect):
+    """Release control (and close the connection); the run's result matters more than a tidy goodbye."""
+    robot = ctx.get("robot")
+    if robot is None:
+        return
+    for fn in (robot.release_control, robot.disconnect) if disconnect else (robot.release_control,):
+        try:
+            fn()
+        except Exception:
+            pass
+
+
+def json_ui():
+    """The dashboard's front-end: the protocol on a copy of fd 1, and fd 1 itself (Python's prints, a child process,
+    a library writing to it) on stderr — nothing but the protocol reaches the dashboard's reader."""
+    proto = os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8")
+    sys.stdout.flush()
+    os.dup2(2, 1)
+    return JsonUI(sys.stdin, proto)
+
+
 def meta_of(ctx, completed, t):
     cfg = ctx.get("config") or {}
     return {"time": t, "completed": completed, "host": socket.gethostname(), "code": describe_code(ROOT),
@@ -148,10 +181,14 @@ def main(argv=None, ui=None, ctx=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1", help="the robot's executor (default: this Pi)")
-    ap.add_argument("--stages", default="0,1,2,3", help="comma list of stages to run (default 0,1,2,3)")
+    ap.add_argument("--stages", default="0,1,2,3,4,5", help="comma list of stages to run (default 0,1,2,3,4,5)")
     ap.add_argument("--list", action="store_true", help="list the steps and exit")
     ap.add_argument("--by-hand", action="store_true",
                     help="stage 3: turn each joint by hand (one at a time limp) instead of the powered test moves")
+    ap.add_argument("--bundle", choices=("ask", "yes", "no"), default="ask",
+                    help="add the support bundle to the report: ask at the end (default), yes, no")
+    ap.add_argument("--ui", choices=("console", "json"), default="console",
+                    help="console (default), or json: the dashboard's First run tab (first_run/json_ui.py)")
     args = ap.parse_args(argv)
     if args.list:
         for s in STEPS + BY_HAND:
@@ -165,25 +202,29 @@ def main(argv=None, ui=None, ctx=None):
     if not stages or any(s not in core.STAGE_TITLES for s in stages):
         ap.error(f"--stages: one or more of {sorted(core.STAGE_TITLES)}")
     t0 = time.time()
+    if ui is None and args.ui == "json":
+        ui = json_ui()
     ui = ui or ConsoleUI()
     ctx = ctx if ctx is not None else build_ctx(args.host)
-    print("RCB first-run check — every step says what it checks; only stage 3 moves the arm (a few degrees).")
+    print("RCB first-run check — every step says what it checks; stages 3-5 move the arm (3: a few degrees, 4: homing, "
+          "5: the homed arm).")
     try:
         results, completed = core.run(select_steps(stages, args.by_hand), ctx, ui, stages)
+        _goodbye(ctx, disconnect=False)     # control is not needed any more; the bundle still reads the robot's state
+        folder = report.write(results, meta_of(ctx, completed, t0), root=report.REPORTS_DIR)
+        zip_path = bundle.offer(ctx, ui, folder, args.bundle)
     finally:
-        robot = ctx.get("robot")
-        if robot is not None:
-            for fn in (robot.release_control, robot.disconnect):
-                try:
-                    fn()
-                except Exception:   # the run's result matters more than a tidy goodbye
-                    pass
-    folder = report.write(results, meta_of(ctx, completed, t0), root=report.REPORTS_DIR)
+        _goodbye(ctx, disconnect=True)
     c = core.counts(results)
+    if hasattr(ui, "finished"):
+        ui.finished({"verdict": core.worst(results), "counts": c, "completed": completed, "report": folder,
+                     "bundle": zip_path})
     print()
     print(f"Result: {core.worst(results)} — " + ", ".join(f"{c[v]} {v}" for v in c if c[v])
           + ("" if completed else " (stopped before the end)"))
     print(f"Report: {os.path.join(folder, 'report.txt')}")
+    if zip_path:
+        print(f"Support bundle: {zip_path}")
     if not completed:
         return 2
     return 1 if core.worst(results) == core.FAIL else 0

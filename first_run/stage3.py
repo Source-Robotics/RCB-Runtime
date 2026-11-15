@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 
 from first_run.core import FAIL, INFO, PASS, SKIP, WARN, Aborted, Cancelled, claim, result, step
+from robotclient import CommandRejected
 
 ORDER = (5, 4, 3, 0, 2, 1)       # J6, J5, J4, J1, J3, J2: the wrist first, the joints carrying the arm last
 HOLD_S = 0.5                     # robotics/joint_test.py HOLD_S: still at each end
@@ -43,11 +44,16 @@ def _jt(ctx):
 
 
 def _move(ctx, ui, j, amp, mv):
-    """One test move of joint j (0-based) by amp deg; the finished result, or None when it did not finish in time."""
+    """One test move of joint j (0-based) by amp deg; the finished result, None when it did not finish in time, or
+    {"state": "refused", "why": ...} when the robot refused to start it — nothing moved (RTI answers since 1.1.0; e.g.
+    a homed arm whose move would pass a soft limit)."""
     robot = ctx["robot"]
     seq0 = int(_jt(ctx).get("seq", 0))
     ramp = 0.5 * math.pi * abs(amp) / float(mv["speed_dps"])
-    robot.joint_test(j + 1, amp, float(mv["speed_dps"]), float(mv["current_ma"]))
+    try:
+        robot.joint_test(j + 1, amp, float(mv["speed_dps"]), float(mv["current_ma"]))
+    except CommandRejected as e:
+        return {"state": "refused", "why": e.message}
     try:
         return ui.wait(f"J{j + 1} is moving {amp:+g} deg and back — watch which way it goes FIRST",
                        lambda: (lambda r: r if int(r.get("seq", 0)) > seq0 else None)(_jt(ctx)),
@@ -59,6 +65,10 @@ def _move(ctx, ui, j, amp, mv):
 
 def _blocked(res, amp):
     return res is None or res.get("state") == "fell_behind" or abs(float(res.get("moved_deg", 0))) < BLOCKED_FRACTION * abs(amp)
+
+
+def _refused(res):
+    return res is not None and res.get("state") == "refused"
 
 
 def _check_joint(ctx, ui, st, j, words, mv):
@@ -75,16 +85,27 @@ def _check_joint(ctx, ui, st, j, words, mv):
             return [result(st, SKIP, f"{name}: the test move was stopped (the arm disabled, an error, a mode change)",
                            value=res)]
         if _blocked(res, amp):
-            ui.say(f"{name} could not move the + way (at its end, or blocked) — trying the other way")
+            why = f"refused: {res['why']}" if _refused(res) else "at its end, or blocked"
+            ui.say(f"{name} could not move the + way ({why}) — trying the other way")
             first = res
             res, sign = _move(ctx, ui, j, -amp, mv), -1
             if res is not None and res.get("state") == "stopped":
                 return [result(st, SKIP, f"{name}: the test move was stopped (the arm disabled, an error, a mode "
                                          "change)", value=res)]
+            if _refused(first) and _refused(res):      # not tested: the robot's state, not the build
+                whys = dict.fromkeys((first["why"], res["why"]))
+                return [result(st, SKIP, f"{name}: the robot refused its test move both ways: " + "; ".join(whys),
+                               value={"plus": first, "minus": res})]
             if _blocked(res, amp):
-                return [result(st, FAIL, f"{name} did not follow its test move either way (moved "
-                                         f"{float((res or {}).get('moved_deg', 0)):+.2f} deg of {amp:g}, behind up to "
-                                         f"{float((res or {}).get('max_error_deg', 0)):.2f} deg)",
+                if _refused(res):          # the + way ran and failed, the - way was refused
+                    ran, how = first, f"the + way, and the robot refused the other way: {res['why']}"
+                elif _refused(first):      # the + way was refused, the - way ran and failed
+                    ran, how = res, f"the - way, and the robot refused the other way: {first['why']}"
+                else:
+                    ran, how = res, "either way"
+                return [result(st, FAIL, f"{name} did not follow its test move {how} (moved "
+                                         f"{float((ran or {}).get('moved_deg', 0)):+.2f} deg of {amp:g}, behind up to "
+                                         f"{float((ran or {}).get('max_error_deg', 0)):.2f} deg)",
                                value={"plus": first, "minus": res}, expected=f"{amp:g} deg each way", hints=FAIL_HINTS)]
     except Cancelled:
         return [result(st, SKIP, f"{name}: skipped by the user (its test move stopped)")]
@@ -96,7 +117,9 @@ def _judge(st, ui, name, words, amp, cur, sign, res):
     peak, end = float(res.get("peak_current_ma", 0)), float(res.get("end_error_deg", 0))
     way = "+" if sign > 0 else "-"
     if words:
-        answer = ui.choose(f"Which way did {name} move FIRST?", [words, "the other way", "I saw no movement"])
+        ask = (f"Which way did {name} move FIRST?" if sign > 0 else
+               f"{name}'s first try was blocked and stopped at once. In its second try, which way did it move FIRST?")
+        answer = ui.choose(ask, [words, "the other way", "I saw no movement"])
         right = words if sign > 0 else "the other way"
     else:
         answer = ui.choose(f"Did you see {name} move?", ["yes", "I saw no movement"])
@@ -140,7 +163,7 @@ def check_moves(ctx, ui):
     if ui.choose("The robot now moves each joint a few degrees and back, slowly, its force limited — J6 first, J2 "
                  "last. Clear the space around the arm and keep a hand on the E-stop.", ["start", "skip"]) != "start":
         return result(st, SKIP, "not started (the user's choice)")
-    why = claim(ctx)
+    why = claim(ctx, ui)
     if why:
         return result(st, SKIP, why)
     cfg = ctx.get("config") or {}

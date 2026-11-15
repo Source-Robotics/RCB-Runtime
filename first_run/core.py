@@ -36,7 +36,7 @@ import traceback
 PASS, WARN, FAIL, SKIP, INFO = "PASS", "WARN", "FAIL", "SKIP", "INFO"
 VERDICTS = (PASS, WARN, FAIL, SKIP, INFO)
 STAGE_TITLES = {0: "The Pi and the configuration", 1: "Power and CAN", 2: "E-stop, buttons, I/O, Hall sensor",
-                3: "Small test moves"}
+                3: "Small test moves", 4: "Homing", 5: "The homed arm"}
 STAGE_ABOUT = {
     0: "Nothing needs power yet: the Pi's setup, the configuration files, the control box version, the robot service.",
     1: "The drives powered, the arm DISABLED: every drive answers, the CAN bus is clean, firmware, supply voltage, "
@@ -45,8 +45,14 @@ STAGE_ABOUT = {
        "the outputs, and turn the Hall-sensor joint by hand.",
     3: "The arm ENABLED, homed or not: each joint moves a few degrees and back, slowly, its force limited, the "
        "others holding; you say which way it went. (--by-hand: you turn each joint yourself instead.)",
+    4: "The arm ENABLED: the normal homing, each joint to its endstop; a failure is explained with what to check.",
+    5: "The arm homed: each joint turns a visible amount and back (you judge how far; its friction and a quiet hold "
+       "are measured), the gripper closes and opens, and a slow move is stopped part-way.",
 }
 DISABLE_WAIT_S = 180.0
+# The dashboard holds control for 5 s after its last command (gui_command_sender.GUI_IDLE_RELEASE_S) — and the user
+# has often just pressed Enable there, because a step asked them to. A claim waits this long for it to let go.
+CLAIM_WAIT_S = 15.0
 
 
 class Cancelled(Exception):
@@ -80,14 +86,29 @@ def counts(results) -> dict:
     return {v: sum(1 for r in results if r["verdict"] == v) for v in VERDICTS}
 
 
-def claim(ctx):
-    """None once this connection holds control (the owned commands: outputs, hall_check, free_joint), else why not."""
-    try:
-        ctx["robot"].take_control()
-    except Exception as e:   # CONTROL_HELD: another client holds it
-        return (f"another client holds control ({getattr(e, 'message', e)}) — the dashboard keeps it ~5 s after its "
-                "last command: wait, or release it there, then run this step again")
-    return None
+def claim(ctx, ui=None):
+    """None once this connection holds control (the owned commands: outputs, hall_check, free_joint, moves), else why
+    not. Held by another client (CONTROL_HELD) and a `ui` given: waits up to CLAIM_WAIT_S for it to let go — the
+    dashboard does 5 s after its last command; the user can skip the wait (Cancelled)."""
+    last: list = [None]
+
+    def take():
+        try:
+            ctx["robot"].take_control()
+        except Exception as e:   # CONTROL_HELD: another client holds it
+            last[0] = e
+            return None
+        return True
+
+    if take():
+        return None
+    if ui is not None and getattr(last[0], "code", None) == "CONTROL_HELD":
+        if ui.wait("Another client holds control — the dashboard lets go 5 s after its last click; waiting for it",
+                   take, CLAIM_WAIT_S, 0.5):
+            return None
+    e = last[0]
+    return (f"another client holds control ({getattr(e, 'message', e)}) — the dashboard keeps it ~5 s after its "
+            "last command: wait, or release it there, then run this step again")
 
 
 def _arm_state(robot) -> str:
@@ -124,6 +145,8 @@ def run_step(st, ctx, ui) -> list:
         out = st["run"](ctx, ui)
     except Cancelled:
         return [result(st, SKIP, "skipped by the user")]
+    except KeyboardInterrupt:  # Ctrl-C while a step works on its own (the setup script, the CAN watch): as in a wait
+        return [result(st, SKIP, "skipped by the user (Ctrl-C)")]
     except Aborted as e:      # keep what the step measured before the stop, and say where it stopped
         e.results = list(getattr(e, "partial", None) or []) + [result(st, SKIP, "the run was stopped here")]
         raise

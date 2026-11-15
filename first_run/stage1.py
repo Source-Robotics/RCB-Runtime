@@ -29,7 +29,8 @@ MISSING_HINTS = [
     "its power: is the drive's LED lit? Follow the power wires to it (with a daisy-chained supply, the connector "
     "before it)",
     "its CAN cable: both connectors fully seated; CAN-H and CAN-L not swapped at any connector",
-    "its CAN ID: the drive must be set to the ID shown — a drive on a wrong ID appears under 'other IDs answering'",
+    "its CAN ID: the drive must be set to the ID shown — a drive on a wrong ID shows up as 'a device answers on ID "
+    "<n>'",
     "termination: one 120 ohm resistor at each END of the bus — with all power off, about 60 ohm between CAN-H and "
     "CAN-L at any connector (120 = one missing, ~40 = one too many)",
 ]

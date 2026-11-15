@@ -168,9 +168,10 @@ def bundle_files():
     return out
 
 
-def build_bundle(info_text, out_dir=None, keep=BUNDLE_KEEP):
+def build_bundle(info_text, out_dir=None, keep=BUNDLE_KEEP, extra=()):
     """Write the zip (ZIP_DEFLATED, level 1: the Pi's CPU over the last few percent); return its path. Runs in the
-    bundle thread at nice 19."""
+    bundle thread at nice 19. extra: more [(path on disk, name in the zip)] — the first-run check adds its report
+    (first_run/bundle.py)."""
     try:
         os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
     except OSError:
@@ -182,7 +183,7 @@ def build_bundle(info_text, out_dir=None, keep=BUNDLE_KEEP):
     tmp = path + ".part"
     with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
         zf.writestr("info.txt", info_text)
-        for src, name in bundle_files():
+        for src, name in list(extra) + bundle_files():
             try:
                 zf.write(src, name)
             except OSError:

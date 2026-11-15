@@ -9,8 +9,9 @@ TODO/first_run_plan.md).
               it once more — a mis-typed answer is redone, not a FAIL)
 
 Every single button, input and output can be skipped on its own (a build without the front-panel buttons, or with
-only some I/O wired): Cancelled from a wait (Ctrl-C in the console) skips that one, and an output's question has
-"not wired". A skipped one is a SKIP in the report, never a FAIL.
+only some I/O wired): Cancelled from a wait (Ctrl-C in the console) skips that one — at its press / switch AND at its
+release / switch back (2026-10-27) — and an output's question has "not wired". A skipped one is a SKIP in the report,
+never a FAIL. A run stopped at a question (Aborted) keeps the results already measured in the step (e.partial).
     hall      the Hall-sensor joint limp (robot.hall_check), the user turns it by hand through the magnet: the sensor
               changes and changes back; optionally twice, to see it trigger at the same angle
 
@@ -21,7 +22,8 @@ from __future__ import annotations
 
 import math
 
-from first_run.core import FAIL, INFO, PASS, SKIP, WARN, Cancelled, claim, result, step
+from first_run.core import FAIL, INFO, PASS, SKIP, WARN, Aborted, Cancelled, claim, result, step
+from robotclient import CommandRejected
 
 PRESS_TIMEOUT_S = 60.0
 BUTTON_TIMEOUT_S = 30.0
@@ -124,8 +126,12 @@ def check_buttons(ctx, ui):
                               hints=[f"{name}'s two wires to the Pi's header (docs/pin_map.md)",
                                      "is the supervisor running? It reads the buttons (logs/supervisor.log)"]))
             continue
-        back = ui.wait(f"... and release {name}", lambda n=name: True if not _io(ctx)["buttons_pressed"][n] else None,
-                       BUTTON_TIMEOUT_S, POLL_S)
+        try:
+            back = ui.wait(f"... and release {name}",
+                           lambda n=name: True if not _io(ctx)["buttons_pressed"][n] else None, BUTTON_TIMEOUT_S, POLL_S)
+        except Cancelled:
+            out.append(result(st, SKIP, f"button {name}: the press was seen; skipped by the user before its release"))
+            continue
         out.append(result(st, PASS if back else FAIL, f"button {name}: " + ("pressed and released" if back else
                                                                              "stays pressed"),
                           hints=[] if back else [f"{name} is stuck or its wire is shorted to ground"]))
@@ -152,10 +158,16 @@ def check_inputs(ctx, ui):
                               hints=[f"input {k + 1}'s wiring and its supply (an isolated input needs its own "
                                      "signal voltage)"]))
             continue
-        off = ui.wait(f"Switch input {k + 1} back", lambda k=k, b=base: True if _io(ctx)["inputs"][k] == b else None,
-                      INPUT_TIMEOUT_S, POLL_S)
+        try:
+            off = ui.wait(f"Switch input {k + 1} back",
+                          lambda k=k, b=base: True if _io(ctx)["inputs"][k] == b else None, INPUT_TIMEOUT_S, POLL_S)
+        except Cancelled:
+            out.append(result(st, SKIP, f"input {k + 1}: the change was seen; skipped by the user before switching back"))
+            continue
         what = "switches both ways" if off else "changed, did not go back"
-        out.append(result(st, PASS if off else WARN, f"input {k + 1}: {what}", value=base))
+        out.append(result(st, PASS if off else WARN, f"input {k + 1}: {what}", value=base,
+                          hints=[] if off else [f"what drives input {k + 1} still gives its signal (a switch that "
+                                                "latches, a sensor still triggered), or the input's wiring holds it"]))
     return out
 
 
@@ -164,7 +176,7 @@ def check_outputs(ctx, ui):
     if not ui.confirm("Test the isolated outputs? Each switches on for 2 s — have something on it you can see (a "
                       "lamp, a relay, a meter), and nothing that moves; answer 'not wired' for one with nothing on it."):
         return result(st, SKIP, "not tested (the user's choice)")
-    why = claim(ctx)
+    why = claim(ctx, ui)
     if why:
         return result(st, SKIP, why)
     robot = ctx["robot"]
@@ -178,8 +190,12 @@ def check_outputs(ctx, ui):
                 ctx["sleep"](OUTPUT_ON_S)
             finally:
                 robot.set_digital_output(k + 1, before)
-            seen = ui.choose(f"Did output {k + 1} (terminal {OUTPUT_TERMINALS[k]}) switch on for ~2 s?",
-                             list(OUTPUT_ANSWERS))
+            try:
+                seen = ui.choose(f"Did output {k + 1} (terminal {OUTPUT_TERMINALS[k]}) switch on for ~2 s?",
+                                 list(OUTPUT_ANSWERS))
+            except Aborted as e:        # the run stops here: keep the outputs already judged
+                e.partial = out
+                raise
         if seen == "not wired":
             out.append(result(st, SKIP, f"output {k + 1}: not wired (the user)"))
             continue
@@ -204,11 +220,14 @@ def check_hall(ctx, ui):
     status = ctx["robot"].get_status() or {}
     if status.get("mode") != "IDLE":
         return result(st, SKIP, f"the Hall check needs IDLE (the robot is in {status.get('mode')})")
-    why = claim(ctx)
+    why = claim(ctx, ui)
     if why:
         return result(st, SKIP, why)
     robot = ctx["robot"]
-    robot.hall_check(True)
+    try:
+        robot.hall_check(True)
+    except CommandRejected as e:        # RTI answers since 1.1.0: not checked, the robot's state says why
+        return result(st, SKIP, f"the robot refused the Hall check: {e.message}")
     try:
         started = ui.wait("Starting the Hall check ...", lambda: True if _hall(ctx).get("joint") == joint + 1 else None,
                           3.0, 0.1)
@@ -231,8 +250,13 @@ def check_hall(ctx, ui):
                                   "turn through the whole range once: the magnet may sit elsewhere"]))
         out = [result(st, PASS, f"the sensor changes at the magnet and back ({name} at "
                                 f"{_fmt(first.get('edge_deg'))})", value=first)]
-        if ui.confirm(f"Check that it triggers at the same place? Turn {name} back past the magnet, then through it "
-                      "again the SAME way as before."):
+        try:
+            repeat = ui.confirm(f"Check that it triggers at the same place? Turn {name} back past the magnet, then "
+                                "through it again the SAME way as before.")
+        except Aborted as e:            # the run stops here: keep the first pass's result
+            e.partial = out
+            raise
+        if repeat:
             robot.hall_check(True)      # renewed again: the question above may have taken a while
             again = ui.wait(f"Turn {name} back past the magnet, then through it again the same way",
                             lambda: (lambda h: h if h.get("changes", 0) >= 6 else None)(_hall(ctx)), HALL_TIMEOUT_S,

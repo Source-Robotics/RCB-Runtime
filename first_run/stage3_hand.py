@@ -20,6 +20,7 @@ homing is the first powered motion and has its own checks.
 from __future__ import annotations
 
 from first_run.core import FAIL, INFO, PASS, SKIP, Aborted, Cancelled, claim, result, step
+from robotclient import CommandRejected
 
 ORDER = (5, 4, 3, 0, 2, 1)       # J6, J5, J4, J1, J3, J2: the wrist first, the joints carrying the arm last
 TURN_DEG = 30.0                  # what the user is asked to turn
@@ -57,25 +58,39 @@ def turn_watcher(read, still_samples):
     return poll
 
 
+def others_while_free(status) -> str:
+    """What every OTHER joint does while one is free — IDLE's own rule (utility/mode_dispatch.handle_idle): a
+    velocity hold, but freedrive on a homed, enabled arm with gravity compensation on, and nothing on a disabled one."""
+    if status.get("state") != "ENABLED":
+        return "the arm is DISABLED, so every other joint is limp too"
+    if status.get("homed") and status.get("gravity_comp"):
+        return "every other joint floats, weightless (freedrive: the arm is homed, gravity compensation on)"
+    return "every other joint keeps holding"
+
+
 def _check_joint(ctx, ui, st, j, words):
     name = f"J{j + 1}"
     robot = ctx["robot"]
-    ask = (f"{name} next: it goes limp (no motor force) while every other joint keeps holding. Hold the arm beyond "
-           f"{name} so it cannot fall. Ready?")
+    ask = (f"{name} next: it goes limp (no motor force); {others_while_free(robot.get_status() or {})}. Hold the arm "
+           f"beyond {name} so it cannot fall. Ready?")
     if ui.choose(ask, ["ready", "skip this joint"]) != "ready":
         return [result(st, SKIP, f"{name}: skipped by the user")]
-    robot.free_joint(j + 1)
     try:
-        if ui.wait(f"Freeing {name} ...", lambda: True if (robot.status() or {}).get("free_joint") == j + 1 else None,
-                   3.0, 0.1) is None:
-            return [result(st, FAIL, f"{name}: the robot did not free it", hints=["logs/RTI.log says why (IDLE only)"])]
-        how = (f"so that {words}" if words else "either way (the robot XML has no <positive_direction> for it)")
-        poll = turn_watcher(lambda: (lambda q: q[j] if len(q) > j else None)(_joints(ctx)),
-                            max(2, int(round(STILL_S / POLL_S))))
-        try:
+        robot.free_joint(j + 1)
+    except CommandRejected as e:        # RTI answers since 1.1.0: not checked, the robot's state says why
+        return [result(st, SKIP, f"{name}: the robot refused to free it: {e.message}")]
+    try:
+        try:                                 # a skip in either wait skips this joint only; the next one follows
+            if ui.wait(f"Freeing {name} ...",
+                       lambda: True if (robot.status() or {}).get("free_joint") == j + 1 else None, 3.0, 0.1) is None:
+                return [result(st, FAIL, f"{name}: the robot did not free it",
+                               hints=["logs/RTI.log says why (IDLE only)"])]
+            how = (f"so that {words}" if words else "either way (the robot XML has no <positive_direction> for it)")
+            poll = turn_watcher(lambda: (lambda q: q[j] if len(q) > j else None)(_joints(ctx)),
+                                max(2, int(round(STILL_S / POLL_S))))
             got = ui.wait(f"Turn {name} by hand about {TURN_DEG:.0f} degrees {how}, then hold it still. (At its end "
                           "already? Back it off a little first.)", poll, TURN_TIMEOUT_S, POLL_S)
-        except Cancelled:                    # skips this joint only; the next one follows
+        except Cancelled:
             return [result(st, SKIP, f"{name}: skipped by the user")]
     finally:
         robot.free_joint(0)
@@ -83,6 +98,10 @@ def _check_joint(ctx, ui, st, j, words):
         if ui.choose(f"The robot read no turn of {name}. Did you turn it?", ["yes", "no"]) == "no":
             return [result(st, SKIP, f"{name}: not turned")]
         seen = (poll.state["hi"] - poll.state["lo"]) if poll.state["lo"] is not None else 0.0
+        if seen >= MIN_TURN_DEG:             # it did turn, but was never held still long enough to be judged
+            return [result(st, SKIP, f"{name}: read a turn of {seen:.0f} deg, but it never held still for "
+                                     f"{STILL_S:g} s — not judged", value=round(seen, 2),
+                           hints=["turn it, then hold it still for a second; run this stage again"])]
         return [result(st, FAIL, f"{name} turned by hand but the encoder read only {seen:.1f} deg",
                        value=round(seen, 2), expected=f">= {MIN_TURN_DEG:.0f} deg",
                        hints=["the motor does not turn with the joint: the coupling between motor and gearbox, a "
@@ -119,7 +138,7 @@ def check_by_hand(ctx, ui):
     status = ctx["robot"].get_status() or {}
     if status.get("mode") != "IDLE":
         return result(st, SKIP, f"needs IDLE (the robot is in {status.get('mode')}: clear its errors first)")
-    why = claim(ctx)
+    why = claim(ctx, ui)
     if why:
         return result(st, SKIP, why)
     words = list((ctx.get("config") or {}).get("positive_direction") or [])

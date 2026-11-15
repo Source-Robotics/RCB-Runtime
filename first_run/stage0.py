@@ -84,7 +84,11 @@ def check_config(ctx, ui):
                      "joint_num": int(cfg["joint_num"]), "can_gripper": can_gripper,
                      "hall_joint": hall[0] if hall else None, "pcb_version": int(sysc["pcb_version"]),
                      "positive_direction": list(cfg.get("positive_direction") or []),
-                     "first_run_move": list(cfg.get("first_run_move") or [])}
+                     "first_run_move": list(cfg.get("first_run_move") or []),
+                     # stage 5 (2026-10-27): each joint's visible turn, the friction model it is measured against
+                     "first_run_scale_deg": list(cfg.get("first_run_scale_deg") or []),
+                     "friction_coulomb_nm": [float(v) for v in cfg.get("friction_coulomb_nm", [])],
+                     "friction_viscous_nm_s": [float(v) for v in cfg.get("friction_viscous_nm_s", [])]}
     value = {k: ctx["config"][k] for k in ("robot", "gripper", "joint_num", "can_gripper")}
     summary = (f"robot {sysc['active_robot']} ({cfg['joint_num']} joints), gripper {sysc['active_gripper']}"
                f"{' (on CAN)' if can_gripper else ''}")

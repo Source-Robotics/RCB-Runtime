@@ -348,6 +348,21 @@ def _first_run_moves(joints) -> list:
     return out
 
 
+def _first_run_scale(joints) -> list:
+    """Per joint <first_run_move scale_deg="..."/>: how far the first-run check's stage 5 turns the homed joint for the
+    user to judge (deg, float, 2026-10-27); None where the attribute is missing or not a positive number (that joint's
+    turn is skipped)."""
+    out: list = []
+    for joint in joints.findall("joint"):
+        el = joint.find("first_run_move")
+        try:
+            v = float(el.get("scale_deg")) if el is not None and el.get("scale_deg") is not None else None
+        except (TypeError, ValueError):
+            v = None
+        out.append(v if v is not None and v == v and v > 0 else None)
+    return out
+
+
 def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None = None,
                            active_gripper: str | None = None) -> dict:
     """
@@ -459,6 +474,7 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         'positive_direction':     get_all_strings(joints, 'positive_direction'),
         # The first-run check's powered test move per joint (2026-10-18; robotics/joint_test.py): None where missing.
         'first_run_move':         _first_run_moves(joints),
+        'first_run_scale_deg':    _first_run_scale(joints),
         # Safety monitor TRACKING limit per joint, deg. Missing / 0 = that joint unchecked.
         'tracking_limit_deg':     get_all_values(joints, 'tracking_limit_deg'),
         # Safety monitor HOLD_OSCILLATION_WARNING threshold per joint, mA (fast motor-current ripple while

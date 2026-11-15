@@ -842,6 +842,7 @@ with ui.tabs().classes("w-full") as tabs:
     tab_preview = ui.tab('Plan Preview',   icon='play_circle')
     tab_plots   = ui.tab('Plots',          icon='show_chart')
     tab_firmware = ui.tab('Firmware',      icon='memory')
+    tab_first_run = ui.tab('First run',    icon='fact_check')  # the first-run check (gui_first_run_tab.py)
     tab_walls   = ui.tab('Walls',          icon='fence')     # TEMPORARY freedrive wall tuner (gui_walls_tab.py)
     tab_blocks  = ui.tab('Blocks',         icon='extension')  # block programming (blockly/); no panel, see below
 tabs.set_value('Joints & TCP')
@@ -1882,6 +1883,15 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         from gui_walls_tab import add_walls_tab
         add_walls_tab(_exec, shared_data, JOINTS, is_visible=lambda: _active_tab_name(tabs.value) == 'Walls',
                       poll_fn=lambda fn, label: _page_sender().submit(fn, label=label))   # not "activity"
+
+    # ─── First run (the first-run check: tools/first_run.py as a child process; gui_first_run_tab.py, 2026-10-27) ───
+    with ui.tab_panel(tab_first_run):
+        try:
+            from gui_first_run_tab import add_first_run_tab
+            add_first_run_tab(is_visible=lambda: _active_tab_name(tabs.value) == 'First run')
+        except Exception:
+            logger.exception("First run tab unavailable")
+            ui.label("First run tab unavailable — see logs/gui.log").classes("text-negative")
 
     # ─── Plots ────────────────────────────────────────────────
     with ui.tab_panel(tab_plots):

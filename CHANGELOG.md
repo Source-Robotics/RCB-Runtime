@@ -22,6 +22,48 @@ What changed in each version of the RCB runtime. The newest version is at the to
   `<safety_monitor><command_check>` in `config/system.xml` to `stop` (`COMMAND_JUMP`, 1207) once normal use shows no
   warnings. Homing is not checked.
 - `tools/run_nets.py --changed [REF]` runs only the tests a change touches.
+- The first-run check (`tools/first_run.py`) has stages 4 and 5, and runs stages 0-5 by default. Stage 4 homes the
+  arm and explains a failed homing for a builder: the robot's own reason, with what to check for that kind of failure.
+  Stage 5 checks the homed arm:
+  - each joint turns a visible amount and back, and the user judges how far it turned (a wrong gear ratio or encoder
+    setting);
+  - meanwhile the robot measures the joint's friction against the robot XML's friction model, and checks that the
+    joint holds without buzzing;
+  - the gripper closes and opens;
+  - a slow J1 move is stopped part-way.
+
+  New robot XML attribute: `<first_run_move scale_deg="...">`, the size of each joint's turn.
+- The dashboard's **First run** tab runs the first-run check: choose the stages, Start; its questions are buttons,
+  a wait has a Skip button, Stop the run ends it early; the transcript shows every result with what to check; the
+  report and earlier reports can be downloaded. The check runs as its own process (`tools/first_run.py --ui json`),
+  so a reloaded page finds the run again, and the dashboard stopping ends the run cleanly (the move in progress
+  stopped, the report written).
+- The first-run report can carry the support bundle (`tools/first_run.py --bundle ask | yes | no`, default ask):
+  one zip with the report, the logs, the incident recordings and the configuration — what to send when asking for
+  help. Like the Logs tab's bundle it needs the arm disabled.
+
+### Changed
+
+- The first-run check waits up to 15 s for the dashboard to let go of control (it holds it for 5 s after the last
+  click, for example on Enable) instead of skipping the step at once.
+
+### Fixed
+
+- The first-run check's Hall-sensor check (stage 2), its test moves (stage 3) and its by-hand check failed with "the
+  check itself failed" when the robot refused to start them; they now report the robot's reason. A test move refused
+  one way, for example past a soft limit on a homed arm, is tried the other way.
+- The first-run check, found while writing its guide:
+  - skipping a button's release or an input's switch-back skips that button or input alone, as it already did at the
+    press; stopping the run at a question keeps the results already measured in that step;
+  - Ctrl-C while a step works on its own (the setup check, the CAN-bus watch) skips that step instead of ending the
+    tool without a report;
+  - skipping the homing, or a homing that runs longer than 180 s, stops it (the arm is then not homed); a homing
+    failure names its joint;
+  - a gripper move that does not finish within 30 s is a FAIL that names it, not "the check itself failed";
+  - the stop test warns instead of passing when J1 had not started moving before the stop;
+  - by hand: skipping while a joint is being freed skips that joint alone; a joint turned but never held still is not
+    reported as an encoder fault; the question says what the other joints do meanwhile (hold, float in freedrive, or
+    limp when the arm is disabled).
 
 ## [1.1.1] - 2026-10-25
 
