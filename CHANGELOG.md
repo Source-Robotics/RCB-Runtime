@@ -86,6 +86,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
   system kept its own list of which codes are warnings, and it lacked this one. The list now comes from the error
   catalog, so every code documented as a warning is one.
 - A voltage limit above 60000 mV (the most a drive accepts) is clamped to it instead of reaching the drive.
+- The dashboard's Kt values and the gripper's force estimate showed and used each drive's polled Kt, also when the
+  robot was using the robot XML's instead. They now show and use the Kt the robot chose at start.
+- `grippers/MSG_small_motor_150mm_rail.xml`: `<kt>` 0.174 Nm/A, what its drive reports (it was 0.111, an unverified
+  placeholder, 57 % off).
 - With the IK engine set to `roboticstoolbox` (not the default), a failed solve came back as an answer — up to 65 cm
   off the target — because the fork reports success as 0 / 1, which the check missed. It is now a failure.
 

@@ -328,10 +328,10 @@ def update_motor_and_gripper_data(
         ]
 
     # === 500-tick staggered updates (static motor info - rarely changes) ===
+    # motor_Kt is NOT refreshed here (2026-11-15): it is the Kt RTI chose at start (utility/kt_init.py — the drive's,
+    # or the robot XML's when the drive's is outside <kt_tolerance>) and scales every torque; the poll's raw drive
+    # value showed in the dashboard even when RTI was not using it.
     elif tick % 500 == 3:
-        shared_data.motor['motor_Kt'][:] = [
-            Motor_Kt_data[i][-1]["Kt"] for i in range(joint_num)
-        ]
         shared_data.motor['HARDWARE_VERSION'][:] = [
             Motor_info_data[i][-1]["HARDWARE_VERSION"] for i in range(joint_num)
         ]
@@ -424,7 +424,7 @@ def update_motor_and_gripper_data(
             shared_data.gripper['gripper_motor_watchdog_error'][0] = e["watchdog_error"]
             shared_data.gripper['gripper_motor_calibrated'][0]     = e["calibrated"]
         elif tick % 500 == 3:
-            shared_data.gripper['gripper_motor_kt'][0]         = Motor_Kt_data[gm_idx][-1]["Kt"]
+            # gripper_motor_kt: the Kt RTI chose at start, kept (2026-11-15) — the force estimate below uses it
             shared_data.gripper['gripper_motor_hw_version'][0] = Motor_info_data[gm_idx][-1]["HARDWARE_VERSION"]
             shared_data.gripper['gripper_motor_sw_version'][0] = Motor_info_data[gm_idx][-1]["SOFTWARE_VERSION"]
             shared_data.gripper['gripper_motor_serial'][0]     = Motor_info_data[gm_idx][-1]["SERIAL_NUMBER"]

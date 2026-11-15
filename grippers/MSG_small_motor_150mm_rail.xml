@@ -3,7 +3,7 @@
     <driver_type>stepfoc</driver_type>  <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
     <hardware_revision>v1.0</hardware_revision>  <!-- This gripper's hardware revision (2026-10-21, versioning V4): the Versions card and get_versions show it. -->
     <Stroke>106</Stroke>        <!-- Stroke in mm, linear rail of 150mm -->
-    <kt>0.111</kt>                 <!-- Torque constant in Nm/A TODO: verify for small motor -->
+    <kt>0.174</kt>                 <!-- Torque constant in Nm/A: what this gripper's drive reports (0.174185 at every start since 2026-10-27; the runtime used it until 2026-11-15). Was 0.111, an unverified placeholder that the Kt check (system.xml <kt_tolerance>) flagged at +57 %. -->
     <Ilim>1700</Ilim>              <!-- Current limit in mA -->
     <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
     <Velocity_limit>80000</Velocity_limit> <!-- Motor velocity limit in ticks/s -->
