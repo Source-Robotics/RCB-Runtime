@@ -1075,9 +1075,10 @@ def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
     Returns
     -------
     kt_final        : np.ndarray  — resolved arm Kt per joint
-    kt_sources      : list[str]   — 'CAN' or 'XML' for each arm joint
+    kt_sources      : list[str]   — 'CAN', 'XML' (no answer) or 'BAND' (answered outside
+                                    the tolerance: the XML value) for each arm joint
     gripper_kt      : float       — resolved gripper Kt (unchanged if no gripper)
-    gripper_kt_src  : str         — 'CAN' or 'XML' for the gripper
+    gripper_kt_src  : str         — the same for the gripper
     """
     kt_final = np.array(kt_xml, dtype=float)
     kt_sources = ['XML'] * n_joints
@@ -1106,7 +1107,8 @@ def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
             elif _kt_plausible(kt_can, kt_final[i], tolerance, f"J{i + 1}"):
                 kt_final[i] = kt_can
                 kt_sources[i] = 'CAN'
-            # an answer outside the band is still an answer: no retry, the XML value stays
+            else:
+                kt_sources[i] = 'BAND'      # answered, outside the band: no retry, the XML value stays
         pending_nodes = still_missing
 
     if pending_nodes:
@@ -1132,6 +1134,8 @@ def fetch_kt_from_can(motors, communication, n_joints, kt_xml, timeout_s=0.35,
                 if _kt_plausible(kt_can, gripper_kt_xml, tolerance, "the gripper"):
                     gripper_kt = kt_can
                     gripper_kt_src = 'CAN'
+                else:
+                    gripper_kt_src = 'BAND'
                 break
 
     return kt_final, kt_sources, gripper_kt, gripper_kt_src

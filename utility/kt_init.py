@@ -31,16 +31,19 @@ def resolve_and_preload_kt(
     active_CAN_gripper: int,
     Motor_Kt_data: dict[int, deque],
     shared_data: Any,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float, tuple]:
     """Resolve Kt values from CAN or XML, then preload data structures.
 
-    Returns the (possibly updated) motor_kt list and gripper_kt float.
+    Returns the (possibly updated) motor_kt list, the gripper_kt float, and the warning keys for drives whose Kt was
+    outside system.xml's <kt_tolerance> (J{n}:KT_MISMATCH_WARNING / GRIPPER:KT_MISMATCH_WARNING, 2026-11-15) — RTI
+    passes them to the error system every tick, so they show for the whole run.
     """
     kt_source_cfg = _sys.get('kt_source', 'auto')
     # Provenance per joint, published to shared memory so the GUI can show whether each Kt was
     # actually read off the motor or is just the XML fallback. 1 = CAN, 0 = XML.
     kt_from_can = [0.0] * joint_num
     gripper_kt_from_can = 0.0
+    kt_warnings: tuple = ()
 
     if kt_source_cfg == 'xml':
         logger.info("Kt: kt_source=xml — using XML Kt values, skipping CAN fetch")
@@ -64,11 +67,14 @@ def resolve_and_preload_kt(
             tolerance=_sys.get('kt_tolerance', 0.3),      # system.xml <kt_tolerance> (2026-11-15)
         )
         for _i in range(joint_num):
-            logger.info(f"Kt: J{_i+1} Kt = {motor_kt[_i]:.6f} ({_kt_sources[_i]})")
+            logger.info(f"Kt: J{_i+1} Kt = {motor_kt[_i]:.6f} ({_source_text(_kt_sources[_i])})")
         if active_CAN_gripper:
-            logger.info(f"Kt: Gripper Kt = {gripper_kt:.6f} ({_gripper_kt_src})")
+            logger.info(f"Kt: Gripper Kt = {gripper_kt:.6f} ({_source_text(_gripper_kt_src)})")
         kt_from_can = [1.0 if s == 'CAN' else 0.0 for s in _kt_sources]
         gripper_kt_from_can = 1.0 if _gripper_kt_src == 'CAN' else 0.0
+        kt_warnings = tuple(f"J{_i + 1}:KT_MISMATCH_WARNING" for _i, s in enumerate(_kt_sources) if s == 'BAND')
+        if active_CAN_gripper and _gripper_kt_src == 'BAND':
+            kt_warnings += ("GRIPPER:KT_MISMATCH_WARNING",)
 
     # Preload Motor_Kt_data and shared memory so the GUI shows the resolved
     # values immediately, without waiting for the first 500-tick round-robin update.
@@ -81,4 +87,11 @@ def resolve_and_preload_kt(
         shared_data.gripper['gripper_motor_kt'][0] = gripper_kt
         shared_data.gripper['gripper_motor_kt_source'][0] = gripper_kt_from_can
 
-    return motor_kt, gripper_kt
+    return motor_kt, gripper_kt, kt_warnings
+
+
+def _source_text(source):
+    """The start-up log's word for where a Kt came from."""
+    if source == 'BAND':
+        return "XML: the drive's value is outside <kt_tolerance>, see the warning above"
+    return source

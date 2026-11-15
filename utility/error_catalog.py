@@ -220,6 +220,13 @@ CATALOG = {
                                    _WARN,
                                    "Lower the joint's speed gains (KPV, KPP). If that does not help, check the "
                                    "encoder magnet and the mechanics."),
+    "KT_MISMATCH_WARNING": _e(2110, "Drive's torque constant far from the robot file",
+                              "At start a drive reported a torque constant (Kt) further from the robot XML's <kt> "
+                              "than <kt_tolerance> in config/system.xml allows. The start-up log names both values.",
+                              "Warning only: the robot keeps running and uses the robot XML's Kt for that joint. The "
+                              "warning stays until the robot service restarts.",
+                              "Check the drive's motor settings (its motor preset) and the robot XML's <kt>, then "
+                              "restart the robot service."),
     "GRIPPER_MOTOR_TEMPERATURE": _drive(2201, "the gripper motor", "Gripper motor overheating",
                                         "The drive reports that {part} is too hot.",
                                         "Let the gripper motor cool down. Clear errors, then enable the robot."),

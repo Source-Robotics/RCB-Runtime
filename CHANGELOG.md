@@ -75,7 +75,11 @@ What changed in each version of the RCB runtime. The newest version is at the to
   ignored by the reply handling.
 - A drive's torque constant (Kt, read at start with `kt_source` auto) was used whatever it was, NaN included. A value
   further than `<kt_tolerance>` (new in `config/system.xml`, 0.3 = ±30 %) from the robot XML's Kt now keeps the XML
-  value, and the start-up log names the joint.
+  value, the start-up log names both values, and the warning `KT_MISMATCH_WARNING` (2110) shows for that joint (or
+  the gripper) until the robot service restarts.
+- The command check's warning `COMMAND_JUMP_WARNING` (1208) would have disabled the robot like an error: the error
+  system kept its own list of which codes are warnings, and it lacked this one. The list now comes from the error
+  catalog, so every code documented as a warning is one.
 - A voltage limit above 60000 mV (the most a drive accepts) is clamped to it instead of reaching the drive.
 
 ## [1.1.1] - 2026-10-25

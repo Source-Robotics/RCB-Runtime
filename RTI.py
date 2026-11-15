@@ -767,7 +767,9 @@ def main():
     # ==========================================================================
     # Kt fetch from CAN bus (or fall back to XML values)
     # ==========================================================================
-    motor_kt, gripper_kt = resolve_and_preload_kt(
+    # _kt_warnings: J{n}:KT_MISMATCH_WARNING for a drive whose Kt is outside <kt_tolerance> (2026-11-15) — passed to
+    # the error system every tick below, so the warning shows for the whole run.
+    motor_kt, gripper_kt, _kt_warnings = resolve_and_preload_kt(
         _sys, Motor, communication1, joint_num,
         motor_kt, gripper_kt, active_CAN_gripper,
         Motor_Kt_data, shared_data,
@@ -2523,6 +2525,8 @@ def main():
             rti_errors=rti_handler.take_command_errors(),
             # J{i}:CAN_REPLY_MISSED_WARNING (warn-only) — a joint's replies missing RTI's read too often.
             can_warnings=can_reply_monitor.warnings,
+            # J{n}:KT_MISMATCH_WARNING (warn-only, the start's Kt check) — a constant tuple, no per-tick work.
+            config_warnings=_kt_warnings,
             # In simulation (utility/sim_mode) the loop has no real-time core or priority and shares two cores with the
             # simulator: a critically slow loop is reported as LOOP_DEGRADED, never latched — timing is not simulated.
             loop_degraded=_loop_degraded or (_SIM and _loop_critical),

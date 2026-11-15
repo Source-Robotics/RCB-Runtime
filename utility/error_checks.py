@@ -107,16 +107,16 @@ LOOP_ERROR_TICK_FACTOR   = 3.0    # ...or ONE tick longer than 3 periods (12 ms 
                                   # (a velocity command keeps running through it). In-tick one-shot work
                                   # measured <= 5.5 ms; reconnect reloads go one node per tick for this.
 
-# Keys (or key suffixes) that are warnings only — they do not set error_active.
-_WARNING_SUFFIXES = ("CAN_STALE", "NOT_HOMED", "LOOP_DEGRADED", "ZONE_WARNING",
-                     "SOFT_LIMIT_WARNING", "JOINT_WALL_WARNING", "OVERSPEED_WARNING", "TRACKING_WARNING",
-                     "TCP_OVERSPEED_WARNING", "HOLD_OSCILLATION_WARNING", "SELF_COLLISION_WARNING", "SELF_COLLISION_STALE",
-                     "CAN_REPLY_MISSED_WARNING", "CONTACT_WARNING", "COLLISION_WARNING")
-
-
 # The cause/fix catalog lives in utility/error_catalog.py (a leaf module, 2026-10-03); re-exported here so
 # `error_checks.ERROR_DESCRIPTIONS` keeps working.
-from utility.error_catalog import ERROR_DESCRIPTIONS
+from utility.error_catalog import CATALOG, ERROR_DESCRIPTIONS
+
+# Keys (or key suffixes: "J3:CAN_STALE") that are warnings only — they do not set error_active and leave the latch
+# when their condition ends. Read from the catalog's kind since 2026-11-15: the hand-kept list it replaced missed
+# COMMAND_JUMP_WARNING (2026-10-27), so the command check's warn mode would have disabled the robot at its first
+# warning. Every key of the old list is a catalog warning; the four catalog warnings it lacked besides that one are
+# activity-log events that never reach this module.
+_WARNING_SUFFIXES = tuple(sorted(k for k, v in CATALOG.items() if v["kind"] == "warning"))
 
 
 def _cause_text(short_key: str, fallback: str) -> str:
@@ -381,7 +381,8 @@ _GRIPPER_MOTOR_ERROR_FIELDS = (
 
 
 def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
-                           loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings=()):
+                           loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings=(),
+                           config_warnings=()):
     """E-STOP, the EXEC / RTI link watchdogs, RT loop health and the safety monitor's events. The caller
     pre-computes every flag; this only turns them into keys."""
     # ------------------------------------------------------------------
@@ -438,6 +439,10 @@ def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_
     # J{i}:CAN_REPLY_MISSED_WARNING (utility/can_reply_monitor.py, 2026-10-12): live, warn-only.
     if can_warnings:
         current_errors.update(can_warnings)
+    # What RTI's start found in the configuration (2026-11-15: J{i}:KT_MISMATCH_WARNING, utility/kt_init.py): live
+    # for the whole run, warn-only — they end with the run that found them.
+    if config_warnings:
+        current_errors.update(config_warnings)
 
 
 def _collect_motor_errors(shared_data, joint_num, current_errors):
@@ -568,6 +573,7 @@ def check_errors(
     rti_errors=(),
     can_warnings=(),
     homing_errors=None,
+    config_warnings=(),
 ) -> tuple:
     """
     Inspect all error sources and update the latched error set.
@@ -595,7 +601,8 @@ def check_errors(
 
     current_errors = set()
     _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
-                           loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings)
+                           loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings,
+                           config_warnings)
     if driver_faults:
         _collect_motor_errors(shared_data, joint_num, current_errors)
     _collect_can_errors(shared_data, joint_num, current_errors)
@@ -800,7 +807,9 @@ def _update_error_metadata(shared_data, latched_errors, error_metadata, details=
 
 
 def _where(key):
-    """'joint 3' for "J3:KEY", 'zone x' for "Z_x:KEY", None for a robot-wide key."""
+    """'joint 3' for "J3:KEY", 'zone x' for "Z_x:KEY", 'the gripper' for "GRIPPER:KEY", None for a robot-wide key."""
+    if key.startswith("GRIPPER:"):
+        return "the gripper"
     if key.startswith("J") and ":" in key:
         return f"joint {key.split(':')[0][1:]}"
     if key.startswith("Z_") and ":" in key:
@@ -848,6 +857,7 @@ def process_errors_tick(
     can_warnings=(),
     homing_errors=None,
     detail_of=None,
+    config_warnings=(),
 ) -> tuple:
     """Run one tick of error processing in the RTI superloop.
 
@@ -874,6 +884,8 @@ def process_errors_tick(
         homing_errors:          {key: reason} — the homing failures the controller reported (2026-10-14): latched
                                 as hard errors, the reason as their description and in the activity log. RTI passes
                                 each once (latched in that call; the latch keeps it until Clear Errors).
+        config_warnings:        Warning keys RTI's start found in the configuration (2026-11-15:
+                                J{i}:KT_MISMATCH_WARNING) — passed every tick, so they show for the whole run.
 
     Returns:
         (clear_error_countdown, latched_errors, error_metadata, current_mode)
@@ -901,6 +913,7 @@ def process_errors_tick(
         rti_errors=rti_errors,
         can_warnings=can_warnings,
         homing_errors=homing_errors,
+        config_warnings=config_warnings,
     )
     shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
     # rti['safety_violation'] (the status event's "safety" field) finally means something: 1 while
