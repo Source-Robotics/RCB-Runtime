@@ -13,8 +13,10 @@ INVALIDATE a claim rather than merely confirm it, which is the point of running 
   C. GRAVITY REACHES THE WIRE. RTI used to send Current=0 always. Tested differentially
      (toggle on vs off) so it does not depend on knowing the Nm->mA factor.
 
-MOTION: one wrist joint, +0.002 rad (0.115 deg), returned to start. Everything else is a
-position hold. Keep the E-stop within reach anyway.
+MOTION: one wrist joint, +0.002 rad (0.115 deg), returned to start, each way as a 1 s smooth
+ramp (hard RTI refuses a stream the arm cannot follow since 2026-10-11: a jump of the target is
+an acceleration spike — RTI_ACCELERATION_LIMIT). Everything else is a position hold. Keep the
+E-stop within reach anyway.
 """
 import argparse
 import struct
@@ -50,6 +52,23 @@ def stream(client, pose, seconds, hz=250.0):
         t_next += period
         client.read_state()
         client.send_joint_position(pose)
+
+
+def ramp(client, start, end, seconds, hz=250.0):
+    """Stream a smooth move from `start` to `end`: a minimum-jerk profile (10s^3 - 15s^4 + 6s^5), zero speed and
+    zero acceleration at both ends, so the stream passes RTI's strict checks (2026-11-15: the step this tool used
+    to send was refused with RTI_ACCELERATION_LIMIT). Peak acceleration 5.77 * d / T^2, peak jerk 60 * d / T^3."""
+    period = 1.0 / hz
+    n = max(1, int(round(seconds * hz)))
+    t_next = time.perf_counter()
+    for i in range(1, n + 1):
+        while time.perf_counter() < t_next:
+            pass
+        t_next += period
+        s = i / n
+        f = s ** 3 * (10.0 - 15.0 * s + 6.0 * s * s)
+        client.read_state()
+        client.send_joint_position([a + (b - a) * f for a, b in zip(start, end)])
 
 
 def sample_commanded(client, pose, seconds, j):
@@ -145,7 +164,8 @@ def main():
         before = snap()
         q1 = list(q0)
         q1[j] = q0[j] + a.delta
-        stream(client, q1, 3.0)
+        ramp(client, q0, q1, 1.0)                     # a ramp, not a jump (see ramp())
+        stream(client, q1, 2.0)
         after = snap()
         d_t = after["joint_position_target"][j] - before["joint_position_target"][j]
         d_c = after["joint_position_commanded"][j] - before["joint_position_commanded"][j]
@@ -153,7 +173,8 @@ def main():
         print(f"    target     {d_t:+.6f} rad")
         print(f"    commanded  {d_c:+.6f} rad")
         print(f"    ACTUAL     {d_a:+.6f} rad   <- measured encoder, the real proof")
-        stream(client, q0, 3.0)
+        ramp(client, q1, q0, 1.0)
+        stream(client, q0, 2.0)
         back = snap()
         print(f"    returned; residual {back['joint_position'][j] - before['joint_position'][j]:+.6f} rad")
 
