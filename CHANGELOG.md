@@ -49,6 +49,11 @@ What changed in each version of the RCB runtime. The newest version is at the to
   `scripts/install.sh` removes the fork first. The robot's live numbers (gravity, feedforward, kinematics) come from
   Pinocchio and do not change. The reachability search (`is_reachable`, block programs' pose moves, dry runs) reads
   either toolbox's IK result and keeps the robot's IK chain instead of rebuilding it at every solve.
+- **The gripper's object codes mean what the gripper firmware sends: 1 = object detected while CLOSING, 2 = while
+  OPENING** (they were the other way round). The driver library `Spectral_BLDC` 1.20 read the firmware's two bits
+  swapped, and the runtime, the client's `GripperResult` and the dashboard were built on that; with 1.22 (now pinned)
+  every part uses the firmware's meaning. A program that tests `code == 2` after a close must test `1` (or use
+  `GripperResult.object_detected`, unchanged). Codes 0 and 3 are unchanged.
 - The first-run check waits up to 15 s for the dashboard to let go of control (it holds it for 5 s after the last
   click, for example on Enable) instead of skipping the step at once.
 

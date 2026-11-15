@@ -25,7 +25,9 @@
 # Versions are pinned (==) for reproducible installs. Bump deliberately.
 
 # ── Robot core (custom Source Robotics libraries, on PyPI) ───────────────────
-Spectral_BLDC==1.20                              # Spectral BLDC motor driver (CAN)
+Spectral_BLDC==1.22                              # Spectral BLDC motor driver (CAN). 1.21+ reports the gripper's
+                                                 # object codes as the firmware sends them (1.20 swapped 1 and 2):
+                                                 # 1 = object while closing, 2 = while opening (2026-11-15)
 SourceRoboticsToolbox==1.3                       # Source Robotics Toolbox
 
 # ── Robotics / kinematics / dynamics ─────────────────────────────────────────

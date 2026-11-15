@@ -3983,11 +3983,11 @@ def update_tables():
         if _grp_ctrl != 2:
             gripper_status_label.text = "FIRMWARE PATH OFF"
             gripper_status_label.classes(replace="text-sm font-mono font-bold text-gray-500")
-        elif _obj == 1:
-            gripper_status_label.text = "OBJECT DETECTED (opening)"
+        elif _obj == 1:     # the firmware's codes since Spectral_BLDC 1.21 (2026-11-15): 1 closing, 2 opening
+            gripper_status_label.text = "OBJECT DETECTED (closing)"
             gripper_status_label.classes(replace="text-sm font-mono font-bold text-orange-600")
         elif _obj == 2:
-            gripper_status_label.text = "OBJECT DETECTED (closing)"
+            gripper_status_label.text = "OBJECT DETECTED (opening)"
             gripper_status_label.classes(replace="text-sm font-mono font-bold text-orange-600")
         elif _obj == 3:
             gripper_status_label.text = "AT POSITION"

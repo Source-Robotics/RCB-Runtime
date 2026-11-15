@@ -14,8 +14,8 @@ gripper motion is driven by RTI's own firmware-mode CAN command (_gripper_fw_sta
 RTI-process-local), so there's no batch/waypoint pipeline to hook a completion signal
 into. Instead, the checkpoint tracks REAL physical completion via
 gripper_object_detection, the same gripper status code the GUI already decodes
-(nicegui_test.py): 0 = still moving, 1/2 = object detected while opening/closing,
-3 = reached target with no object.
+(nicegui_test.py): 0 = still moving, 1/2 = object detected while closing/opening (the
+firmware's meaning, Spectral_BLDC 1.21+; 2026-11-15), 3 = reached target with no object.
 
 "Any nonzero value means settled" was the ORIGINAL rule and is no longer sufficient — see
 _poll_gripper_completions, which decides on THREE criteria (position tolerance, a debounced
@@ -3684,7 +3684,7 @@ class TrajectoryPlanner(Thread):
 
         THREE independent criteria, any of which completes it. One is not enough:
         `gripper_object_detection` is the gripper's status code (0 moving, 1/2 object
-        while opening/closing, 3 at target) whose behaviour on a NEW move — reset
+        while closing/opening, 3 at target) whose behaviour on a NEW move — reset
         to 0, or hold the previous value — has never been verified on hardware.
         A stale nonzero would complete every command on its first poll.
 
@@ -3756,20 +3756,21 @@ class TrajectoryPlanner(Thread):
         """Is this object-detection code consistent with the way we are travelling?
 
         Scale: 1 = fully open, 254 = fully closed, so OPENING decreases position.
-          1 = object while opening -> only believable if the target is more open
-          2 = object while closing -> only believable if the target is more closed
+          1 = object while closing -> only believable if the target is more closed
+          2 = object while opening -> only believable if the target is more open
           3 = reached target, no object -> direction carries no information
-        With no position feed there is nothing to cross-check against, so the code
-        is taken at face value (the old behaviour).
+        The firmware's own meaning of 1 and 2, as Spectral_BLDC 1.21+ reports it (2026-11-15; 1.20 swapped them and
+        this check was written against the swap). With no position feed there is nothing to cross-check against, so
+        the code is taken at face value (the old behaviour).
         """
         if obj == 3:
             return True
         if position is None:
             return True
         if obj == 1:
-            return target < position
-        if obj == 2:
             return target > position
+        if obj == 2:
+            return target < position
         return True
 
     def _finish_gripper(self, cid, obj, reason):

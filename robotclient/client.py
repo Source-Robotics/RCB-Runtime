@@ -82,8 +82,8 @@ class GripperResult:
     their target with nothing there; "complete" alone cannot.
 
     Attributes:
-        code: Why the jaws stopped. `1`: something stopped them while opening.
-            `2`: something stopped them while closing. `3`: they reached the
+        code: Why the jaws stopped. `1`: something stopped them while closing.
+            `2`: something stopped them while opening. `3`: they reached the
             target with nothing in the way, also when they came within 5 of it
             while the gripper still reported motion. A settled command never
             reports `0`, the gripper's "still moving".
@@ -102,8 +102,8 @@ class GripperResult:
 
     _NAMES = {
         0: "still moving",
-        1: "object detected while opening",
-        2: "object detected while closing",
+        1: "object detected while closing",
+        2: "object detected while opening",
         3: "reached target, no object",
     }
 
@@ -146,8 +146,8 @@ class GripperResult:
     def name(self) -> str:
         """Short text for the code, such as "reached target, no object".
 
-        Code 0 reads "still moving", 1 "object detected while opening", 2 "object
-        detected while closing" and 3 "reached target, no object". Any other code
+        Code 0 reads "still moving", 1 "object detected while closing", 2 "object
+        detected while opening" and 3 "reached target, no object". Any other code
         reads "unknown(N)", with the code for N.
 
         Examples:
@@ -5617,7 +5617,7 @@ class RobotClient:
                 0 mean 120 s.
 
         Returns:
-            The command's `GripperResult`: code 2 after a close. Code 1, an opening
+            The command's `GripperResult`: code 1 after a close. Code 2, an opening
             that something blocked, passes too.
 
         Raises:

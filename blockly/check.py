@@ -15,7 +15,8 @@ api_tests/58_block_check_load.py measures what it costs the RT loop.
 """
 from robotclient.client import GripperResult
 
-GRIP_CAUGHT = 2         # GripperResult code: "object detected while closing" — a Check assumes the grip works
+GRIP_CAUGHT = 1         # GripperResult code: "object detected while closing" — a Check assumes the grip works
+#                         (the firmware's code since Spectral_BLDC 1.21, 2026-11-15; it was 2 under 1.20's swap)
 
 
 def make_client(start_joints):

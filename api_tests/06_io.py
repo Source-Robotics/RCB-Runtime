@@ -252,7 +252,7 @@ def test_gripper_timeout(robot, args):
     """Probe the GRIPPER_SETTLE_TIMEOUT path. Not in the checklist.
 
     HARDWARE FINDING 2026-08-06: blocking the jaws does NOT reach this path. The
-    gripper reports "object detected while closing" (code 2) for an obstruction
+    gripper reports "object detected while closing" (code 1 since Spectral_BLDC 1.21; 2 before) for an obstruction
     exactly as it does for a part — it cannot tell them apart, and should not
     have to. So the command completes normally in ~0.4 s, correctly.
 
