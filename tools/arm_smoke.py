@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -33,7 +34,8 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from project_paths import RTI_LOG, TEMP_DATA_DIR                          # noqa: E402
+from project_paths import ROBOTS_DIR, RTI_LOG, SYSTEM_XML, TEMP_DATA_DIR  # noqa: E402
+from config.xml_parser import load_software_joint_limits, load_system_config  # noqa: E402
 from utility.code_version import git_commit                               # noqa: E402
 from utility import sim_mode                                              # noqa: E402
 from utility.logger_setup import parse_line                               # noqa: E402
@@ -164,7 +166,27 @@ def _ready_problems(s):
         p.append(f"an error is active ({s.get('err') or s.get('error_active')})")
     if s.get("mode") not in ("IDLE", "EXEC"):
         p.append(f"mode {s.get('mode')!r} (IDLE or EXEC needed)")
+    p.extend(_soft_limit_problems(s.get("joints")))
     return p
+
+
+def _soft_limit_problems(joints_deg):
+    """Joints past their soft limits (2026-11-15). The RTI link test holds the CURRENT pose, and RTI refuses — rightly
+    — to hold a target past a soft limit: a pose left by hand against a freedrive wall sits a little past it (J2 0.13
+    deg on the arm), and the run failed half-way with RTI_POSITION_LIMIT. Unreadable limits: no problem reported."""
+    if not joints_deg:
+        return []
+    try:
+        lo, hi = load_software_joint_limits(load_system_config(SYSTEM_XML, ROBOTS_DIR)["robot_xml_path"])
+    except Exception:
+        return []
+    out = []
+    for i, deg in enumerate(joints_deg[:len(lo)]):
+        lo_d, hi_d = math.degrees(lo[i]), math.degrees(hi[i])
+        if deg < lo_d or deg > hi_d:               # NaN (no limit) compares False both ways
+            edge = lo_d if deg < lo_d else hi_d
+            out.append(f"J{i + 1} at {deg:.2f} deg, past its soft limit {edge:.2f} deg (jog it back inside)")
+    return out
 
 
 def _wait_control_free(robot, timeout=15.0):

@@ -106,6 +106,7 @@ from hardware.can_hardware import scan_can_bus, initialize_can_communication
 from config.networking import RT_CPU_CORE, zmq_listener, zmq_sender_setup, zmq_answer_sender_setup, udp_socket_receive_setup, udp_socket_send_setup, broadcast_udp_telemetry, init_rti_receive_socket, drain_rti_udp, RTI_PORT_SENDER, init_rti_tcp_listener, accept_rti_tcp, drain_rti_tcp, send_rti_tcp, drain_rti_tcp_backlog
 from communication.can_message_handlers import receive_and_process_can_messages, handle_polling_and_overrides, update_can_connection_status, drain_can_discard
 from communication.can_message_handlers import send_gripper_commands, send_motor_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
+from communication.can_message_handlers import send_brake_on_idle
 from utility.kt_init import resolve_and_preload_kt
 from utility.tick_types import TickContext, TickResult
 from utility.mode_dispatch import build_mode_dispatch, dispatch_step
@@ -758,6 +759,11 @@ def main():
     BOOT_CONFIG_PACE_S = 0.0005
 
     _reload_motor_config(num_repeats=2, pace_s=BOOT_CONFIG_PACE_S)
+    # Every joint brakes when idle (2026-11-15): firmware 110 restores a SAVED brake-or-coast at power-up; RTI asserts
+    # brake in RAM here and after each reconnect (send_brake_on_idle's docstring). A separate call, not part of
+    # _reload_motor_config, whose tick-50/150/300 use must not change.
+    send_brake_on_idle(Motor, range(joint_num))
+    log_startup.info(f"brake when idle: sent to J1-J{joint_num} (in RAM; firmware before 107 ignores it)")
 
     # ==========================================================================
     # Preload gripper data (If CAN gripper is active)

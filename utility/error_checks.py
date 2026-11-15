@@ -367,6 +367,11 @@ _MOTOR_ERROR_FIELDS = (
     ("motor_watchdog_error",    "WATCHDOG"),
 )
 
+# A drive fault none of the flags above names is latched (NOT_CALIBRATED / DRIVE_FAULT) once it has lasted this many
+# ticks (0.2 s at 250 Hz; 2026-11-15): the flags arrive by round-robin ~84 ms after the drive's live fault bit.
+UNNAMED_FAULT_TICKS = 50
+_unnamed_fault_ticks = [0] * 16          # per CAN node (allocated once: _collect_motor_errors runs every tick)
+
 # Motor-level faults from the gripper's motor driver (same as arm motors): (shared_data.gripper field, error key).
 _GRIPPER_MOTOR_ERROR_FIELDS = (
     ("gripper_motor_temp_error",     "GRIPPER_MOTOR_TEMPERATURE"),
@@ -470,10 +475,24 @@ def _collect_motor_errors(shared_data, joint_num, current_errors):
         # Note the flags init to -1 (unknown, pre-first-reply), which is != 0 and so does NOT
         # suppress — unknown stays conservative.
         if shared_data.motor['global_motor_error'][i] == 0:
+            _unnamed_fault_ticks[i] = 0
             continue
+        named = False
         for field, short_key in _MOTOR_ERROR_FIELDS:
             if shared_data.motor[field][i]:
                 current_errors.add(_joint_key(i, short_key))
+                named = True
+        # A fault none of the flags above names (2026-11-15: firmware 110's "not calibrated" sets the drive's fault
+        # without them; so does its wrong-product lock) latched nothing: the joint stopped with no named cause. It is
+        # named once it has lasted UNNAMED_FAULT_TICKS — the per-type flags come by round-robin ~84 ms after the live
+        # bit, so a real named fault is never mistaken for it.
+        if named:
+            _unnamed_fault_ticks[i] = 0
+            continue
+        _unnamed_fault_ticks[i] += 1
+        if _unnamed_fault_ticks[i] >= UNNAMED_FAULT_TICKS:
+            current_errors.add(_joint_key(i, "NOT_CALIBRATED" if shared_data.motor['motor_calibrated'][i] == 0
+                                          else "DRIVE_FAULT"))
 
 
 def _collect_can_errors(shared_data, joint_num, current_errors):

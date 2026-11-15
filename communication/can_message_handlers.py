@@ -171,6 +171,18 @@ def handle_motor_reconnect(
             return
 
 
+def send_brake_on_idle(Motor, nodes):
+    """Make each drive in `nodes` BRAKE when idle — in RAM, never saved (2026-11-15).
+
+    Firmware 110 SAVES brake-or-coast (parameter 18) and restores it at power-up: one coast saved by anyone (the
+    Motor GUI's stop notch and a Save, a bench script) and J2 / J3 would drop at every stop, fault, homing idle step
+    and flash. RTI asserts brake at its start and after a joint reconnects (a rebooted drive restores what it saved).
+    Not in load_motor_configs: the tick-50/150/300 re-send block shares it and must not change. Firmware before 107
+    has no IN_SETTINGS frame and ignores it."""
+    for i in nodes:
+        Motor[i].Send_Brake_Coast(True)
+
+
 def _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_velocity_limit, motor_Ilim,
                   motor_KPP, motor_KP, motor_KD, motor_KPIQ, motor_KIIQ, motor_KPV, motor_KIV, motor_voltage_limit):
     """Re-send one joint's config after it recovered (handle_motor_reconnect's storm guard decides when)."""
@@ -187,6 +199,7 @@ def _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_v
                        num_repeats=2,
                        motor_index=i,
                        voltage_limit=motor_voltage_limit)
+    send_brake_on_idle(Motor, (i,))      # a rebooted drive restores its SAVED brake-or-coast (firmware 110)
     write_motor_config_to_shared(
         shared_data, joint_num,
         KPP=motor_KPP, KPV=motor_KPV, KIV=motor_KIV,

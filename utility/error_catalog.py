@@ -220,6 +220,16 @@ CATALOG = {
                                    _WARN,
                                    "Lower the joint's speed gains (KPV, KPP). If that does not help, check the "
                                    "encoder magnet and the mechanics."),
+    "NOT_CALIBRATED": _drive(2111, "the joint", "Motor not calibrated",
+                             "The drive of {part} reports a fault and that its motor is not calibrated (for example "
+                             "after a firmware update that did not keep the calibration).",
+                             "Calibrate the motor with its shaft free (the drive manual's calibration), or flash the "
+                             "firmware it had before. Clear errors, then home the robot again."),
+    "DRIVE_FAULT": _drive(2112, "the joint", "Drive fault without a named cause",
+                          "The drive of {part} reports a fault but none of the faults the robot knows (for example a "
+                          "firmware image made for the other drive product).",
+                          "Read the drive's state in the dashboard's motor table. Clear errors; if it comes back, check "
+                          "the drive's firmware and wiring."),
     "KT_MISMATCH_WARNING": _e(2110, "Drive's torque constant far from the robot file",
                               "At start a drive reported a torque constant (Kt) further from the robot XML's <kt> "
                               "than <kt_tolerance> in config/system.xml allows. The start-up log names both values.",

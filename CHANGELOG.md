@@ -91,6 +91,16 @@ What changed in each version of the RCB runtime. The newest version is at the to
   system kept its own list of which codes are warnings, and it lacked this one. The list now comes from the error
   catalog, so every code documented as a warning is one.
 - A voltage limit above 60000 mV (the most a drive accepts) is clamped to it instead of reaching the drive.
+- Every joint brakes when idle, whatever its drive has saved: the robot sends brake at its start and after a joint
+  reconnects (in the drive's RAM, never saved). Drive firmware 110 saves brake-or-coast, and a coast saved by anyone
+  would have let J2 and J3 drop at every stop, fault, homing idle and flash.
+- A drive fault with none of the known causes latched nothing: the joint stopped without a named error. It now latches
+  `NOT_CALIBRATED` (2111) when the drive reports its motor not calibrated, else `DRIVE_FAULT` (2112).
+- `tools/flash_motor_firmware.py app-reset` waited 2 s for the bootloader, which appears ~8 s after the reset on the
+  arm's drives: it always reported "did not answer". It now waits as long as `flash` does.
+- `tools/arm_smoke.py` refuses to start, naming the joint, while a joint is past its soft limit: its RTI link test
+  holds the current pose, and from a pose left by hand slightly past a soft limit the robot (correctly) refused to
+  hold it, half-way through the run.
 - The dashboard's Kt values and the gripper's force estimate showed and used each drive's polled Kt, also when the
   robot was using the robot XML's instead. They now show and use the Kt the robot chose at start.
 - `grippers/MSG_small_motor_150mm_rail.xml`: `<kt>` 0.174 Nm/A, what its drive reports (it was 0.111, an unverified

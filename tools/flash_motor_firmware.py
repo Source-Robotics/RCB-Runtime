@@ -1424,7 +1424,9 @@ def cmd_app_reset(args):
     try:
         send_app_reset(bus, args.node)
         time.sleep(APP_RESET_GAP_S)
-        alive = wait_for_bootloader(bus, args.node, 20, 0.1)
+        # As long as `flash` waits (2026-11-15): the bootloader appears ~8.2 s after the reset and listens ~2 s. This
+        # waited 20 x 0.1 s = 2 s and so reported "did not answer" for every healthy 103 board of the arm.
+        alive = wait_for_bootloader(bus, args.node, PING_RETRIES_AFTER_RESET, 0.1)
     finally:
         close_bus(bus)
     print(f"Node {_node_label(args.node)} "
