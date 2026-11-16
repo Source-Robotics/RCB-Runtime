@@ -308,6 +308,9 @@ def setup(joints: int = 6, force_reinit: bool = False):
         ("BATCH_DATE",          np.int32),
         ("SOFTWARE_VERSION",    np.int32),
         ("SERIAL_NUMBER",       np.int32),
+        # What the drive does when idle, from its identity reply (2026-11-16): 2 = brake, 1 = coast, 0 = not read
+        # (data/update_shared_data.idle_brake_code)
+        ("motor_idle_brake",    np.int32),
         ("HALL_INDEX",          np.int32),
         ("ADDITIONAL_PIN2",     np.int32),
         ("HALL_EDGE_DETECT",    np.int32),
@@ -785,6 +788,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "gripper_motor_hw_version",
         "gripper_motor_sw_version",
         "gripper_motor_serial",
+        "gripper_motor_idle_brake",      # 2 = brakes when idle, 1 = coasts, 0 = not read (as motor_idle_brake)
         "gripper_motor_temp_error",
         "gripper_motor_enc_error",
         "gripper_motor_vbus_error",

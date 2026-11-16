@@ -2353,6 +2353,7 @@ def main():
             active_CAN_gripper=active_CAN_gripper,
             gripper_kt=float(gripper_kt),
             gripper_speed_bank=st.filter_banks['gripper_speed'],
+            Motor=Motor,
         )
         _profile_last = _profile_mark(_profile_last, "motor_gripper_shared")
 

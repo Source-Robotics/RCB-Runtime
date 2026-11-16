@@ -3331,8 +3331,9 @@ class RobotClient:
         The robot stops sending on the CAN bus, so a separate flasher program can
         use it; everything else keeps running: the E-stop, the I/O, the status.
         About 0.1 s after the robot falls silent, each drive's watchdog lets go of
-        its motor: the joints brake and sink slowly, the gripper coasts. So the
-        arm must be parked or supported, which nothing on the robot can check:
+        its motor: the joints brake and sink slowly, the gripper brakes or coasts
+        as its drive is set (the dashboard's "When idle"). So the arm must be
+        parked or supported, which nothing on the robot can check:
         the call needs your claim, and the robot records which one you made.
 
         It works while disabled, not homed or with an error latched: that is how a

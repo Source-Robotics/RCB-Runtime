@@ -279,6 +279,16 @@ def update_joint_rest(*, shared_data, Joint_data, filter_banks, joint_num, delta
     ft[3:] = R.T @ f_ext_world[3:]
 
 
+def idle_brake_code(motor) -> int:
+    """What a drive does when idle, from its last identity reply (firmware 109+): 2 = brake (its windings shorted: it
+    resists being turned and slows to a stop, it does not hold), 1 = coast (turns freely), 0 = not read (no reply yet,
+    or firmware before 109)."""
+    flags = getattr(motor, 'identity_flags', None)
+    if not flags:
+        return 0
+    return 2 if flags.get('brake_on_idle') else 1
+
+
 def update_motor_and_gripper_data(
     *,
     shared_data,
@@ -294,8 +304,12 @@ def update_motor_and_gripper_data(
     active_CAN_gripper: int,
     gripper_kt: float = 0.111,
     gripper_speed_bank=None,
+    Motor=None,
 ):
     """Update shared memory with latest motor and gripper data.
+
+    `Motor`: the drives' objects, for what their identity replies said (motor_idle_brake, gripper_motor_idle_brake);
+    None leaves those at 0 (not read).
 
     ⚠️ MUST be called BEFORE update_joint_and_tcp_data() on the same tick — that function
     consumes the shared_data.motor[] arrays written here. See the module docstring.
@@ -344,6 +358,9 @@ def update_motor_and_gripper_data(
         shared_data.motor['SERIAL_NUMBER'][:] = [
             Motor_info_data[i][-1]["SERIAL_NUMBER"] for i in range(joint_num)
         ]
+        if Motor is not None:
+            for i in range(joint_num):
+                shared_data.motor['motor_idle_brake'][i] = idle_brake_code(Motor[i])
 
     elif tick % 5 == 1:
         shared_data.motor['motor_temperature_error'][:] = [
@@ -428,6 +445,8 @@ def update_motor_and_gripper_data(
             shared_data.gripper['gripper_motor_hw_version'][0] = Motor_info_data[gm_idx][-1]["HARDWARE_VERSION"]
             shared_data.gripper['gripper_motor_sw_version'][0] = Motor_info_data[gm_idx][-1]["SOFTWARE_VERSION"]
             shared_data.gripper['gripper_motor_serial'][0]     = Motor_info_data[gm_idx][-1]["SERIAL_NUMBER"]
+            if Motor is not None:
+                shared_data.gripper['gripper_motor_idle_brake'][0] = idle_brake_code(Motor[gm_idx])
 
   
         # --- Gripper SI unit conversions ---

@@ -41,6 +41,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - The first-run report can carry the support bundle (`tools/first_run.py --bundle ask | yes | no`, default ask):
   one zip with the report, the logs, the incident recordings and the configuration — what to send when asking for
   help. Like the Logs tab's bundle it needs the arm disabled.
+- The dashboard shows what each drive does when idle (disabled, Idle, a watchdog trip): "brake" (it resists being
+  turned and slows to a stop, but does not hold a position) or "coast" (it turns freely), as the drive reports it —
+  the Gripper tab's "When idle" line and the Motor tab's "When idle" column. RTI asks every drive for its identity
+  every ~4 s; drive firmware before 109 does not answer and shows "---".
 
 ### Changed
 

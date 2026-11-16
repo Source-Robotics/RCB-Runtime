@@ -342,6 +342,7 @@ motor_columns = [
     {'name': 'HW',    'label': 'HW Ver',   'field': 'HW'},
     {'name': 'SW',    'label': 'SW Ver',   'field': 'SW'},
     {'name': 'SN',    'label': 'Serial',   'field': 'SN'},
+    {'name': 'idle',  'label': 'When idle', 'field': 'idle'},
 ]
 
 # What RTI actually PUT ON THE WIRE this tick, in motor space — the literal ints handed to
@@ -368,6 +369,19 @@ def _fmt_kt_src(value):
     """Where a Kt value actually came from: read off the motor over CAN, or the XML fallback
     (motor didn't answer, or kt_source=xml). Resolved once at startup by utility/kt_init.py."""
     return "CAN" if float(value) else "XML"
+
+
+IDLE_TOOLTIP = ("What the drive does when it is idle (disabled, Idle, a watchdog trip), as the drive reports it: "
+                "brake = its windings are shorted, so it resists being turned and slows to a stop, but it does not "
+                "hold a position; coast = it turns freely. --- = not read yet, or firmware before 109.")
+
+
+def _fmt_idle(arr, i=0):
+    """A drive's idle behaviour from shared memory (data/update_shared_data.idle_brake_code). `arr` is None while a
+    dashboard started before the field existed runs (shared memory modules stay as first imported)."""
+    if arr is None:
+        return "---"
+    return {2: "brake", 1: "coast"}.get(int(arr[i]), "---")
 
 error_columns = [
     {'name': 'joint', 'label': 'Joint',      'field': 'joint'},
@@ -1028,6 +1042,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             ui.label("HW Version");       grp_motor_hw_lbl    = ui.label("---")
             ui.label("SW Version");       grp_motor_sw_lbl    = ui.label("---")
             ui.label("Serial");           grp_motor_sn_lbl    = ui.label("---")
+            ui.label("When idle").tooltip(IDLE_TOOLTIP); grp_motor_idle_lbl = ui.label("---")
 
         ui.label("Gripper Motor Error Flags").classes("text-sm font-semibold mb-1 text-gray-600 uppercase tracking-wide")
         grp_motor_err_columns = [
@@ -3301,7 +3316,8 @@ async def handle_fw_enter():
             # old bring-up value, until 2026-10-24).
             f"Every motor will LOSE TORQUE {_sys_cfg.get('drive_watchdog_ms', 100) / 1000:g} s after the robot falls "
             "silent on the bus: each drive's watchdog lets go, the joints brake into a slow sag (shorted-phase "
-            "brake), the gripper coasts. They stay that way for the whole session — about 25 s per joint.\n\n"
+            "brake), the gripper brakes or coasts as its drive is set (the Gripper tab's \"When idle\"). They stay "
+            "that way for the whole session — about 25 s per joint.\n\n"
             "If the arm is not parked or physically supported, IT WILL FALL. "
             "Anything it lands on, including a person, is in the way.\n\n"
             "Only continue if you have supported it by other means.",
@@ -3834,6 +3850,7 @@ def update_tables():
             'HW':    int(shared_data.motor['HARDWARE_VERSION'][i]),
             'SW':    int(shared_data.motor['SOFTWARE_VERSION'][i]),
             'SN':    int(shared_data.motor['SERIAL_NUMBER'][i]),
+            'idle':  _fmt_idle(shared_data.motor.get('motor_idle_brake'), i),
         } for i in range(JOINTS)]
         motor_table.update()
 
@@ -3931,6 +3948,7 @@ def update_tables():
         grp_motor_hw_lbl.text   = str(int(shared_data.gripper['gripper_motor_hw_version'][0]))
         grp_motor_sw_lbl.text   = str(int(shared_data.gripper['gripper_motor_sw_version'][0]))
         grp_motor_sn_lbl.text   = str(int(shared_data.gripper['gripper_motor_serial'][0]))
+        grp_motor_idle_lbl.text = _fmt_idle(shared_data.gripper.get('gripper_motor_idle_brake'))
 
         grp_motor_err_table.rows = [{
             'temp':  int(shared_data.gripper['gripper_motor_temp_error'][0]),

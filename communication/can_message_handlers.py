@@ -431,6 +431,11 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
         motors[idx].Send_Respond_Device_Info()
         if state["device_info_counter"] == (1000 + total_motors - 1):
             state["device_info_counter"] = 0
+    # The same sweep for each drive's identity (2026-11-16; firmware 109+, older firmware does not answer): the library
+    # decodes the reply into the motor object (identity_flags: brake on idle, gripper mode, ...), and
+    # data/update_shared_data.py copies what the dashboard shows.
+    elif 500 <= state["device_info_counter"] < (500 + total_motors):
+        motors[idx].Send_Respond_Identity()
     else:
         # Normal Telemetry
         if step == 0:
