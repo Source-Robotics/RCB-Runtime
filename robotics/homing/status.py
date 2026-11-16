@@ -9,6 +9,9 @@ STATUS_IDLE    = 0
 STATUS_RUNNING = 1
 STATUS_DONE    = 2
 STATUS_FAILED  = 3
+# 2026-11-16 (user: "pause and ask"): the joint homed, but off where this arm's joint always homes — homing waits for
+# an answer (accept it as the new reference / home that joint again); controller.answer_question().
+STATUS_QUESTION = 4
 
 
 def log_milestone(code, message=None, level="info"):

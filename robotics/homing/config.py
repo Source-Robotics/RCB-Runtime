@@ -157,6 +157,13 @@ def from_config(cls, xml_config: dict, joint_num: int) -> 'HomingController':
         release_sample_pct  = release_sample,
         two_pass_max_diff   = two_pass_max_diff,
     )
+    # 2026-11-16 (user, after J6 wound its cables): <homing_max_travel_deg> per arm joint -> motor ticks (the joint's
+    # gear and encoder); missing / 0 = no limit. Set after construction (the constructor's signature is pinned).
+    max_deg = _fill('homing_max_travel_deg', 0.0)
+    gears = np.asarray(xml_config.get('gear_ratio', np.ones(joint_num)), dtype=float)
+    bits = np.asarray(xml_config.get('motor_encoder', np.full(joint_num, 14.0)), dtype=float)
+    obj._max_travel = {j: (int(round(max_deg[j] / 360.0 * gears[j] * 2 ** int(bits[j]))), float(max_deg[j]))
+                       for j in range(joint_num) if max_deg[j] > 0}
     if do_gripper:
         obj._gripper_normal_ilim           = gripper_normal_ilim
         obj._gripper_normal_velocity_limit = gripper_normal_velocity_limit

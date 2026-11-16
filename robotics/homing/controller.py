@@ -13,7 +13,7 @@ from robotics.homing import config as _config
 from robotics.homing import moves as _moves
 from robotics.homing.gripper import GripperHomingState
 from robotics.homing.joint import JointHomingState
-from robotics.homing.status import STATUS_FAILED, log_milestone
+from robotics.homing.status import STATUS_DONE, STATUS_FAILED, STATUS_QUESTION, log_milestone
 
 
 class HomingController:
@@ -174,6 +174,14 @@ class HomingController:
         # homing_status = 3, which the dispatch reset to 0 in the same tick — the error list never showed it.
         self._failures: list = []
         self.has_failures = False
+        # 2026-11-16 (user: "pause and ask"): an arm joint that homed off where the recognised arm's joint always
+        # homes no longer fails the homing — {j: deg off} waits for an answer: the step's other homings finish, an
+        # <after> block triggered by it waits, the step does not end. Accept (accept_answer) = the table takes the new
+        # spot and homing goes on; the other answer is Stop (the homing ends, not homed — drop_question). "Home again
+        # where it stands" was removed the same day: J6 homes to a Hall sensor, and re-homed from its sensor it turned
+        # ~0.9 turn and wound its cables (the user E-stopped it).
+        self._question: dict = {}
+        self._accepted = False                            # taken at the next step()
 
     # ------------------------------------------------------------------
     # Public time-based properties — backward compat
@@ -203,8 +211,8 @@ class HomingController:
 
     # ------------------------------------------------------------------
     def _make_joint_state(self, j: int) -> JointHomingState:
-        """Create a JointHomingState for joint index j."""
-        return JointHomingState(
+        """Create a JointHomingState for joint index j (with its <homing_max_travel_deg>, 2026-11-16)."""
+        state = JointHomingState(
             j                   = j,
             homing_speed        = float(self.homing_speeds[j]),
             homing_direction    = int(self.homing_directions[j]),
@@ -238,6 +246,10 @@ class HomingController:
             release_sample_pct   = float(self.release_sample_pct[j]),
             two_pass_max_diff    = float(self.two_pass_max_diff[j]),
         )
+        limits = getattr(self, "_max_travel", None)                 # from_config sets it; {j: (ticks, deg)}
+        if limits and j in limits:
+            state.max_travel_ticks, state.max_travel_deg = limits[j]
+        return state
 
     # ------------------------------------------------------------------
     def enter(self, Motor, joint_num, load_motor_configs_fn, motor_config, shared_data=None):
@@ -385,6 +397,9 @@ class HomingController:
         self._seq_ticks = 0
         self._homing_stats = {}
         self._hold_pos = {}
+        self._question = {}
+        self._accepted = False
+        self._publish_question(shared_data)
         self._approach_travel = {}
         self._approach_arrival = {}
         if self.arm_check is not None:
@@ -570,7 +585,7 @@ class HomingController:
         """Advance the <after> blocks: a homed trigger starts its nudges (none: its homing); after them each of its
         actuators starts homing once it is no longer homing in this step (the gripper's calibration ends first)."""
         for af in self._afters:
-            if af['stage'] == 'wait' and af['joint'] not in self._active_states:
+            if af['stage'] == 'wait' and af['joint'] not in self._active_states and af['joint'] not in self._question:
                 nudges = ", ".join(f"{self._jlabel(nd['joint'], Motor)} {nd['speed']:+.0f} ticks/s for "
                                    f"{nd['duration_s']:.1f} s" for nd in af['nudges'])
                 homes = ", ".join(self._jlabel(j, Motor) for j in af['home_joints'])
@@ -661,7 +676,10 @@ class HomingController:
         if self._seq_phase == self._IDLE:
             logger.warning("step() called before start()")
             return 'running'
-        self._seq_ticks += 1
+        if not self.waiting_for_answer:                  # the history's duration leaves the wait out
+            self._seq_ticks += 1
+        if self._accepted and self._seq_phase == self._HOMING:
+            self._take_accept(Motor, shared_data)
 
         if self._seq_phase == self._PRE_MOVE:
             return self._do_step_pre_move(Motor, Joint, shared_data)
@@ -771,8 +789,8 @@ class HomingController:
             self._active_j = first_active
             self._active_state = self._active_states[first_active]
 
-        # All done? Advance to next step
-        if not self._active_states and all(af['stage'] == 'done' for af in self._afters):
+        # All done? Advance to next step (not while a question waits: the arm holds until it is answered)
+        if self._step_complete():
             return self._advance_sequence(shared_data)
 
         return 'running'
@@ -874,12 +892,90 @@ class HomingController:
             if verdict.get("text"):
                 logger.info(verdict["text"])
             return True
+        if not verdict.get("unknown"):
+            # 2026-11-16 (user: "pause and ask"): the arm was recognised and this joint homed off its spot — ask
+            self._ask(verdict, shared_data)
+            return True
         logger.error(verdict["text"])
         for i, d in verdict["off"]:
             shared_data.rti["homing_status"][i] = STATUS_FAILED
             self._report_failure(i, verdict["reason"])
         self._seq_phase = self._FAILED
         return False
+
+    # ------------------------------------------------------------------
+    # The question (2026-11-16, user: "pause and ask" — TODO/driver_110_rtb15_plan.md item 10)
+    # ------------------------------------------------------------------
+    def _step_complete(self) -> bool:
+        """The homing step is through: no joint homing, every <after> block done, no question open."""
+        return not self._active_states and not self._question and all(af['stage'] == 'done' for af in self._afters)
+
+    @property
+    def waiting_for_answer(self) -> bool:
+        """True while a question is open and nothing else of the step is running: the arm only holds."""
+        return bool(self._question) and self._seq_phase == self._HOMING and not self._active_states
+
+    @property
+    def question(self) -> dict:
+        """The joints homing asks about {joint index: deg off its usual spot}; {} when none."""
+        return dict(self._question)
+
+    def _ask(self, verdict, shared_data):
+        """check_so_far: joint(s) homed off where the recognised arm's joint always homes. Each joint is homed (its latch
+        is its reference until answered), but homing does not go on past this step until someone answers."""
+        for j, d in verdict["off"]:
+            self._question[j] = float(d)
+            shared_data.rti["homing_status"][j] = STATUS_QUESTION
+        self._publish_question(shared_data)
+        names = ", ".join(f"{self._jlabel(j, self._Motor)} {d:+.2f} deg" for j, d in verdict["off"])
+        logger.warning(f"QUESTION: {names} — {verdict.get('reason', '')} Homing holds the arm and waits for an answer: "
+                       f"accept it as the new reference, or stop the homing")
+        log_milestone("HOMING_QUESTION", f"{names} off where this arm always homes — waiting for an answer: accept "
+                                         f"as the new reference, or stop the homing", level="warning")
+
+    def _publish_question(self, shared_data):
+        """rti['homing_question']: [0] = 1 while a question waits; [1 + j] = joint j's deg off, NaN when not asked."""
+        rti = getattr(shared_data, "rti", None)
+        q = rti.get("homing_question") if isinstance(rti, dict) else None
+        if q is None:
+            return
+        q[1:] = np.nan
+        for j, d in self._question.items():
+            if 1 + j < len(q):
+                q[1 + j] = d
+        q[0] = 1.0 if self._question else 0.0
+
+    def drop_question(self, shared_data):
+        """Leaving HOMING (_HomingDispatch.exit): an unanswered question goes with it — Stop / Disable is the other
+        answer (the homing ends, not homed)."""
+        if self._question:
+            logger.warning("the homing question was not accepted: the homing ended first (not homed)")
+        self._question = {}
+        self._accepted = False
+        self._publish_question(shared_data)
+
+    def accept_answer(self):
+        """RTI's homing_answer:accept: None = taken (acted on at the next tick), else why it is refused."""
+        if self._seq_phase != self._HOMING or not self._question:
+            return "no homing question is waiting"
+        if self._accepted:
+            return "the answer is already being acted on"
+        self._accepted = True
+        return None
+
+    def _take_accept(self, Motor, shared_data):
+        """Accept: the table takes this homing's spot for the asked joints (they are homed; their <after> blocks start;
+        the step goes on)."""
+        self._accepted = False
+        joints = sorted(self._question)
+        names = ", ".join(self._jlabel(j, Motor) for j in joints)
+        self._question = {}
+        line = self.arm_check.accept_question() if self.arm_check is not None else ""
+        for j in joints:
+            shared_data.rti["homing_status"][j] = STATUS_DONE
+        logger.info(f"{names}: accepted as the new reference ({line})")
+        log_milestone("HOMING_QUESTION", f"{names}: accepted as the new reference")
+        self._publish_question(shared_data)
 
     def _report_failure(self, j: int, reason: str):
         """One failure for the error pass: J{n}:HOMING_FAILED for an arm joint, GRIPPER_HOMING_FAILED for the gripper."""

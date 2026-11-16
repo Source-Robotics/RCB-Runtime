@@ -100,6 +100,8 @@
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
             <homing_current_ma>700</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
             <homing_timeout_s>13</homing_timeout_s>   <!-- Homing timeout in seconds — J0 travels furthest so needs more time -->
+            <homing_max_travel_deg>150</homing_max_travel_deg>   <!-- 2026-11-16: a homing search turning further than this from where it began stops and FAILS (J6 wound its cables); ~1.3-2x the largest travel of 98 homings; a gripper XML can replace one joint's
+                 (<arm_joint_homing_max_travel_deg>: the bare Flange's J6 360) -->
             <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
             <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
             <homing_two_pass_max_diff>3500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
@@ -172,6 +174,7 @@
             <homing_direction>1</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
             <homing_current_ma>250</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
             <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_max_travel_deg>90</homing_max_travel_deg>
             <homing_backoff_s>1.5</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
             <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
             <homing_two_pass_max_diff>2000</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
@@ -245,6 +248,7 @@
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
             <homing_current_ma>250</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
             <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_max_travel_deg>100</homing_max_travel_deg>
             <homing_backoff_s>1.5</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
             <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
@@ -318,6 +322,7 @@
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
             <homing_current_ma>1200</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
             <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_max_travel_deg>220</homing_max_travel_deg>
             <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
             <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
@@ -391,6 +396,7 @@
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
             <homing_current_ma>1200</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
             <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_max_travel_deg>240</homing_max_travel_deg>
             <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
             <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
@@ -470,6 +476,7 @@
             <homing_direction>0</homing_direction>   <!-- 0=positive motor direction, 1=negative; tune per joint -->
             <homing_current_ma>800</homing_current_ma>   <!-- Current threshold in mA — above this (with stall) = endstop hit -->
             <homing_timeout_s>15</homing_timeout_s>   <!-- Homing timeout in seconds -->
+            <homing_max_travel_deg>150</homing_max_travel_deg>
             <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
             <homing_two_pass>0</homing_two_pass>   <!-- 0 = single pass (Hall sensor joints skip two-pass regardless) -->
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->

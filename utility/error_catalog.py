@@ -611,6 +611,7 @@ CATALOG = {
     "FREE_JOINT": _info(9021, "Joint freed for hand turning"),
     "JOINT_TEST": _info(9022, "Joint test move"),
     "STOPPED_ON_DISCONNECT": _info(9023, "Stopped: the controlling client left"),
+    "HOMING_QUESTION": _info(9024, "Homing asks about a joint"),
 }
 
 ERROR_DESCRIPTIONS = CATALOG          # the old name (utility/error_checks.py, nets)

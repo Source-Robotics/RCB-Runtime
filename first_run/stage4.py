@@ -93,6 +93,28 @@ def _stop(robot):
         pass
 
 
+def _answer_question(robot, ui, question):
+    """Homing asks (2026-11-16, user: "pause and ask"): a joint homed off where this arm's joint always homes, and
+    homing holds the arm. Asks the user; sends the answer; waits until the robot no longer reports the question (its
+    status follows within a tick). -> what was answered, or None = stop (the caller stops the homing)."""
+    listed = ", ".join(f"{k} {float(v):+.2f} deg" for k, v in question.items())
+    joints = ", ".join(question)
+    pick = ui.choose(f"Homing asks: {listed} off where this arm always homes it. Changed something on purpose (the "
+                     f"gripper re-fitted, a belt or a drive replaced)? Then accept it as the new reference. Otherwise "
+                     f"(a false stall, a skipped belt, a slipping coupling) stop the homing, check {joints}, bring the "
+                     f"arm to its park pose and run this stage again.", ["accept", "stop"])
+    if pick != "accept":
+        return None
+    try:
+        robot.accept_homing_reference(wait=False)
+    except CommandRejected:               # answered meanwhile (the dashboard): the wait goes on with what happens next
+        pass
+    t_end = time.monotonic() + 3.0
+    while time.monotonic() < t_end and (robot.status() or {}).get("homing_question"):
+        time.sleep(POLL_S)
+    return f"{joints}: accepted as the new reference"
+
+
 def check_homing(ctx, ui):
     st = HOME
     robot = ctx["robot"]
@@ -123,16 +145,26 @@ def check_homing(ctx, ui):
         seen["polls"] += 1
         if s.get("mode") == "HOMING":
             seen["homing"] = True
-            return None
+            return s if s.get("homing_question") else None     # homing asks (2026-11-16): answered below
         if not seen["homing"] and seen["polls"] * POLL_S < START_TIMEOUT_S:
             return None                   # not begun yet (the status follows within ~20 ms; a few polls of slack)
         return s
 
-    try:
-        s = ui.wait("Homing — each joint to its endstop, then the start pose", ended, HOME_TIMEOUT_S, POLL_S)
-    except Cancelled:                     # a skip stops the homing, like a skip of any other move
-        _stop(robot)
-        return result(st, SKIP, "skipped by the user: the homing was stopped, the arm is not homed")
+    answers = []
+    while True:
+        try:
+            s = ui.wait("Homing — each joint to its endstop, then the start pose", ended, HOME_TIMEOUT_S, POLL_S)
+        except Cancelled:                     # a skip stops the homing, like a skip of any other move
+            _stop(robot)
+            return result(st, SKIP, "skipped by the user: the homing was stopped, the arm is not homed")
+        if s is None or not s.get("homing_question"):
+            break
+        asked = _answer_question(robot, ui, s["homing_question"])
+        if asked is None:
+            _stop(robot)
+            return result(st, FAIL, "stopped at homing's question: a joint homed off where this arm always homes; "
+                          "the homing was stopped, the arm is not homed", hints=list(GENERAL_HINTS))
+        answers.append(asked)
     took = time.monotonic() - t0
     if s is None:
         _stop(robot)
@@ -144,7 +176,8 @@ def check_homing(ctx, ui):
         return result(st, FAIL, "homing never started (the robot stayed in " + str(s.get("mode")) + ")",
                       value=s.get("mode"), hints=GENERAL_HINTS)
     if s.get("mode") == "IDLE" and s.get("homed") and not failed:
-        return result(st, PASS, "homed" + (f" in {took:.0f} s" if took >= 1 else ""), value=round(took, 1))
+        return result(st, PASS, "homed" + (f" in {took:.0f} s" if took >= 1 else "")
+                      + (f" ({'; '.join(answers)})" if answers else ""), value=round(took, 1))
     out = []
     for e in failed or errs:
         key = str(e.get("key"))

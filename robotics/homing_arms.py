@@ -414,13 +414,21 @@ class HomingArms:
         if self._thread is not None:
             self._q.put(("save", copy.deepcopy(self.table)))
         d = off[0][1]
+        # 2026-11-16 (user: "pause and ask"): the controller asks instead of failing — this text is the question's why
         why = (f"it homed {d:+.2f} deg from where arm {arm_label(arm)} always homes — checked as soon as it homed: a "
-               f"false stall (could it move? was it at its park pose? something in the way?), a skipped belt or a "
-               f"slipping coupling. Move it to its park pose and home again; after a deliberate mechanical change: "
-               f"System Info > 'Arms (homing)' > 'Accept as new reference'")
+               f"false stall (could it move? something in the way?), a skipped belt or a slipping coupling — or a "
+               f"deliberate change (the gripper re-fitted, a belt or a drive replaced).")
         verdict["reason"] = why
-        verdict["text"] = f"FAILED: J{j + 1} — {why}"
+        verdict["text"] = f"J{j + 1} — {why}"
         return verdict
+
+    def accept_question(self) -> str:
+        """Homing's question answered 'accept' (2026-11-16): the joints of the fault check_so_far just recorded take this
+        homing's spot as their reference (accept_last); the save is queued. In memory on the RT thread."""
+        line = accept_last(self.table, self.gears, self.gripper_dependent, self.counts)
+        if self._thread is not None:
+            self._q.put(("save", copy.deepcopy(self.table)))
+        return line
 
     def judge_and_learn(self, latches: dict, stats: dict | None = None, utc: str | None = None) -> dict:
         """Called on the real-time thread when the homing sequence is complete: judge, fold in (with homing's own stats

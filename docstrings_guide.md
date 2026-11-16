@@ -144,7 +144,7 @@ when the function returns `None`. For a tuple, say what each element is, in orde
 
 Every exception a caller should be ready for, as `ExceptionName: When it is raised.`:
 
-1. **The robot's exceptions first,** in this order: `CommandRejected`, `MotionFailed`, `HomingFailed`,
+1. **The robot's exceptions first,** in this order: `CommandRejected`, `MotionFailed`, `HomingFailed`, `HomingQuestion`,
    `GripFailed`, `RobotTimeout`, `RobotConnectionError`, `VersionMismatch`, `ControlLost` (the real-time client's).
 2. **Then the argument errors:** `ValueError`, `TypeError`.
 3. **Then the other built-in exceptions the call passes on,** such as a socket's: `RuntimeError`, `OSError`.

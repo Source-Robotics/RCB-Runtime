@@ -473,6 +473,8 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         'homing_direction':       get_all_values(joints, 'homing_direction'),
         'homing_current_ma':      get_all_values(joints, 'homing_current_ma'),
         'homing_timeout_s':       get_all_values(joints, 'homing_timeout_s'),
+        # 2026-11-16: how far a joint's homing search may turn (deg at the joint); missing = NaN = no limit
+        'homing_max_travel_deg':  get_all_values(joints, 'homing_max_travel_deg'),
         'homing_backoff_s':       get_all_values(joints, 'homing_backoff_s'),
         'has_hall_sensor':        get_all_values(joints, 'has_hall_sensor'),
         # What + looks like on the arm, in words (2026-10-18; the first-run check's stage 3): None where missing.
@@ -607,6 +609,18 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
                         home_offsets[j] = gripper_joint_offsets[j]
                     # If flag is set but gripper has no entry, keep the robot XML fallback
             cfg['home_offset'] = home_offsets
+
+        # ---- the tool's homing travel limits (2026-11-16, user: the bare flange's J6 can start anywhere) ----
+        # <arm_joint_homing_max_travel_deg><joint id="5">360</joint>: replaces the robot XML's <homing_max_travel_deg>
+        # for that joint while this gripper is active; a joint the tool does not list keeps the robot's value.
+        travel_elem = gripper_elem.find('arm_joint_homing_max_travel_deg')
+        if travel_elem is not None:
+            travel = np.array(cfg['homing_max_travel_deg'], dtype=float)
+            for jelem in travel_elem.findall('joint'):
+                jid = jelem.get('id')
+                if jid is not None and jelem.text and 0 <= int(jid) < len(travel):
+                    travel[int(jid)] = float(jelem.text.strip())
+            cfg['homing_max_travel_deg'] = travel
 
     _fill_motion_limit_defaults(cfg)
     # Must run AFTER the ceilings are resolved — it clamps against them, and a NaN ceiling

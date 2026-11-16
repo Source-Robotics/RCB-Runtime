@@ -18,6 +18,7 @@ from .exceptions import (
     GripFailed,
 )
 from .exceptions import HomingFailed as HomingFailed  # "as": an explicit re-export (2026-10-14)
+from .exceptions import HomingQuestion as HomingQuestion  # homing asks about a joint (2026-11-16)
 # This client's version and the version check at connect (2026-10-21, versioning V3; robotclient/version.py).
 from .exceptions import VersionMismatch, VersionWarning
 from .version import __version__

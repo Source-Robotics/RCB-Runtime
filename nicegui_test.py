@@ -4764,6 +4764,9 @@ ui.timer(1.0, refresh_processes)           # slow panel (System Info tab)
 ui.timer(0.5, refresh_firmware_tab)        # park verdict + mode badge (Firmware tab)
 ui.timer(0.3, _drain_exec_toasts)          # command failures from the sender thread
 ui.timer(0.5, _refresh_control_state)       # who holds control (status bar, greyed controls)
+# Homing's question (2026-11-16, user: "pause and ask"): a joint homed off its usual spot -> a dialog on every page
+from gui_homing_question import add_homing_question  # noqa: E402
+ui.timer(0.5, add_homing_question(shared_data, JOINTS, _exec))
 # Memory and disk move, but slowly — 5 s is plenty, and it keeps the shared strings fresh for any
 # other consumer too. Platform/CPU/disk-device are published once at startup (they cannot change
 # without a reboot). Both calls are cheap: one virtual_memory() and one statvfs.

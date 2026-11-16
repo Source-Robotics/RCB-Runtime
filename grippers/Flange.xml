@@ -8,6 +8,14 @@
         <joint id="4">-2.258</joint>   <!-- J5: homes against gripper lower arm — offset depends on gripper dimensions -->
     </arm_joint_home_offsets>
 
+  <!-- Per-arm-joint homing travel limits (deg at the joint) that replace the robot XML's <homing_max_travel_deg> for
+         this tool (2026-11-16, user). The bare flange: nothing turns with J6 to wind up, and J6 can start at any
+         orientation — one full turn always reaches its Hall sensor. Tools with cables or hoses keep the robot XML's
+         150 deg (they start from their usual pose). -->
+    <arm_joint_homing_max_travel_deg>
+        <joint id="5">360</joint>   <!-- J6 -->
+    </arm_joint_homing_max_travel_deg>
+
     <!-- Kinematic / dynamics parameters — used by PAR6.py to build the DH tool link -->
     <kinematics>
         <d>-0.0571</d>                                                                     <!-- DH link offset [m] TODO: verify -->

@@ -525,6 +525,11 @@ class _HomingDispatch:
 
     def exit(self, ctx):
         self._homing_ctrl.exit(ctx.Motor, ctx.joint_num)
+        # An open question (2026-11-16) ends with the homing: Stop / Disable while it waits = interrupted, as below
+        # (read with getattr: the nets' stand-in controllers have no question)
+        drop = getattr(self._homing_ctrl, "drop_question", None)
+        if drop is not None:
+            drop(ctx.shared_data)
         if not getattr(self, "_ended", True):
             # Interrupted (2026-10-24, user: "Not homed: re-home"): Stop, Disable or a mode change ended the homing
             # before it finished. Every joint kept a valid reference (its old one or its new one), but the flags

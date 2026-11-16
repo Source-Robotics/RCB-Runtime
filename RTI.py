@@ -1524,6 +1524,21 @@ def main():
             log_activity(_rti_activity_logger, "RTI", "info", "FREE_JOINT", id=st.command_id,
                          message=f"J{n} free for hand turning (current limit 0)")
 
+    def _handle_homing_answer(cmd_msg, cmd_dict):
+        """homing_answer:accept — the answer to homing's question (2026-11-16, user: "pause and ask";
+        robotics/homing/controller.py): a joint homed off where this arm's joint always homes, and homing holds the arm
+        until someone answers. accept = this homing's spot becomes the joint's reference and homing goes on; the other
+        answer is Stop (the homing ends, not homed). Refused when no question is waiting. ("rehome", re-homing the
+        joint where it stood, was removed the same day: it wound J6's cables.)"""
+        what = cmd_msg.split(":", 1)[1].strip() if ":" in cmd_msg else ""
+        if what != "accept":
+            _refused(log_homing, "homing_answer: %r is not an answer (accept, or stop the homing)", what)
+            return
+        why = (homing_ctrl.accept_answer() if st.current_mode == RobotMode.HOMING
+               else "no homing question is waiting (the robot is not homing)")
+        if why:
+            _refused(log_homing, "homing answer refused: %s", why)
+
     def _handle_joint_test(cmd_msg, cmd_dict):
         """joint_test:<n>:<amplitude deg>:<speed deg/s>:<current mA> — a small powered test move of joint n and back,
         homed or not (robotics/joint_test.py, 2026-10-18; the first-run check's stage 3); n = 0 stops it. Only in IDLE
@@ -2217,6 +2232,7 @@ def main():
         "hall_check":        _handle_hall_check,
         "free_joint":        _handle_free_joint,
         "joint_test":        _handle_joint_test,
+        "homing_answer":     _handle_homing_answer,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,

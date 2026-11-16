@@ -49,6 +49,11 @@ class JointHomingState:
     # reach the sensor again — with only backoff_s (0.3 s < the 0.5 s guard) a J6 that started ON its sensor re-triggered
     # "too early" on every approach, forever (each retry also restarted the timeout). After this many tries homing FAILS.
     _HALL_PRE_CLEAR_MAX     = 3
+    # 2026-11-16 (user, after J6 turned ~0.9 turn and wound its cables): how far the joint may turn from where its
+    # homing began while it searches for its endstop / Hall sensor (motor ticks; 0 = no limit) — the robot XML's
+    # <homing_max_travel_deg>, set per joint by HomingController._make_joint_state. Beyond it the search stops and fails.
+    max_travel_ticks        = 0
+    max_travel_deg          = 0.0
 
     # The motor Ilim is set to homing_current_ma, so the motor saturates just below
     # that value. Detect at this fraction of Ilim so the threshold is always reachable.
@@ -201,6 +206,7 @@ class JointHomingState:
         self.travel_ticks      = None
         self.travel_s          = None
         self.fail_reason       = None
+        self._travel_origin    = None   # the first valid position read in this homing (the travel limit's reference)
 
     # ------------------------------------------------------------------
     @property
@@ -261,6 +267,7 @@ class JointHomingState:
         self.travel_ticks      = None
         self.travel_s          = None
         self.fail_reason       = None
+        self._travel_origin    = None
 
     @property
     def _label(self) -> str:
@@ -305,6 +312,9 @@ class JointHomingState:
             )
             self._limits_sent = True
 
+        if self.max_travel_ticks and self._phase in (self._HOMING, self._PRE_CLEAR) and self._travel_exceeded(motor):
+            self._fail(shared_data, self._travel_reason(motor))
+            return 'running'
         if self._phase == self._HOMING:
             return self._do_homing(motor, shared_data)
         elif self._phase == self._PRE_CLEAR:
@@ -321,6 +331,30 @@ class JointHomingState:
             return self._do_post_move(motor, joint_or_none, shared_data)
         else:
             return self._do_settle(motor, joint_or_none, shared_data)
+
+    # ------------------------------------------------------------------
+    def _travel_exceeded(self, motor) -> bool:
+        """The search turned the joint further than max_travel_ticks from where this homing began (2026-11-16): the
+        motor is stopped here, the caller fails the homing. The first valid read is the reference."""
+        pos = motor.position
+        if pos is None:
+            return False
+        if self._travel_origin is None:
+            self._travel_origin = int(pos)
+            return False
+        if abs(int(pos) - self._travel_origin) <= self.max_travel_ticks:
+            return False
+        motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
+        return True
+
+    def _travel_reason(self, motor) -> str:
+        """Why the travel limit stopped this homing: how far, the limit, what to check."""
+        deg = abs(int(motor.position) - self._travel_origin) / self.max_travel_ticks * self.max_travel_deg
+        what = "its Hall sensor" if self.has_hall_sensor else "its endstop"
+        check = "the sensor and its magnet" if self.has_hall_sensor else "that its endstop is there"
+        return (f"it turned {deg:.0f} deg from where its homing began without finding {what} (the limit is "
+                f"{self.max_travel_deg:.0f} deg, <homing_max_travel_deg> in the robot XML) — start the homing from the "
+                f"park pose; if it started there, check {check}")
 
     # ------------------------------------------------------------------
     def _signed_speed(self, factor: float = 1.0) -> int:

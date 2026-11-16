@@ -109,3 +109,20 @@ class HomingFailed(RobotError):
         listed = ", ".join(self.errors) or "none reported"
         super().__init__(f"homing failed — errors: {listed} (the reason: the dashboard's error list or "
                          f"logs/activity_rti.log)")
+
+
+class HomingQuestion(RobotError):
+    """home(wait=True) / wait_homed(): homing stopped to ask about a joint that homed off where this arm's joint always
+    homes (2026-11-16, user: "pause and ask"). The robot is still homing and holds the arm; homing goes on after
+    accept_homing_reference() (a deliberate change: the gripper re-fitted, a belt or a drive replaced); stop() ends the
+    homing instead (not homed: park the arm, home again); or the dashboard's answer.
+
+    `joints` = {"J6": 2.42}: each joint asked about and how far (deg) it homed from its usual spot.
+    """
+
+    def __init__(self, joints):
+        self.joints = dict(joints)
+        listed = ", ".join(f"{k} {v:+.2f} deg" for k, v in self.joints.items()) or "a joint"
+        super().__init__(f"homing asks: {listed} off where this arm always homes — accept_homing_reference() after a "
+                         f"deliberate change (the gripper re-fitted, a belt or a drive replaced), else stop() (not "
+                         f"homed: park the arm, home again)")

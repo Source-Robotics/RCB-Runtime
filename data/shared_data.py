@@ -544,7 +544,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
         # -1 = nothing heard from that node yet. See error_checks.py for how it gates errors.
         ("node_error_bits", joint_num + 1),
         ("CAN_node_connection_error", 16),
-        ("homing_status",     joint_num + 1),   # joints + gripper slot: 0=idle,1=running,2=done,3=failed
+        ("homing_status",     joint_num + 1),   # joints + gripper slot: 0=idle,1=running,2=done,3=failed,4=question
         ("joint_homed",      joint_num + 1),   # joints + gripper slot: 0=not homed, 1=homed
         ("gripper_ctrl_mode", 1),              # 0=no gripper, 1=motor mode, 2=firmware mode
         # JOG live state — mirror of JogHandler config so new GUI tabs can read
@@ -751,8 +751,11 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # free_joint (robotics/free_joint.py, 2026-10-18): the joint freed for hand turning (1-based), 0 = none.
     # joint_test (robotics/joint_test.py, 2026-10-18): a test move's joint, state, amplitude, moved, max error, peak
     # current, end error, seq (RESULT_FIELDS there).
+    # homing_question (robotics/homing/controller.py, 2026-11-16): [0] = 1 while homing waits for an answer about a
+    # joint that homed off where this arm's joint always homes, else 0; [1 + j] = joint j's distance from that spot
+    # (deg) while it is in the question, NaN otherwise.
     for name, count in [("sc_pair_gaps", 49), ("jog_ref", joint_num), ("jog_dir", joint_num),
-                        ("can_read_first", 1), ("command_valid", 2),
+                        ("can_read_first", 1), ("command_valid", 2), ("homing_question", 1 + joint_num),
                         ("hall_check_joint", 1), ("hall_check_pin", 1), ("hall_check_changes", 1),
                         ("hall_check_edge_deg", 2), ("free_joint", 1), ("joint_test", 8)]:
         shm, arr = _attach_or_create(name, np.float64, count)

@@ -166,6 +166,10 @@ COMMAND_RULES = {
     # forwarded it, RTI refused the switch into its activity log only, and in EXEC the executor had already aborted
     # every client's program (_LEAVES_EXEC) while the arm played on what RTI held. An error latched means DISABLED.
     "home":          (IMMEDIATE, ["IDLE"], "ENABLED", False),
+    # The answer to homing's question (2026-11-16, user: "pause and ask"): a joint homed off where this arm's joint
+    # always homes, and homing holds the arm until answered — accept, or stop (the homing ends, not homed). Only in
+    # HOMING (RTI refuses it when no question waits).
+    "accept_homing_reference": (IMMEDIATE, ["HOMING"], "ENABLED", False),
     "clear_errors":   (IMMEDIATE, None, None, False),
     "stop":          (IMMEDIATE, None, None, False),
     # pause/resume only mean something mid-EXEC-motion — reject cleanly elsewhere

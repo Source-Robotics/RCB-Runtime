@@ -36,8 +36,8 @@ from .constants import (
     DEFAULT_PORT, IMMEDIATE_TIMEOUT, FORCE_TAKE_TIMEOUT, ACK_TIMEOUT, DEFAULT_MOVE_TIMEOUT,
     WAIT_STATE_TIMEOUT, WAIT_HOMED_TIMEOUT,
 )
-from .exceptions import (RobotError, RobotTimeout, MotionFailed, GripFailed, HomingFailed, VersionMismatch,
-                         RobotConnectionError)
+from .exceptions import (RobotError, RobotTimeout, MotionFailed, GripFailed, HomingFailed, HomingQuestion,
+                         VersionMismatch, RobotConnectionError)
 from .version import check_protocols, wire_names_for
 
 # Pose angles (2026-10-21): radians unless a call says angle_unit="deg".
@@ -2729,6 +2729,13 @@ class RobotClient:
         with `enter_idle_mode()`, `stop()` or `disable()` abandons it, and the arm
         is then not homed (`HOMING_ABORTED` in the activity log): home it again.
 
+        When a joint homes more than 1 deg from where this arm's joint always
+        homes, homing asks instead of failing: it holds the arm and waits, and
+        `latest_status()["homing_question"]` names the joint, for example
+        `{"J6": 2.42}`. Answer with `accept_homing_reference()`, or end the
+        homing with `stop()` (the arm is then not homed), or in the dashboard. It
+        asks only once the arm is recognised from the joints homed before it.
+
         Args:
             wait: Wait until homing has ended, up to 3 minutes.
                 `None` follows the client's `sync` setting.
@@ -2739,6 +2746,8 @@ class RobotClient:
                 answer within 1 s (`Errors:`).
             HomingFailed: With `wait`, homing failed. It names the robot's error
                 keys.
+            HomingQuestion: With `wait`, homing asks about a joint. Its `joints`
+                names each one and how far off it homed, in degrees.
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
                 homing had not ended after 3 minutes.
             RobotConnectionError: The client is not connected.
@@ -2754,7 +2763,8 @@ class RobotClient:
             it clear.
 
         See also:
-            `enable()`, `clear_errors()`, `enter_exec_mode()`
+            `enable()`, `clear_errors()`, `enter_exec_mode()`,
+            `accept_homing_reference()`
 
         Examples:
             >>> robot.enable(wait=True)
@@ -2770,12 +2780,74 @@ class RobotClient:
                 pass   # never entered HOMING (already homed / instant) — check below
             self._wait_homed(WAIT_HOMED_TIMEOUT, "home")
 
+    def accept_homing_reference(self, wait: bool | None = None) -> None:
+        """Accept where a joint just homed as its new reference.
+
+        Homing asks when a joint homes more than 1 deg from where this arm's
+        joint always homes: it holds the arm until it is answered, and
+        `latest_status()["homing_question"]` names the joint. Accept after a
+        deliberate change, such as the gripper re-fitted or a belt or a drive
+        replaced: the robot stores the new spot for that joint and homing goes
+        on. Otherwise end the homing with `stop()`: the arm is then not homed;
+        bring it to its park pose and home it again.
+
+        Args:
+            wait: Wait until homing has ended, up to 3 minutes.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot refused it: it is not homing or not
+                enabled, or another client holds control. Or RTI refused it or did not
+                answer within 1 s (`Errors:`).
+            HomingFailed: With `wait`, homing failed later on.
+            HomingQuestion: With `wait`, homing asks about another joint.
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
+                homing had not ended after 3 minutes.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_REFUSED: No homing question is waiting. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        Warning:
+            A joint that stopped short of its endstop, a false stall, gets a wrong
+            reference when accepted: its angles are then off by that much. If
+            nothing was changed on purpose, stop the homing instead.
+
+        See also:
+            `home()`, `stop()`, `latest_status()`
+
+        Examples:
+            >>> try:
+            ...     robot.home(wait=True)
+            ... except HomingQuestion as question:
+            ...     print(question.joints)
+            ...     robot.accept_homing_reference(wait=True)
+        """
+        self._immediate("accept_homing_reference")
+        if self._should_wait(wait):
+            self._wait_answered("accept_homing_reference")
+
+    def _wait_answered(self, what):
+        """After accepting homing's question: until the robot no longer reports it (the answer is taken within a
+        tick; the status that still shows it must not end the wait), then as home(wait=True)."""
+        try:
+            self.wait(lambda s: not s.get("homing_question"), 3.0, what)
+        except RobotTimeout:
+            pass   # still asked: _wait_homed raises HomingQuestion with it
+        self._wait_homed(WAIT_HOMED_TIMEOUT, what)
+
     def _wait_homed(self, timeout, what):
         """Until homed and out of HOMING — or out of HOMING with an error (a failed homing latches one, 2026-10-14):
-        then HomingFailed at once, naming the robot's error keys."""
-        self.wait(lambda s: s.get("mode") != "HOMING" and (s.get("homed") is True or s.get("err") == 1),
+        then HomingFailed at once, naming the robot's error keys — or homing asks about a joint (2026-11-16): then
+        HomingQuestion at once, with the joints asked about."""
+        self.wait(lambda s: s.get("homing_question") or (s.get("mode") != "HOMING"
+                                                         and (s.get("homed") is True or s.get("err") == 1)),
                   timeout, what)
         st = self.latest_status()
+        if st.get("homing_question"):
+            raise HomingQuestion(st["homing_question"])
         if st.get("homed") is not True and st.get("err") == 1:
             raise HomingFailed(st.get("errors") or [])
 
@@ -5813,6 +5885,9 @@ class RobotClient:
             HomingFailed: Homing ended with an error, or an error is latched while
                 the arm is not homed. Its `errors` lists the robot's error and
                 warning keys, for example `J3:HOMING_FAILED`.
+            HomingQuestion: Homing asks about a joint that homed off its usual
+                spot. Answer with `accept_homing_reference()`, or end the
+                homing with `stop()`.
             RobotTimeout: The arm was not homed within `timeout`, for example
                 because the robot refused or abandoned the homing.
             RobotConnectionError: The client is not connected, or lost its

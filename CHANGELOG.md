@@ -45,6 +45,20 @@ What changed in each version of the RCB runtime. The newest version is at the to
   turned and slows to a stop, but does not hold a position) or "coast" (it turns freely), as the drive reports it —
   the Gripper tab's "When idle" line and the Motor tab's "When idle" column. RTI asks every drive for its identity
   every ~4 s; drive firmware before 109 does not answer and shows "---".
+- Homing asks instead of failing when a joint homes more than 1 deg from where this arm's joint always homes (for
+  example after the gripper was re-fitted): the joints homing in the same step finish, then the arm holds and the
+  dashboard asks "Accept as new reference" (the robot keeps the new spot and homing goes on, no second homing) or
+  "Stop homing" (the homing ends, not homed: park the arm and home it again). From a program:
+  `status()["homing_question"]`, `accept_homing_reference()` or `stop()`, and `home(wait=True)` / `wait_homed()`
+  raise the new `HomingQuestion`. It asks once the arm is recognised from the joints homed before; a first joint
+  that matches no known arm still fails the homing.
+- `<homing_max_travel_deg>` per joint in the robot XML: a joint whose homing search turns further than that from
+  where its homing began stops and fails its homing with that reason (a start pose away from the park pose, a dead
+  Hall sensor, a missing endstop). PAR6: J1 150, J2 90, J3 100, J4 220, J5 240, J6 150 deg — 1.3-2x the largest
+  travel of its last 98 homings. A gripper XML can replace a joint's limit (`<arm_joint_homing_max_travel_deg>`):
+  the bare Flange's J6 gets 360 deg (nothing turns with it, and it can start at any orientation); the grippers,
+  Vacuum and MHZ2-10D keep 150 (they start from their usual pose). Missing = no limit, as before. Until now J6, which
+  homes to a Hall sensor, was limited only by its 15 s timeout (about one full turn).
 
 ### Changed
 

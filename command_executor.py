@@ -650,6 +650,7 @@ RTI_ANSWER_TIMEOUT_S = 1.0
 # them from RTI's handlers and fails when this table disagrees. Every command here can also answer RTI_NOT_RUNNING (no
 # answer in time, ask_rti) and, from a handler that raised, INTERNAL. Commands that RTI never refuses are absent.
 RTI_ANSWER_CODES = {
+    "accept_homing_reference": ("RTI_REFUSED",),
     "enable": ("ENABLE_REJECTED",),
     "enter_exec_mode": ("MODE_REJECTED",),
     "enter_flashing_mode": ("MODE_REJECTED",),
@@ -891,6 +892,16 @@ def _error_keys():
         return []
 
 
+def _homing_question():
+    """Homing's open question (2026-11-16, user: "pause and ask"): {"J6": 2.42} = the joints that homed off where this
+    arm's joint always homes and how far (deg; homing holds the arm until accept_homing_reference or a stop), or
+    None. RTI's rti['homing_question'] (robotics/homing/controller.py)."""
+    q = shared_data.rti.get("homing_question")
+    if q is None or float(q[0]) < 0.5:
+        return None
+    return {f"J{j + 1}": round(float(d), 2) for j, d in enumerate(q[1:1 + JOINT_NUM]) if d == d}
+
+
 def _planner_status():
     engine, backend = _ik_solver_status_fields()
     if _planner is None:
@@ -982,6 +993,7 @@ def _handle_get_status(args, cid, conn):
     planner = _planner_status()
     reply(conn, {"id": cid, "status": "ok", "data": {
         "mode": mode, "state": state, "homed": homed,
+        "homing_question": _homing_question(),
         # The pose angles this executor parses and returns (2026-10-21: "xyz-mobile" = R = Rx(rx) Ry(ry) Rz(rz)). A block
         # program refuses an executor without it — one from before the change would read its points another way.
         "pose_angles": POSE_CONVENTION,
@@ -2359,6 +2371,7 @@ IMMEDIATE_HANDLERS = {
     "enable":           _forward_to_rti("enable", "enable"),
     "disable":          _forward_to_rti("disable", "disable"),
     "home":             _forward_to_rti("home", "home"),
+    "accept_homing_reference": _forward_to_rti("homing_answer:accept", "accept_homing_reference"),
     "clear_errors":     _handle_clear_errors,
     "enter_exec_mode":  _forward_to_rti("set_mode:EXEC", "enter_exec_mode"),
     # pause/resume route to exec_pause/exec_resume: straight to the ExecHandler
@@ -2537,6 +2550,8 @@ def current_status():
         "mode": mode,
         "state": state,
         "homed": homed,
+        # Homing's open question (2026-11-16): {"J6": 2.42} or None — homing holds the arm until it is answered
+        "homing_question": _homing_question(),
         "err": int(shared_data.rti["error_active"][0]),
         # The error KEYS, not just the 0/1 flag. Without these a remote PC can see THAT
         # something went wrong but never WHAT: every hard error forces ACTIVE_ERROR, which
