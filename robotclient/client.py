@@ -28,6 +28,7 @@ spin about its own axis).
 """
 from __future__ import annotations
 import math
+import time
 from typing import Any, Callable, Sequence
 
 from .connection import Connection
@@ -6148,6 +6149,93 @@ class RobotClient:
             [23.6, 23.5, 23.4, 23.6, 23.5, 23.3]
         """
         return self._immediate("get_hardware", [1 if can else 0])
+
+    def read_drive_parameters(self, drive: int | None = None, wait: bool | None = None) -> None:
+        """Read every parameter that the drives hold now.
+
+        The robot asks each drive for its parameters (about 90 each: gains and
+        limits, the motor model, the control loops, the watchdog, the build and
+        board ids) one at a time, paced between its regular status requests, so
+        its control loop does not slow down. All drives take about 5 s, one drive
+        under 1 s. A new read replaces one that is still running. It moves
+        nothing and changes nothing; it works in any mode. Read the values with
+        `get_drive_parameters()`.
+
+        Args:
+            drive: The drive to read: 1 to the number of joints for a joint, one
+                more for a CAN gripper. `None` reads every drive.
+            wait: Wait until the read has finished, up to 30 s.
+                `None` follows the client's `sync` setting.
+
+        Raises:
+            CommandRejected: The robot refused it: no such drive. Or RTI refused
+                it or did not answer within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
+                the read had not finished after 30 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `drive` is not one of this robot's drives.
+            RTI_REFUSED: RTI refused it: no such drive. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        See also:
+            `get_drive_parameters()`, `get_hardware()`
+
+        Examples:
+            >>> robot.read_drive_parameters(wait=True)
+            >>> robot.read_drive_parameters(6, wait=True)
+        """
+        self._immediate("read_drive_parameters", [] if drive is None else [drive])
+        if self._should_wait(wait):
+            deadline = time.monotonic() + 30.0
+            while True:
+                if (self.get_drive_parameters(drive)["read"]["state"] or "") != "reading":
+                    return
+                if time.monotonic() > deadline:
+                    raise RobotTimeout("read_drive_parameters: the read had not finished after 30 s")
+                time.sleep(0.2)
+
+    def get_drive_parameters(self, drive: int | None = None) -> dict:
+        """Return the drive parameters that the last read found.
+
+        Each value is what the drive answered when it was read with
+        `read_drive_parameters()`; nothing is read now. A parameter not read
+        yet has the value `None`. It moves nothing.
+
+        Args:
+            drive: One drive: 1 to the number of joints for a joint, one more for
+                a CAN gripper. `None` returns every drive.
+
+        Returns:
+            A dict:
+            `read`: the read's `state` (`"idle"`, `"reading"` or `"done"`), `done`
+                and `total` (requests), and `drive` (the one being read now, or
+                `None`).
+            `drives`: per drive (`"J1"` ... and `"gripper"`): `read_utc` (when
+                its read finished, an ISO 8601 UTC time, or `None`) and
+                `parameters`, a list of dicts: `number`, `name`, `value` (a
+                number, or `None`) and `state` (`"read"`, `"not read"`,
+                `"unknown"` to its firmware, `"no answer"` or `"asked"`).
+
+        Raises:
+            CommandRejected: The robot refused it: no such drive.
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `drive` is not one of this robot's drives.
+
+        See also:
+            `read_drive_parameters()`, `get_hardware()`
+
+        Examples:
+            >>> j1 = robot.get_drive_parameters(1)["drives"]["J1"]
+            >>> [p["value"] for p in j1["parameters"] if p["number"] == 16]
+            [2400.0]
+        """
+        return self._immediate("get_drive_parameters", [] if drive is None else [drive])
 
     def get_versions(self) -> dict:
         """Return the version of every part of the robot.

@@ -62,6 +62,8 @@ ALWAYS_OPEN = frozenset({
     "get_hardware",
     # Every part's version (2026-10-21): the runtime, the OS, the description package, the box, each drive.
     "get_versions",
+    # Every drive's parameters (2026-11-16): a read, paced in RTI's poll slot — moves nothing, changes nothing.
+    "read_drive_parameters", "get_drive_parameters",
     # make-it-safer — anyone, always, no exceptions
     "stop", "pause", "disable", "safety_stop", "clear_errors",
     # A jog has NO timeout: the GUI sends one jog on mouse-down and one jog_stop on
@@ -144,6 +146,8 @@ COMMAND_RULES = {
     "capture_telemetry": (IMMEDIATE, None, None, False),
     "stop_capture":      (IMMEDIATE, None, None, False),
     "get_hardware":      (IMMEDIATE, None, None, False),   # utility/hardware_report.py (2026-10-18)
+    "read_drive_parameters": (IMMEDIATE, None, None, False),   # utility/drive_params.py (2026-11-16)
+    "get_drive_parameters": (IMMEDIATE, None, None, False),
     "get_versions":      (IMMEDIATE, None, None, False),   # utility/versions.py (2026-10-21)
     # IK only, moves nothing — any mode, any state, homed or not (`near` defaults to the measured
     # joints, which only picks WHICH solution is returned, never whether one exists).

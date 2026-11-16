@@ -230,6 +230,15 @@ CATALOG = {
                           "firmware image made for the other drive product).",
                           "Read the drive's state in the dashboard's motor table. Clear errors; if it comes back, check "
                           "the drive's firmware and wiring."),
+    "DRIVE_CHANGED_WARNING": _e(2113, "Joint's drive replaced or recalibrated",
+                                "At start the drive of this joint reported another board id (or calibration id) than "
+                                "the one this arm had: the arm was recognised by its other drives. The start-up log "
+                                "names both.",
+                                "Warning only: the robot runs as usual. If the joint homes at its usual spot, that "
+                                "homing stores the new drive and the warning goes; if it homes off its spot, homing "
+                                "asks first.",
+                                "Nothing, if the drive was replaced or recalibrated on purpose: home the robot. If not, "
+                                "check which drive is in that joint."),
     "KT_MISMATCH_WARNING": _e(2110, "Drive's torque constant far from the robot file",
                               "At start a drive reported a torque constant (Kt) further from the robot XML's <kt> "
                               "than <kt_tolerance> in config/system.xml allows. The start-up log names both values.",

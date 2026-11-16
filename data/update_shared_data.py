@@ -289,6 +289,15 @@ def idle_brake_code(motor) -> int:
     return 2 if flags.get('brake_on_idle') else 1
 
 
+def drive_param(motor, number) -> int:
+    """A drive parameter's last answer (Motor.parameters, firmware 109+), 0 when it has not answered."""
+    params = getattr(motor, 'parameters', None)
+    if not params:
+        return 0
+    v = params.get(number)
+    return 0 if v is None else int(v)
+
+
 def update_motor_and_gripper_data(
     *,
     shared_data,
@@ -361,6 +370,8 @@ def update_motor_and_gripper_data(
         if Motor is not None:
             for i in range(joint_num):
                 shared_data.motor['motor_idle_brake'][i] = idle_brake_code(Motor[i])
+                shared_data.motor['motor_board_id'][i] = drive_param(Motor[i], 86)         # the board id (2026-11-16)
+                shared_data.motor['motor_calibration_id'][i] = drive_param(Motor[i], 87)   # the calibration id
 
     elif tick % 5 == 1:
         shared_data.motor['motor_temperature_error'][:] = [
@@ -447,6 +458,7 @@ def update_motor_and_gripper_data(
             shared_data.gripper['gripper_motor_serial'][0]     = Motor_info_data[gm_idx][-1]["SERIAL_NUMBER"]
             if Motor is not None:
                 shared_data.gripper['gripper_motor_idle_brake'][0] = idle_brake_code(Motor[gm_idx])
+                shared_data.gripper['gripper_motor_board_id'][0] = drive_param(Motor[gm_idx], 86)
 
   
         # --- Gripper SI unit conversions ---

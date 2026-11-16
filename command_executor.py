@@ -659,6 +659,7 @@ RTI_ANSWER_CODES = {
     "hall_check": ("HALL_CHECK_REFUSED",),
     "home": ("MODE_REJECTED",),
     "joint_test": ("JOINT_TEST_REFUSED",),
+    "read_drive_parameters": ("RTI_REFUSED",),
     "reload_filters": ("RTI_REFUSED",),
     "reload_recipes": ("RTI_REFUSED",),
     "reload_zones": ("RTI_REFUSED",),
@@ -1260,6 +1261,76 @@ def _handle_get_hardware(args, cid, conn):
     reply(conn, {"id": cid, "status": "ok", "data": hardware_snapshot(
         shared_data, JOINT_NUM, _HAS_CAN_GRIPPER, _sys["pcb_version"], can_link=link,
         driver_types=cfg.get("motor_driver_type"), gripper_driver_type=cfg.get("gripper_driver_type"))})
+
+
+_DRIVE_PARAM_STATES = {0: "not read", 1: "read", 2: "unknown", 3: "no answer", 4: "asked"}
+_DRIVE_READ_STATES = {0: "idle", 1: "reading", 2: "done"}
+
+
+def _drive_nodes():
+    """The drives' names and CAN nodes: J1..J<n>, then the gripper (a CAN gripper only)."""
+    return [(f"J{i + 1}", i) for i in range(JOINT_NUM)] + ([("gripper", JOINT_NUM)] if _HAS_CAN_GRIPPER else [])
+
+
+def _arg_drive(v):
+    """A drive: 1..JOINT_NUM for a joint, JOINT_NUM + 1 for the CAN gripper -> its CAN node (0-based)."""
+    n = len(_drive_nodes())
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= n:
+        raise ValueError(f"a drive 1..{n} ({JOINT_NUM + 1} = the gripper)" if _HAS_CAN_GRIPPER else f"a joint 1..{n}")
+    return v - 1
+
+
+def _handle_read_drive_parameters(args, cid, conn):
+    """read_drive_parameters [drive] — read every parameter of one drive (1..JOINT_NUM, JOINT_NUM + 1 = the CAN
+    gripper) or of all (no argument): RTI asks one parameter every other poll slot (utility/drive_params.py; ~5 s for
+    all, under 1 s for one), the frames per tick unchanged. get_drive_parameters reports the progress and the values.
+    Open to every client, any mode; moves nothing, changes nothing (2026-11-16)."""
+    if len(args) > 1:
+        msg = f"read_drive_parameters takes at most one drive, got {len(args)} arguments"
+        _log_exec_reject(cid, "BAD_ARGS", msg, command="read_drive_parameters")
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
+    try:
+        node = _arg_drive(args[0]) if args else -1
+    except ValueError as e:
+        msg = f"read_drive_parameters: {args[0]!r} — expected {e}"
+        _log_exec_reject(cid, "BAD_ARGS", msg, command="read_drive_parameters")
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
+    _answered(conn, cid, _fmt_command("read_drive_parameters", args), f"read_params:{node}")
+
+
+def _handle_get_drive_parameters(args, cid, conn):
+    """get_drive_parameters [drive] — what the last read found (shared memory, utility/drive_params.py): the read's
+    progress, and per drive when its read finished and each parameter's number, name, value and state (read / not read
+    / unknown to its firmware / no answer / asked). Open to every client; moves nothing (2026-11-16)."""
+    from utility.drive_params import SLOTS, catalogue
+    try:
+        only = _arg_drive(args[0]) if args else None
+    except ValueError as e:
+        msg = f"get_drive_parameters: {args[0]!r} — expected {e}"
+        _log_exec_reject(cid, "BAD_ARGS", msg, command="get_drive_parameters")
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
+    rti = shared_data.rti
+    vals, states, prog, times = (rti["drive_params"], rti["drive_params_state"], rti["drive_params_read"],
+                                 rti["drive_params_time"])
+    names = catalogue()
+    reading = int(prog[3])
+    drives = {}
+    for label, node in _drive_nodes():
+        if only is not None and node != only:
+            continue
+        t = float(times[node])
+        drives[label] = {
+            "read_utc": (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t)) if t > 0 else None),
+            "parameters": [{"number": num, "name": name,
+                            "value": (float(vals[node * SLOTS + num]) if int(states[node * SLOTS + num]) == 1
+                                      else None),
+                            "state": _DRIVE_PARAM_STATES.get(int(states[node * SLOTS + num]), "not read")}
+                           for num, name in names.items()]}
+    label_of = {node: label for label, node in _drive_nodes()}
+    reply(conn, {"id": cid, "status": "ok", "data": {
+        "read": {"state": _DRIVE_READ_STATES.get(int(prog[0]), "idle"), "done": int(prog[1]), "total": int(prog[2]),
+                 "drive": label_of.get(reading) if reading >= 0 else None},
+        "drives": drives}})
 
 
 # The runtime's version (the VERSION file), read once: the executor reports the code it started with.
@@ -2350,6 +2421,8 @@ IMMEDIATE_HANDLERS = {
     "get_status":       _handle_get_status,
     "get_health":       _handle_get_health,            # diagnostics (2026-10-15)
     "get_hardware":     _handle_get_hardware,          # the first-run check's data (2026-10-18)
+    "read_drive_parameters": _handle_read_drive_parameters,   # every drive's parameters (2026-11-16)
+    "get_drive_parameters": _handle_get_drive_parameters,
     "get_versions":     _handle_get_versions,          # every part's version (2026-10-21)
     "set_log_level":    _handle_set_log_level,
     "capture_telemetry": _handle_capture_telemetry,

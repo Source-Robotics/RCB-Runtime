@@ -343,6 +343,7 @@ motor_columns = [
     {'name': 'SW',    'label': 'SW Ver',   'field': 'SW'},
     {'name': 'SN',    'label': 'Serial',   'field': 'SN'},
     {'name': 'idle',  'label': 'When idle', 'field': 'idle'},
+    {'name': 'board', 'label': 'Board ID', 'field': 'board'},
 ]
 
 # What RTI actually PUT ON THE WIRE this tick, in motor space — the literal ints handed to
@@ -374,6 +375,13 @@ def _fmt_kt_src(value):
 IDLE_TOOLTIP = ("What the drive does when it is idle (disabled, Idle, a watchdog trip), as the drive reports it: "
                 "brake = its windings are shorted, so it resists being turned and slows to a stop, but it does not "
                 "hold a position; coast = it turns freely. --- = not read yet, or firmware before 109.")
+
+
+def _fmt_board(arr, i=0):
+    """A drive's board id (parameter 86, 2026-11-16) as 8 hex digits; --- when not read (0) or no field yet."""
+    if arr is None or not int(arr[i]):
+        return "---"
+    return f"{int(arr[i]) & 0xFFFFFFFF:08X}"
 
 
 def _fmt_idle(arr, i=0):
@@ -856,6 +864,7 @@ with ui.tabs().classes("w-full") as tabs:
     tab_preview = ui.tab('Plan Preview',   icon='play_circle')
     tab_plots   = ui.tab('Plots',          icon='show_chart')
     tab_firmware = ui.tab('Firmware',      icon='memory')
+    tab_drive_params = ui.tab('Drive parameters', icon='settings_input_component')   # gui_drive_params_tab.py
     tab_first_run = ui.tab('First run',    icon='fact_check')  # the first-run check (gui_first_run_tab.py)
     tab_walls   = ui.tab('Walls',          icon='fence')     # TEMPORARY freedrive wall tuner (gui_walls_tab.py)
     tab_blocks  = ui.tab('Blocks',         icon='extension')  # block programming (blockly/); no panel, see below
@@ -1043,6 +1052,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             ui.label("SW Version");       grp_motor_sw_lbl    = ui.label("---")
             ui.label("Serial");           grp_motor_sn_lbl    = ui.label("---")
             ui.label("When idle").tooltip(IDLE_TOOLTIP); grp_motor_idle_lbl = ui.label("---")
+            ui.label("Board ID");         grp_motor_board_lbl = ui.label("---")
 
         ui.label("Gripper Motor Error Flags").classes("text-sm font-semibold mb-1 text-gray-600 uppercase tracking-wide")
         grp_motor_err_columns = [
@@ -1898,6 +1908,20 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         from gui_walls_tab import add_walls_tab
         add_walls_tab(_exec, shared_data, JOINTS, is_visible=lambda: _active_tab_name(tabs.value) == 'Walls',
                       poll_fn=lambda fn, label: _page_sender().submit(fn, label=label))   # not "activity"
+
+    # ─── Drive parameters (every drive's parameters, read on demand; gui_drive_params_tab.py, 2026-11-16) ───
+    with ui.tab_panel(tab_drive_params):
+        try:
+            from gui_drive_params_tab import add_drive_params_tab
+            _grip_raw = _xml_cfg.get('gripper_CAN_gripper', 0)          # (_gui_has_can_gripper is defined later)
+            add_drive_params_tab(shared_data, JOINTS,
+                                 not (isinstance(_grip_raw, float) and math.isnan(_grip_raw)) and int(_grip_raw) == 1,
+                                 _xml_cfg,
+                                 poll_fn=lambda fn, label: _page_sender().submit(fn, label=label),
+                                 is_visible=lambda: _active_tab_name(tabs.value) == 'Drive parameters')
+        except Exception:
+            logger.exception("Drive parameters tab unavailable")
+            ui.label("Drive parameters tab unavailable — see logs/gui.log").classes("text-negative")
 
     # ─── First run (the first-run check: tools/first_run.py as a child process; gui_first_run_tab.py, 2026-10-27) ───
     with ui.tab_panel(tab_first_run):
@@ -3851,6 +3875,7 @@ def update_tables():
             'SW':    int(shared_data.motor['SOFTWARE_VERSION'][i]),
             'SN':    int(shared_data.motor['SERIAL_NUMBER'][i]),
             'idle':  _fmt_idle(shared_data.motor.get('motor_idle_brake'), i),
+            'board': _fmt_board(shared_data.motor.get('motor_board_id'), i),
         } for i in range(JOINTS)]
         motor_table.update()
 
@@ -3949,6 +3974,7 @@ def update_tables():
         grp_motor_sw_lbl.text   = str(int(shared_data.gripper['gripper_motor_sw_version'][0]))
         grp_motor_sn_lbl.text   = str(int(shared_data.gripper['gripper_motor_serial'][0]))
         grp_motor_idle_lbl.text = _fmt_idle(shared_data.gripper.get('gripper_motor_idle_brake'))
+        grp_motor_board_lbl.text = _fmt_board(shared_data.gripper.get('gripper_motor_board_id'))
 
         grp_motor_err_table.rows = [{
             'temp':  int(shared_data.gripper['gripper_motor_temp_error'][0]),

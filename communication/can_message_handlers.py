@@ -183,6 +183,69 @@ def send_brake_on_idle(Motor, nodes):
         Motor[i].Send_Brake_Coast(True)
 
 
+# The drives' identity for recognising the arm (2026-11-16, robotics/homing_arms.recognise_boards): parameter 86 = the
+# board id (from the chip, never changes), 87 = a calibration id (new at every calibration, 0 = none). Firmware 109+.
+PARAM_BOARD_ID = 86
+PARAM_CALIBRATION_ID = 87
+_PARAM_REPLY_CMD_ID = 38            # RESPOND_PARAMETER_ID: [number][value i32], or [number] alone (unknown number)
+
+
+def request_board_ids(Motor, nodes):
+    """Ask each drive in `nodes` for its board / calibration id, without waiting: the replies go through the normal
+    receive path into the motor object (Motor[i].parameters) — after a reconnect a swapped drive reports its own. The
+    old values are dropped first, so a drive that does not answer reads as unknown, never as the one before it."""
+    for i in nodes:
+        params = getattr(Motor[i], "parameters", None)
+        if params is not None:
+            params.pop(PARAM_BOARD_ID, None)
+            params.pop(PARAM_CALIBRATION_ID, None)
+        Motor[i].Send_Get_Parameter(PARAM_BOARD_ID)
+        Motor[i].Send_Get_Parameter(PARAM_CALIBRATION_ID)
+
+
+def board_ids_of(Motor, nodes):
+    """({node: board id as 8 hex digits or None}, {node: calibration id or None}) from what the drives last answered."""
+    from robotics.homing_arms import board_text
+    boards, cals = {}, {}
+    for i in nodes:
+        params = getattr(Motor[i], "parameters", None) or {}
+        boards[i] = board_text(params.get(PARAM_BOARD_ID))
+        c = params.get(PARAM_CALIBRATION_ID)
+        cals[i] = None if c is None else int(c)
+    return boards, cals
+
+
+def fetch_board_ids(motors, communication, nodes, timeout_s=0.3, retries=2):
+    """RTI's start (2026-11-16): ask each node for its board and calibration id and wait for each answer, as the Kt
+    fetch does. Returns board_ids_of(...). A node that does not answer (firmware before 109) reads as None."""
+    for i in nodes:
+        for number in (PARAM_BOARD_ID, PARAM_CALIBRATION_ID):
+            _read_param_for_node(motors, communication, i, number, timeout_s, retries)
+    return board_ids_of(motors, nodes)
+
+
+def _read_param_for_node(motors, communication, node_id, number, timeout_s, retries):
+    """Request one parameter of one node and wait for its answer (the library stores it in motor.parameters)."""
+    m = motors[node_id]
+    for _ in range(retries):
+        _drain_pending_can_messages(communication)
+        m.parameters.pop(number, None)
+        m.unknown_parameter = None
+        m.Send_Get_Parameter(number)
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
+            message, msg_ID = communication.receive_can_messages(
+                timeout=min(0.05, max(0.0, deadline - time.perf_counter())))
+            if message is None or msg_ID is None or msg_ID[0] != node_id or msg_ID[1] != _PARAM_REPLY_CMD_ID:
+                continue
+            m.UnpackData(message, msg_ID)
+            if number in m.parameters:
+                return m.parameters[number]
+            if m.unknown_parameter == number:
+                return None
+    return None
+
+
 def _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_velocity_limit, motor_Ilim,
                   motor_KPP, motor_KP, motor_KD, motor_KPIQ, motor_KIIQ, motor_KPV, motor_KIV, motor_voltage_limit):
     """Re-send one joint's config after it recovered (handle_motor_reconnect's storm guard decides when)."""
@@ -200,6 +263,7 @@ def _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_v
                        motor_index=i,
                        voltage_limit=motor_voltage_limit)
     send_brake_on_idle(Motor, (i,))      # a rebooted drive restores its SAVED brake-or-coast (firmware 110)
+    request_board_ids(Motor, (i,))       # a swapped drive reports its own board (2026-11-16): read at the next homing
     write_motor_config_to_shared(
         shared_data, joint_num,
         KPP=motor_KPP, KPV=motor_KPV, KIV=motor_KIV,
@@ -423,6 +487,9 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
     # --- Handle Round-Robin Status Polling ---
     total_motors = joint_num + active_CAN_gripper  # includes gripper motor when present
     state["device_info_counter"] += 1
+    params = state.get("params")                   # a drive-parameter read on demand (utility/drive_params.py)
+    if params is not None and params.active:
+        params.collect(motors)
     step = state["step"]
     idx = state["joint_index"]
 
@@ -436,6 +503,12 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
     # data/update_shared_data.py copies what the dashboard shows.
     elif 500 <= state["device_info_counter"] < (500 + total_motors):
         motors[idx].Send_Respond_Identity()
+    elif params is not None and params.queue and params.turn():      # (only while requests are left to ask)
+        # A drive-parameter read (2026-11-16): every other free poll slot asks ONE parameter instead of a telemetry
+        # request — the frames per tick stay what they are; the answer is copied a few ticks later (collect, above).
+        # The round robin waits for the next tick, so every drive keeps its telemetry (at half the rate meanwhile).
+        params.send_next(motors)
+        return
     else:
         # Normal Telemetry
         if step == 0:

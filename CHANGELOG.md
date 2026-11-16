@@ -59,6 +59,17 @@ What changed in each version of the RCB runtime. The newest version is at the to
   the bare Flange's J6 gets 360 deg (nothing turns with it, and it can start at any orientation); the grippers,
   Vacuum and MHZ2-10D keep 150 (they start from their usual pose). Missing = no limit, as before. Until now J6, which
   homes to a Hall sensor, was limited only by its 15 s timeout (about one full turn).
+- The arm is recognised by its drives' board ids before homing (drive firmware 109+): RTI reads each drive's board id
+  and calibration id at start (and a drive's again after it reconnects), and the start-up log names the arm. Homing then
+  checks every joint against that arm, the first one too. Another arm's boards = a new arm, learned on its first homings
+  without "Learn a new arm"; a replaced or recalibrated drive (5 of the 6 boards still match) = the warning
+  `J<n>:DRIVE_CHANGED_WARNING` (2113) until a homing stores it. An arm learned before gets its boards at its next homing.
+  The dashboard shows the board ids (Motor tab, the Gripper tab) and which arm they name (System Info, Arms).
+- A Drive parameters tab and `read_drive_parameters()` / `get_drive_parameters()`: every parameter each drive holds
+  (about 90: gains and limits, the motor model, the control loops, the watchdog, the build, the board ids), read on
+  demand — "Read all" or one drive, and by default when the tab opens (a switch, remembered per browser). RTI asks one
+  parameter every other status poll, so the frames per tick and the control loop stay as they are (about 5 s for every
+  drive). The gains and limits RTI sends from the robot XML show the XML's value too when the drive holds another.
 
 ### Changed
 

@@ -28,6 +28,16 @@ gripper) is stored per gripper, so a new gripper is learned instead of failing. 
 kept; the reference is their circular mean within one motor revolution. A shift of a WHOLE motor revolution cannot be
 told apart from the multi-turn count after a power cycle and is not caught.
 
+2026-11-16 (user: "swapping arms and the box detecting them"; TODO/driver_110_rtb15_plan.md item 1): with drive
+firmware 110 every drive reports its board id (parameter 86, from the chip, never changes) and a calibration id (87, new
+at every calibration). RTI reads them at start; `recognise_boards` names the arm BEFORE homing — then homing checks
+every joint against it, the first one too (an off joint asks: the controller's question). The user's decisions: no arm
+with these boards = a new arm, learned automatically (no 'learn a new arm' request needed); BOARD_MATCH_MIN of the six
+boards = still that arm with a drive replaced (or a calibration id changed): DRIVE_CHANGED_WARNING until a homing stores
+the new one; arms learned before (no boards stored) get theirs at their next homing, and until every arm has its boards
+an unknown set is decided by homing as before. The table: each arm's "boards" {"J1": "3FDC70EE", ...} and
+"calibrations" {"J1": 123, ...}.
+
 RTI: the table is read at start; RTI's real-time thread only touches the dict in memory — a worker thread that moves
 itself off RTI's core (as utility/incident_dump does) re-reads the file when a homing starts (to see `tools/homing_arms.py`
 edits) and writes it after one ends. `tools/homing_arms.py`: list, name, forget, accept the last failed homing.
@@ -52,6 +62,7 @@ APPROACH_MIN = 3       # homings with an approach before that spot is learned (u
 SAME_ARM_MIN = 4       # joints that must agree with a known arm for "this IS that arm" (6 joints; by chance ~1e-4)
 WINDOW = 10            # latches kept per joint
 HISTORY = 100          # homings kept per arm (the dashboard's history, 2026-10-09)
+BOARD_MATCH_MIN = 5    # of the six joint boards: still that arm, one drive replaced (user, 2026-11-16)
 
 
 def make_uid(prefix: str, seed: str) -> str:
@@ -316,6 +327,68 @@ def accept_last(table: dict, gears, gripper_dependent, counts) -> str:
     return (f"{arm_label(arm)}: new reference for " + ", ".join(changed)) if changed else "nothing was off — cleared"
 
 
+def board_text(value) -> str | None:
+    """A drive's board id as 8 hex digits (parameter 86); None for no answer or 0."""
+    if value is None:
+        return None
+    v = int(value) & 0xFFFFFFFF
+    return f"{v:08X}" if v else None
+
+
+def recognise_boards(table: dict, boards: dict, calibrations: dict | None = None) -> dict:
+    """The connected arm from its drives' board ids, before homing (2026-11-16). boards {joint index: hex text or None},
+    calibrations {joint index: int or None}. -> {"kind", "arm", "changed", "text"}; kind:
+      "unread"  — a joint's drive gave no board id (firmware before 109, not answering): homing recognises it, as before
+      "known"   — the arm with these boards (at least BOARD_MATCH_MIN of them); "changed" = [(j, "board" | "calibration",
+                  old, new)] for a drive replaced or recalibrated since its boards were stored
+      "unbound" — no arm has them, and some arm's boards are not stored yet: homing decides (and stores them)
+      "new"     — no arm has them, every arm's boards are stored: a new arm, learned on its first homings"""
+    calibrations = calibrations or {}
+    if not boards or any(b is None for b in boards.values()):
+        missing = ", ".join(f"J{j + 1}" for j, b in sorted(boards.items()) if b is None)
+        return {"kind": "unread", "arm": None, "changed": [],
+                "text": f"no board id from {missing or 'the drives'} (firmware before 109?): the arm is recognised by "
+                        f"homing, as before"}
+    arm = _arm_by_boards(table, boards)
+    if arm is not None:
+        changed = _drive_changes(arm, boards, calibrations)
+        text = f"arm recognised by its drive boards: {arm_label(arm)}"
+        if changed:
+            text += " — " + "; ".join(f"J{j + 1}'s drive {'board was replaced' if what == 'board' else 'was recalibrated'}"
+                                      for j, what, _, _ in changed) + " (stored at its next homing)"
+        return {"kind": "known", "arm": arm["id"], "changed": changed, "text": text}
+    if any(not a.get("boards") for a in table["arms"]):
+        return {"kind": "unbound", "arm": None, "changed": [],
+                "text": "no arm with these drive boards yet — homing recognises the arm (and stores its boards)"}
+    return {"kind": "new", "arm": None, "changed": [],
+            "text": "a new arm: no known arm has these drive boards — it is learned on its first homings"}
+
+
+def _arm_by_boards(table: dict, boards: dict) -> dict | None:
+    """The stored arm sharing the most boards with `boards`, if at least BOARD_MATCH_MIN of them (all, for fewer)."""
+    best: tuple | None = None
+    for arm in table["arms"]:
+        stored = arm.get("boards") or {}
+        if stored:
+            agree = sum(1 for j, b in boards.items() if stored.get(f"J{j + 1}") == b)
+            if best is None or agree > best[0]:
+                best = (agree, arm)
+    return best[1] if best is not None and best[0] >= min(BOARD_MATCH_MIN, len(boards)) else None
+
+
+def _drive_changes(arm: dict, boards: dict, calibrations: dict) -> list:
+    """[(j, "board" | "calibration", stored, now)]: a board other than the stored one, or on the stored board a
+    calibration id other than the stored one (both known)."""
+    stored, cals = arm.get("boards") or {}, arm.get("calibrations") or {}
+    changed = [(j, "board", stored.get(f"J{j + 1}"), b) for j, b in sorted(boards.items())
+               if stored.get(f"J{j + 1}") != b]
+    for j, c in sorted(calibrations.items()):
+        old = cals.get(f"J{j + 1}")
+        if stored.get(f"J{j + 1}") == boards.get(j) and c is not None and old is not None and old != c:
+            changed.append((j, "calibration", old, c))
+    return changed
+
+
 def load_table(path) -> dict:
     try:
         with open(path) as fh:
@@ -349,6 +422,19 @@ class HomingArms:
         self._thread = None
         self._so_far_arm = None        # check_so_far: the arm recognised from the first joints homed
         self._so_far_off = False       # ... none recognised: nothing judged before the end
+        # 2026-11-16: the drives' board / calibration ids ({joint index: ...}; set_boards), what they say (by_boards),
+        # where RTI reads them again when a homing starts (boards_provider: a drive may have been swapped meanwhile),
+        # and the start's warnings for the error pass: base_warnings (RTI's Kt warnings) + a J{n}:DRIVE_CHANGED_WARNING
+        # per changed drive = config_warnings (one tuple, rebuilt only when it changes: RTI reads it every tick)
+        self.boards: dict = {}
+        self.calibrations: dict = {}
+        self.by_boards: dict = {"kind": "unread", "arm": None, "changed": [], "text": ""}
+        self.boards_provider = None
+        self.base_warnings: tuple = ()
+        self.config_warnings: tuple = ()
+        self._boards_pending = False   # recognise again at the first check of a homing (the table re-read by then)
+        self._new_by_boards = False    # this homing learns a new arm: no known arm has its boards
+        self._board_note: str | None = None   # the log line of a homing that starts with its arm known by its boards (once)
 
     def start(self) -> None:
         if self.path and self._thread is None:
@@ -359,6 +445,11 @@ class HomingArms:
         """Pick up `tools/homing_arms.py` edits made since the last homing (read off the RT thread)."""
         self._so_far_arm = None
         self._so_far_off = False
+        self._new_by_boards = False
+        if self.boards_provider is not None:              # a drive swapped since the start reports its own ids
+            boards, cals = self.boards_provider()
+            self.boards, self.calibrations = dict(boards), dict(cals)
+        self._boards_pending = bool(self.boards)
         if self._thread is not None:
             self._q.put(("load", None))
 
@@ -372,6 +463,8 @@ class HomingArms:
         fresh, self._fresh = self._fresh, None
         if fresh is not None:
             self.table = fresh
+        if self._boards_pending:
+            self._boards_at_homing()
         if self._so_far_off:
             return {"kind": "skip"}
         keys = {i: joint_key(i, self.gripper_dependent, self.gripper) for i in latches}
@@ -389,9 +482,11 @@ class HomingArms:
             self._so_far_off = True
             if closest is None:                 # still learning the first arm (or nothing comparable): the end check
                 return {"kind": "skip"}
-            if self.table.get("learn_next"):
-                return {"kind": "skip", "text": "the first joint(s) homed match none of the known arms — "
-                                                "learning a new arm (requested: 'learn a new arm on the next homing')"}
+            if self.table.get("learn_next") or self._new_by_boards:
+                because = ("no known arm has these drive boards" if self._new_by_boards
+                           else "requested: 'learn a new arm on the next homing'")
+                return {"kind": "skip", "text": f"the first joint(s) homed match none of the known arms — "
+                                                f"learning a new arm ({because})"}
             # 2026-10-14 (user): no longer "another arm?" — a joint that false-stalled first (J1 could not turn in a
             # folded pose) made every later joint unchecked and the sequence went on to the gripper on wrong references
             _, arm, off = closest
@@ -407,7 +502,8 @@ class HomingArms:
             return {"kind": "skip"}
         _, _, off, devs = compare(arm, {j: latches[j]}, keys, self.counts, self.gears)
         if not off:
-            return {"kind": "ok"}
+            note, self._board_note = self._board_note, None
+            return {"kind": "ok", "text": note} if note else {"kind": "ok"}
         verdict = {"kind": "fault", "arm": arm["id"], "off": off, "devs": devs, "keys": keys}
         apply(self.table, verdict, latches, self.gripper, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()), {},
               self.prefix)
@@ -439,7 +535,7 @@ class HomingArms:
         ensure_uids(self.table, self.prefix)
         utc = utc or time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         verdict = judge(self.table, latches, self.gripper, self.gears, self.gripper_dependent, self.counts)
-        learn = bool(self.table.pop("learn_next", False))
+        learn = bool(self.table.pop("learn_next", False)) or self._new_by_boards
         unknown = self._unknown_at_end(latches) if verdict["kind"] == "new" and not learn else None
         if unknown is not None:
             # 2026-10-14 (user): a new arm only on request — here no known arm matches and none was requested
@@ -448,9 +544,70 @@ class HomingArms:
             return unknown
         apply(self.table, verdict, latches, self.gripper, utc, stats, self.prefix)
         verdict["text"] = describe(self.table, verdict)
+        stored = self._store_boards(verdict)
+        if stored:
+            verdict["text"] += f" — {stored}"
         if self._thread is not None:
             self._q.put(("save", copy.deepcopy(self.table)))
         return verdict
+
+    # ---- the drives' board ids (2026-11-16) ------------------------------------------------------------------------
+    def set_boards(self, boards: dict, calibrations: dict) -> dict:
+        """RTI's start: the arm joints' board ids {j: hex text | None} and calibration ids {j: int | None}. Recognises
+        the arm (recognise_boards) and sets the start's warnings; returns the recognition (its "text" for the log)."""
+        self.boards, self.calibrations = dict(boards), dict(calibrations)
+        self.by_boards = recognise_boards(self.table, self.boards, self.calibrations)
+        self._set_drive_warnings()
+        return self.by_boards
+
+    def set_base_warnings(self, warnings) -> None:
+        """RTI's other start-up warnings (the Kt check): config_warnings = these + the drive changes."""
+        self.base_warnings = tuple(warnings)
+        self._set_drive_warnings()
+
+    def _set_drive_warnings(self) -> None:
+        drive = tuple(sorted({f"J{j + 1}:DRIVE_CHANGED_WARNING" for j, _, _, _ in self.by_boards.get("changed", [])}))
+        self.config_warnings = self.base_warnings + drive
+
+    def _boards_at_homing(self) -> None:
+        """A homing's first check (the table re-read): recognise the arm by its boards again — a KNOWN arm is then
+        checked joint by joint from its first joint (an off joint asks); no arm with these boards (and every arm's
+        boards stored) = this homing learns a new arm."""
+        self._boards_pending = False
+        self.by_boards = recognise_boards(self.table, self.boards, self.calibrations)
+        self._set_drive_warnings()
+        kind, arm_id = self.by_boards["kind"], self.by_boards["arm"]
+        arm = next((a for a in self.table["arms"] if a["id"] == arm_id), None)
+        if kind == "known" and arm is not None and arm.get("known"):
+            self._so_far_arm = arm_id
+            self._board_note = f"{self.by_boards['text']} — each joint homed is checked at once, the first one too"
+        elif kind == "new":
+            self._new_by_boards = True
+
+    def _store_boards(self, verdict: dict) -> str:
+        """After a homing that recognised (or learned) an arm by where its joints homed: store its drives' boards when
+        it has none yet, or when the boards recognised THIS arm with a drive changed. Returns what was done ('' =
+        nothing). Never when the boards named another arm (said in the log instead)."""
+        if verdict.get("kind") not in ("known", "learning", "relearn", "new") or not self.boards \
+                or any(b is None for b in self.boards.values()):
+            return ""
+        arm = next((a for a in self.table["arms"] if a["id"] == verdict.get("arm")), None)
+        if arm is None:
+            return ""
+        named = self.by_boards.get("arm")
+        if named is not None and named != arm["id"]:
+            other = next((a for a in self.table["arms"] if a["id"] == named), None)
+            return (f"its drive boards belong to arm {arm_label(other) if other else named}: not stored (drives moved "
+                    f"between arms?)")
+        boards = {f"J{j + 1}": b for j, b in sorted(self.boards.items())}
+        cals = {f"J{j + 1}": int(c) for j, c in sorted(self.calibrations.items()) if c is not None}
+        if arm.get("boards") == boards and (arm.get("calibrations") or {}) == cals:
+            return ""
+        first = not arm.get("boards")
+        arm["boards"], arm["calibrations"] = boards, cals
+        self.by_boards = recognise_boards(self.table, self.boards, self.calibrations)
+        self._set_drive_warnings()
+        return "its drive boards stored" if first else "its changed drive stored"
 
     def _unknown_at_end(self, latches: dict) -> dict | None:
         """The end check's verdict when no known arm matches and no new arm was requested: FAILED, each joint off the

@@ -106,7 +106,8 @@ from hardware.can_hardware import scan_can_bus, initialize_can_communication
 from config.networking import RT_CPU_CORE, zmq_listener, zmq_sender_setup, zmq_answer_sender_setup, udp_socket_receive_setup, udp_socket_send_setup, broadcast_udp_telemetry, init_rti_receive_socket, drain_rti_udp, RTI_PORT_SENDER, init_rti_tcp_listener, accept_rti_tcp, drain_rti_tcp, send_rti_tcp, drain_rti_tcp_backlog
 from communication.can_message_handlers import receive_and_process_can_messages, handle_polling_and_overrides, update_can_connection_status, drain_can_discard
 from communication.can_message_handlers import send_gripper_commands, send_motor_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
-from communication.can_message_handlers import send_brake_on_idle
+from communication.can_message_handlers import send_brake_on_idle, fetch_board_ids, board_ids_of
+from utility.drive_params import ParamRead, catalogue as drive_param_catalogue
 from utility.kt_init import resolve_and_preload_kt
 from utility.tick_types import TickContext, TickResult
 from utility.mode_dispatch import build_mode_dispatch, dispatch_step
@@ -688,6 +689,11 @@ def main():
 
 
     scheduled_state = {"step": 0,"joint_index": 0,"device_info_counter": 0}
+    # Every drive's parameters, read on demand inside the poll slot (utility/drive_params.py, 2026-11-16; read_params)
+    param_read = ParamRead(shared_data.rti["drive_params"], shared_data.rti["drive_params_state"],
+                           shared_data.rti["drive_params_read"], shared_data.rti["drive_params_time"],
+                           drive_param_catalogue())
+    scheduled_state["params"] = param_read
     # Optional override function (set externally when needed)
     scheduled_override_queue = deque()  # Each item is a tuple: (function, repeat_count)
     current_override = {"fn": None,"count": 0}
@@ -780,6 +786,25 @@ def main():
         motor_kt, gripper_kt, active_CAN_gripper,
         Motor_Kt_data, shared_data,
     )
+
+    # ==========================================================================
+    # The drives' board / calibration ids (2026-11-16, user: "swapping arms and the box detecting them"): the arm is
+    # recognised by its boards BEFORE homing (robotics/homing_arms.recognise_boards); a drive replaced or recalibrated
+    # = J{n}:DRIVE_CHANGED_WARNING until a homing stores it. Read again at each homing's start (a swapped drive's
+    # reconnect asks for them: request_board_ids). The start's warnings for the error pass live in the arm check.
+    # ==========================================================================
+    _boards, _cals = fetch_board_ids(Motor, communication1, range(joint_num + (1 if active_CAN_gripper else 0)))
+    _arm_check = homing_ctrl.arm_check
+    _by_boards = _arm_check.set_boards({j: _boards[j] for j in range(joint_num)},
+                                       {j: _cals[j] for j in range(joint_num)})
+    _arm_check.set_base_warnings(_kt_warnings)
+    _arm_check.boards_provider = lambda: board_ids_of(Motor, range(joint_num))
+    log_startup.info("drive boards: " + ", ".join(f"J{j + 1} {_boards[j] or '?'}" for j in range(joint_num))
+                     + (f", gripper {_boards[joint_num] or '?'}" if active_CAN_gripper else "")
+                     + f" — {_by_boards['text']}")
+    for _j, _what, _old, _new in _by_boards["changed"]:
+        log_startup.warning(f"J{_j + 1}: its drive's {_what} id changed: {_old} -> {_new} (still this arm: the other "
+                            f"drives' boards match) — stored at the next homing; if it homes off its spot, homing asks")
 
     # The start-up clear (2026-10-05) is sent in the loop at tick BOOT_CLEAR_TICK since 2026-10-13: the drivers keep the
     # watchdog trip the LAST run's end left them (the Kt replies above carry err=1 from every node — before the clear,
@@ -1524,6 +1549,23 @@ def main():
             log_activity(_rti_activity_logger, "RTI", "info", "FREE_JOINT", id=st.command_id,
                          message=f"J{n} free for hand turning (current limit 0)")
 
+    def _handle_read_params(cmd_msg, cmd_dict):
+        """read_params:<node> — read every parameter of drive <node> (0-based: the joints, then the gripper), or of all
+        drives with -1 (utility/drive_params.py, 2026-11-16: the dashboard's Drive parameters tab, read_drive_parameters).
+        Paced inside the poll slot — the frames per tick stay the same; a new read replaces one running. Any mode."""
+        what = cmd_msg.split(":", 1)[1].strip() if ":" in cmd_msg else "-1"
+        nodes_all = list(range(joint_num + (1 if active_CAN_gripper else 0)))
+        try:
+            node = int(what)
+        except ValueError:
+            node = -2
+        if node != -1 and node not in nodes_all:
+            _refused(log_handler, "read_params: %r is no drive here (0..%d, or -1 for all)", what, len(nodes_all) - 1)
+            return
+        param_read.start(nodes_all if node == -1 else [node])
+        log_handler.info("reading the parameters of %s (%d requests, paced in the poll slot)",
+                     "every drive" if node == -1 else f"node {node}", int(shared_data.rti["drive_params_read"][2]))
+
     def _handle_homing_answer(cmd_msg, cmd_dict):
         """homing_answer:accept — the answer to homing's question (2026-11-16, user: "pause and ask";
         robotics/homing/controller.py): a joint homed off where this arm's joint always homes, and homing holds the arm
@@ -2233,6 +2275,7 @@ def main():
         "free_joint":        _handle_free_joint,
         "joint_test":        _handle_joint_test,
         "homing_answer":     _handle_homing_answer,
+        "read_params":       _handle_read_params,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
@@ -2548,8 +2591,10 @@ def main():
             rti_errors=rti_handler.take_command_errors(),
             # J{i}:CAN_REPLY_MISSED_WARNING (warn-only) — a joint's replies missing RTI's read too often.
             can_warnings=can_reply_monitor.warnings,
-            # J{n}:KT_MISMATCH_WARNING (warn-only, the start's Kt check) — a constant tuple, no per-tick work.
-            config_warnings=_kt_warnings,
+            # J{n}:KT_MISMATCH_WARNING (the start's Kt check) + J{n}:DRIVE_CHANGED_WARNING (a drive replaced since
+            # the arm's boards were stored; gone once a homing stores it), warn-only — one tuple the arm check
+            # rebuilds only when it changes: an attribute read per tick.
+            config_warnings=homing_ctrl.arm_check.config_warnings,
             # In simulation (utility/sim_mode) the loop has no real-time core or priority and shares two cores with the
             # simulator: a critically slow loop is reported as LOOP_DEGRADED, never latched — timing is not simulated.
             loop_degraded=_loop_degraded or (_SIM and _loop_critical),

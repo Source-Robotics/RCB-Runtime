@@ -103,6 +103,8 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
         ui.label("Arms (homing)").classes("text-sm font-semibold text-gray-600 uppercase tracking-wide")
         ui.label(HELP).classes("text-xs text-gray-500 mb-2")
         last_lbl = ui.label("").classes("text-sm mb-2")
+        # 2026-11-16: which arm the drives' board ids name, before any homing (robotics/homing_arms.recognise_boards)
+        boards_lbl = ui.label("").classes("text-sm mb-2")
         table_el = ui.table(columns=columns, rows=[], row_key="id").classes("w-full").props("dense flat")
         with ui.row().classes("items-end gap-3 mt-2"):
             arm_sel = ui.select(options={}, label="Arm").classes("w-48")
@@ -224,6 +226,7 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
         except OSError:
             mtime = 0.0
         if mtime == state["mtime"]:
+            show_boards()
             return
         state["mtime"] = mtime
         state["table"] = t = ha.load_table(path)
@@ -247,6 +250,22 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
         lf = t.get("last_failed")
         failed_row.set_visibility(bool(lf))
         failed_lbl.set_text(f"Stored failed homing: {lf['arm']} at {dt.fmt_utc_text(lf['utc'], '%Y-%m-%d %H:%M:%S %Z')}" if lf else "")
+        show_boards()
+
+    def show_boards():
+        """The connected arm by its drives' board ids (shared memory; 0 = not read yet) — read with .get: a dashboard
+        started before the field existed has none."""
+        motor = getattr(shared_data, "motor", None)
+        ids = motor.get("motor_board_id") if isinstance(motor, dict) else None
+        if ids is None:
+            boards_lbl.set_text("")
+            return
+        cal = motor.get("motor_calibration_id")
+        boards = {j: ha.board_text(int(ids[j])) for j in range(joint_num)}
+        cals = {j: (int(cal[j]) or None) if cal is not None else None for j in range(joint_num)}
+        rec = ha.recognise_boards(state["table"], boards, cals)
+        boards_lbl.set_text("Connected now: " + rec["text"])
+        boards_lbl.classes(replace="text-sm mb-2 " + ("text-orange-700" if rec["changed"] else "text-gray-700"))
 
     def show_joints():
         arm = next((a for a in state["table"]["arms"] if a["id"] == arm_sel.value), None)
@@ -260,4 +279,5 @@ def add_homing_arms_card(shared_data, cfg: dict, joint_num: int, path: str | Non
     return {"refresh": refresh, "table": table_el, "last": last_lbl, "select": arm_sel, "name": name_in,
             "rename": do_rename, "forget_now": forget_now, "accept_now": accept_now, "failed_row": failed_row,
             "buttons": (rename_btn, forget_btn, accept_btn), "joints": joints_el, "history": history_el, "state": state,
-            "learn": do_learn, "learn_now": learn_now, "learn_btn": learn_btn, "learn_lbl": learn_lbl}
+            "learn": do_learn, "learn_now": learn_now, "learn_btn": learn_btn, "learn_lbl": learn_lbl,
+            "boards": boards_lbl, "show_boards": show_boards}

@@ -311,6 +311,10 @@ def setup(joints: int = 6, force_reinit: bool = False):
         # What the drive does when idle, from its identity reply (2026-11-16): 2 = brake, 1 = coast, 0 = not read
         # (data/update_shared_data.idle_brake_code)
         ("motor_idle_brake",    np.int32),
+        # The drive's board id (parameter 86) and calibration id (87), 0 = not read (2026-11-16: the arm is recognised
+        # by its boards, robotics/homing_arms.recognise_boards). int64: a board id is an unsigned 32-bit number.
+        ("motor_board_id",      np.int64),
+        ("motor_calibration_id", np.int64),
         ("HALL_INDEX",          np.int32),
         ("ADDITIONAL_PIN2",     np.int32),
         ("HALL_EDGE_DETECT",    np.int32),
@@ -756,6 +760,10 @@ def setup(joints: int = 6, force_reinit: bool = False):
     # (deg) while it is in the question, NaN otherwise.
     for name, count in [("sc_pair_gaps", 49), ("jog_ref", joint_num), ("jog_dir", joint_num),
                         ("can_read_first", 1), ("command_valid", 2), ("homing_question", 1 + joint_num),
+                        # every drive's parameters read on demand (utility/drive_params.py, 2026-11-16): values and
+                        # their state [node * 256 + number], the read's progress, each node's read time
+                        ("drive_params", (joint_num + 1) * 256), ("drive_params_state", (joint_num + 1) * 256),
+                        ("drive_params_read", 5), ("drive_params_time", joint_num + 1),
                         ("hall_check_joint", 1), ("hall_check_pin", 1), ("hall_check_changes", 1),
                         ("hall_check_edge_deg", 2), ("free_joint", 1), ("joint_test", 8)]:
         shm, arr = _attach_or_create(name, np.float64, count)
@@ -815,6 +823,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "gripper_ticks_per_meter",       # Conversion factor: encoder ticks per meter of stroke
         "gripper_gear_r",                # Gear pitch radius (m), loaded from XML
         "gripper_stroke_m",              # Full stroke length (m), loaded from XML
+        "gripper_motor_board_id",        # the gripper drive's board id (parameter 86), 0 = not read (2026-11-16)
     ]:
         shm, arr = _attach_or_create(name, np.float64, 1)
         gripper_shms[name] = shm
