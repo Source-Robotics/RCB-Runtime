@@ -67,7 +67,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
   The dashboard shows the board ids (Motor tab, the Gripper tab) and which arm they name (System Info, Arms).
 - A Drive parameters tab and `read_drive_parameters()` / `get_drive_parameters()`: every parameter each drive holds
   (about 90: gains and limits, the motor model, the control loops, the watchdog, the build, the board ids), read on
-  demand — "Read all" or one drive, and by default when the tab opens (a switch, remembered per browser). RTI asks one
+  demand — "Read all" or one drive, and by default when the tab opens (a switch, remembered per browser) — and once
+  by RTI itself 4 s after it starts, so they are at hand from the start. RTI asks one
   parameter every other status poll, so the frames per tick and the control loop stay as they are (about 5 s for every
   drive). The gains and limits RTI sends from the robot XML show the XML's value too when the drive holds another.
 

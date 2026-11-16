@@ -694,6 +694,13 @@ def main():
                            shared_data.rti["drive_params_read"], shared_data.rti["drive_params_time"],
                            drive_param_catalogue())
     scheduled_state["params"] = param_read
+    PARAM_READ_AT_START_TICK = 1000      # 4 s in: after the start-up config re-sends (ticks 50 / 150 / 300)
+
+    def _read_params_at_start():
+        """The start's read of every drive's parameters (once, at PARAM_READ_AT_START_TICK)."""
+        param_read.start(range(joint_num + (1 if active_CAN_gripper else 0)))
+        log_startup.info("reading every drive's parameters (%d requests, paced in the poll slot)",
+                         int(shared_data.rti["drive_params_read"][2]))
     # Optional override function (set externally when needed)
     scheduled_override_queue = deque()  # Each item is a tuple: (function, repeat_count)
     current_override = {"fn": None,"count": 0}
@@ -2752,6 +2759,11 @@ def main():
         # 1's commands restarted every timer. One clear to every driver; the loop ignores what the drivers REPORT until
         # the settle after it is over (driver_faults in the error pass). Connection losses, the E-stop, the monitor and
         # every system error are read from tick 1.
+        # Every drive's parameters, read once at start (2026-11-16, user: "get them during the first boot to have them on
+        # hand"): after the start-up config re-sends (ticks 50 / 150 / 300, untouched) so it shows what each drive holds
+        # once RTI has configured it; paced in the poll slot like any read (~5 s, the frames per tick unchanged).
+        if _tick_now == PARAM_READ_AT_START_TICK:
+            _read_params_at_start()
         if _tick_now == BOOT_CLEAR_TICK:
             send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
                               Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper, all_motors=True)
