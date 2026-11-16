@@ -53,6 +53,55 @@ def float_parameters() -> frozenset:
 XML_KEYS = {8: "KPP", 9: "KPV", 10: "KIV", 11: "KPIQ", 12: "KIIQ", 13: "KP", 14: "KD", 15: "velocity_limit",
             16: "Ilim", 17: "voltage_limit"}
 
+# Writing (2026-11-16, the user's decisions): the values RTI sends are applied live (set_pid_gains, its key names) and
+# saved to the robot / gripper XML (its tag names) — never written to the drive alone, RTI would overwrite them at the
+# next start or reconnect; the drive-only values below are written to the drive's RAM with the arm disabled and kept
+# only after "Save to drive" (the drive's whole working config, one save command); everything else is read-only (the ids
+# and build, pole pairs, Kt, the measured current-sense zeros and trims, calibration runs, the scope, status bits, the
+# gripper's mode / stroke, brake on idle: RTI asserts brake at every start).
+PID_KEYS = {8: "KPP", 9: "KPV", 10: "KIV", 11: "KPIQ", 12: "KIIQ", 13: "KP", 14: "KD", 15: "vel_lim", 16: "Ilim",
+            17: "vlim"}
+XML_TAGS = {8: "KPP", 9: "KPV", 10: "KIV", 11: "KPIQ", 12: "KIIQ", 13: "KP", 14: "KD", 15: "Velocity_limit",
+            16: "Ilim", 17: "voltage_limit"}
+INT_XML = frozenset({15, 16, 17})              # written as whole numbers (ticks/s, mA, mV)
+DRIVE_EDITABLE = (76, 77, 49, 50, 51, 64, 74, 75, 58, 90, 91, 2, 3, 4, 5, 19, 81, 37, 38, 53, 46)
+
+
+def kind(number: int) -> str:
+    """"rti" (RTI sends it from the XML), "drive" (drive-only, editable) or "read-only"."""
+    if number in XML_KEYS:
+        return "rti"
+    return "drive" if number in DRIVE_EDITABLE else "read-only"
+
+
+def xml_text(number: int, value: float) -> str:
+    """A value as it is written into the XML: whole numbers for the limits, otherwise the shortest exact form."""
+    if number in INT_XML:
+        return str(int(round(value)))
+    text = f"{float(value):.10g}"
+    return text
+
+
+def xml_set_value(text: str, tag: str, value_text: str, joint_id: int | None = None) -> str:
+    """`text` (an XML file) with ONE value replaced in place — the first <tag>...</tag> inside <joint id="joint_id"> (a
+    robot XML), or the first one in the file (a gripper XML: its values sit at the top level). Every other character —
+    comments, layout — stays as it was (ElementTree would drop the comments). ValueError when it is not found."""
+    import re
+    lo, hi = 0, len(text)
+    if joint_id is not None:
+        m = re.search(rf'<joint\s+id="{int(joint_id)}"\s*>', text)
+        if m is None:
+            raise ValueError(f'no <joint id="{joint_id}"> in the file')
+        end = text.find("</joint>", m.end())
+        if end < 0:
+            raise ValueError(f'<joint id="{joint_id}"> is not closed')
+        lo, hi = m.end(), end
+    m = re.compile(rf"<{re.escape(tag)}>([^<]*)</{re.escape(tag)}>").search(text, lo, hi)
+    if m is None:
+        raise ValueError(f"no <{tag}> {'in joint ' + str(joint_id) if joint_id is not None else 'in the file'}")
+    return text[:m.start(1)] + value_text + text[m.end(1):]
+
+
 # The dashboard's groups, in this order; a number in none of them goes to "Other".
 GROUPS = [
     ("Identity and build", [86, 87, 84, 85, 23, 1, 78, 83]),
@@ -134,6 +183,19 @@ class ParamRead:
         self.read[0], self.read[1], self.read[2] = 1.0, 0.0, float(len(self.queue))
         self.read[3] = float(nodes[0]) if nodes else -1.0
         self.read[4] += 1.0
+
+    def add(self, node: int, numbers) -> None:
+        """Ask these numbers of one node (again: after a write) — appended, a read that runs goes on."""
+        if not self.active:
+            self.read[0], self.read[1], self.read[2] = 1.0, 0.0, 0.0
+            self.read[4] += 1.0
+            self._left = {}
+        numbers = list(numbers)
+        for num in numbers:
+            self.state[node * SLOTS + num] = NOT_READ
+            self.queue.append((node, num))
+        self.read[2] += float(len(numbers))
+        self._left[node] = self._left.get(node, 0) + len(numbers)
 
     def turn(self) -> bool:
         """Every other free poll slot is the read's (the telemetry poll keeps the others)."""

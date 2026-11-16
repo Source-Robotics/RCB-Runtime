@@ -1918,7 +1918,8 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                                  not (isinstance(_grip_raw, float) and math.isnan(_grip_raw)) and int(_grip_raw) == 1,
                                  _xml_cfg,
                                  poll_fn=lambda fn, label: _page_sender().submit(fn, label=label),
-                                 is_visible=lambda: _active_tab_name(tabs.value) == 'Drive parameters')
+                                 is_visible=lambda: _active_tab_name(tabs.value) == 'Drive parameters',
+                                 exec_fn=_exec, toast_fn=lambda text, level="positive": _gui_toasts.put((text, level)))
         except Exception:
             logger.exception("Drive parameters tab unavailable")
             ui.label("Drive parameters tab unavailable — see logs/gui.log").classes("text-negative")

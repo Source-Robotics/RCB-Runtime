@@ -695,6 +695,10 @@ def main():
                            drive_param_catalogue())
     scheduled_state["params"] = param_read
     PARAM_READ_AT_START_TICK = 1000      # 4 s in: after the start-up config re-sends (ticks 50 / 150 / 300)
+    # Per node, the tick before which its silence is not latched as lost: a drive saving its config to flash (save_drive)
+    # does not answer for up to ~1 s (2026-11-16)
+    can_quiet_until = np.zeros(16)
+    SAVE_QUIET_TICKS = 750               # 3 s
 
     def _read_params_at_start():
         """The start's read of every drive's parameters (once, at PARAM_READ_AT_START_TICK)."""
@@ -1573,6 +1577,49 @@ def main():
         log_handler.info("reading the parameters of %s (%d requests, paced in the poll slot)",
                      "every drive" if node == -1 else f"node {node}", int(shared_data.rti["drive_params_read"][2]))
 
+    def _drive_write_refusal(node):
+        """Why a drive's parameter may not be written / saved now, or None (2026-11-16: the arm disabled, a drive here)."""
+        if shared_data.robot_state.get() == "ENABLED":
+            return "disable the arm first: a drive's parameters are written only while the arm is disabled"
+        if node not in range(joint_num + (1 if active_CAN_gripper else 0)):
+            return f"no drive {node} here"
+        return None
+
+    def _handle_write_param(cmd_msg, cmd_dict):
+        """write_param:<node>:<number>:<value> — write one drive-only parameter into the drive's RAM (utility/drive_params
+        DRIVE_EDITABLE; 2026-11-16), then read it back. Only with the arm disabled; kept only after save_drive."""
+        from utility.drive_params import DRIVE_EDITABLE
+        parts = cmd_msg.split(":")
+        try:
+            node, number, value = int(parts[1]), int(parts[2]), int(parts[3])
+        except (IndexError, ValueError):
+            _refused(log_handler, "write_param: %r is not <node>:<number>:<whole value>", cmd_msg)
+            return
+        why = _drive_write_refusal(node) or (None if number in DRIVE_EDITABLE else
+                                              f"parameter {number} is not one the dashboard writes")
+        if why:
+            _refused(log_handler, "write_param refused: %s", why)
+            return
+        Motor[node].Send_Parameter(number, value)
+        param_read.add(node, [number])
+        log_handler.info("parameter %d of node %d written: %d (in its RAM; read back now)", number, node, value)
+
+    def _handle_save_drive(cmd_msg, cmd_dict):
+        """save_drive:<node> — the drive stores its WHOLE working config in its flash (one save command: the gains, limits,
+        watchdog and brake RTI sent too), 2026-11-16. Only with the arm disabled. It does not answer for up to ~1 s
+        while it saves: its loss is not latched for SAVE_QUIET_TICKS (can_quiet_until)."""
+        try:
+            node = int(cmd_msg.split(":", 1)[1])
+        except (IndexError, ValueError):
+            node = -1
+        why = _drive_write_refusal(node)
+        if why:
+            _refused(log_handler, "save_drive refused: %s", why)
+            return
+        can_quiet_until[node] = shared_data.rti["loop_tick"][0] + SAVE_QUIET_TICKS
+        Motor[node].Send_Save_config()
+        log_handler.info("node %d saves its whole working config to its flash (it may not answer for ~1 s)", node)
+
     def _handle_homing_answer(cmd_msg, cmd_dict):
         """homing_answer:accept — the answer to homing's question (2026-11-16, user: "pause and ask";
         robotics/homing/controller.py): a joint homed off where this arm's joint always homes, and homing holds the arm
@@ -2283,6 +2330,8 @@ def main():
         "joint_test":        _handle_joint_test,
         "homing_answer":     _handle_homing_answer,
         "read_params":       _handle_read_params,
+        "write_param":       _handle_write_param,
+        "save_drive":        _handle_save_drive,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
@@ -2389,6 +2438,7 @@ def main():
                 active_CAN_gripper=active_CAN_gripper,
                 warning_threshold = 10,
                 error_threshold = 50, #Number of loop ticks
+                quiet_until=can_quiet_until,      # a drive saving its config (save_drive, 2026-11-16)
             )
         _profile_last = _profile_mark(_profile_last, "can_connection_status")
 

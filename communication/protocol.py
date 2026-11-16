@@ -148,6 +148,12 @@ COMMAND_RULES = {
     "get_hardware":      (IMMEDIATE, None, None, False),   # utility/hardware_report.py (2026-10-18)
     "read_drive_parameters": (IMMEDIATE, None, None, False),   # utility/drive_params.py (2026-11-16)
     "get_drive_parameters": (IMMEDIATE, None, None, False),
+    # Writing them (2026-11-16, the user's decisions): a drive-only value into the drive's RAM, and the drive's whole
+    # working config into its flash — only with the arm DISABLED; an RTI-sent value into the robot / gripper XML (the
+    # next start uses it; set_pid_gains applies it live) — any mode. Owned: they change the robot.
+    "write_drive_parameter": (IMMEDIATE, None, "DISABLED", False),
+    "save_drive_config":    (IMMEDIATE, None, "DISABLED", False),
+    "save_drive_parameter_to_xml": (IMMEDIATE, None, None, False),
     "get_versions":      (IMMEDIATE, None, None, False),   # utility/versions.py (2026-10-21)
     # IK only, moves nothing — any mode, any state, homed or not (`near` defaults to the measured
     # joints, which only picks WHICH solution is returned, never whether one exists).

@@ -56,9 +56,13 @@ def update_can_connection_status(
     active_CAN_gripper: int,
     warning_threshold: int = 10,
     error_threshold: int = 50,
+    quiet_until=None,
 ):
     """
     Monitor CAN node health based on data age and received IDs.
+
+    quiet_until (2026-11-16): per node, a tick before which its silence is not latched as CAN_NODE lost — a drive saving
+    its config to flash (save_drive) does not answer for up to ~1 s; its live stale warning still shows.
     """
 
     current_tick = shared_data.rti["loop_tick"][0]
@@ -76,7 +80,7 @@ def update_can_connection_status(
         else:
             shared_data.rti["old_data_warning"][i] = 0
 
-        if tick_diff >= error_threshold:
+        if tick_diff >= error_threshold and (quiet_until is None or current_tick >= quiet_until[i]):
             shared_data.rti["CAN_node_connection_error"][i] = 1
         # No else — CAN_node_connection_error is latched; only clear_errors() resets it.
 

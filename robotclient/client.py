@@ -6237,6 +6237,148 @@ class RobotClient:
         """
         return self._immediate("get_drive_parameters", [] if drive is None else [drive])
 
+    def write_drive_parameter(self, drive: int, number: int, value: float) -> None:
+        """Write one of a drive's own settings into the drive.
+
+        For the settings only the drive holds, which the robot never sends it:
+        its motor model (R, L), its control loops' bandwidths and speed estimate,
+        the commutation delay, the position input filter, the integral deadband,
+        the Id setpoint, Rstint, the thermistor, the watchdog fallback, the
+        heartbeat, the sound limit, and the anti-cogging, encoder-table and
+        switching-zero switches (`get_drive_parameters()` lists their numbers).
+        The value goes into the drive's working memory and is read back at once;
+        it is lost at the drive's next power-off unless `save_drive_config()`
+        stores it. Only with the arm disabled. The gains and limits the robot
+        sends are set with `set_pid_gains()` and
+        `save_drive_parameter_to_xml()` instead.
+
+        Args:
+            drive: 1 to the number of joints for a joint, one more for a CAN
+                gripper.
+            number: The parameter's number.
+            value: Its new value, a whole number in the drive's own units.
+
+        Raises:
+            CommandRejected: The robot refused it: the arm is enabled, another
+                client holds control, no such drive, a parameter not written
+                here, or not a whole number. Or RTI refused it or did not answer
+                within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No such drive, a parameter not written here, or not a whole
+                number.
+            RTI_REFUSED: RTI refused it: the arm is enabled. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        Warning:
+            A wrong motor model or loop bandwidth can make that joint buzz or
+            unable to hold when it is next enabled: try a change on one joint, and
+            keep the old value at hand.
+
+        See also:
+            `save_drive_config()`, `get_drive_parameters()`, `set_pid_gains()`
+
+        Examples:
+            >>> robot.write_drive_parameter(6, 49, 2000)
+        """
+        self._immediate("write_drive_parameter", [drive, number, value])
+
+    def save_drive_config(self, drive: int) -> None:
+        """Store a drive's whole working config in its flash memory.
+
+        The drive has one save command: it stores everything it holds now, the
+        settings written with `write_drive_parameter()` and also the gains,
+        limits, watchdog and brake setting the robot sends it, and keeps them
+        after a power-off. While it saves, for up to about a second, it does not
+        answer; the robot does not report it lost meanwhile. Only with the arm
+        disabled. Read its values again afterwards with
+        `read_drive_parameters()`.
+
+        Args:
+            drive: 1 to the number of joints for a joint, one more for a CAN
+                gripper.
+
+        Raises:
+            CommandRejected: The robot refused it: the arm is enabled, another
+                client holds control, or no such drive. Or RTI refused it or did
+                not answer within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No such drive.
+            RTI_REFUSED: RTI refused it: the arm is enabled. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        Warning:
+            What is saved comes back at every power-up of that drive, also
+            without the robot software, for example a coast setting that lets J2
+            or J3 drop when they are idle. Save only a drive whose values you have
+            checked.
+
+        See also:
+            `write_drive_parameter()`, `read_drive_parameters()`
+
+        Examples:
+            >>> robot.save_drive_config(6)
+            >>> robot.read_drive_parameters(6, wait=True)
+        """
+        self._immediate("save_drive_config", [drive])
+
+    def save_drive_parameter_to_xml(self, drive: int, number: int, value: float) -> dict:
+        """Save one of the gains or limits the robot sends to its config file.
+
+        For the values the robot sends every drive from its configuration at
+        start: the gains (8 to 14) and the velocity, current and voltage limits
+        (15 to 17). The value is written into that joint's entry in the robot's
+        XML file, or the gripper's file, changing only that number: every
+        comment stays. A copy of the file is kept in `temp_data/xml_backups/`
+        first, and the file is read again to check that only that value
+        changed. The robot uses it from its next start; `set_pid_gains()`
+        applies a joint's value now. It works in any mode.
+
+        Args:
+            drive: 1 to the number of joints for a joint, one more for a CAN
+                gripper.
+            number: The parameter's number, 8 to 17.
+            value: Its new value, in the drive's own units as in the file. The
+                limits are written as whole numbers.
+
+        Returns:
+            A dict: `file` (the file's name), `key` (the configuration key, for
+            example `motor_KPV`), `value` (as written) and `backup` (the copy's
+            name).
+
+        Raises:
+            CommandRejected: The robot refused it: another client holds control,
+                no such drive, a parameter it does not send, a value below 0 (or
+                0 for the velocity and current limits), or the file could not be
+                changed (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No such drive, a parameter not sent from the file, or a value
+                out of range.
+            INTERNAL: The file could not be written, or reading it again found
+                another change; the file is then put back as it was.
+
+        Warning:
+            A limit in the file is the most the robot ever asks of that joint.
+            Raise one only within what the joint's motor and drive are made for.
+
+        See also:
+            `set_pid_gains()`, `get_drive_parameters()`
+
+        Examples:
+            >>> robot.save_drive_parameter_to_xml(3, 9, 0.02)
+        """
+        return self._immediate("save_drive_parameter_to_xml", [drive, number, value])
+
     def get_versions(self) -> dict:
         """Return the version of every part of the robot.
 

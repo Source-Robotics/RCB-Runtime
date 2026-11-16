@@ -676,6 +676,7 @@ RTI_ANSWER_CODES = {
     "rti_set_tcp_vel_limit": ("RTI_REFUSED",),
     "rti_set_vel_scale": ("RTI_REFUSED",),
     "safety_stop": ("MODE_REJECTED",),
+    "save_drive_config": ("RTI_REFUSED",),
     "set_can_read_first": ("RTI_REFUSED",),
     "set_collision_detection": ("RTI_REFUSED",),
     "set_completion_policy": ("RTI_REFUSED",),
@@ -688,6 +689,7 @@ RTI_ANSWER_CODES = {
     "set_payload": ("RTI_REFUSED",),
     "set_recipe": ("RTI_REFUSED",),
     "stop": ("RTI_REFUSED",),
+    "write_drive_parameter": ("RTI_REFUSED",),
 }
 _answer_seq = itertools.count(1)
 _ANSWER_PREFIX = f"{_os.getpid()}-"        # a token of an executor that restarted is never mistaken for a new one
@@ -1331,6 +1333,134 @@ def _handle_get_drive_parameters(args, cid, conn):
         "read": {"state": _DRIVE_READ_STATES.get(int(prog[0]), "idle"), "done": int(prog[1]), "total": int(prog[2]),
                  "drive": label_of.get(reading) if reading >= 0 else None},
         "drives": drives}})
+
+
+def _arg_number_value(number, value):
+    """(number, value) checks of the writes: a whole parameter number, a finite numeric value."""
+    if isinstance(number, bool) or not isinstance(number, int):
+        raise ValueError("a whole parameter number")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value in (float("inf"),
+                                                                                                     float("-inf")):
+        raise ValueError("a finite number")
+    return number, value
+
+
+def _bad_args(cid, conn, command, msg):
+    _log_exec_reject(cid, "BAD_ARGS", msg, command=command)
+    return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
+
+
+def _handle_write_drive_parameter(args, cid, conn):
+    """write_drive_parameter drive number value — one drive-only parameter (utility/drive_params.DRIVE_EDITABLE) into
+    the drive's RAM, read back after; only with the arm disabled (the rule; RTI checks again). Kept by the drive only
+    after save_drive_config (2026-11-16)."""
+    from utility.drive_params import DRIVE_EDITABLE
+    if len(args) != 3:
+        return _bad_args(cid, conn, "write_drive_parameter", f"write_drive_parameter needs drive, number, value; got "
+                                                             f"{len(args)} argument(s)")
+    try:
+        node = _arg_drive(args[0])
+        number, value = _arg_number_value(args[1], args[2])
+    except ValueError as e:
+        return _bad_args(cid, conn, "write_drive_parameter", f"write_drive_parameter: {list(args)} — expected {e}")
+    if number not in DRIVE_EDITABLE:
+        return _bad_args(cid, conn, "write_drive_parameter", f"parameter {number} is not one written to a drive here "
+                                                             f"(the gains and limits RTI sends: set_pid_gains / "
+                                                             f"save_drive_parameter_to_xml; the rest is read-only)")
+    if float(value) != int(value) or not -2 ** 31 <= int(value) < 2 ** 31:
+        return _bad_args(cid, conn, "write_drive_parameter", f"parameter {number} takes a whole number, not {value!r}")
+    _answered(conn, cid, _fmt_command("write_drive_parameter", args), f"write_param:{node}:{number}:{int(value)}")
+
+
+def _handle_save_drive_config(args, cid, conn):
+    """save_drive_config drive — the drive stores its WHOLE working config in its flash (one save command: what RTI sent
+    too); only with the arm disabled; it does not answer for up to ~1 s meanwhile (2026-11-16)."""
+    if len(args) != 1:
+        return _bad_args(cid, conn, "save_drive_config", f"save_drive_config needs one drive, got {len(args)}")
+    try:
+        node = _arg_drive(args[0])
+    except ValueError as e:
+        return _bad_args(cid, conn, "save_drive_config", f"save_drive_config: {args[0]!r} — expected {e}")
+    _answered(conn, cid, _fmt_command("save_drive_config", args), f"save_drive:{node}")
+
+
+def _handle_save_drive_parameter_to_xml(args, cid, conn):
+    """save_drive_parameter_to_xml drive number value — one of the gains / limits RTI sends (8-17) into the robot XML's
+    joint (or the gripper XML), editing only that number in the text (every comment kept), after a copy of the file in
+    temp_data/xml_backups/; the file is parsed again and refused unless that one value changed. The next start uses it
+    (set_pid_gains applies a joint's live). Any mode (2026-11-16)."""
+    from utility.drive_params import XML_KEYS, XML_TAGS, xml_set_value, xml_text
+    if len(args) != 3:
+        return _bad_args(cid, conn, "save_drive_parameter_to_xml", f"save_drive_parameter_to_xml needs drive, number, "
+                                                                   f"value; got {len(args)} argument(s)")
+    try:
+        node = _arg_drive(args[0])
+        number, value = _arg_number_value(args[1], args[2])
+    except ValueError as e:
+        return _bad_args(cid, conn, "save_drive_parameter_to_xml", f"save_drive_parameter_to_xml: {list(args)} — "
+                                                                   f"expected {e}")
+    if number not in XML_TAGS:
+        return _bad_args(cid, conn, "save_drive_parameter_to_xml", f"parameter {number} is not one RTI sends from the "
+                                                                   f"XML (8-17)")
+    if value < 0 or (number in (15, 16) and value <= 0):
+        return _bad_args(cid, conn, "save_drive_parameter_to_xml", f"parameter {number}: {value!r} — expected "
+                                                                   f"{'above 0' if number in (15, 16) else '0 or more'}")
+    gripper = node >= JOINT_NUM
+    path = _GRIPPER_XML if gripper else Path(str(_sys['robot_xml_path']))
+    key = f"{'gripper' if gripper else 'motor'}_{XML_KEYS[number]}"
+    try:
+        before_text = path.read_text()
+        after_text = xml_set_value(before_text, XML_TAGS[number], xml_text(number, value),
+                                   joint_id=None if gripper else node)
+        backups = TEMP_DATA_DIR / "xml_backups"
+        backups.mkdir(parents=True, exist_ok=True)
+        backup = backups / f"{path.stem}.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.xml"
+        backup.write_text(before_text)
+        tmp = path.with_suffix(".xml.tmp")
+        tmp.write_text(after_text)
+        _os.replace(tmp, path)
+        new_cfg = read_XML2.load_full_robot_config(str(_sys['robot_xml_path']), grippers_dir=GRIPPERS_DIR,
+                                                   active_gripper=_sys['active_gripper'])
+        problem = _xml_change_problem(cfg, new_cfg, key, None if gripper else node, float(xml_text(number, value)))
+        if problem:
+            path.write_text(before_text)
+            return reply(conn, {"id": cid, "status": "error", "code": "INTERNAL",
+                                "message": f"save_drive_parameter_to_xml: not saved, {problem} (the file is back as "
+                                           f"it was)"})
+    except (OSError, ValueError) as e:
+        return reply(conn, {"id": cid, "status": "error", "code": "INTERNAL",
+                            "message": f"save_drive_parameter_to_xml: not saved: {e}"})
+    log_tcp.info("saved %s = %s to %s (backup %s) — the next start uses it", key, xml_text(number, value), path.name,
+                 backup.name)
+    reply(conn, {"id": cid, "status": "ok", "data": {"file": path.name, "key": key, "value": float(xml_text(number,
+                                                                                                         value)),
+                                                     "backup": backup.name}})
+
+
+def _xml_change_problem(old_cfg, new_cfg, key, joint, value):
+    """None when the re-parsed configuration differs from the one this executor started with only in `key` (its
+    `joint`'s entry, or the gripper's) and holds `value` there; else what differs."""
+    def same(a, b):
+        try:
+            return bool(np.array_equal(np.asarray(a, dtype=float), np.asarray(b, dtype=float), equal_nan=True))
+        except (TypeError, ValueError):
+            return a == b
+    got = new_cfg.get(key)
+    got = got[joint] if joint is not None else got
+    if not np.isclose(float(got), value):
+        return f"{key} reads {got} after the edit, not {value}"
+    for k in old_cfg:
+        if k.startswith("_") or k == key:
+            continue
+        if not same(old_cfg[k], new_cfg.get(k)):
+            return f"{k} changed too"
+    if joint is not None:
+        old_v = np.array(old_cfg[key], dtype=float)
+        new_v = np.array(new_cfg[key], dtype=float)
+        old_v[joint] = new_v[joint]
+        if not np.array_equal(old_v, new_v, equal_nan=True):
+            return f"another joint's {key} changed too"
+    return None
 
 
 # The runtime's version (the VERSION file), read once: the executor reports the code it started with.
@@ -2423,6 +2553,9 @@ IMMEDIATE_HANDLERS = {
     "get_hardware":     _handle_get_hardware,          # the first-run check's data (2026-10-18)
     "read_drive_parameters": _handle_read_drive_parameters,   # every drive's parameters (2026-11-16)
     "get_drive_parameters": _handle_get_drive_parameters,
+    "write_drive_parameter": _handle_write_drive_parameter,
+    "save_drive_config":    _handle_save_drive_config,
+    "save_drive_parameter_to_xml": _handle_save_drive_parameter_to_xml,
     "get_versions":     _handle_get_versions,          # every part's version (2026-10-21)
     "set_log_level":    _handle_set_log_level,
     "capture_telemetry": _handle_capture_telemetry,

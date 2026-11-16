@@ -1,18 +1,24 @@
-"""The dashboard's Drive parameters tab (2026-11-16, user: "all actual parameters listed in the GUI"; the read only —
-writing comes next, TODO/driver_110_rtb15_plan.md).
+"""The dashboard's Drive parameters tab (2026-11-16, user: "all actual parameters listed in the GUI";
+TODO/driver_110_rtb15_plan.md).
 
 Every drive's parameters as the drive holds them, read on demand: "Read all" (or one drive), and — the user's choice,
 on by default, remembered per browser — a read when the tab opens. RTI paces the read inside its poll slot
 (utility/drive_params.py: one request every other free slot, the frames per tick unchanged; ~5 s for all drives); this
 tab only shows shared memory: the progress, each drive's read time, and per group a table (J1 .. J<n>, the gripper). The
 ten values RTI sends every drive from the robot XML (gains and limits) show the XML's value too when they differ.
+
+Changing a value (the user's decisions, the same day), one value at a time, read back after: a gain / limit RTI sends —
+"Apply live" (a joint: set_pid_gains) and "Save to XML" (robot / gripper XML, only that number in the text, a backup
+first); a drive-only value (utility/drive_params.DRIVE_EDITABLE) — "Write to drive" (its RAM, the arm disabled); and
+"Save this drive to its flash" (its whole working config, the arm disabled, after a confirmation). The rest is read-only.
 """
 from __future__ import annotations
 
 import math
 import time
 
-from utility.drive_params import ASKED, NO_ANSWER, NOT_READ, READ, SLOTS, UNKNOWN, XML_KEYS, catalogue, fmt, grouped
+from utility.drive_params import (ASKED, NO_ANSWER, NOT_READ, PID_KEYS, READ, SLOTS, UNKNOWN, XML_KEYS, catalogue, fmt,
+                                  grouped, kind)
 
 AUTO_KEY = "rcb.driveParams.autoRead"           # the browser's localStorage key of the auto-read switch
 
@@ -71,9 +77,31 @@ def ages(times, cols, now=None) -> str:
     return " · ".join(out)
 
 
-def add_drive_params_tab(shared_data, joint_num: int, has_gripper: bool, xml_cfg: dict, poll_fn, is_visible):
+def editor_actions(number: int, node: int, joint_num: int, enabled: bool) -> dict:
+    """Which of the editor's buttons a parameter / drive gets, and why some are off: {"live", "xml", "write", "save",
+    "hint"}. RTI-sent: live (joints only: set_pid_gains has no gripper) + xml; drive-only: write (arm disabled);
+    save (arm disabled) for every drive."""
+    k = kind(number)
+    out = {"live": k == "rti" and node < joint_num, "xml": k == "rti", "write": k == "drive" and not enabled,
+           "save": not enabled, "hint": ""}
+    if k == "rti":
+        out["hint"] = ("RTI sends this from the XML at every start: 'Apply live' changes it until the next start, "
+                       "'Save to XML' from the next start." if node < joint_num else
+                       "RTI sends this from the gripper XML at every start: 'Save to XML' takes effect at the next start.")
+    elif k == "drive":
+        out["hint"] = ("Into the drive's working memory — kept after a power-off only once the drive is saved to its "
+                       "flash." if not enabled else "Disable the arm to write a drive's own values.")
+    else:
+        out["hint"] = "Read-only here (an id, a measured or calibrated value, a status)."
+    return out
+
+
+def add_drive_params_tab(shared_data, joint_num: int, has_gripper: bool, xml_cfg: dict, poll_fn, is_visible,
+                         exec_fn=None, toast_fn=None):
     """The tab. poll_fn(fn, label) sends a RobotClient call (no 'activity': a read is not operating the robot);
-    is_visible() says whether the tab is shown (it refreshes and auto-reads only then)."""
+    exec_fn(fn, label) one that changes the robot (the page's _exec: it takes control); toast_fn(text, kind) shows a
+    message from the sender's thread; is_visible() says whether the tab is shown (it refreshes and auto-reads only
+    then)."""
     from nicegui import ui
     names = catalogue()
     groups = grouped(names)
@@ -93,6 +121,110 @@ def add_drive_params_tab(shared_data, joint_num: int, has_gripper: bool, xml_cfg
         one = ui.select({k + 1: label for k, (label, _) in enumerate(cols)}, value=1, label="Drive").classes("w-28")
         ui.button("Read this drive", icon="download", on_click=lambda: read(int(one.value))).props("outline size=sm")
         auto = ui.switch("Read all when this tab opens", value=True)
+    # ---- changing a value (one at a time, read back after) ----
+    editable = [n for n in names if kind(n) != "read-only"]
+    with ui.card().classes("w-full mt-2"):
+        ui.label("Change a value").classes("text-xs font-semibold text-gray-600 uppercase")
+        with ui.row().classes("items-end gap-3"):
+            e_drive = ui.select({k + 1: label for k, (label, _) in enumerate(cols)}, value=1,
+                                label="Drive").classes("w-28")
+            e_param = ui.select({n: f"{n}  {names[n]}" for n in editable}, value=editable[0] if editable else None,
+                                label="Parameter").classes("w-96")
+            e_now = ui.label("").classes("text-sm font-mono")
+            e_value = ui.number("New value").classes("w-36")
+        with ui.row().classes("items-center gap-2"):
+            b_live = ui.button("Apply live", icon="bolt").props("size=sm")
+            b_xml = ui.button("Save to XML", icon="save").props("outline size=sm")
+            b_write = ui.button("Write to drive", icon="edit").props("size=sm")
+            b_save = ui.button("Save this drive to its flash…", icon="memory").props("color=warning outline size=sm")
+        e_hint = ui.label("").classes("text-xs text-gray-500")
+
+    def current(node, number):
+        rti = getattr(shared_data, "rti", {})
+        vals, states = rti.get("drive_params"), rti.get("drive_params_state")
+        if vals is None or int(states[node * SLOTS + number]) != READ:
+            return None
+        return float(vals[node * SLOTS + number])
+
+    def show_editor():
+        number, drive = e_param.value, int(e_drive.value or 1)
+        if number is None:
+            return
+        node = cols[drive - 1][1]
+        enabled = getattr(shared_data, "robot_state", None) is not None and shared_data.robot_state.get() == "ENABLED"
+        acts = editor_actions(int(number), node, joint_num, enabled)
+        now = current(node, int(number))
+        e_now.set_text(f"now: {fmt(int(number), now) if now is not None else 'not read'}")
+        for b, on in ((b_live, acts["live"]), (b_xml, acts["xml"]), (b_write, kind(int(number)) == "drive")):
+            b.set_visibility(on)
+        b_write.set_enabled(acts["write"])
+        b_save.set_enabled(acts["save"])
+        e_hint.set_text(acts["hint"])
+
+    def toast(text, level="positive"):
+        if toast_fn is not None:
+            toast_fn(text, level)
+
+    def reread(drive, after_s=0.5):
+        ui.timer(after_s, lambda: read(drive), once=True)
+
+    def chosen():
+        if e_value.value is None or e_param.value is None:
+            ui.notify("Type the new value first", type="warning")
+            return None
+        return int(e_drive.value or 1), int(e_param.value), float(e_value.value)
+
+    def do_live():
+        c = chosen()
+        if c is None or exec_fn is None:
+            return
+        drive, number, value = c
+        exec_fn(lambda r: r.set_pid_gains(drive - 1, **{PID_KEYS[number]: value}), "set_pid_gains")
+        reread(drive)
+
+    def do_xml():
+        c = chosen()
+        if c is None or exec_fn is None:
+            return
+        drive, number, value = c
+
+        def save(r):
+            res = r.save_drive_parameter_to_xml(drive, number, value)
+            toast(f"Saved {res['key']} = {res['value']:g} to {res['file']} (backup {res['backup']}) — used from the "
+                  f"next start")
+        exec_fn(save, "save_drive_parameter_to_xml")
+
+    def do_write():
+        c = chosen()
+        if c is None or exec_fn is None:
+            return
+        drive, number, value = c
+        exec_fn(lambda r: r.write_drive_parameter(drive, number, value), "write_drive_parameter")
+
+    async def do_save():
+        drive = int(e_drive.value or 1)
+        label = cols[drive - 1][0]
+        with ui.dialog() as dlg, ui.card().classes("max-w-xl"):
+            ui.label(f"Save {label}'s drive to its flash?").classes("text-lg font-bold")
+            ui.markdown("The drive stores **everything it holds now** — the values written here, and also the gains, "
+                        "limits, watchdog and brake setting the robot sent it — and comes up with them at every "
+                        "power-up, also without the robot software. It does not answer for up to about a second "
+                        "while it saves. Its values are read again afterwards.").classes("text-sm")
+            with ui.row().classes("gap-2 justify-end w-full mt-2"):
+                ui.button("Cancel", on_click=lambda: dlg.submit(False)).props("outline")
+                ui.button(f"Save {label}", on_click=lambda: dlg.submit(True)).props("color=warning")
+        if not await dlg or exec_fn is None:
+            return
+        exec_fn(lambda r: r.save_drive_config(drive), "save_drive_config")
+        reread(drive, after_s=3.5)
+
+    b_live.on_click(do_live)
+    b_xml.on_click(do_xml)
+    b_write.on_click(do_write)
+    b_save.on_click(do_save)
+    e_drive.on_value_change(lambda _: show_editor())
+    e_param.on_value_change(lambda _: show_editor())
+
     progress = ui.linear_progress(value=0, show_value=False).props("size=8px").classes("w-full mt-2")
     progress_lbl = ui.label("").classes("text-xs text-gray-600")
     ages_lbl = ui.label("").classes("text-xs text-gray-500 mb-2")
@@ -128,6 +260,7 @@ def add_drive_params_tab(shared_data, joint_num: int, has_gripper: bool, xml_cfg
         state["visible"] = visible
         if prog is None or not visible:
             return
+        show_editor()
         if opened and auto.value and int(prog[0]) != 1:
             read()
         done, total, reading = int(prog[1]), int(prog[2]), int(prog[0]) == 1
@@ -148,4 +281,6 @@ def add_drive_params_tab(shared_data, joint_num: int, has_gripper: bool, xml_cfg
             table.update()
 
     ui.timer(0.5, refresh)
-    return {"refresh": refresh, "auto": auto, "tables": tables, "progress": progress, "label": progress_lbl}
+    return {"refresh": refresh, "auto": auto, "tables": tables, "progress": progress, "label": progress_lbl,
+            "editor": {"drive": e_drive, "param": e_param, "value": e_value, "live": b_live, "xml": b_xml,
+                       "write": b_write, "save": b_save, "show": show_editor}}
