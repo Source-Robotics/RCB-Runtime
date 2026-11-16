@@ -300,10 +300,12 @@ class TrajectoryPlanner(Thread):
     # for each value's rationale.
 
     # Gripper defaults — match the GUI's _gripper_cmd_state exactly (nicegui_test.py):
-    # firmware-mode raw scale 0-255, 1=fully open, 254=fully closed. NOT millimeters —
+    # firmware-mode raw scale 0-255, 0=fully open, 255=fully closed. NOT millimeters —
     # firmware-mode grippers don't expose a verified mm conversion (see module docstring).
-    GRIPPER_OPEN_POS = 1
-    GRIPPER_CLOSE_POS = 254
+    # The full stroke since 2026-11-16 (was 1 / 254): gripper firmware 110 sets both calibrated ends clear of the
+    # mechanical stops, so a move to 0 or 255 arrives with a few mA and no object; before 110 they lay inside the stops.
+    GRIPPER_OPEN_POS = 0
+    GRIPPER_CLOSE_POS = 255
     GRIPPER_DEFAULT_SPEED = 100
     GRIPPER_DEFAULT_CURRENT = 200
     GRIPPER_SETTLE_TIMEOUT_S = 5.0  # generous margin over a typical full-stroke time — at the default speed (100)
@@ -3693,8 +3695,8 @@ class TrajectoryPlanner(Thread):
              code is useless.
           2. DEBOUNCED + DIRECTION-CHECKED code. Nonzero for GRIPPER_DEBOUNCE_TICKS
              consecutive polls (one glitched frame cannot complete a command), AND
-             consistent with the direction of travel: on this gripper 1 = fully
-             open and 254 = fully closed, so "object while opening" (2) is only
+             consistent with the direction of travel: on this gripper 0 = fully
+             open and 255 = fully closed, so "object while opening" (2) is only
              believable when the target is MORE OPEN than where we are. A stale
              code from the opposite direction is rejected — which is exactly the
              failure the unverified reset behaviour would produce.
@@ -3755,7 +3757,7 @@ class TrajectoryPlanner(Thread):
     def _code_matches_direction(self, obj, target, position):
         """Is this object-detection code consistent with the way we are travelling?
 
-        Scale: 1 = fully open, 254 = fully closed, so OPENING decreases position.
+        Scale: 0 = fully open, 255 = fully closed, so OPENING decreases position.
           1 = object while closing -> only believable if the target is more closed
           2 = object while opening -> only believable if the target is more open
           3 = reached target, no object -> direction carries no information

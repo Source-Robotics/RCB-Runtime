@@ -5197,8 +5197,8 @@ class RobotClient:
     def open_gripper(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
         """Open the gripper's jaws fully, as a queued command.
 
-        The jaws move to position 1, next to the open end (0) of the gripper's 0
-        to 255 scale, at speed 100 of 255 and with at most 200 mA. The command
+        The jaws move to position 0, the open end of the gripper's 0 to 255
+        scale, at speed 100 of 255 and with at most 200 mA. The command
         waits in the queue like a move, but the robot does not wait for a move to
         finish: it starts the jaws as soon as it has sent the moves queued before
         it. So the jaws can open while the arm still moves, and a move queued
@@ -5265,8 +5265,8 @@ class RobotClient:
     def close_gripper(self, timeout: float = DEFAULT_MOVE_TIMEOUT, **options: Any) -> str:
         """Close the gripper's jaws fully, as a queued command.
 
-        The jaws move to position 254, next to the closed end (255) of the
-        gripper's 0 to 255 scale, at speed 100 of 255 and with at most 200 mA. A
+        The jaws move to position 255, the closed end of the gripper's 0 to
+        255 scale, at speed 100 of 255 and with at most 200 mA. A
         part between the jaws stops them, and they keep pressing on it with that
         current. The command waits in the queue like a move, but the robot does
         not wait for a move to finish: it starts the jaws as soon as it has sent
@@ -5375,7 +5375,7 @@ class RobotClient:
         The position is on the gripper's own scale, not in millimetres: 0 is the
         fully open end and 255 the fully closed end, as the gripper found them
         when it was calibrated, and the scale runs evenly in between.
-        `open_gripper()` and `close_gripper()` use 1 and 254. A part between the
+        `open_gripper()` and `close_gripper()` use 0 and 255. A part between the
         jaws stops them, and they keep pressing on it with `current`.
 
         Otherwise it behaves like them. The command waits in the queue like a

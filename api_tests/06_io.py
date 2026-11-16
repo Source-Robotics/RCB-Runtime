@@ -22,7 +22,7 @@ worth re-running on new gripper hardware or new firmware.
     python3 api_tests/06_io.py --gripper-object --go     # needs an object in the jaws
     python3 api_tests/06_io.py --gripper-timeout --go    # needs the jaws blocked
 
-Position is a RAW 0-255 scale (1 = fully open, 254 = fully closed), NOT
+Position is a RAW 0-255 scale (0 = fully open, 255 = fully closed), NOT
 millimeters — firmware-mode grippers expose no verified mm conversion.
 """
 import time
@@ -439,7 +439,7 @@ def run():
                    help="RUN THIS FIRST: does gripper_object_detection reset on a new "
                         "move? Everything else assumes it does. Must run ON the robot.")
     p.add_argument("--gripper-positions", type=int, nargs="+", metavar="POS",
-                   help="raw 0-255 targets to sweep, e.g. --gripper-positions 1 64 128 200 254")
+                   help="raw 0-255 targets to sweep, e.g. --gripper-positions 0 64 128 200 255")
     p.add_argument("--gripper-supersede", action="store_true",
                    help="queue two gripper commands; the first must report SUPERSEDED")
     p.add_argument("--gripper-timeout", action="store_true",
@@ -456,7 +456,7 @@ def run():
     if args.gripper_all:
         args.gripper_signal = args.gripper = args.gripper_supersede = True
         if not args.gripper_positions:
-            args.gripper_positions = [1, 64, 128, 200, 254]
+            args.gripper_positions = [0, 64, 128, 200, 255]
 
     robot = connect(args)
     pins = _pins(args)

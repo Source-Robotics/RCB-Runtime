@@ -54,6 +54,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
   swapped, and the runtime, the client's `GripperResult` and the dashboard were built on that; with 1.22 (now pinned)
   every part uses the firmware's meaning. A program that tests `code == 2` after a close must test `1` (or use
   `GripperResult.object_detected`, unchanged). Codes 0 and 3 are unchanged.
+- `open_gripper()` / `close_gripper()`, the dashboard's Open / Close and the blocks' gripper scale use the gripper's
+  full stroke, positions 0 and 255 (they were 1 and 254). Gripper firmware 110 sets both calibrated ends clear of the
+  mechanical stops, so the jaws arrive there with a few mA instead of pressing into a stop; on older gripper firmware
+  0 and 255 lay inside the stops (flash the gripper to 110 first).
 - The first-run check waits up to 15 s for the dashboard to let go of control (it holds it for 5 s after the last
   click, for example on Enable) instead of skipping the step at once.
 

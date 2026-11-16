@@ -37,7 +37,7 @@ MAX_TEXT_LEN = 500
 MAX_VARIABLES = 200
 JOINT_SANITY_DEG = 1000.0   # garbage filter only — the joint LIMITS are the robot XML's, checked by the executor
 NUMBER_SANITY = 1e12
-GRIPPER_OPEN, GRIPPER_CLOSED = 1, 254       # move_gripper's raw scale (docs/Robotclient_commands.md)
+GRIPPER_OPEN, GRIPPER_CLOSED = 0, 255       # move_gripper's raw scale, the full stroke (firmware 110; 2026-11-16)
 INDENT = "    "
 
 KIND_NAMES = {"Number": "a number", "Boolean": "a yes / no value", "String": "text", "Any": "a variable",

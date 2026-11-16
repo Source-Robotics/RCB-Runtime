@@ -916,7 +916,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             _exec(lambda r: r.set_gripper(pos, spd, cur, act), label)
 
         def _gr_move(pos):
-            # Open/Close pass 1/254; Goto passes the slider's tracked value.
+            # Open/Close pass 0/255 (the full stroke on gripper firmware 110, 2026-11-16); Goto passes the slider's tracked value.
             # We do NOT write `position` into _gripper_cmd_state — that field is
             # owned by the slider so Goto always reflects the slider, not the
             # last hard-coded button target.
@@ -971,8 +971,8 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                 gripper_ctrl_mode_toggle = ui.toggle(['motor', 'firmware'], value='motor',
                                                     on_change=_on_gripper_ctrl_mode)
                 ui.separator().props("vertical")
-                ui.button("Open",  icon="open_in_full",  on_click=lambda: _gr_move(1)  ).props("color=primary outline size=sm")
-                ui.button("Close", icon="close_fullscreen",on_click=lambda: _gr_move(254)).props("color=primary outline size=sm")
+                ui.button("Open",  icon="open_in_full",  on_click=lambda: _gr_move(0)  ).props("color=primary outline size=sm")
+                ui.button("Close", icon="close_fullscreen",on_click=lambda: _gr_move(255)).props("color=primary outline size=sm")
                 ui.button("Goto",  icon="play_arrow",    on_click=lambda: _gr_move(_gripper_cmd_state['position'])).props("color=primary outline size=sm")
                 ui.button("Stop",  icon="stop",          on_click=_gr_stop      ).props("color=warning outline size=sm") \
                     .tooltip("Halt in place — holds the jaws where they are (still gripping)")
