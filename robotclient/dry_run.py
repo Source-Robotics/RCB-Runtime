@@ -600,6 +600,12 @@ class DryRunRobotClient(RobotClient):
     def identify_arm(self) -> None:
         self._record_immediate_event("identify_arm", {"kind": "sound"})
 
+    def play_sound(self, name: str) -> None:
+        from utility.sound import TUNES
+        if not isinstance(name, str) or name not in TUNES:
+            raise CommandRejected("BAD_ARGS", f"play_sound takes one tune name: {', '.join(TUNES)}")
+        self._record_immediate_event("play_sound", {"name": name, "kind": "sound"})
+
     def set_sound(self, **settings) -> None:
         self._record_immediate_event("set_sound", {"settings": dict(settings), "kind": "sound"})
 

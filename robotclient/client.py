@@ -6382,13 +6382,15 @@ class RobotClient:
     def identify_arm(self) -> None:
         """Play this arm's identify tune through one of its motors.
 
-        A short rising tune, so you can hear which arm a client is talking to.
-        One drive plays it: J2, unless `set_sound(node=...)` names another. It
-        plays on the robot's sound axis (`q` as shipped: the tone is a small
-        torque at its pitch, which nothing judges at rest). Nothing moves. It
-        plays with the arm enabled or disabled, in any mode except with the
-        motors off, while flashing and while the robot starts. It needs no
-        control of the robot.
+        A short tune, so you can hear which arm a client is talking to: the one
+        chosen with `set_sound(identify_tune=...)` (`"fanfare"` as shipped). One
+        drive plays it: J2, unless `set_sound(node=...)` names another. At rest
+        it plays on the robot's sound axis (`q` as shipped: the tone is a small
+        torque at its pitch, which nothing judges at rest); in EXEC, JOG, RTI
+        and SOFT_RTI on `d` (no torque), so it never disturbs a move. Nothing
+        moves. It plays with the arm enabled or disabled, in any mode except
+        with the motors off, while flashing and while the robot starts. It needs
+        no control of the robot.
 
         Raises:
             CommandRejected: RTI refused it: the identify sound is switched off,
@@ -6495,6 +6497,47 @@ class RobotClient:
         """
         self._immediate("play_tune", [[list(n) if isinstance(n, tuple) else n for n in notes]])
 
+    def play_sound(self, name: str) -> None:
+        """Play a tune from the robot's sound library by its name.
+
+        The library holds 15 short tunes: `"power_up"`, `"rise"`,
+        `"low_double"`, `"fanfare"`, `"sweep_up"`, `"sweep_down"`,
+        `"ding_dong"`, `"double_beep"`, `"chirp"`, `"fall"`, `"minor"`,
+        `"alarm"`, `"triple_low"`, `"heartbeat"` and `"arpeggio"`. The robot's own
+        sounds each play one of them, chosen with `set_sound()`. At rest the
+        tune plays on the robot's sound axis, as the robot's own sounds do; in
+        EXEC, JOG, RTI and SOFT_RTI on `d` (no torque), so it never disturbs a
+        move. The command returns as soon as the robot has taken it; a tone or
+        tune asked for while another plays replaces it. Switched on or off with
+        programs' sounds: `set_sound(programs=...)`.
+
+        Args:
+            name: The tune's name, one of the 15 above.
+
+        Raises:
+            CommandRejected: The robot refused it: no such tune, or another
+                client holds control. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `name` is not a tune of the library.
+            RTI_REFUSED: Programs' sounds are switched off
+                (`set_sound(programs=0)`), or the drives do not hold now: the
+                motors are off, the robot is flashing a drive or starting. The
+                message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        See also:
+            `set_sound()`, `play_tune()`, `beep()`
+
+        Examples:
+            >>> robot.play_sound("ding_dong")
+        """
+        self._immediate("play_sound", [name])
+
     def set_sound(self, **settings: Any) -> None:
         """Change the robot's sound settings and save them.
 
@@ -6516,12 +6559,16 @@ class RobotClient:
                 `current_ma`: the loudness as a current, 10 to 1000 mA. `node`:
                 the drive that plays, 0 for J1 up to the last joint, one more
                 for a CAN gripper. `limit_mv`: the most voltage the sound may
-                use, 500 to 6000 mV.
+                use, 500 to 6000 mV. `boot_tune`, `homing_done_tune`,
+                `error_tune` and `identify_tune`: the tune each of the robot's
+                own sounds plays, a name from the library (see `play_sound()`).
 
         Defaults:
             From `config/system.xml`. As shipped: all five sounds on, `axis`
             `"q"`, `current_ma` 290 mA, `node` 1 (J2), `limit_mv` 3600 mV (the
-            values chosen on PAR6 by ear).
+            values chosen on PAR6 by ear); the tunes `boot_tune` `"power_up"`,
+            `homing_done_tune` `"rise"`, `error_tune` `"low_double"`,
+            `identify_tune` `"fanfare"`.
 
         Raises:
             CommandRejected: The robot refused it: an unknown setting or a value
@@ -6532,8 +6579,8 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
 
         Errors:
-            BAD_ARGS: No setting named, an unknown setting, or a value out of
-                range.
+            BAD_ARGS: No setting named, an unknown setting, a value out of range,
+                or a tune not in the library.
             INTERNAL: The file could not be written, or the edited file did not
                 read back the values; the file is left unchanged.
             RTI_REFUSED: RTI did not take a setting. The message says why.

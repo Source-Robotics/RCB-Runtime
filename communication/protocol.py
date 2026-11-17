@@ -162,6 +162,7 @@ COMMAND_RULES = {
     "identify_arm":  (IMMEDIATE, None, None, False),
     "beep":          (IMMEDIATE, None, None, False),
     "play_tune":     (IMMEDIATE, None, None, False),
+    "play_sound":    (IMMEDIATE, None, None, False),
     "set_sound":     (IMMEDIATE, None, None, False),
     "get_versions":      (IMMEDIATE, None, None, False),   # utility/versions.py (2026-10-21)
     # IK only, moves nothing — any mode, any state, homed or not (`near` defaults to the measured

@@ -661,6 +661,7 @@ RTI_ANSWER_CODES = {
     "home": ("MODE_REJECTED",),
     "identify_arm": ("RTI_REFUSED",),
     "joint_test": ("JOINT_TEST_REFUSED",),
+    "play_sound": ("RTI_REFUSED",),
     "play_tune": ("RTI_REFUSED",),
     "read_drive_parameters": ("RTI_REFUSED",),
     "reload_filters": ("RTI_REFUSED",),
@@ -1480,12 +1481,21 @@ def _handle_play_tune(args, cid, conn):
         _answered(conn, cid, "play_tune", f"sound:tune:{tune}")
 
 
+def _handle_play_sound(args, cid, conn):
+    """play_sound name — a tune of the robot's library (utility/sound.TUNES) as a program's sound (<sound><programs>):
+    on the robot's sound axis at rest, on d in EXEC / JOG / RTI / SOFT_RTI (RTI decides; 2026-11-17)."""
+    from utility.sound import TUNES
+    if len(args) != 1 or not isinstance(args[0], str) or args[0] not in TUNES:
+        return _bad_args(cid, conn, "play_sound", f"play_sound takes one tune name: {', '.join(TUNES)}")
+    _answered(conn, cid, "play_sound", f"sound:play:{args[0]}")
+
+
 def _handle_set_sound(args, cid, conn):
     """set_sound {setting: value, ...} — the sound's settings (utility/sound.py SETTINGS): saved in config/system.xml's
     <sound> (only those values edited, every comment kept; the edited text must read back the values before it is
     written; a copy in temp_data/xml_backups/ first), then passed to RTI (2026-11-17)."""
     from config.xml_parser.system import _parse_sound
-    from utility.sound import SETTINGS, SWITCHES, set_values_in_block, sound_text
+    from utility.sound import SETTINGS, SWITCHES, TUNE_SETTINGS, TUNES, set_values_in_block, sound_text
     if not isinstance(args, dict) or not args:
         return _bad_args(cid, conn, "set_sound", "set_sound needs settings by name, for example {'error': 0}")
     bounds = {"current_ma": (10, 1000), "node": (0, len(_drive_nodes()) - 1), "limit_mv": (500, 6000)}
@@ -1497,6 +1507,8 @@ def _handle_set_sound(args, cid, conn):
             why = "0 or 1 (or True / False)"
         elif key == "axis":
             ok, why = value in ("d", "q"), "'d' or 'q'"
+        elif key in TUNE_SETTINGS:
+            ok, why = isinstance(value, str) and value in TUNES, f"a tune of the library ({', '.join(TUNES)})"
         else:
             lo, hi = bounds[key]
             ok = (not isinstance(value, bool) and isinstance(value, (int, float)) and lo <= value <= hi
@@ -2647,6 +2659,7 @@ IMMEDIATE_HANDLERS = {
     "identify_arm":     _handle_identify_arm,        # sound through the motors (utility/sound.py, 2026-11-17)
     "beep":             _handle_beep,
     "play_tune":        _handle_play_tune,
+    "play_sound":       _handle_play_sound,
     "set_sound":        _handle_set_sound,
     "get_versions":     _handle_get_versions,          # every part's version (2026-10-21)
     "set_log_level":    _handle_set_log_level,

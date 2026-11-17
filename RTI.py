@@ -110,6 +110,7 @@ from communication.can_message_handlers import send_brake_on_idle, fetch_board_i
 from utility.drive_params import ParamRead, catalogue as drive_param_catalogue
 from utility.drive_capture import DriveCapture
 from utility.sound import SoundPlayer
+from utility.safety_monitor import COLLISION_MODES
 from utility.kt_init import resolve_and_preload_kt
 from utility.tick_types import TickContext, TickResult
 from utility.mode_dispatch import build_mode_dispatch, dispatch_step
@@ -727,17 +728,22 @@ def main():
         disabled arm and ACTIVE_ERROR hold at zero speed (utility/mode_dispatch: velocity-hold), so they play."""
         return st.current_mode not in (RobotMode.BOOTING, RobotMode.FLASHING, RobotMode.SAFETY_STOP)
 
+    def _sound_axis():
+        """The robot's own sounds' axis now: None = the settings' (q as shipped) at rest; d in EXEC / JOG / RTI /
+        SOFT_RTI, where the contact / collision checks read the motor current (a q tone is a torque)."""
+        return "d" if st.current_mode in COLLISION_MODES else None
+
     def _sound_boot():
         """The boot chime once the robot is ready (user 2026-11-17: "when ready"), unless an error is latched then —
         the error tune has marked that."""
         if float(shared_data.rti["error_active"][0]) < 0.5:
-            sound.event("boot", _sound_holds())
+            sound.event("boot", _sound_holds(), _sound_axis())
 
     def _sound_on_error():
         """The error tune when an error has just latched (error_active rising), if its switch is on."""
         ea = float(shared_data.rti["error_active"][0])
         if ea >= 0.5 and _sound_err_prev[0] < 0.5:
-            sound.event("error", _sound_holds())
+            sound.event("error", _sound_holds(), _sound_axis())
         _sound_err_prev[0] = ea
 
     def _arm_captures_at_start():
@@ -1704,24 +1710,31 @@ def main():
         log_handler.info("node %d saves its whole working config to its flash (it may not answer for ~1 s)", node)
 
     def _handle_sound(cmd_msg, cmd_dict):
-        """sound:identify | sound:tune:<hz,ms;...> — play through the motors (utility/sound.py, 2026-11-17): identify
-        (its switch: <sound><identify>), a program's tune (<sound><programs>). Refused when its switch is off or the
-        drives do not hold (motors off, flashing, starting — _sound_holds), or a malformed / out-of-range tune."""
-        from utility.sound import TUNES, decode, note_hz
+        """sound:identify | sound:play:<name> | sound:tune:<hz,ms;...> — play through the motors (utility/sound.py,
+        2026-11-17): identify (its switch: <sound><identify>; its chosen tune), a library tune or a program's raw tune
+        (<sound><programs>; the raw tune always on d). Refused when its switch is off or the drives do not hold (motors
+        off, flashing, starting — _sound_holds), an unknown name, or a malformed / out-of-range tune."""
+        from utility.sound import PROGRAMS_AXIS, TUNES, decode, tune_ms
         parts = cmd_msg.split(":", 2)
         what = parts[1] if len(parts) > 1 else ""
         holds = _sound_holds()
         if what == "identify":
-            why = sound.request("identify", [(note_hz(n), int(s * 1000)) for n, s in TUNES["identify"]], holds)
+            why = sound.request("identify", sound.tune("identify"), holds, _sound_axis())
+        elif what == "play":
+            name = parts[2] if len(parts) > 2 else ""
+            if name not in TUNES:
+                _refused(log_handler, "sound: %r is not a tune of the library", name)
+                return
+            why = sound.request("programs", tune_ms(name), holds, _sound_axis())
         elif what == "tune":
             try:
                 events = decode(parts[2] if len(parts) > 2 else "")
             except (ValueError, IndexError) as e:
                 _refused(log_handler, "sound: a malformed tune (%s)", e)
                 return
-            why = sound.request("programs", events, holds)
+            why = sound.request("programs", events, holds, PROGRAMS_AXIS)
         else:
-            _refused(log_handler, "sound: %r is not identify / tune", what)
+            _refused(log_handler, "sound: %r is not identify / play / tune", what)
             return
         if why:
             _refused(log_handler, "sound refused: %s", why)
@@ -1729,13 +1742,19 @@ def main():
     def _handle_sound_set(cmd_msg, cmd_dict):
         """sound_set:<key>=<value>,... — the sound's settings changed (the executor saved them in system.xml first);
         the next tune sends the playing drive its voltage cap and axis."""
-        from utility.sound import SETTINGS, SWITCHES
+        from utility.sound import SETTINGS, SWITCHES, TUNE_SETTINGS, TUNES
         changes = {}
         for item in (cmd_msg.split(":", 1)[1] if ":" in cmd_msg else "").split(","):
             key, _, value = item.partition("=")
             if key not in SETTINGS:
                 _refused(log_handler, "sound_set: %r is not a sound setting", key)
                 return
+            if key in TUNE_SETTINGS:
+                if value not in TUNES:
+                    _refused(log_handler, "sound_set: %s=%r is not a tune of the library", key, value)
+                    return
+                changes[key] = value
+                continue
             try:
                 changes[key] = (value if key == "axis" else int(value) if key in SWITCHES + ("node",)
                                 else float(value))
@@ -3238,7 +3257,7 @@ def main():
                              message=f"{_from_mode} → {st.current_mode}")
                 if (_from_mode == RobotMode.HOMING and new_mode == RobotMode.IDLE
                         and shared_data.homed_state.get() == "HOMED"):
-                    sound.event("homing_done", _sound_holds())           # the homing chime (utility/sound.py)
+                    sound.event("homing_done", _sound_holds(), _sound_axis())   # the homing chime (utility/sound.py)
 
                 if new_mode == RobotMode.SAFETY_STOP:
                     # The motors off hold the jaws too (2026-10-24: the user's "freeze it also" named safety_stop()).

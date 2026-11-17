@@ -14,6 +14,7 @@ from pathlib import Path
 
 from config.schema_versions import check_schema
 from config.xml_parser.xml_access import get_active_gripper, get_joint_count, parse_robot_config
+from utility.sound import DEFAULT_TUNES as _DEFAULT_TUNES, TUNES as _TUNES      # the sound library (<sound> tunes)
 
 # <drive_watchdog_ms> (2026-10-13): every drive's CAN watchdog. 0 would switch it off in the drive firmware; the
 # minimum is 2x the tick-50/150/300 configuration bursts (~200 frames ahead of that tick's commands: a drive went 40 ms
@@ -328,7 +329,8 @@ def _parse_dynamics_feedforward(elem: ET.Element | None) -> dict:
 # <sound> (2026-11-17, utility/sound.py): each use switched on (1) / off (0), the axis, the loudness, the drive that plays,
 # the sound's voltage cap. A missing block / value = these; an unreadable or out-of-range value = its default + a warning.
 _SOUND_FALLBACK = {"boot": 1, "homing_done": 1, "error": 1, "identify": 1, "programs": 1, "axis": "q",
-                   "current_ma": 290.0, "node": 1, "limit_mv": 3600.0}
+                   "current_ma": 290.0, "node": 1, "limit_mv": 3600.0,
+                   **{f"{e}_tune": t for e, t in _DEFAULT_TUNES.items()}}
 _SOUND_BOUNDS = {"current_ma": (10.0, 1000.0), "node": (0, 15), "limit_mv": (500.0, 6000.0)}
 SOUND_SWITCHES = ("boot", "homing_done", "error", "identify", "programs")
 
@@ -352,6 +354,12 @@ def _parse_sound(elem: ET.Element | None) -> dict:
                 out[key] = text
             else:
                 logger.warning("system.xml <sound><axis> is %r, not d / q — using %s", text, default)
+        elif key.endswith("_tune"):
+            if text in _TUNES:
+                out[key] = text
+            else:
+                logger.warning("system.xml <sound><%s> is %r, not a tune of the library (utility/sound.TUNES) — "
+                               "using %s", key, text, default)
         else:
             try:
                 val = float(text)

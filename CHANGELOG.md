@@ -99,6 +99,12 @@ What changed in each version of the RCB runtime. The newest version is at the to
   Programs' tones always play on `d`: they can sound during a move, where the contact and collision checks read the
   motor current. Nothing moves; a drive plays while it holds, so the arm may be enabled or disabled, not with the
   motors off. A tune's few frames go out in the status-poll slot: the per-tick data is never delayed.
+- A library of 15 short tunes for the robot's sounds (`power_up`, `rise`, `low_double`, `fanfare`, `sweep_up`,
+  `sweep_down`, `ding_dong`, `double_beep`, `chirp`, `fall`, `minor`, `alarm`, `triple_low`, `heartbeat`,
+  `arpeggio`): each of the robot's own sounds (ready after start, homing done, error, identify) plays the one picked
+  for it on the Sound card (a ▶ plays each) or with `set_sound(boot_tune=..., homing_done_tune=..., error_tune=...,
+  identify_tune=...)`; `play_sound(name)` plays one from a program. The robot's own sounds and library tunes play on
+  the robot's sound axis at rest and on `d` in EXEC, JOG, RTI and SOFT_RTI, so a tone never disturbs a move.
 
 ### Changed
 

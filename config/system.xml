@@ -348,7 +348,10 @@
          pitch (they play at rest); d = no torque, quieter. Programs' tones always play on d (they can sound during a
          move, where the contact checks read the current). current_ma: the loudness (10-1000). node: the drive that
          plays (0 = J1; 1 = J2, the loudest on PAR6). limit_mv: the sound's voltage at most (the drive's parameter 81,
-         500-6000). The dashboard's Sound card changes these values here. -->
+         500-6000). boot_tune / homing_done_tune / error_tune / identify_tune: the tune each plays, one of power_up,
+         rise, low_double, fanfare, sweep_up, sweep_down, ding_dong, double_beep, chirp, fall, minor, alarm,
+         triple_low, heartbeat, arpeggio (utility/sound.py TUNES; the Sound card plays each). The dashboard's Sound card
+         changes these values here. -->
     <sound>
         <boot>1</boot>
         <homing_done>1</homing_done>
@@ -359,5 +362,9 @@
         <current_ma>290</current_ma>
         <node>1</node>
         <limit_mv>3600</limit_mv>
+        <boot_tune>arpeggio</boot_tune>
+        <homing_done_tune>rise</homing_done_tune>
+        <error_tune>low_double</error_tune>
+        <identify_tune>fanfare</identify_tune>
     </sound>
 </system>

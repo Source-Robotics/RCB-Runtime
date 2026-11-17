@@ -1,6 +1,6 @@
 """Sound through the motors (2026-11-17, user: homing done, an error, identify this arm, tones for programs — each
 switched on / off; after the listening test: a boot chime too, the robot's own sounds on q, programs' tones on d;
-TODO/driver_110_rtb15_plan.md).
+then a library of 15 tunes, one chosen per robot sound; TODO/driver_110_rtb15_plan.md).
 
 Firmware 109+ plays tones through a motor: a queue of up to 31 events per drive (a frequency, a loudness as a current,
 how long until the next event; frequency 0 silences), started with one play command. A drive plays only in a
@@ -9,9 +9,10 @@ closed loop (position, velocity, current or PD mode) — RTI keeps every drive i
 drive plays — <sound><node> in system.xml (1 = J2, the loudest on PAR6: the largest gear and the upper arm's shell) —
 at most <limit_mv> (parameter 81). The axis (parameter 82): d = the sound's current makes no torque (quieter); q =
 louder, the tone is a real torque at its pitch (J2 at 250 mA: 1.84 Nm). The robot's own sounds (boot, homing done, an
-error, identify) play on <sound><axis> (q): they play at rest, where nothing judges the torque. Programs' tones always
-play on d (PROGRAMS_AXIS, user 2026-11-17): they can sound during a move, where the contact / collision checks read the
-motor current. Every tune sends both parameters first, so the axis is right per tune and a drive that restarted gets
+error, identify) and a library tune (play_sound) play on <sound><axis> (q) at rest, where nothing judges the torque, and
+on d in EXEC / JOG / RTI / SOFT_RTI, where the contact / collision checks read the motor current (RTI's _sound_axis).
+Programs' raw tones (beep / play_tune) always play on d (PROGRAMS_AXIS, user 2026-11-17). Each robot sound plays the
+tune chosen for it from TUNES (<sound><EVENT_tune>; DEFAULT_TUNES). Every tune sends both parameters first, so the axis is right per tune and a drive that restarted gets
 them again. A Spectral Micro (the gripper's drive) plays only up to 2500 Hz.
 
 SoundPlayer is RTI's side: a queue of single frames sent in the shared status-poll slot (one every other free slot,
@@ -27,17 +28,33 @@ from collections import deque
 MAX_EVENTS = 30                           # the drive's queue holds 31: the last is the silence
 MIN_HZ, MAX_HZ = 20.0, 3000.0             # the drive plays 20 Hz to under half its loop rate (3125 Hz on a STEPFOC)
 SWITCHES = ("boot", "homing_done", "error", "identify", "programs")
-PROGRAMS_AXIS = "d"                       # programs' tones: never a torque during a move (user, 2026-11-17)
-SETTINGS = SWITCHES + ("axis", "current_ma", "node", "limit_mv")
+EVENTS = ("boot", "homing_done", "error", "identify")       # the robot's own sounds: each plays a tune chosen from TUNES
+TUNE_SETTINGS = tuple(f"{e}_tune" for e in EVENTS)
+PROGRAMS_AXIS = "d"                       # programs' raw tones: never a torque during a move (user, 2026-11-17)
+SETTINGS = SWITCHES + ("axis", "current_ma", "node", "limit_mv") + TUNE_SETTINGS
 P_SOUND_LIMIT_MV, P_SOUND_AXIS = 81, 82
-# (note or Hz, seconds); 0 = a rest
+# The library (2026-11-17, user: "a list of 15 different sounds ... select what i like the most"): original short tunes,
+# (note or Hz, seconds); 0 = a rest. A name is a setting's value in system.xml: rename one only with its files.
 TUNES = {
-    "boot": (("G4", 0.12), ("D5", 0.12), ("G5", 0.30)),
-    "homing_done": (("C5", 0.11), ("E5", 0.11), ("G5", 0.22)),
-    "error": (("A3", 0.18), (0, 0.09), ("A3", 0.26)),
-    "identify": (("G4", 0.12), ("C5", 0.12), ("E5", 0.12), ("G5", 0.12), ("E5", 0.12), ("G5", 0.36)),
-    "test": (("A4", 0.4),),
+    "power_up": (("G4", 0.12), ("D5", 0.12), ("G5", 0.30)),
+    "rise": (("C5", 0.11), ("E5", 0.11), ("G5", 0.22)),
+    "low_double": (("A3", 0.18), (0, 0.09), ("A3", 0.26)),
+    "fanfare": (("G4", 0.12), ("C5", 0.12), ("E5", 0.12), ("G5", 0.12), ("E5", 0.12), ("G5", 0.36)),
+    "sweep_up": (("C5", 0.05), ("D5", 0.05), ("E5", 0.05), ("F5", 0.05), ("G5", 0.05), ("A5", 0.05), ("B5", 0.05),
+                 ("C6", 0.15)),
+    "sweep_down": (("C6", 0.05), ("B5", 0.05), ("A5", 0.05), ("G5", 0.05), ("F5", 0.05), ("E5", 0.05), ("D5", 0.05),
+                   ("C5", 0.15)),
+    "ding_dong": (("E5", 0.18), ("C5", 0.32)),
+    "double_beep": (("A5", 0.08), (0, 0.06), ("A5", 0.08)),
+    "chirp": (("G5", 0.05), ("C6", 0.05), ("G6", 0.12)),
+    "fall": (("G5", 0.11), ("E5", 0.11), ("C5", 0.22)),
+    "minor": (("A4", 0.12), ("C5", 0.12), ("E5", 0.24)),
+    "alarm": (("A5", 0.12), ("E5", 0.12), ("A5", 0.12), ("E5", 0.12), ("A5", 0.12), ("E5", 0.12)),
+    "triple_low": (("C4", 0.14), (0, 0.08), ("C4", 0.14), (0, 0.08), ("C4", 0.14)),
+    "heartbeat": (("C4", 0.08), (0, 0.08), ("C4", 0.14), (0, 0.35), ("C4", 0.08), (0, 0.08), ("C4", 0.14)),
+    "arpeggio": (("C4", 0.07), ("E4", 0.07), ("G4", 0.07), ("C5", 0.07), ("E5", 0.07), ("G5", 0.07), ("C6", 0.20)),
 }
+DEFAULT_TUNES = {"boot": "power_up", "homing_done": "rise", "error": "low_double", "identify": "fanfare"}
 _NOTE = re.compile(r"^([A-Ga-g])([#b]?)(\d)$")
 _OFFSETS = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
 
@@ -96,11 +113,17 @@ def decode(text) -> list:
     return out
 
 
+def tune_ms(name: str) -> list:
+    """[(Hz, ms)] of a library tune (TUNES)."""
+    return [(note_hz(n), int(round(s * 1000))) for n, s in TUNES[name]]
+
+
 def sound_text(key: str, value) -> str:
-    """A <sound> setting's text in system.xml: a switch / the node as an integer, the axis as it is, a number as %g."""
+    """A <sound> setting's text in system.xml: a switch / the node as an integer, the axis / a tune's name as it is, a
+    number as %g."""
     if key in SWITCHES or key == "node":
         return str(int(value))
-    if key == "axis":
+    if key == "axis" or key in TUNE_SETTINGS:
         return str(value)
     return f"{float(value):g}"
 
@@ -150,22 +173,29 @@ class SoundPlayer:
         self.queue.append(("event", n, 0.0, 0, 0))
         self.queue.append(("play", n))
 
-    def event(self, name: str, holds: bool) -> bool:
-        """A built-in tune for an event (boot / homing_done / error) when its switch is on and the drives hold. True =
-        queued."""
+    def tune(self, event: str) -> list:
+        """[(Hz, ms)] of the tune chosen for one of the robot's own sounds (<sound><EVENT_tune>; a name not in the
+        library: that sound's default)."""
+        name = self.settings.get(f"{event}_tune", DEFAULT_TUNES[event])
+        return tune_ms(name if name in TUNES else DEFAULT_TUNES[event])
+
+    def event(self, name: str, holds: bool, axis=None) -> bool:
+        """One of the robot's own sounds (boot / homing_done / error) when its switch is on and the drives hold, on
+        `axis` (None = the settings'). True = queued."""
         if not holds or not int(self.settings.get(name, 0)):
             return False
-        self.play([(note_hz(n), int(s * 1000)) for n, s in TUNES[name]])
+        self.play(self.tune(name), axis)
         return True
 
-    def request(self, switch: str, events, holds: bool) -> str | None:
-        """A tune asked for (identify / programs): why not, or None and it is queued."""
+    def request(self, switch: str, events, holds: bool, axis=None) -> str | None:
+        """A tune asked for (identify / programs), on `axis` (None = the settings'): why not, or None and it is
+        queued."""
         if not int(self.settings.get(switch, 0)):
             return f"sound for {switch} is switched off (system.xml <sound>, the dashboard's Sound card)"
         if not holds:
             return ("the drives are not holding (motors off, flashing or starting): a drive plays only in a closed "
                     "loop")
-        self.play(events, PROGRAMS_AXIS if switch == "programs" else None)
+        self.play(events, axis)
         return None
 
     def send_next(self, motors) -> None:
