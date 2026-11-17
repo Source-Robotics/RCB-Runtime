@@ -3903,6 +3903,8 @@ class RobotClient:
 
         Errors:
             NO_GRIPPER: The robot has no CAN gripper.
+            RTI_REFUSED: The gripper is being changed (`begin_gripper_change()`):
+                end the change first.
             RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
                 responding. The command may still have taken effect.
 
@@ -6378,6 +6380,80 @@ class RobotClient:
             >>> robot.save_drive_parameter_to_xml(3, 9, 0.02)
         """
         return self._immediate("save_drive_parameter_to_xml", [drive, number, value])
+
+    def begin_gripper_change(self) -> None:
+        """Begin changing the gripper with the arm holding its homing.
+
+        Use it before you unplug the gripper. The arm stays disabled and its
+        joints keep holding, so the wrist resists while you twist the gripper
+        off and on. The jaws go idle first, and let go of a part they hold.
+        While the gripper is being changed, its silence and its faults are not
+        reported, so unplugging it does not un-home the arm; enabling, the
+        gripper's commands and every mode but IDLE and motors off are refused.
+        A gripper plugged in again gets its settings from the robot by itself.
+        End it with `end_gripper_change()` once the gripper answers;
+        `latest_status()["gripper"]["changing"]` and `["answering"]` show
+        where it is. For now the same kind of gripper must be fitted again: the
+        robot keeps the active gripper XML. The new gripper's jaws need
+        calibrating afterwards (`calibrate_gripper()`).
+
+        Raises:
+            CommandRejected: The robot refused it: the arm is enabled or not in
+                IDLE, another client holds control, or there is no CAN gripper.
+                Or RTI refused it or did not answer within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            NO_GRIPPER: The robot has no CAN gripper.
+            BAD_ARGS: An argument was given; it takes none.
+            RTI_REFUSED: RTI refused it: the arm is enabled, it is not in IDLE,
+                or the gripper is already being changed. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        See also:
+            `end_gripper_change()`, `calibrate_gripper()`, `store_gripper_tool_id()`
+
+        Examples:
+            >>> robot.begin_gripper_change()
+            >>> # unplug the gripper, fit it again
+            >>> robot.end_gripper_change()
+        """
+        self._immediate("begin_gripper_change")
+
+    def end_gripper_change(self) -> None:
+        """End changing the gripper once it answers again.
+
+        The robot clears the gripper drive's faults, then counts its silence
+        and faults again after one second. Enabling and the gripper's commands
+        work again. Refused while the gripper does not answer: plug it in
+        first.
+
+        Raises:
+            CommandRejected: The robot refused it: the gripper is not being
+                changed, it does not answer, another client holds control, or
+                there is no CAN gripper. Or RTI refused it or did not answer
+                within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            NO_GRIPPER: The robot has no CAN gripper.
+            BAD_ARGS: An argument was given; it takes none.
+            RTI_REFUSED: RTI refused it: the gripper is not being changed, or
+                its drive does not answer. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        See also:
+            `begin_gripper_change()`, `calibrate_gripper()`
+
+        Examples:
+            >>> robot.end_gripper_change()
+            >>> robot.calibrate_gripper()
+        """
+        self._immediate("end_gripper_change")
 
     def store_gripper_tool_id(self) -> dict:
         """Store this gripper's tool ID in its drive.

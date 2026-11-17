@@ -1039,6 +1039,15 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         ui.label("Gripper Status").classes("text-sm font-semibold mt-2 mb-1 text-gray-600 uppercase tracking-wide")
         gripper_table = ui.table(columns=gripper_columns, rows=[]).classes("w-full")
 
+        # Change the gripper while the arm keeps its homing (gui_gripper_change.py, 2026-11-17); built in a try
+        try:
+            from gui_gripper_change import add_change_card
+            _grip_raw_c = _xml_cfg.get('gripper_CAN_gripper', 0)
+            add_change_card(shared_data, _exec, not (isinstance(_grip_raw_c, float) and math.isnan(_grip_raw_c))
+                            and int(_grip_raw_c) == 1)
+        except Exception:
+            logger.exception("the Change-gripper card unavailable")
+
         ui.separator().classes("my-3")
         ui.label("Gripper Motor Health").classes("text-sm font-semibold mb-1 text-gray-600 uppercase tracking-wide")
         with ui.grid(columns=2).classes("gap-x-8 gap-y-1 font-mono text-sm mt-1 mb-2"):

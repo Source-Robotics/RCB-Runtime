@@ -769,6 +769,8 @@ def setup(joints: int = 6, force_reinit: bool = False):
                         # the gripper drive's tool id against the gripper XML's (utility/drive_checks.py, 2026-11-17):
                         # [the drive's (-1 not known), the XML's (-1 none declared), TOOL_STATES code]
                         ("gripper_tool", 3),
+                        # the Change-gripper mode: 1 while the gripper is being swapped (TODO/live_gripper_swap_plan.md)
+                        ("gripper_change", 1),
                         ("hall_check_joint", 1), ("hall_check_pin", 1), ("hall_check_changes", 1),
                         ("hall_check_edge_deg", 2), ("free_joint", 1), ("joint_test", 8)]:
         shm, arr = _attach_or_create(name, np.float64, count)

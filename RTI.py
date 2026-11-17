@@ -510,6 +510,17 @@ def main():
         'action': 0,
     }
 
+    # The Change-gripper mode (TODO/live_gripper_swap_plan.md P1, 2026-11-17, user: the arm disabled and holding while
+    # the gripper is unplugged and fitted again): its silence and faults are neither latched nor un-home the arm.
+    _gripper_change = {"on": False, "errors_from": 0.0}
+    GRIPPER_CHANGE_GRACE_TICKS = 250      # after the change: 1 s before the gripper's loss and faults count again
+
+    def _gripper_errors_active():
+        """active_CAN_gripper for the error pass: 0 during the Change-gripper mode and its grace after it."""
+        if not active_CAN_gripper or _gripper_change["on"]:
+            return 0
+        return 0 if shared_data.rti["loop_tick"][0] < _gripper_change["errors_from"] else active_CAN_gripper
+
     def _freeze_gripper(why):
         """Hold the jaws where they are (2026-10-24, user: a stop "should freeze it also"). The firmware-mode target
         becomes the measured jaw position, so a gripper still travelling to its last target stops there. Called on a
@@ -731,6 +742,8 @@ def main():
         (utility/drive_checks.tool_check; user 2026-11-17: a mismatch is a stop). Published in rti['gripper_tool'];
         a change logged once; a mismatch kept in the base warnings, re-raised every tick: the arm cannot be enabled.
         Checked all along, so storing the id (or, later, another gripper fitted) clears or raises it within seconds."""
+        if _gripper_change["on"]:                 # the drive may be unplugged or another one meanwhile
+            return
         from utility.drive_checks import TOOL_STATES, tool_check
         xml_id = cfg.get('gripper_tool_id')
         drive_id = getattr(Motor[joint_num], "tool_id", None)
@@ -1502,6 +1515,8 @@ def main():
         _errors_active = bool(shared_data.rti['error_active'][0])
         _safety_active = bool(shared_data.rti['safety_violation'][0])
         success, reason = request_enable(_errors_active, _safety_active)
+        if success and _gripper_change["on"]:      # the Change-gripper mode (P1, 2026-11-17)
+            success, reason = False, "finish the gripper change first (end_gripper_change)"
         _before = shared_data.robot_state.get()
         if success:
             shared_data.robot_state.set("ENABLED")
@@ -1725,6 +1740,65 @@ def main():
         Motor[node].Send_Parameter(number, value)
         param_read.add(node, [number])
         log_handler.info("parameter %d of node %d written: %d (in its RAM; read back now)", number, node, value)
+
+    def _handle_gripper_change(cmd_msg, cmd_dict):
+        """gripper_change:1 | gripper_change:0 — the Change-gripper mode (TODO/live_gripper_swap_plan.md P1, 2026-11-17,
+        user: the arm disabled and holding while the gripper is swapped).
+        1: only with a CAN gripper, in IDLE, the arm disabled. The jaws go idle (they let go), a calibration stops, the
+        gripper's homing is gone (gripper_homed 0); its silence is not latched (can_quiet_until) and its faults are not
+        collected (_gripper_errors_active), so unplugging it does not un-home the arm. Meanwhile enabling, the
+        gripper's commands and every mode but IDLE / SAFETY_STOP are refused; the reconnect path sends a re-plugged
+        gripper its config by itself.
+        0: only while the gripper answers (CAN_gripper_connected): its faults cleared, then GRIPPER_CHANGE_GRACE_TICKS
+        before its loss and faults count again; its fault capture armed again."""
+        want = cmd_msg.split(":", 1)[1].strip() if ":" in cmd_msg else ""
+        tick = float(shared_data.rti["loop_tick"][0])
+        if want == "1":
+            if not active_CAN_gripper:
+                why = "no CAN gripper"
+            elif _gripper_change["on"]:
+                why = "the gripper is already being changed"
+            elif shared_data.robot_state.get() == "ENABLED":
+                why = "disable the arm first: the gripper is changed with the arm disabled (its joints still hold)"
+            elif st.current_mode != RobotMode.IDLE or st.pending_mode_request is not None:
+                why = f"only in IDLE, not {getattr(st.current_mode, 'value', st.current_mode)}"
+            else:
+                why = None
+            if why:
+                _refused(log_gripper, "gripper change refused: %s", why)
+                return
+            _gripper_fw_state['action'] = 0
+            _gripper_fw_state['_idle_repeats'] = GRIPPER_IDLE_PACK_REPEATS
+            st._gripper_calibrate_pending = st._gripper_calibrate_running = False
+            shared_data.gripper['gripper_homed'][0] = 0
+            can_quiet_until[joint_num] = float("inf")
+            _gripper_change["on"] = True
+            shared_data.rti["gripper_change"][0] = 1.0
+            log_gripper.info("changing the gripper: its jaws idle, its silence and faults not counted, the arm keeps "
+                             "its homing; enabling refused until the change ends")
+            log_activity(_rti_activity_logger, "RTI", "info", "GRIPPER_CHANGE", id=st.command_id,
+                         message="the gripper change began")
+        elif want == "0":
+            if not _gripper_change["on"]:
+                _refused(log_gripper, "gripper change: not changing the gripper")
+                return
+            if not shared_data.rti["CAN_gripper_connected"][0]:
+                _refused(log_gripper, "gripper change: the gripper does not answer — plug it in (its drive on CAN "
+                                      "node %d)", joint_num)
+                return
+            for _ in range(CLEAR_ERROR_SEND_REPEATS):
+                Motor[joint_num].Send_Clear_Error()
+            _gripper_change["on"] = False
+            _gripper_change["errors_from"] = tick + GRIPPER_CHANGE_GRACE_TICKS
+            can_quiet_until[joint_num] = tick + GRIPPER_CHANGE_GRACE_TICKS
+            shared_data.rti["gripper_change"][0] = 0.0
+            drive_capture.arm([joint_num])
+            log_gripper.info("the gripper change ended: the gripper answers; its faults cleared, counted again in %.1f s",
+                             GRIPPER_CHANGE_GRACE_TICKS * delta_t)
+            log_activity(_rti_activity_logger, "RTI", "info", "GRIPPER_CHANGE", id=st.command_id,
+                         message="the gripper change ended")
+        else:
+            _refused(log_gripper, "gripper_change: %r is not gripper_change:1 / gripper_change:0", cmd_msg)
 
     def _handle_tool_id(cmd_msg, cmd_dict):
         """tool_id:<n> — store a tool id in the gripper drive (store_gripper_tool_id, 2026-11-17): its parameter 1, then
@@ -2015,6 +2089,9 @@ def main():
         # the user can see when the sweep is done, so an explicit
         # Open/Close/Goto/Stop is the cancel signal.
         parts = cmd_msg.split(":")
+        if _gripper_change["on"]:
+            _refused(log_gripper, "gripper_set refused: the gripper is being changed (end_gripper_change first)")
+            return
         if len(parts) == 5 and active_CAN_gripper:
             try:
                 _gripper_fw_state['position'] = int(parts[1])
@@ -2030,6 +2107,9 @@ def main():
 
 
     def _handle_gripper_calibrate(cmd_msg, cmd_dict):
+        if _gripper_change["on"]:
+            _refused(log_gripper, "gripper_calibrate refused: the gripper is being changed (end_gripper_change first)")
+            return
         if active_CAN_gripper:
             st._gripper_calibrate_pending = True
             # No target after the calibration (2026-10-24): the old one was sent again once it ended, so the jaws
@@ -2041,6 +2121,9 @@ def main():
     def _handle_gripper_ctrl_mode(cmd_msg, cmd_dict):
         # 1 = motor mode, 2 = firmware mode
         parts = cmd_msg.split(":", 1)  # see _handle_gravity_comp for why this is guarded
+        if _gripper_change["on"]:
+            _refused(log_gripper, "gripper_ctrl_mode refused: the gripper is being changed (end_gripper_change first)")
+            return
         if len(parts) != 2 or not active_CAN_gripper:
             return
         try:
@@ -2544,6 +2627,7 @@ def main():
         "write_param":       _handle_write_param,
         "save_drive":        _handle_save_drive,
         "tool_id":           _handle_tool_id,
+        "gripper_change":    _handle_gripper_change,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
@@ -2849,7 +2933,7 @@ def main():
         st.clear_error_countdown, st.latched_errors, st.error_metadata, st.current_mode = process_errors_tick(
             shared_data, Motor, Motor_errors_data, joint_num,
             st.clear_error_countdown, st.latched_errors, st.error_metadata,
-            active_CAN_gripper, st.current_mode, homing_ctrl,
+            _gripper_errors_active(), st.current_mode, homing_ctrl,     # 0 while the gripper is being changed
             check_estop_active(),
             Gripper_data=Gripper_data,
             exec_link_lost=_exec_link_lost,
@@ -3248,13 +3332,17 @@ def main():
             # something. The number is still published for the operator to see; it
             # just no longer decides.
             _park_ok = bool(st.pending_mode_force)
-            success, new_mode, reason = request_mode_change(
-                st.current_mode, st.pending_mode_request,
-                robot_enabled=_robot_enabled,
-                homed=_homed,
-                errors_active=_errors_active,
-                park_ok=_park_ok,
-            )
+            _asked = str(getattr(st.pending_mode_request, "value", st.pending_mode_request)).upper()
+            if _gripper_change["on"] and _asked not in ("IDLE", "SAFETY_STOP"):     # the Change-gripper mode (P1)
+                success, new_mode, reason = False, st.current_mode, "finish the gripper change first (end_gripper_change)"
+            else:
+                success, new_mode, reason = request_mode_change(
+                    st.current_mode, st.pending_mode_request,
+                    robot_enabled=_robot_enabled,
+                    homed=_homed,
+                    errors_active=_errors_active,
+                    park_ok=_park_ok,
+                )
             if success:
                 # Record WHICH claim the operator made to get in here. If an arm
                 # ever falls during maintenance, this line is the evidence for

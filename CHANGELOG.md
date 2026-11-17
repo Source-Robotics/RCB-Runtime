@@ -111,6 +111,12 @@ What changed in each version of the RCB runtime. The newest version is at the to
   (`GRIPPER_TOOL_MISMATCH`, 2116: it cannot be enabled, since the gripper XML's tool length, mass and collision model
   would be wrong); a drive with none stored gets a note. The Gripper tab shows both and stores the XML's ID in the
   drive with a confirmation (`store_gripper_tool_id()`: the ID and a flash save, the arm disabled).
+- Change the gripper without losing the homing: `begin_gripper_change()` (the Gripper tab's "Change gripper", the arm
+  disabled; its joints keep holding) idles the jaws and stops counting the gripper's silence and faults, so unplugging
+  it no longer un-homes the arm; enabling, the gripper's commands and every mode but IDLE and motors off are refused
+  meanwhile; a gripper plugged in again gets its settings by itself. `end_gripper_change()` (Done) once it answers; then
+  calibrate its jaws. For now the same kind of gripper is fitted again (the active gripper XML stays);
+  `latest_status()["gripper"]` reports `changing` and `answering`.
 
 ### Changed
 

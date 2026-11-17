@@ -157,6 +157,10 @@ COMMAND_RULES = {
     "save_drive_config":    (IMMEDIATE, None, "DISABLED", False),
     # the gripper XML's tool id into the gripper drive's flash (2026-11-17): like save_drive_config, arm disabled
     "store_gripper_tool_id": (IMMEDIATE, None, "DISABLED", False),
+    # the Change-gripper mode (TODO/live_gripper_swap_plan.md P1, 2026-11-17): begun in IDLE with the arm disabled;
+    # ended in any mode (an E-stop meanwhile leaves the arm in ACTIVE_ERROR) — RTI checks the gripper answers
+    "begin_gripper_change": (IMMEDIATE, ["IDLE"], "DISABLED", False),
+    "end_gripper_change":   (IMMEDIATE, None, None, False),
     "save_drive_parameter_to_xml": (IMMEDIATE, None, None, False),
     # Sound through the motors (2026-11-17, utility/sound.py): any mode here; RTI refuses when the use's switch is
     # off or the drives do not hold (motors off, flashing, starting). identify_arm is open to everyone; a program's

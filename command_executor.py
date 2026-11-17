@@ -652,7 +652,10 @@ RTI_ANSWER_TIMEOUT_S = 1.0
 RTI_ANSWER_CODES = {
     "accept_homing_reference": ("RTI_REFUSED",),
     "beep": ("RTI_REFUSED",),
+    "begin_gripper_change": ("RTI_REFUSED",),
+    "calibrate_gripper": ("RTI_REFUSED",),
     "enable": ("ENABLE_REJECTED",),
+    "end_gripper_change": ("RTI_REFUSED",),
     "enter_exec_mode": ("MODE_REJECTED",),
     "enter_flashing_mode": ("MODE_REJECTED",),
     "enter_jog_mode": ("MODE_REJECTED",),
@@ -1441,6 +1444,33 @@ def _handle_save_drive_parameter_to_xml(args, cid, conn):
     reply(conn, {"id": cid, "status": "ok", "data": {"file": path.name, "key": key, "value": float(xml_text(number,
                                                                                                          value)),
                                                      "backup": backup.name}})
+
+
+def _gripper_change_refused(command, args, cid, conn):
+    """The executor's own checks of begin_gripper_change / end_gripper_change: no arguments, a CAN gripper. -> True
+    when it replied (refused)."""
+    if args:
+        _bad_args(cid, conn, command, f"{command} takes no arguments")
+        return True
+    if not _HAS_CAN_GRIPPER:
+        msg = "no CAN gripper: the Change-gripper mode is for a gripper with a drive"
+        _log_exec_reject(cid, "NO_GRIPPER", msg, command=command)
+        reply(conn, {"id": cid, "status": "error", "code": "NO_GRIPPER", "message": msg})
+        return True
+    return False
+
+
+def _handle_begin_gripper_change(args, cid, conn):
+    """begin_gripper_change -> RTI's gripper_change:1 (the Change-gripper mode, TODO/live_gripper_swap_plan.md P1,
+    2026-11-17): the arm disabled and holding its homing while the gripper is swapped. RTI checks the rest."""
+    if not _gripper_change_refused("begin_gripper_change", args, cid, conn):
+        _answered(conn, cid, "begin_gripper_change", "gripper_change:1")
+
+
+def _handle_end_gripper_change(args, cid, conn):
+    """end_gripper_change -> RTI's gripper_change:0: ends the Change-gripper mode once the gripper answers."""
+    if not _gripper_change_refused("end_gripper_change", args, cid, conn):
+        _answered(conn, cid, "end_gripper_change", "gripper_change:0")
 
 
 def _handle_store_gripper_tool_id(args, cid, conn):
@@ -2355,7 +2385,10 @@ def _gripper_status():
     g = shared_data.gripper
     return {"mode": {1: "motor", 2: "firmware"}.get(int(shared_data.rti['gripper_ctrl_mode'][0]), "unknown"),
             "calibrated": bool(int(g['gripper_calibrated'][0])), "position": int(g['gripper_position'][0]),
-            "code": int(g['gripper_object_detection'][0])}
+            "code": int(g['gripper_object_detection'][0]),
+            # the Change-gripper mode (2026-11-17): the gripper is being swapped; "answering": its drive answers now
+            "changing": bool(shared_data.rti["gripper_change"][0] >= 0.5),
+            "answering": bool(shared_data.rti["CAN_gripper_connected"][0] >= 0.5)}
 
 
 def _hall_check_status(rti):
@@ -2676,6 +2709,8 @@ IMMEDIATE_HANDLERS = {
     "save_drive_config":    _handle_save_drive_config,
     "save_drive_parameter_to_xml": _handle_save_drive_parameter_to_xml,
     "store_gripper_tool_id": _handle_store_gripper_tool_id,   # the gripper drive's tool id (2026-11-17)
+    "begin_gripper_change": _handle_begin_gripper_change,     # the Change-gripper mode (2026-11-17)
+    "end_gripper_change": _handle_end_gripper_change,
     "identify_arm":     _handle_identify_arm,        # sound through the motors (utility/sound.py, 2026-11-17)
     "beep":             _handle_beep,
     "play_tune":        _handle_play_tune,

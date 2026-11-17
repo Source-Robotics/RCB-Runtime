@@ -600,6 +600,12 @@ class DryRunRobotClient(RobotClient):
     def identify_arm(self) -> None:
         self._record_immediate_event("identify_arm", {"kind": "sound"})
 
+    def begin_gripper_change(self) -> None:
+        self._record_immediate_event("begin_gripper_change", {"kind": "gripper"})
+
+    def end_gripper_change(self) -> None:
+        self._record_immediate_event("end_gripper_change", {"kind": "gripper"})
+
     def store_gripper_tool_id(self) -> dict:
         # offline nothing is stored in a drive
         self._record_immediate_event("store_gripper_tool_id", {"kind": "drive"})
