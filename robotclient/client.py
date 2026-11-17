@@ -6379,6 +6379,176 @@ class RobotClient:
         """
         return self._immediate("save_drive_parameter_to_xml", [drive, number, value])
 
+    def identify_arm(self) -> None:
+        """Play this arm's identify tune through one of its motors.
+
+        A short rising tune, so you can hear which arm a client is talking to.
+        One drive plays it: J2, unless `set_sound(node=...)` names another. It
+        plays on the robot's sound axis (`q` as shipped: the tone is a small
+        torque at its pitch, which nothing judges at rest). Nothing moves. It
+        plays with the arm enabled or disabled, in any mode except with the
+        motors off, while flashing and while the robot starts. It needs no
+        control of the robot.
+
+        Raises:
+            CommandRejected: RTI refused it: the identify sound is switched off,
+                or the drives do not hold now. Or RTI did not answer within 1 s
+                (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            RTI_REFUSED: The identify sound is switched off
+                (`set_sound(identify=0)`), or the drives do not hold now: the
+                motors are off, the robot is flashing a drive or starting. The
+                message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        See also:
+            `set_sound()`, `beep()`, `play_tune()`
+
+        Examples:
+            >>> robot.identify_arm()
+        """
+        self._immediate("identify_arm")
+
+    def beep(self, freq_hz: float = 880.0, duration_s: float = 0.2) -> None:
+        """Play one tone through the arm's playing motor.
+
+        The command returns as soon as the robot has taken the tone; the tone
+        then sounds for `duration_s`. A tone or tune asked for while another
+        plays replaces it. A program's tone always plays on the `d` axis: it
+        makes no torque, so a tone during a move never disturbs the move or the
+        contact checks; it is quieter than the robot's own sounds. Programs'
+        sounds are switched on or off together with `set_sound(programs=...)`.
+
+        Args:
+            freq_hz: The pitch, 20 to 3000 Hz. A gripper's drive, if it plays,
+                sounds only up to 2500 Hz.
+            duration_s: How long it sounds, 0.02 to 5 s.
+
+        Raises:
+            CommandRejected: The robot refused it: a value is out of range, or
+                another client holds control. Or RTI refused it or did not answer
+                within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: The pitch or the duration is out of range, or not a number.
+            RTI_REFUSED: Programs' sounds are switched off
+                (`set_sound(programs=0)`), or the drives do not hold now: the
+                motors are off, the robot is flashing a drive or starting. The
+                message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        See also:
+            `play_tune()`, `set_sound()`
+
+        Examples:
+            >>> robot.beep()
+            >>> robot.beep(440, 0.5)
+        """
+        self._immediate("beep", [freq_hz, duration_s])
+
+    def play_tune(self, notes: list) -> None:
+        """Play a tune through the arm's playing motor.
+
+        The drive plays the notes in order with its own timing, so they keep
+        their lengths exactly. The command returns as soon as the robot has
+        taken the tune. A tone or tune asked for while another plays replaces
+        it. Like `beep()`, it plays on the `d` axis: no torque during a move.
+        Programs' sounds are switched on or off together with
+        `set_sound(programs=...)`.
+
+        Args:
+            notes: 1 to 30 `(note, seconds)` pairs. The note is a name such as
+                `"A4"` (440 Hz), `"C#5"` or `"Eb3"`, a pitch from 20 to 3000 Hz,
+                or 0 for a rest. Each lasts 0.02 to 5 s.
+
+        Raises:
+            CommandRejected: The robot refused it: a note is not valid, or
+                another client holds control. Or RTI refused it or did not answer
+                within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No notes or more than 30, a note that is not a `(note,
+                seconds)` pair, an unknown note name, a pitch out of range, or a
+                length out of range. The message names the note.
+            RTI_REFUSED: Programs' sounds are switched off
+                (`set_sound(programs=0)`), or the drives do not hold now: the
+                motors are off, the robot is flashing a drive or starting. The
+                message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        See also:
+            `beep()`, `set_sound()`
+
+        Examples:
+            >>> robot.play_tune([("C5", 0.1), ("E5", 0.1), ("G5", 0.2)])
+            >>> robot.play_tune([("A3", 0.2), (0, 0.1), ("A3", 0.3)])
+        """
+        self._immediate("play_tune", [[list(n) if isinstance(n, tuple) else n for n in notes]])
+
+    def set_sound(self, **settings: Any) -> None:
+        """Change the robot's sound settings and save them.
+
+        Each setting named is written into the `<sound>` block of
+        `config/system.xml`, changing only that value: every comment stays, and
+        a copy of the file is kept in `temp_data/xml_backups/` first. The robot
+        uses the new values at once and at every start. Settings not named keep
+        theirs.
+
+        Args:
+            **settings: Any of these: `boot`, `homing_done`, `error`,
+                `identify` and `programs`, each 1 or 0 (or `True` / `False`),
+                switch the five sounds on or off: the chime when the robot is
+                ready after it starts, the chime when homing ends, the tune when
+                an error latches, `identify_arm()`, and programs' `beep()` and
+                `play_tune()`. `axis`: the axis of the robot's own sounds, `"q"`
+                (louder: the tone is a small torque at its pitch) or `"d"` (no
+                torque, quieter); programs' tones always play on `"d"`.
+                `current_ma`: the loudness as a current, 10 to 1000 mA. `node`:
+                the drive that plays, 0 for J1 up to the last joint, one more
+                for a CAN gripper. `limit_mv`: the most voltage the sound may
+                use, 500 to 6000 mV.
+
+        Defaults:
+            From `config/system.xml`. As shipped: all five sounds on, `axis`
+            `"q"`, `current_ma` 290 mA, `node` 1 (J2), `limit_mv` 3600 mV (the
+            values chosen on PAR6 by ear).
+
+        Raises:
+            CommandRejected: The robot refused it: an unknown setting or a value
+                out of range, another client holds control, or the file could not
+                be changed. Or RTI refused it or did not answer within 1 s
+                (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: No setting named, an unknown setting, or a value out of
+                range.
+            INTERNAL: The file could not be written, or the edited file did not
+                read back the values; the file is left unchanged.
+            RTI_REFUSED: RTI did not take a setting. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The file is already saved.
+
+        See also:
+            `identify_arm()`, `beep()`, `play_tune()`
+
+        Examples:
+            >>> robot.set_sound(error=0)
+            >>> robot.set_sound(axis="q", current_ma=300)
+        """
+        self._immediate("set_sound", dict(settings))
+
     def get_versions(self) -> dict:
         """Return the version of every part of the robot.
 

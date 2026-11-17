@@ -26,7 +26,7 @@ from utility.robot_factory import create_robot
 from .client import RobotClient, _pose_in, _pose_out
 from .commands import generate_id
 from .constants import DEFAULT_MOVE_TIMEOUT
-from .exceptions import MotionFailed, RobotTimeout
+from .exceptions import CommandRejected, MotionFailed, RobotTimeout
 
 
 @dataclass(frozen=True)
@@ -579,6 +579,29 @@ class DryRunRobotClient(RobotClient):
 
     def get_digital_input(self, pin: int) -> bool:
         return False
+
+    # Sound (2026-11-17): offline nothing plays and nothing is saved; a tone is checked the robot's way
+    # (utility/sound.tune_events) so a Check refuses what the robot would refuse.
+    def _sound_events(self, command, notes):
+        from utility.sound import tune_events
+        try:
+            return tune_events(notes)
+        except ValueError as e:
+            raise CommandRejected("BAD_ARGS", f"{command}: {e}") from None
+
+    def beep(self, freq_hz: float = 880.0, duration_s: float = 0.2) -> None:
+        self._sound_events("beep", [(freq_hz, duration_s)])
+        self._record_immediate_event("beep", {"freq_hz": freq_hz, "duration_s": duration_s, "kind": "sound"})
+
+    def play_tune(self, notes: list) -> None:
+        events = self._sound_events("play_tune", notes)
+        self._record_immediate_event("play_tune", {"notes": len(events), "kind": "sound"})
+
+    def identify_arm(self) -> None:
+        self._record_immediate_event("identify_arm", {"kind": "sound"})
+
+    def set_sound(self, **settings) -> None:
+        self._record_immediate_event("set_sound", {"settings": dict(settings), "kind": "sound"})
 
     def wait(self, predicate: Callable[[dict], bool], timeout: float | None = None, what: str = 'wait') -> None:
         del timeout

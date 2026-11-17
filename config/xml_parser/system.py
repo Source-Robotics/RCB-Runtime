@@ -99,6 +99,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
     self_collision = _parse_self_collision(root.find("self_collision"))
     friction_comp = _parse_friction_comp(root.find("friction_comp"))
     dynamics_feedforward = _parse_dynamics_feedforward(root.find("dynamics_feedforward"))
+    sound = _parse_sound(root.find("sound"))
     # <realtime_required>: 1 (default) = RTI refuses to start without SCHED_FIFO on its core (as industrial
     # real-time interfaces do); 0 = log and run degraded (a development box without the RT kernel or caps).
     _rt_text = (root.findtext("realtime_required") or "1").strip()
@@ -165,6 +166,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         "friction_comp":  friction_comp,
         "dynamics_feedforward": dynamics_feedforward,
         "display_timezone": display_timezone,
+        "sound":          sound,
     }
 
 
@@ -320,6 +322,47 @@ def _parse_dynamics_feedforward(elem: ET.Element | None) -> dict:
             logger.warning("system.xml <dynamics_feedforward><friction_fraction> %r is not in [0, 1] — using 1", text)
         else:
             out["friction_fraction"] = val
+    return out
+
+
+# <sound> (2026-11-17, utility/sound.py): each use switched on (1) / off (0), the axis, the loudness, the drive that plays,
+# the sound's voltage cap. A missing block / value = these; an unreadable or out-of-range value = its default + a warning.
+_SOUND_FALLBACK = {"boot": 1, "homing_done": 1, "error": 1, "identify": 1, "programs": 1, "axis": "q",
+                   "current_ma": 290.0, "node": 1, "limit_mv": 3600.0}
+_SOUND_BOUNDS = {"current_ma": (10.0, 1000.0), "node": (0, 15), "limit_mv": (500.0, 6000.0)}
+SOUND_SWITCHES = ("boot", "homing_done", "error", "identify", "programs")
+
+
+def _parse_sound(elem: ET.Element | None) -> dict:
+    """<sound> in system.xml (see _SOUND_FALLBACK)."""
+    out = dict(_SOUND_FALLBACK)
+    if elem is None:
+        return out
+    for key, default in _SOUND_FALLBACK.items():
+        text = elem.findtext(key, default="").strip().lower()
+        if not text:
+            continue
+        if key in SOUND_SWITCHES:
+            if text in ("0", "1"):
+                out[key] = int(text)
+            else:
+                logger.warning("system.xml <sound><%s> is %r, not 0 / 1 — using %s", key, text, default)
+        elif key == "axis":
+            if text in ("d", "q"):
+                out[key] = text
+            else:
+                logger.warning("system.xml <sound><axis> is %r, not d / q — using %s", text, default)
+        else:
+            try:
+                val = float(text)
+            except ValueError:
+                logger.warning("system.xml <sound><%s> is not a number (%r) — using %s", key, text, default)
+                continue
+            lo, hi = _SOUND_BOUNDS[key]
+            if not lo <= val <= hi:
+                logger.warning("system.xml <sound><%s> = %s is outside [%s, %s] — using %s", key, val, lo, hi, default)
+                continue
+            out[key] = int(val) if key == "node" else val
     return out
 
 

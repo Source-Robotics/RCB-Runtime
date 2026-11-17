@@ -109,6 +109,7 @@ from communication.can_message_handlers import send_gripper_commands, send_motor
 from communication.can_message_handlers import send_brake_on_idle, fetch_board_ids, board_ids_of
 from utility.drive_params import ParamRead, catalogue as drive_param_catalogue
 from utility.drive_capture import DriveCapture
+from utility.sound import SoundPlayer
 from utility.kt_init import resolve_and_preload_kt
 from utility.tick_types import TickContext, TickResult
 from utility.mode_dispatch import build_mode_dispatch, dispatch_step
@@ -699,6 +700,10 @@ def main():
     drive_capture = DriveCapture(shared_data.rti["drive_capture"], shared_data.rti["drive_capture_meta"],
                                  shared_data.rti["node_error_bits"], range(joint_num + (1 if active_CAN_gripper else 0)))
     scheduled_state["capture"] = drive_capture
+    # Sound through the motors (utility/sound.py, 2026-11-17): system.xml <sound>; homing done, an error, identify,
+    # programs' tones — each switched on / off
+    sound = SoundPlayer(_sys["sound"])
+    scheduled_state["sound"] = sound
     PARAM_READ_AT_START_TICK = 1000      # 4 s in: after the start-up config re-sends (ticks 50 / 150 / 300)
     # Per node, the tick before which its silence is not latched as lost: a drive saving its config to flash (save_drive)
     # does not answer for up to ~1 s (2026-11-16)
@@ -713,6 +718,27 @@ def main():
 
     DRIVE_CHECKS_TICK = 3000             # 12 s in: the start-up read (from tick 1000, ~5 s) has finished
     CAPTURE_ARM_TICK = 3100              # the drives' fault captures armed (utility/drive_capture.py)
+
+    SOUND_BOOT_TICK = 3200               # the boot chime: the robot is ready (after the drive checks at 3000)
+    _sound_err_prev = [0.0]
+
+    def _sound_holds():
+        """The drives are in a closed loop (they can play): not booting, not flashing (no CAN), not motors off. A
+        disabled arm and ACTIVE_ERROR hold at zero speed (utility/mode_dispatch: velocity-hold), so they play."""
+        return st.current_mode not in (RobotMode.BOOTING, RobotMode.FLASHING, RobotMode.SAFETY_STOP)
+
+    def _sound_boot():
+        """The boot chime once the robot is ready (user 2026-11-17: "when ready"), unless an error is latched then —
+        the error tune has marked that."""
+        if float(shared_data.rti["error_active"][0]) < 0.5:
+            sound.event("boot", _sound_holds())
+
+    def _sound_on_error():
+        """The error tune when an error has just latched (error_active rising), if its switch is on."""
+        ea = float(shared_data.rti["error_active"][0])
+        if ea >= 0.5 and _sound_err_prev[0] < 0.5:
+            sound.event("error", _sound_holds())
+        _sound_err_prev[0] = ea
 
     def _arm_captures_at_start():
         """Arm every drive's own recording of a fault (once; again after Clear Errors and after each read)."""
@@ -1677,6 +1703,48 @@ def main():
         Motor[node].Send_Save_config()
         log_handler.info("node %d saves its whole working config to its flash (it may not answer for ~1 s)", node)
 
+    def _handle_sound(cmd_msg, cmd_dict):
+        """sound:identify | sound:tune:<hz,ms;...> — play through the motors (utility/sound.py, 2026-11-17): identify
+        (its switch: <sound><identify>), a program's tune (<sound><programs>). Refused when its switch is off or the
+        drives do not hold (motors off, flashing, starting — _sound_holds), or a malformed / out-of-range tune."""
+        from utility.sound import TUNES, decode, note_hz
+        parts = cmd_msg.split(":", 2)
+        what = parts[1] if len(parts) > 1 else ""
+        holds = _sound_holds()
+        if what == "identify":
+            why = sound.request("identify", [(note_hz(n), int(s * 1000)) for n, s in TUNES["identify"]], holds)
+        elif what == "tune":
+            try:
+                events = decode(parts[2] if len(parts) > 2 else "")
+            except (ValueError, IndexError) as e:
+                _refused(log_handler, "sound: a malformed tune (%s)", e)
+                return
+            why = sound.request("programs", events, holds)
+        else:
+            _refused(log_handler, "sound: %r is not identify / tune", what)
+            return
+        if why:
+            _refused(log_handler, "sound refused: %s", why)
+
+    def _handle_sound_set(cmd_msg, cmd_dict):
+        """sound_set:<key>=<value>,... — the sound's settings changed (the executor saved them in system.xml first);
+        the next tune sends the playing drive its voltage cap and axis."""
+        from utility.sound import SETTINGS, SWITCHES
+        changes = {}
+        for item in (cmd_msg.split(":", 1)[1] if ":" in cmd_msg else "").split(","):
+            key, _, value = item.partition("=")
+            if key not in SETTINGS:
+                _refused(log_handler, "sound_set: %r is not a sound setting", key)
+                return
+            try:
+                changes[key] = (value if key == "axis" else int(value) if key in SWITCHES + ("node",)
+                                else float(value))
+            except ValueError:
+                _refused(log_handler, "sound_set: %s=%r", key, value)
+                return
+        sound.apply(changes)
+        log_handler.info("sound settings: %s", sound.settings)
+
     def _handle_homing_answer(cmd_msg, cmd_dict):
         """homing_answer:accept — the answer to homing's question (2026-11-16, user: "pause and ask";
         robotics/homing/controller.py): a joint homed off where this arm's joint always homes, and homing holds the arm
@@ -2387,6 +2455,8 @@ def main():
         "joint_test":        _handle_joint_test,
         "homing_answer":     _handle_homing_answer,
         "read_params":       _handle_read_params,
+        "sound":             _handle_sound,
+        "sound_set":         _handle_sound_set,
         "write_param":       _handle_write_param,
         "save_drive":        _handle_save_drive,
         "coriolis_comp":     _handle_coriolis_comp,
@@ -2727,6 +2797,7 @@ def main():
         if _err_now and not _gripper_err_prev[0]:  # an error latched: the jaws stop where they are (2026-10-24)
             _freeze_gripper("an error latched")
         _gripper_err_prev[0] = _err_now
+        _sound_on_error()                          # the error tune when one has just latched (utility/sound.py)
         _profile_last = _profile_mark(_profile_last, "error_checks")
 
     # Python's garbage collector (2026-10-24, utility/gc_pauses.py). Every object start-up made is frozen, so a full
@@ -2875,6 +2946,8 @@ def main():
             _drive_checks_at_start()
         if _tick_now == CAPTURE_ARM_TICK:
             _arm_captures_at_start()
+        if _tick_now == SOUND_BOOT_TICK:
+            _sound_boot()
         if _tick_now == BOOT_CLEAR_TICK:
             send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
                               Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper, all_motors=True)
@@ -3163,6 +3236,9 @@ def main():
                 log_mode.info(f"→ {st.current_mode}")
                 log_activity(_rti_activity_logger, "RTI", "info", "MODE_CHANGE", id=st.pending_mode_request_id,
                              message=f"{_from_mode} → {st.current_mode}")
+                if (_from_mode == RobotMode.HOMING and new_mode == RobotMode.IDLE
+                        and shared_data.homed_state.get() == "HOMED"):
+                    sound.event("homing_done", _sound_holds())           # the homing chime (utility/sound.py)
 
                 if new_mode == RobotMode.SAFETY_STOP:
                     # The motors off hold the jaws too (2026-10-24: the user's "freeze it also" named safety_stop()).

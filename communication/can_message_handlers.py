@@ -503,6 +503,7 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
     capture = state.get("capture")                 # a drive's own recording of a fault (utility/drive_capture.py)
     if capture is not None:
         capture.step(motors)
+    sound = state.get("sound")                     # sound through the motors (utility/sound.py)
     step = state["step"]
     idx = state["joint_index"]
 
@@ -516,12 +517,16 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
     # data/update_shared_data.py copies what the dashboard shows.
     elif 500 <= state["device_info_counter"] < (500 + total_motors):
         motors[idx].Send_Respond_Identity()
-    elif ((params is not None and params.queue) or (capture is not None and capture.queue)) and _job_turn(state):
+    elif ((params is not None and params.queue) or (capture is not None and capture.queue)
+          or (sound is not None and sound.queue)) and _job_turn(state):
         # A drive-parameter read (2026-11-16) or a drive capture's requests (2026-11-17): every other free poll slot
         # sends ONE of their requests instead of a telemetry request — the frames per tick stay what they are; the
         # answers come through the normal receive path. The round robin waits for the next tick, so every drive keeps
-        # its telemetry (at half the rate meanwhile). The parameter read goes first.
-        if params is not None and params.queue:
+        # its telemetry (at half the rate meanwhile). Sound (2026-11-17) first — a tune is a few frames and should
+        # sound when it is asked for; then the parameter read; then the capture.
+        if sound is not None and sound.queue:
+            sound.send_next(motors)
+        elif params is not None and params.queue:
             params.send_next(motors)
         else:
             capture.send_next(motors)

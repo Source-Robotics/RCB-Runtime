@@ -1535,6 +1535,17 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         except Exception:
             logger.exception("versions card unavailable")
 
+        # Sound through the motors: the four sounds on / off, the playing drive, Identify (gui_sound_card.py,
+        # utility/sound.py, 2026-11-17). Built in a try: a failure must not break the page.
+        try:
+            from gui_sound_card import add_sound_card
+            _grip_raw = _xml_cfg.get('gripper_CAN_gripper', 0)          # (_gui_has_can_gripper is defined later)
+            add_sound_card(_sys_cfg.get("sound") or {}, int(_sys_cfg["joint_num"]),
+                           not (isinstance(_grip_raw, float) and math.isnan(_grip_raw)) and int(_grip_raw) == 1,
+                           exec_fn=_exec, poll_fn=lambda fn, label: _page_sender().submit(fn, label=label))
+        except Exception:
+            logger.exception("sound card unavailable")
+
     # ─── Errors ───────────────────────────────────────────────
     with ui.tab_panel(tab_errors):
         with ui.card().classes("w-full"):

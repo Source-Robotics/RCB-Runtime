@@ -155,6 +155,12 @@ def _wait_input(block, depth, ctx):
     return [f"rt.wait_input(robot, {pin}, {on}, {timeout!r})"]
 
 
+def _beep(block, depth, ctx):
+    hz = _number(block, "HZ", "the pitch", 20, 3000)
+    seconds = _number(block, "SECONDS", "the length", 0.02, 5)
+    return [f"robot.beep({hz!r}, {seconds!r})"]
+
+
 def _log(block, depth, ctx):
     code, _, _ = _value(block, "TEXT", "what to log", PLAIN, depth, ctx)
     return [f"rt.log({code})"]
@@ -230,6 +236,7 @@ STATEMENTS = {
     "rcb_gripper_move": _gripper_move,
     "rcb_set_output": _set_output,
     "rcb_wait_input": _wait_input,
+    "rcb_beep": _beep,
     "rcb_log": _log,
     "rcb_halt": _halt,
     "controls_repeat_ext": _repeat,

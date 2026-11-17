@@ -340,4 +340,24 @@
          Captures: capture_before_s: seconds kept before the request (0-30); capture_keep: files kept (1-20).
          Applied within ~1 s of a change; the dashboard's Recordings tab edits it (utility/recorder_settings.py). -->
     <recorder before_s="5" after_s="2" incident_keep="20" min_interval_s="10" capture_before_s="5" capture_keep="10"/>
+    <!-- Sound through the motors (2026-11-17, user: "all of them, each can be switched on and off"; utility/sound.py).
+         A drive plays only while it holds: enabled or disabled, not with the motors off. boot / homing_done / error /
+         identify / programs: 1 on, 0 off (boot: when the robot is ready, ~13 s after it starts; homing done: a rising
+         chime; error: a low double tone when an error latches; identify: identify_arm() and the dashboard's button;
+         programs: beep() / play_tune()). axis: the robot's own sounds' axis — q = louder, the tone is a torque at its
+         pitch (they play at rest); d = no torque, quieter. Programs' tones always play on d (they can sound during a
+         move, where the contact checks read the current). current_ma: the loudness (10-1000). node: the drive that
+         plays (0 = J1; 1 = J2, the loudest on PAR6). limit_mv: the sound's voltage at most (the drive's parameter 81,
+         500-6000). The dashboard's Sound card changes these values here. -->
+    <sound>
+        <boot>1</boot>
+        <homing_done>1</homing_done>
+        <error>1</error>
+        <identify>1</identify>
+        <programs>1</programs>
+        <axis>q</axis>
+        <current_ma>290</current_ma>
+        <node>1</node>
+        <limit_mv>3600</limit_mv>
+    </sound>
 </system>

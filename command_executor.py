@@ -651,6 +651,7 @@ RTI_ANSWER_TIMEOUT_S = 1.0
 # answer in time, ask_rti) and, from a handler that raised, INTERNAL. Commands that RTI never refuses are absent.
 RTI_ANSWER_CODES = {
     "accept_homing_reference": ("RTI_REFUSED",),
+    "beep": ("RTI_REFUSED",),
     "enable": ("ENABLE_REJECTED",),
     "enter_exec_mode": ("MODE_REJECTED",),
     "enter_flashing_mode": ("MODE_REJECTED",),
@@ -658,7 +659,9 @@ RTI_ANSWER_CODES = {
     "free_joint": ("FREE_JOINT_REFUSED",),
     "hall_check": ("HALL_CHECK_REFUSED",),
     "home": ("MODE_REJECTED",),
+    "identify_arm": ("RTI_REFUSED",),
     "joint_test": ("JOINT_TEST_REFUSED",),
+    "play_tune": ("RTI_REFUSED",),
     "read_drive_parameters": ("RTI_REFUSED",),
     "reload_filters": ("RTI_REFUSED",),
     "reload_recipes": ("RTI_REFUSED",),
@@ -688,6 +691,7 @@ RTI_ANSWER_CODES = {
     "set_log_level": ("RTI_REFUSED",),
     "set_payload": ("RTI_REFUSED",),
     "set_recipe": ("RTI_REFUSED",),
+    "set_sound": ("RTI_REFUSED",),
     "stop": ("RTI_REFUSED",),
     "write_drive_parameter": ("RTI_REFUSED",),
 }
@@ -1435,6 +1439,90 @@ def _handle_save_drive_parameter_to_xml(args, cid, conn):
     reply(conn, {"id": cid, "status": "ok", "data": {"file": path.name, "key": key, "value": float(xml_text(number,
                                                                                                          value)),
                                                      "backup": backup.name}})
+
+
+def _handle_identify_arm(args, cid, conn):
+    """identify_arm — this arm plays a short tune through one motor ("which arm is this?"; utility/sound.py,
+    2026-11-17). RTI refuses when <sound><identify> is off or the drives do not hold (motors off, flashing,
+    starting). Open to every client."""
+    _answered(conn, cid, "identify_arm", "sound:identify")
+
+
+def _tune_text(cid, conn, command, notes):
+    """A tune's text for RTI's sound:tune: message, or None after a BAD_ARGS reply (utility/sound.tune_events'
+    checks)."""
+    from utility.sound import encode, tune_events
+    try:
+        return encode(tune_events(notes))
+    except ValueError as e:
+        _bad_args(cid, conn, command, f"{command}: {e}")
+        return None
+
+
+def _handle_beep(args, cid, conn):
+    """beep [freq_hz [duration_s]] — one tone through the playing motor (880 Hz, 0.2 s by default; 20-3000 Hz,
+    0.02-5 s), on the d axis (utility/sound.PROGRAMS_AXIS). A program's sound: <sound><programs> (2026-11-17)."""
+    if len(args) > 2:
+        return _bad_args(cid, conn, "beep", f"beep takes freq_hz and duration_s, got {len(args)} arguments")
+    freq = args[0] if args else 880.0
+    dur = args[1] if len(args) > 1 else 0.2
+    tune = _tune_text(cid, conn, "beep", [(freq, dur)])
+    if tune is not None:
+        _answered(conn, cid, _fmt_command("beep", args), f"sound:tune:{tune}")
+
+
+def _handle_play_tune(args, cid, conn):
+    """play_tune notes — up to 30 [note or Hz, seconds] (a note name such as "A4", 0 = a rest); the drive plays them
+    in order with its own timing. A program's sound: <sound><programs> (2026-11-17)."""
+    notes = args[0] if len(args) == 1 and isinstance(args[0], list) else args
+    tune = _tune_text(cid, conn, "play_tune", notes)
+    if tune is not None:
+        _answered(conn, cid, "play_tune", f"sound:tune:{tune}")
+
+
+def _handle_set_sound(args, cid, conn):
+    """set_sound {setting: value, ...} — the sound's settings (utility/sound.py SETTINGS): saved in config/system.xml's
+    <sound> (only those values edited, every comment kept; the edited text must read back the values before it is
+    written; a copy in temp_data/xml_backups/ first), then passed to RTI (2026-11-17)."""
+    from config.xml_parser.system import _parse_sound
+    from utility.sound import SETTINGS, SWITCHES, set_values_in_block, sound_text
+    if not isinstance(args, dict) or not args:
+        return _bad_args(cid, conn, "set_sound", "set_sound needs settings by name, for example {'error': 0}")
+    bounds = {"current_ma": (10, 1000), "node": (0, len(_drive_nodes()) - 1), "limit_mv": (500, 6000)}
+    for key, value in args.items():
+        if key not in SETTINGS:
+            return _bad_args(cid, conn, "set_sound", f"set_sound: {key!r} is not a sound setting ({', '.join(SETTINGS)})")
+        if key in SWITCHES:
+            ok = value in (0, 1) and not isinstance(value, float)
+            why = "0 or 1 (or True / False)"
+        elif key == "axis":
+            ok, why = value in ("d", "q"), "'d' or 'q'"
+        else:
+            lo, hi = bounds[key]
+            ok = (not isinstance(value, bool) and isinstance(value, (int, float)) and lo <= value <= hi
+                  and (key != "node" or value == int(value)))
+            why = f"{lo}-{hi}"
+        if not ok:
+            return _bad_args(cid, conn, "set_sound", f"set_sound: {key} is {why}, not {value!r}")
+    texts = {k: sound_text(k, v) for k, v in args.items()}
+    path = Path(SYSTEM_XML)
+    try:
+        before = path.read_text()
+        after = set_values_in_block(before, "sound", texts)
+        got = _parse_sound(read_XML2.ET.fromstring(after).find("sound"))     # nosec B314 — our own file
+        if any(sound_text(k, got[k]) != v for k, v in texts.items()):
+            raise ValueError("the edited <sound> block does not read back the values")
+        backups = TEMP_DATA_DIR / "xml_backups"
+        backups.mkdir(parents=True, exist_ok=True)
+        (backups / f"system.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.xml").write_text(before)
+        tmp = path.with_suffix(".xml.tmp")
+        tmp.write_text(after)
+        _os.replace(tmp, path)
+    except (OSError, ValueError, read_XML2.ET.ParseError) as e:
+        return reply(conn, {"id": cid, "status": "error", "code": "INTERNAL",
+                            "message": f"set_sound: not saved (system.xml unchanged): {e}"})
+    log_tcp.info("sound settings saved in system.xml: %s", texts)
+    _answered(conn, cid, "set_sound", f"sound_set:{','.join(f'{k}={v}' for k, v in texts.items())}")
 
 
 def _xml_change_problem(old_cfg, new_cfg, key, joint, value):
@@ -2556,6 +2644,10 @@ IMMEDIATE_HANDLERS = {
     "write_drive_parameter": _handle_write_drive_parameter,
     "save_drive_config":    _handle_save_drive_config,
     "save_drive_parameter_to_xml": _handle_save_drive_parameter_to_xml,
+    "identify_arm":     _handle_identify_arm,        # sound through the motors (utility/sound.py, 2026-11-17)
+    "beep":             _handle_beep,
+    "play_tune":        _handle_play_tune,
+    "set_sound":        _handle_set_sound,
     "get_versions":     _handle_get_versions,          # every part's version (2026-10-21)
     "set_log_level":    _handle_set_log_level,
     "capture_telemetry": _handle_capture_telemetry,

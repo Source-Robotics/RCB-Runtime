@@ -69,4 +69,17 @@ Blockly.common.defineBlocksWithJsonArray([
     style: 'rcb_io',
     tooltip: 'Wait for an input. If it does not come in time, the program stops with an error.',
   },
+  {
+    type: 'rcb_beep',
+    message0: 'beep %1 Hz for %2 s',
+    args0: [
+      {type: 'field_number', name: 'HZ', value: 880, min: 20, max: 3000, precision: 1},
+      {type: 'field_number', name: 'SECONDS', value: 0.2, min: 0.02, max: 5, precision: 0.01},
+    ],
+    previousStatement: null,
+    nextStatement: null,
+    style: 'rcb_io',
+    tooltip: 'A tone through one of the arm\'s motors; nothing moves. The next block starts at once. ' +
+             'Switched off on the System Info tab\'s Sound card ("Programs\' tones").',
+  },
 ]);

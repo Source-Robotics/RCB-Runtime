@@ -88,6 +88,17 @@ What changed in each version of the RCB runtime. The newest version is at the to
   power-off once `save_drive_config()` stores the drive's whole working config in its flash (arm disabled, after a
   confirmation in the dashboard; the drive does not answer for up to a second while it saves, and the robot does not
   report it lost for 3 s). Everything else stays read-only.
+- Sound through the motors (drive firmware 109+): a chime when the robot is ready after it starts (~13 s, skipped
+  when an error is latched then), a chime when homing ends, a tune when an error latches, `identify_arm()` ("which arm
+  is this?", open to every client) and programs' tones (`beep()`, `play_tune()`, and a "beep" block in the Blocks
+  editor's I/O). Each of the five is switched on or off in `config/system.xml`'s new `<sound>` block, on the System
+  Info tab's Sound card or with `set_sound()`, which also chooses the playing drive (J2 as shipped: the loudest on
+  PAR6), the axis of the robot's own sounds (`q` as shipped: louder, the tone is a small torque at its pitch, played
+  at rest where nothing judges it; `d`: no torque), the loudness and the sound's voltage cap, and saves them in
+  `system.xml` (only those values change, every comment stays, a copy goes to `temp_data/xml_backups/` first).
+  Programs' tones always play on `d`: they can sound during a move, where the contact and collision checks read the
+  motor current. Nothing moves; a drive plays while it holds, so the arm may be enabled or disabled, not with the
+  motors off. A tune's few frames go out in the status-poll slot: the per-tick data is never delayed.
 
 ### Changed
 

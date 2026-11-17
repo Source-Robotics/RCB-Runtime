@@ -64,6 +64,8 @@ ALWAYS_OPEN = frozenset({
     "get_versions",
     # Every drive's parameters (2026-11-16): a read, paced in RTI's poll slot — moves nothing, changes nothing.
     "read_drive_parameters", "get_drive_parameters",
+    # "Which arm is this?" (2026-11-17): a short tune through one motor — moves nothing.
+    "identify_arm",
     # make-it-safer — anyone, always, no exceptions
     "stop", "pause", "disable", "safety_stop", "clear_errors",
     # A jog has NO timeout: the GUI sends one jog on mouse-down and one jog_stop on
@@ -154,6 +156,13 @@ COMMAND_RULES = {
     "write_drive_parameter": (IMMEDIATE, None, "DISABLED", False),
     "save_drive_config":    (IMMEDIATE, None, "DISABLED", False),
     "save_drive_parameter_to_xml": (IMMEDIATE, None, None, False),
+    # Sound through the motors (2026-11-17, utility/sound.py): any mode here; RTI refuses when the use's switch is
+    # off or the drives do not hold (motors off, flashing, starting). identify_arm is open to everyone; a program's
+    # tones and the settings are owned.
+    "identify_arm":  (IMMEDIATE, None, None, False),
+    "beep":          (IMMEDIATE, None, None, False),
+    "play_tune":     (IMMEDIATE, None, None, False),
+    "set_sound":     (IMMEDIATE, None, None, False),
     "get_versions":      (IMMEDIATE, None, None, False),   # utility/versions.py (2026-10-21)
     # IK only, moves nothing — any mode, any state, homed or not (`near` defaults to the measured
     # joints, which only picks WHICH solution is returned, never whether one exists).

@@ -37,6 +37,7 @@ const RCB_TOOLBOX = (() => {
         {kind: 'block', type: 'rcb_set_output'},
         {kind: 'block', type: 'rcb_input'},
         {kind: 'block', type: 'rcb_wait_input'},
+        {kind: 'block', type: 'rcb_beep'},
       ]},
       {kind: 'sep'},
       {kind: 'category', name: 'Logic', categorystyle: 'logic_category', contents: [
