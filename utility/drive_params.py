@@ -159,7 +159,6 @@ class ParamRead:
         self.queue: deque = deque()          # (node, number) still to ask
         self.inflight: deque = deque()       # (node, number, tick asked)
         self.tick = 0
-        self._turn = False
         self._left: dict = {}                # node -> numbers not finished (its read time when it reaches 0)
         self.read[0], self.read[3] = 0.0, -1.0
 
@@ -196,11 +195,6 @@ class ParamRead:
             self.queue.append((node, num))
         self.read[2] += float(len(numbers))
         self._left[node] = self._left.get(node, 0) + len(numbers)
-
-    def turn(self) -> bool:
-        """Every other free poll slot is the read's (the telemetry poll keeps the others)."""
-        self._turn = not self._turn
-        return self._turn
 
     def send_next(self, motors) -> None:
         """Ask the next (node, number); its old answer is dropped first, so a missing answer is never an old one."""

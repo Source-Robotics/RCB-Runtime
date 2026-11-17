@@ -80,6 +80,12 @@ def main() -> int:
     def activity(level, code, message, cid, origin):
         log_activity(act_logger, "REC", level, code, id=cid, message=message, origin=origin)
 
+    # A drive's own recording of its fault (utility/drive_capture.py, 2026-11-17): RTI publishes it, this saves it
+    from data import shared_data as _sd
+    from utility.drive_capture import CaptureSaver
+    capture_saver = CaptureSaver(_sd.rti["drive_capture"], _sd.rti["drive_capture_meta"], TEMP_DATA_DIR / "drive_captures",
+                                 _sd.joint_num, activity)
+
     reader = rec = None
     last_stats = time.monotonic()
     logger.info("recorder up: waiting for RTI's trace")
@@ -106,6 +112,9 @@ def main() -> int:
                         settings = new
                         if rec is not None:
                             rec.apply_settings(settings)
+            saved = capture_saver.poll()
+            if saved is not None:
+                logger.info(f"drive capture saved: {saved.name}")
             if reader is not None and rec is not None:
                 rows, lost = reader.poll()
                 rec.feed(rows, lost, t0)

@@ -108,6 +108,7 @@ from communication.can_message_handlers import receive_and_process_can_messages,
 from communication.can_message_handlers import send_gripper_commands, send_motor_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
 from communication.can_message_handlers import send_brake_on_idle, fetch_board_ids, board_ids_of
 from utility.drive_params import ParamRead, catalogue as drive_param_catalogue
+from utility.drive_capture import DriveCapture
 from utility.kt_init import resolve_and_preload_kt
 from utility.tick_types import TickContext, TickResult
 from utility.mode_dispatch import build_mode_dispatch, dispatch_step
@@ -694,6 +695,10 @@ def main():
                            shared_data.rti["drive_params_read"], shared_data.rti["drive_params_time"],
                            drive_param_catalogue())
     scheduled_state["params"] = param_read
+    # A drive's own recording of its fault (utility/drive_capture.py, 2026-11-17): armed at start, read after a fault
+    drive_capture = DriveCapture(shared_data.rti["drive_capture"], shared_data.rti["drive_capture_meta"],
+                                 shared_data.rti["node_error_bits"], range(joint_num + (1 if active_CAN_gripper else 0)))
+    scheduled_state["capture"] = drive_capture
     PARAM_READ_AT_START_TICK = 1000      # 4 s in: after the start-up config re-sends (ticks 50 / 150 / 300)
     # Per node, the tick before which its silence is not latched as lost: a drive saving its config to flash (save_drive)
     # does not answer for up to ~1 s (2026-11-16)
@@ -707,6 +712,13 @@ def main():
                          int(shared_data.rti["drive_params_read"][2]))
 
     DRIVE_CHECKS_TICK = 3000             # 12 s in: the start-up read (from tick 1000, ~5 s) has finished
+    CAPTURE_ARM_TICK = 3100              # the drives' fault captures armed (utility/drive_capture.py)
+
+    def _arm_captures_at_start():
+        """Arm every drive's own recording of a fault (once; again after Clear Errors and after each read)."""
+        drive_capture.arm(range(joint_num + (1 if active_CAN_gripper else 0)))
+        log_startup.info("each drive records its next fault itself: current, speed and position error at 1562 Hz, "
+                         "0.5 s before it (read and saved in temp_data/drive_captures/)")
 
     def _drive_checks_at_start():
         """The start's drive checks (utility/drive_checks.py, 2026-11-17, user): each drive holds the gains and limits
@@ -1460,6 +1472,8 @@ def main():
         send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
                           Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper)
         st.clear_error_countdown = CLEAR_ERROR_SETTLE_TICKS
+        if shared_data.rti["loop_tick"][0] > CAPTURE_ARM_TICK:   # the fault captures again (a drive that rebooted lost it)
+            drive_capture.rearm(range(joint_num + (1 if active_CAN_gripper else 0)))
 
 
     def _handle_gravity_comp(cmd_msg, cmd_dict):
@@ -2859,6 +2873,8 @@ def main():
             _read_params_at_start()
         if _tick_now == DRIVE_CHECKS_TICK:
             _drive_checks_at_start()
+        if _tick_now == CAPTURE_ARM_TICK:
+            _arm_captures_at_start()
         if _tick_now == BOOT_CLEAR_TICK:
             send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
                               Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper, all_motors=True)

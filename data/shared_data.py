@@ -764,6 +764,8 @@ def setup(joints: int = 6, force_reinit: bool = False):
                         # their state [node * 256 + number], the read's progress, each node's read time
                         ("drive_params", (joint_num + 1) * 256), ("drive_params_state", (joint_num + 1) * 256),
                         ("drive_params_read", 5), ("drive_params_time", joint_num + 1),
+                        # a drive's own recording of its fault (utility/drive_capture.py, 2026-11-17)
+                        ("drive_capture", 3 * 1024), ("drive_capture_meta", 12),
                         ("hall_check_joint", 1), ("hall_check_pin", 1), ("hall_check_changes", 1),
                         ("hall_check_edge_deg", 2), ("free_joint", 1), ("joint_test", 8)]:
         shm, arr = _attach_or_create(name, np.float64, count)

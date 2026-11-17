@@ -636,6 +636,7 @@ CATALOG = {
     "JOINT_TEST": _info(9022, "Joint test move"),
     "STOPPED_ON_DISCONNECT": _info(9023, "Stopped: the controlling client left"),
     "HOMING_QUESTION": _info(9024, "Homing asks about a joint"),
+    "DRIVE_CAPTURE_SAVED": _info(9025, "A drive's own recording of its fault saved"),
 }
 
 ERROR_DESCRIPTIONS = CATALOG          # the old name (utility/error_checks.py, nets)

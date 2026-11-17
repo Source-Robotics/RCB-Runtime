@@ -1585,6 +1585,12 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         except Exception:
             logger.exception("Recordings tab unavailable")
             ui.label("Recordings tab unavailable — see logs/gui.log").classes("text-negative")
+        try:                                     # a drive's own recording of its fault (gui_drive_captures.py, 2026-11-17)
+            from gui_drive_captures import add_drive_captures_card
+            add_drive_captures_card()
+        except Exception:
+            logger.exception("Drive captures card unavailable")
+            ui.label("Drive captures unavailable — see logs/gui.log").classes("text-negative")
 
     # ─── PID Config ───────────────────────────────────────────
     with ui.tab_panel(tab_pid):

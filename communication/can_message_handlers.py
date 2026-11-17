@@ -467,6 +467,12 @@ def send_gripper_commands(motors, dummy_device, active_gripper, joint_num,
         # Dummy data keeps loop timing consistent (prevents 1ms jitter)
         dummy_device.Send_Respond_Ping()
 
+def _job_turn(state) -> bool:
+    """Every other call True: the share of the free poll slots the on-demand jobs get (the telemetry keeps the rest)."""
+    state["job_turn"] = not state.get("job_turn", False)
+    return state["job_turn"]
+
+
 def handle_polling_and_overrides(motors, state, overrides, override_queue, joint_num, active_CAN_gripper=0):
     """3. Manages high-priority overrides and round-robin health polling.
     Includes the gripper motor in the round-robin when active_CAN_gripper=1."""
@@ -494,6 +500,9 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
     params = state.get("params")                   # a drive-parameter read on demand (utility/drive_params.py)
     if params is not None and params.active:
         params.collect(motors)
+    capture = state.get("capture")                 # a drive's own recording of a fault (utility/drive_capture.py)
+    if capture is not None:
+        capture.step(motors)
     step = state["step"]
     idx = state["joint_index"]
 
@@ -507,11 +516,15 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
     # data/update_shared_data.py copies what the dashboard shows.
     elif 500 <= state["device_info_counter"] < (500 + total_motors):
         motors[idx].Send_Respond_Identity()
-    elif params is not None and params.queue and params.turn():      # (only while requests are left to ask)
-        # A drive-parameter read (2026-11-16): every other free poll slot asks ONE parameter instead of a telemetry
-        # request — the frames per tick stay what they are; the answer is copied a few ticks later (collect, above).
-        # The round robin waits for the next tick, so every drive keeps its telemetry (at half the rate meanwhile).
-        params.send_next(motors)
+    elif ((params is not None and params.queue) or (capture is not None and capture.queue)) and _job_turn(state):
+        # A drive-parameter read (2026-11-16) or a drive capture's requests (2026-11-17): every other free poll slot
+        # sends ONE of their requests instead of a telemetry request — the frames per tick stay what they are; the
+        # answers come through the normal receive path. The round robin waits for the next tick, so every drive keeps
+        # its telemetry (at half the rate meanwhile). The parameter read goes first.
+        if params is not None and params.queue:
+            params.send_next(motors)
+        else:
+            capture.send_next(motors)
         return
     else:
         # Normal Telemetry

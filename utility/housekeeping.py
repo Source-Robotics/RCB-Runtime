@@ -40,6 +40,7 @@ KEPT_DIRS = {"calibration": "the arms' calibration-screw readings (api_tests/65)
              "sim": "tools/sim_run.py: its own limit (newest 30 runs) and rotating logs",
              "incidents": "utility/incident_dump.py: newest 20",
              "captures": "utility/incident_dump.py: newest 10",
+             "drive_captures": "utility/drive_capture.py: a drive's own recording of its fault, newest 30, ~10 KB each",
              "support": "gui_logs_tab.py: newest 3 bundles",
              "first_run": "tools/first_run.py: the first-run check's reports, a few KB each, newest 50",
              "nets": "tools/run_nets.py: one log per net, overwritten each run",

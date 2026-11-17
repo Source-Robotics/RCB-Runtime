@@ -71,6 +71,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
   by RTI itself 4 s after it starts, so they are at hand from the start. RTI asks one
   parameter every other status poll, so the frames per tick and the control loop stay as they are (about 5 s for every
   drive). The gains and limits RTI sends from the robot XML show the XML's value too when the drive holds another.
+- Each drive records its own next fault (drive firmware 109+): armed at start, after Clear Errors and after each read,
+  it keeps the motor current, speed and position error at 1562 Hz from 0.5 s before the fault; the robot reads it
+  back after the fault (2 samples per request in the status-poll slot: the per-tick data is never delayed) and saves it
+  in `temp_data/drive_captures/`; the Recordings tab plots it with the fault at 0 ms.
 - Two checks of the drives 12 s after the robot starts: each drive holds the gains and limits the robot sent it (after the
   start-up parameter read; otherwise `J<n>:GAINS_MISMATCH_WARNING` (2114), both values in the log), and each is the
   product its `<driver_type>` names (otherwise `J<n>:DRIVE_PRODUCT_MISMATCH` (2115): the arm cannot be enabled until the
