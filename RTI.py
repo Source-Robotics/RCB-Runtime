@@ -718,6 +718,38 @@ def main():
                          int(shared_data.rti["drive_params_read"][2]))
 
     DRIVE_CHECKS_TICK = 3000             # 12 s in: the start-up read (from tick 1000, ~5 s) has finished
+    TOOL_CHECK_TICKS = 250               # the gripper drive's tool id against its XML: about once a second (cold)
+    _drive_check_found: list = []        # the start's drive-check keys, kept next to the tool check's (base warnings)
+    _tool_state = {"state": None, "key": ()}
+
+    def _apply_base_warnings():
+        """The arm check's base warnings: the Kt warnings, the start's drive checks, the gripper's tool check."""
+        _arm_check.set_base_warnings(tuple(_kt_warnings) + tuple(_drive_check_found) + _tool_state["key"])
+
+    def _gripper_tool_check():
+        """The gripper drive's tool id (its identity reply, about every 4 s) against the gripper XML's <tool_id>
+        (utility/drive_checks.tool_check; user 2026-11-17: a mismatch is a stop). Published in rti['gripper_tool'];
+        a change logged once; a mismatch kept in the base warnings, re-raised every tick: the arm cannot be enabled.
+        Checked all along, so storing the id (or, later, another gripper fitted) clears or raises it within seconds."""
+        from utility.drive_checks import TOOL_STATES, tool_check
+        xml_id = cfg.get('gripper_tool_id')
+        drive_id = getattr(Motor[joint_num], "tool_id", None)
+        state, text = tool_check(xml_id, drive_id)
+        out = shared_data.rti["gripper_tool"]
+        out[0] = -1.0 if drive_id is None else float(drive_id)
+        out[1] = -1.0 if xml_id is None else float(xml_id)
+        out[2] = float(TOOL_STATES[state])
+        if state == _tool_state["state"]:
+            return
+        _tool_state["state"] = state
+        if state == "mismatch":
+            log_startup.error("gripper tool id: %s — the arm cannot be enabled (GRIPPER_TOOL_MISMATCH)", text)
+        elif state != "unknown":
+            log_startup.info("gripper tool id: %s", text)
+        key = ("GRIPPER:GRIPPER_TOOL_MISMATCH",) if state == "mismatch" else ()
+        if key != _tool_state["key"]:
+            _tool_state["key"] = key
+            _apply_base_warnings()
     CAPTURE_ARM_TICK = 3100              # the drives' fault captures armed (utility/drive_capture.py)
 
     SOUND_BOOT_TICK = 3200               # the boot chime: the robot is ready (after the drive checks at 3000)
@@ -790,8 +822,9 @@ def main():
         log_startup.info("drive checks at start: %s", ", ".join(found) if found else
                          "every drive is the product its XML declares" + ("" if not read_done or homing_ran else
                                                                           " and holds what RTI sent"))
+        _drive_check_found[:] = found
         if found:
-            _arm_check.set_base_warnings(tuple(_kt_warnings) + tuple(found))
+            _apply_base_warnings()
     # Optional override function (set externally when needed)
     scheduled_override_queue = deque()  # Each item is a tuple: (function, repeat_count)
     current_override = {"fn": None,"count": 0}
@@ -1693,6 +1726,38 @@ def main():
         param_read.add(node, [number])
         log_handler.info("parameter %d of node %d written: %d (in its RAM; read back now)", number, node, value)
 
+    def _handle_tool_id(cmd_msg, cmd_dict):
+        """tool_id:<n> — store a tool id in the gripper drive (store_gripper_tool_id, 2026-11-17): its parameter 1, then
+        the drive's flash save (its whole working config, as save_drive). Only with the arm disabled, a CAN gripper, and
+        a drive whose flash keeps a second settings block (its identity flag; else the id is lost at power-off). The
+        tool check (_gripper_tool_check) reads it back from the drive's next identity reply."""
+        from utility.drive_checks import tool_name
+        try:
+            tool = int(cmd_msg.split(":", 1)[1])
+        except (IndexError, ValueError):
+            tool = -1
+        node = joint_num
+        flags = getattr(Motor[node], "identity_flags", None) if active_CAN_gripper else None
+        if not active_CAN_gripper:
+            why = "no CAN gripper: its tool id lives in a gripper's drive"
+        elif not 0 <= tool <= 255:
+            why = f"{cmd_msg!r} is not tool_id:<0-255>"
+        else:
+            why = _drive_write_refusal(node)
+            if why is None and not flags:
+                why = "the gripper drive has not reported its identity yet — try again in a few seconds"
+            elif why is None and not flags.get("settings_block2"):
+                why = ("the gripper drive's flash keeps no second settings block (firmware 109+): the id would be lost "
+                       "at power-off")
+        if why:
+            _refused(log_handler, "tool_id refused: %s", why)
+            return
+        Motor[node].Send_Tool_ID(tool)
+        can_quiet_until[node] = shared_data.rti["loop_tick"][0] + SAVE_QUIET_TICKS
+        Motor[node].Send_Save_config()
+        log_handler.info("gripper drive: tool id %d (%s) stored, its flash saved (it may not answer for ~1 s)", tool,
+                         tool_name(tool))
+
     def _handle_save_drive(cmd_msg, cmd_dict):
         """save_drive:<node> — the drive stores its WHOLE working config in its flash (one save command: the gains, limits,
         watchdog and brake RTI sent too), 2026-11-16. Only with the arm disabled. It does not answer for up to ~1 s
@@ -2478,6 +2543,7 @@ def main():
         "sound_set":         _handle_sound_set,
         "write_param":       _handle_write_param,
         "save_drive":        _handle_save_drive,
+        "tool_id":           _handle_tool_id,
         "coriolis_comp":     _handle_coriolis_comp,
         "set_mode":          _handle_set_mode,
         "jog_set":           _handle_jog_set,
@@ -2963,6 +3029,8 @@ def main():
             _read_params_at_start()
         if _tick_now == DRIVE_CHECKS_TICK:
             _drive_checks_at_start()
+        if active_CAN_gripper and _tick_now % TOOL_CHECK_TICKS == 0:
+            _gripper_tool_check()
         if _tick_now == CAPTURE_ARM_TICK:
             _arm_captures_at_start()
         if _tick_now == SOUND_BOOT_TICK:

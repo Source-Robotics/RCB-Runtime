@@ -1,6 +1,7 @@
 <gripper name="SSG48">
     <CAN_gripper>1</CAN_gripper>   <!-- 1 = CAN-driven motor gripper -->
     <driver_type>spectral-bldc</driver_type>  <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
+    <tool_id>1</tool_id>  <!-- What the gripper's drive is built into (its parameter 1, firmware 109+): 1 = SSG-48; an MSG 11-33 = tens the rail (1/2/3 = 100/150/200 mm), units the motor (1/2/3 = small 21.5 / medium 40 / large 60 mm). RTI compares the drive's with this one: another = GRIPPER_TOOL_MISMATCH, the arm cannot be enabled; 0 = not stored yet (the Gripper tab stores it). 2026-11-17. -->
     <hardware_revision>v1.0</hardware_revision>  <!-- This gripper's hardware revision (2026-10-21, versioning V4): the Versions card and get_versions show it. -->
     <Stroke>47</Stroke>            <!-- Stroke in mm, linear rail of 100mm -->
     <kt>0.3</kt>                 <!-- Torque constant in Nm/A -->

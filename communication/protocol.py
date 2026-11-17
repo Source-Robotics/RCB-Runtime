@@ -155,6 +155,8 @@ COMMAND_RULES = {
     # next start uses it; set_pid_gains applies it live) — any mode. Owned: they change the robot.
     "write_drive_parameter": (IMMEDIATE, None, "DISABLED", False),
     "save_drive_config":    (IMMEDIATE, None, "DISABLED", False),
+    # the gripper XML's tool id into the gripper drive's flash (2026-11-17): like save_drive_config, arm disabled
+    "store_gripper_tool_id": (IMMEDIATE, None, "DISABLED", False),
     "save_drive_parameter_to_xml": (IMMEDIATE, None, None, False),
     # Sound through the motors (2026-11-17, utility/sound.py): any mode here; RTI refuses when the use's switch is
     # off or the drives do not hold (motors off, flashing, starting). identify_arm is open to everyone; a program's

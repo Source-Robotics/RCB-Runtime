@@ -7,7 +7,12 @@
 - Product: the identity reply's product (1 STEPFOC, 2 Spectral Micro) against the robot / gripper XML's <driver_type>.
   A drive that is not the product the XML describes runs other gains in other units: J<n>:DRIVE_PRODUCT_MISMATCH, a
   hard error re-raised every tick — the arm cannot be enabled until the drive or the XML is fixed and RTI restarts.
-Pure functions; RTI runs them once (RTI.py _drive_checks_at_start).
+- Gripper tool id (2026-11-17, user: a mismatch = a stop): the gripper drive's tool id (parameter 1, in its identity
+  reply every ~4 s) against the gripper XML's <tool_id> — 1 SSG-48, 11-33 an MSG (tens = rail 100 / 150 / 200 mm,
+  units = motor 21.5 / 40 / 60 mm), 200-254 a custom gripper. Another id: GRIPPER:GRIPPER_TOOL_MISMATCH, a hard error
+  (the gripper XML's tool length, mass and collision model would be wrong for every move); 0 = not stored yet, a note.
+  RTI checks it about once a second (RTI.py _gripper_tool_check), so storing the id clears it at once.
+Pure functions; RTI runs the first two once (RTI.py _drive_checks_at_start).
 """
 from __future__ import annotations
 
@@ -57,3 +62,41 @@ def product_mismatch(driver_type, product_id) -> str | None:
         return None
     return (f"the drive reports {PRODUCT_NAMES.get(int(product_id), f'product {product_id}')}, the XML's "
             f"<driver_type> says {driver_type}")
+
+
+MSG_RAILS_MM = {1: 100, 2: 150, 3: 200}
+MSG_MOTORS_MM = {1: "21.5", 2: "40", 3: "60"}
+TOOL_STATES = {"none": 0, "unknown": 1, "unset": 2, "match": 3, "mismatch": 4}
+
+
+def tool_name(tool_id) -> str:
+    """A tool id in words: 'none' (0), 'SSG-48' (1), 'MSG, 150 mm rail, 21.5 mm motor' (21), 'custom 200' (200-254),
+    'unknown 7' (anything else)."""
+    t = int(tool_id)
+    if t == 0:
+        return "none"
+    if t == 1:
+        return "SSG-48"
+    if t // 10 in MSG_RAILS_MM and t % 10 in MSG_MOTORS_MM:
+        return f"MSG, {MSG_RAILS_MM[t // 10]} mm rail, {MSG_MOTORS_MM[t % 10]} mm motor"
+    if 200 <= t <= 254:
+        return f"custom {t}"
+    return f"unknown {t}"
+
+
+def tool_check(xml_id, drive_id) -> tuple:
+    """(state, text) of the gripper drive's tool id against the gripper XML's: 'none' (the XML declares no id: nothing
+    to check), 'unknown' (the drive has not said yet), 'unset' (the drive holds 0: not stored yet), 'match',
+    'mismatch'."""
+    if xml_id is None:
+        return "none", "the gripper XML declares no <tool_id>: not checked"
+    if drive_id is None:
+        return "unknown", "the gripper drive has not reported its tool id yet"
+    xml_id, drive_id = int(xml_id), int(drive_id)
+    if drive_id == 0:
+        return "unset", (f"the gripper drive has no tool id stored: store {xml_id} ({tool_name(xml_id)}) from the "
+                         f"Gripper tab or store_gripper_tool_id()")
+    if drive_id == xml_id:
+        return "match", f"the gripper drive's tool id {drive_id} ({tool_name(drive_id)}) matches the gripper XML"
+    return "mismatch", (f"the gripper drive's tool id is {drive_id} ({tool_name(drive_id)}); the gripper XML says "
+                        f"{xml_id} ({tool_name(xml_id)})")

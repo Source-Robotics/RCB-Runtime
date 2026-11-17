@@ -401,6 +401,16 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         def _gval(tag): return get_gripper_values(grippers, gripper_name, tag)
         gripper_elem = None
 
+    def _tool_id(text, name):
+        """<tool_id> of a gripper XML (0-255; what its drive is built into, utility/drive_checks.py): None when missing
+        or malformed (with a warning)."""
+        if text is None:
+            return None
+        if text.isdigit() and 0 <= int(text) <= 255:
+            return int(text)
+        logger.warning("gripper %s: <tool_id> %r is not a whole number 0-255 — not checked", name, text)
+        return None
+
     def _gstr(tag, default=None):
         """Gripper STRING field — _gval coerces to float. None = not declared."""
         if gripper_elem is None:
@@ -518,6 +528,7 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
                                    "pairs": _parse_collision_pairs(gripper_elem.find("collision") if gripper_elem is not None else None, "collision", frame_b=6)},
         'gripper_name':           gripper_name,
         'gripper_driver_type':    _gstr('driver_type'),
+        'gripper_tool_id':        _tool_id(_gstr('tool_id'), gripper_name),     # None = not declared: not checked
         'gripper_stroke':         _gval('Stroke'),
         'gripper_kt':             _gval('kt'),
         'gripper_gear_r':         _gval('Gear_r'),

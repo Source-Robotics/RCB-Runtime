@@ -254,6 +254,15 @@ CATALOG = {
                                  "for another driver.",
                                  "Fit the drive the XML names, or correct its <driver_type>, then restart the robot "
                                  "service."),
+    "GRIPPER_TOOL_MISMATCH": _e(2116, "Gripper is not the one the gripper file names",
+                                "The gripper's drive reports a tool id (the gripper it is built into) other than the "
+                                "<tool_id> in the active gripper XML: for example a gripper with another rail or "
+                                "motor, or another kind of gripper. The log names both.",
+                                "The robot stops and cannot be enabled: the gripper XML's tool length, mass and "
+                                "collision model would be wrong for every move and check.",
+                                "Select the gripper XML of the gripper that is fitted (<active_gripper> in "
+                                "config/system.xml), or, if the drive's id is wrong, store the right one from the "
+                                "Gripper tab (store_gripper_tool_id()). The check clears within a few seconds."),
     "KT_MISMATCH_WARNING": _e(2110, "Drive's torque constant far from the robot file",
                               "At start a drive reported a torque constant (Kt) further from the robot XML's <kt> "
                               "than <kt_tolerance> in config/system.xml allows. The start-up log names both values.",

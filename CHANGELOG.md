@@ -105,6 +105,12 @@ What changed in each version of the RCB runtime. The newest version is at the to
   for it on the Sound card (a ▶ plays each) or with `set_sound(boot_tune=..., homing_done_tune=..., error_tune=...,
   identify_tune=...)`; `play_sound(name)` plays one from a program. The robot's own sounds and library tunes play on
   the robot's sound axis at rest and on `d` in EXEC, JOG, RTI and SOFT_RTI, so a tone never disturbs a move.
+- The gripper's tool ID (drive firmware 109+): each sized gripper XML declares `<tool_id>` (1 the SSG-48; an MSG 11-33,
+  the tens digit its rail 100 / 150 / 200 mm, the units its motor small / medium / large), and the robot compares it
+  with the tool ID the gripper's drive reports, about once a second. Another ID stops the robot
+  (`GRIPPER_TOOL_MISMATCH`, 2116: it cannot be enabled, since the gripper XML's tool length, mass and collision model
+  would be wrong); a drive with none stored gets a note. The Gripper tab shows both and stores the XML's ID in the
+  drive with a confirmation (`store_gripper_tool_id()`: the ID and a flash save, the arm disabled).
 
 ### Changed
 

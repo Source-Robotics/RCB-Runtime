@@ -1053,6 +1053,15 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             ui.label("Serial");           grp_motor_sn_lbl    = ui.label("---")
             ui.label("When idle").tooltip(IDLE_TOOLTIP); grp_motor_idle_lbl = ui.label("---")
             ui.label("Board ID");         grp_motor_board_lbl = ui.label("---")
+            # the gripper drive's tool id against the gripper XML's, and its Store button (gui_gripper_tool.py,
+            # 2026-11-17); built in a try: a failure must not break the page
+            ui.label("Tool ID")
+            try:
+                from gui_gripper_tool import add_tool_cell
+                grp_tool_cell = add_tool_cell(exec_fn=_exec)
+            except Exception:
+                logger.exception("gripper tool ID line unavailable")
+                grp_tool_cell = None
 
         ui.label("Gripper Motor Error Flags").classes("text-sm font-semibold mb-1 text-gray-600 uppercase tracking-wide")
         grp_motor_err_columns = [
@@ -3993,6 +4002,8 @@ def update_tables():
         grp_motor_sn_lbl.text   = str(int(shared_data.gripper['gripper_motor_serial'][0]))
         grp_motor_idle_lbl.text = _fmt_idle(shared_data.gripper.get('gripper_motor_idle_brake'))
         grp_motor_board_lbl.text = _fmt_board(shared_data.gripper.get('gripper_motor_board_id'))
+        if grp_tool_cell is not None:
+            grp_tool_cell["update"](shared_data.rti.get('gripper_tool'))
 
         grp_motor_err_table.rows = [{
             'temp':  int(shared_data.gripper['gripper_motor_temp_error'][0]),

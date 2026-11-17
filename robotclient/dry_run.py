@@ -600,6 +600,11 @@ class DryRunRobotClient(RobotClient):
     def identify_arm(self) -> None:
         self._record_immediate_event("identify_arm", {"kind": "sound"})
 
+    def store_gripper_tool_id(self) -> dict:
+        # offline nothing is stored in a drive
+        self._record_immediate_event("store_gripper_tool_id", {"kind": "drive"})
+        return {"tool_id": None, "tool": None}
+
     def play_sound(self, name: str) -> None:
         from utility.sound import TUNES
         if not isinstance(name, str) or name not in TUNES:

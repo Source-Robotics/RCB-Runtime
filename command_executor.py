@@ -694,6 +694,7 @@ RTI_ANSWER_CODES = {
     "set_recipe": ("RTI_REFUSED",),
     "set_sound": ("RTI_REFUSED",),
     "stop": ("RTI_REFUSED",),
+    "store_gripper_tool_id": ("RTI_REFUSED",),
     "write_drive_parameter": ("RTI_REFUSED",),
 }
 _answer_seq = itertools.count(1)
@@ -1440,6 +1441,24 @@ def _handle_save_drive_parameter_to_xml(args, cid, conn):
     reply(conn, {"id": cid, "status": "ok", "data": {"file": path.name, "key": key, "value": float(xml_text(number,
                                                                                                          value)),
                                                      "backup": backup.name}})
+
+
+def _handle_store_gripper_tool_id(args, cid, conn):
+    """store_gripper_tool_id — store the active gripper XML's <tool_id> in the gripper's drive (its parameter 1 and a
+    flash save; utility/drive_checks.py, 2026-11-17). The arm disabled (the rule; RTI checks again, and that the drive's
+    flash can keep it). Replies {"tool_id": n, "tool": its name}."""
+    from utility.drive_checks import tool_name
+    if args:
+        return _bad_args(cid, conn, "store_gripper_tool_id", "store_gripper_tool_id takes no arguments")
+    if not _HAS_CAN_GRIPPER:
+        msg = "no CAN gripper: a tool id is stored in a gripper's drive"
+        _log_exec_reject(cid, "NO_GRIPPER", msg, command="store_gripper_tool_id")
+        return reply(conn, {"id": cid, "status": "error", "code": "NO_GRIPPER", "message": msg})
+    tool = cfg.get("gripper_tool_id")
+    if tool is None:
+        return _bad_args(cid, conn, "store_gripper_tool_id",
+                         f"the gripper XML ({cfg.get('gripper_name')}) declares no <tool_id> to store")
+    _answered(conn, cid, "store_gripper_tool_id", f"tool_id:{tool}", data={"tool_id": tool, "tool": tool_name(tool)})
 
 
 def _handle_identify_arm(args, cid, conn):
@@ -2656,6 +2675,7 @@ IMMEDIATE_HANDLERS = {
     "write_drive_parameter": _handle_write_drive_parameter,
     "save_drive_config":    _handle_save_drive_config,
     "save_drive_parameter_to_xml": _handle_save_drive_parameter_to_xml,
+    "store_gripper_tool_id": _handle_store_gripper_tool_id,   # the gripper drive's tool id (2026-11-17)
     "identify_arm":     _handle_identify_arm,        # sound through the motors (utility/sound.py, 2026-11-17)
     "beep":             _handle_beep,
     "play_tune":        _handle_play_tune,

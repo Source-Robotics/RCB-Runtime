@@ -6379,6 +6379,57 @@ class RobotClient:
         """
         return self._immediate("save_drive_parameter_to_xml", [drive, number, value])
 
+    def store_gripper_tool_id(self) -> dict:
+        """Store this gripper's tool ID in its drive.
+
+        A gripper's drive can hold which gripper it is built into, its tool ID:
+        1 for an SSG-48, 11 to 33 for an MSG (the tens digit is the rail, 1, 2
+        or 3 for 100, 150 or 200 mm; the units digit the motor, 1, 2 or 3 for
+        the small, medium or large one), 200 to 254 for a gripper of your own.
+        The robot compares it with the `<tool_id>` in the active gripper's XML
+        all the time: another ID stops the robot (`GRIPPER_TOOL_MISMATCH`, it
+        cannot be enabled), since that XML's tool length, mass and collision
+        model would be wrong; 0, not stored yet, only gets a note. This command
+        writes the XML's ID into the drive and saves the drive's flash, so it
+        stays after a power-off. The save stores the drive's whole working
+        config, as `save_drive_config()` does. The drive does not answer for up
+        to about a second meanwhile. Only with the arm disabled. Nothing moves.
+
+        Returns:
+            A dict: `tool_id` (the number stored) and `tool` (it in words, for
+            example "MSG, 150 mm rail, 21.5 mm motor").
+
+        Raises:
+            CommandRejected: The robot refused it: the arm is enabled, another
+                client holds control, there is no CAN gripper, or its XML
+                declares no tool ID. Or RTI refused it or did not answer within
+                1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            NO_GRIPPER: The robot has no CAN gripper.
+            BAD_ARGS: The active gripper's XML declares no `<tool_id>`.
+            RTI_REFUSED: RTI refused it: the arm is enabled, the gripper's drive
+                has not reported its identity yet, or its flash cannot keep the
+                ID (firmware before 109). The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        Warning:
+            Store it only with the gripper the XML describes fitted. An ID
+            stored in the wrong gripper's drive hides the mismatch this check
+            exists for.
+
+        See also:
+            `save_drive_config()`, `get_drive_parameters()`
+
+        Examples:
+            >>> robot.store_gripper_tool_id()
+            {'tool_id': 21, 'tool': 'MSG, 150 mm rail, 21.5 mm motor'}
+        """
+        return self._immediate("store_gripper_tool_id")
+
     def identify_arm(self) -> None:
         """Play this arm's identify tune through one of its motors.
 
