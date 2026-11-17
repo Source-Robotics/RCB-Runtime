@@ -705,6 +705,49 @@ def main():
         param_read.start(range(joint_num + (1 if active_CAN_gripper else 0)))
         log_startup.info("reading every drive's parameters (%d requests, paced in the poll slot)",
                          int(shared_data.rti["drive_params_read"][2]))
+
+    DRIVE_CHECKS_TICK = 3000             # 12 s in: the start-up read (from tick 1000, ~5 s) has finished
+
+    def _drive_checks_at_start():
+        """The start's drive checks (utility/drive_checks.py, 2026-11-17, user): each drive holds the gains and limits
+        RTI sent (from the start-up read; skipped when a homing ran meanwhile — its current limit is the homing's), and
+        each is the product its XML's <driver_type> declares. Once, at DRIVE_CHECKS_TICK. A gains mismatch is a
+        warning; a product mismatch a hard error re-raised every tick (the arm cannot be enabled)."""
+        from utility.drive_checks import GAIN_NAMES, gains_mismatches, product_mismatch, sent_values
+        from utility.drive_params import READ, SLOTS
+        vals, states = shared_data.rti["drive_params"], shared_data.rti["drive_params_state"]
+        nodes = [(f"J{j + 1}", j, sent_values(motor_KPP[j], motor_KPV[j], motor_KIV[j], motor_KPIQ[j], motor_KIIQ[j],
+                                              motor_KP[j], motor_KD[j], motor_velocity_limit[j], motor_Ilim[j],
+                                              motor_voltage_limit[j]), cfg['motor_driver_type'][j])
+                 for j in range(joint_num)]
+        if active_CAN_gripper:
+            nodes.append(("GRIPPER", joint_num, sent_values(st.gripper_KPP, st.gripper_KPV, st.gripper_KIV,
+                                                            st.gripper_KPIQ, st.gripper_KIIQ, st.gripper_KP, st.gripper_KD,
+                                                            st.gripper_velocity_limit, st.gripper_Ilim,
+                                                            st.gripper_voltage_limit), cfg.get('gripper_driver_type')))
+        read_done = float(shared_data.rti["drive_params_read"][0]) == 2.0
+        homing_ran = bool(np.any(shared_data.rti["homing_status"]))
+        found = []
+        for label, node, sent, driver_type in nodes:
+            if read_done and not homing_ran:
+                held = {n: float(vals[node * SLOTS + n]) for n in sent if int(states[node * SLOTS + n]) == READ}
+                bad = gains_mismatches(sent, held)
+                if bad:
+                    found.append(f"{label}:GAINS_MISMATCH_WARNING")
+                    log_startup.warning("%s: the drive holds %s — not what RTI sent (a config frame lost?)", label,
+                                        "; ".join(f"{GAIN_NAMES[n]} {h:g} (sent {v:g})" for n, v, h in bad))
+            why = product_mismatch(driver_type, getattr(Motor[node], "product_id", None))
+            if why:
+                found.append(f"{label}:DRIVE_PRODUCT_MISMATCH")
+                log_startup.error("%s: %s — not the drive the robot XML describes: the arm cannot be enabled", label, why)
+        if not read_done or homing_ran:
+            log_startup.warning("the drives' gains were not checked: %s", "a homing ran during the start-up read"
+                                if homing_ran else "the start-up parameter read had not finished")
+        log_startup.info("drive checks at start: %s", ", ".join(found) if found else
+                         "every drive is the product its XML declares" + ("" if not read_done or homing_ran else
+                                                                          " and holds what RTI sent"))
+        if found:
+            _arm_check.set_base_warnings(tuple(_kt_warnings) + tuple(found))
     # Optional override function (set externally when needed)
     scheduled_override_queue = deque()  # Each item is a tuple: (function, repeat_count)
     current_override = {"fn": None,"count": 0}
@@ -2814,6 +2857,8 @@ def main():
         # once RTI has configured it; paced in the poll slot like any read (~5 s, the frames per tick unchanged).
         if _tick_now == PARAM_READ_AT_START_TICK:
             _read_params_at_start()
+        if _tick_now == DRIVE_CHECKS_TICK:
+            _drive_checks_at_start()
         if _tick_now == BOOT_CLEAR_TICK:
             send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
                               Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper, all_motors=True)

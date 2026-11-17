@@ -71,6 +71,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
   by RTI itself 4 s after it starts, so they are at hand from the start. RTI asks one
   parameter every other status poll, so the frames per tick and the control loop stay as they are (about 5 s for every
   drive). The gains and limits RTI sends from the robot XML show the XML's value too when the drive holds another.
+- Two checks of the drives 12 s after the robot starts: each drive holds the gains and limits the robot sent it (after the
+  start-up parameter read; otherwise `J<n>:GAINS_MISMATCH_WARNING` (2114), both values in the log), and each is the
+  product its `<driver_type>` names (otherwise `J<n>:DRIVE_PRODUCT_MISMATCH` (2115): the arm cannot be enabled until the
+  drive or the XML is fixed).
 - Changing drive parameters, one value at a time and read back after: the gains and limits RTI sends are applied live
   (a joint) and saved with `save_drive_parameter_to_xml()` into the robot or gripper XML — only that number changes in
   the file, every comment stays, a copy goes to `temp_data/xml_backups/` first, and the file is read again and put back

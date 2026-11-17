@@ -239,6 +239,21 @@ CATALOG = {
                                 "asks first.",
                                 "Nothing, if the drive was replaced or recalibrated on purpose: home the robot. If not, "
                                 "check which drive is in that joint."),
+    "GAINS_MISMATCH_WARNING": _e(2114, "Drive holds other gains than the robot sent",
+                                 "After the start-up read of the drives' parameters, this drive held other gains or "
+                                 "limits than RTI sent it from the robot XML (a config frame lost on the bus, or the "
+                                 "drive changed by someone else since). The start-up log names each value, both ways.",
+                                 "Warning only: the robot keeps running, but that joint runs the drive's values. The "
+                                 "warning stays until the robot service restarts.",
+                                 "Restart the robot service (it sends the configuration again); if it comes back, check "
+                                 "that joint's CAN cable. The Drive parameters tab shows what the drive holds."),
+    "DRIVE_PRODUCT_MISMATCH": _e(2115, "Drive is not the product the robot file names",
+                                 "At start this drive reported another product than its <driver_type> in the robot or "
+                                 "gripper XML: a stepper drive where a brushless one is named, or the other way round.",
+                                 "The robot stops and cannot be enabled: the drive would run gains and limits meant "
+                                 "for another driver.",
+                                 "Fit the drive the XML names, or correct its <driver_type>, then restart the robot "
+                                 "service."),
     "KT_MISMATCH_WARNING": _e(2110, "Drive's torque constant far from the robot file",
                               "At start a drive reported a torque constant (Kt) further from the robot XML's <kt> "
                               "than <kt_tolerance> in config/system.xml allows. The start-up log names both values.",
