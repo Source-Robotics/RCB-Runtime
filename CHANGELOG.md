@@ -15,6 +15,16 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Added
 
+- A tool without a drive (the Flange, a vacuum tool, MHZ2-10D) is changed live too, both ways: from a gripper with a
+  drive to the Flange and back, without restarting the robot service. The Change-gripper mode works with any tool;
+  the card lists every tool file ("(no drive)" marked), and Done does not wait for a drive that is not there. Coming
+  from a tool without a drive, the new gripper's drive is checked (product, tool ID) once it answers, and its loss is
+  reported after one second if it never does.
+
+- The dashboard's Change gripper is one step: with the arm enabled and homed it moves the arm to the pose a homing
+  ends in (a checked move at 25 %), then disables it and begins the change; every joint holds at zero speed while the gripper is
+  swapped. The card tells you when to unplug the gripper. After Done it offers "Home the arm".
+
 - A held jog has a dead-man. The dashboard's browser tells the robot every 0.2 s while a jog button or joystick is
   pressed (`jog_alive()`, new); a jog whose keep-alives stop for 0.6 s — a lost button release, a context menu, a tab
   switched or a lost connection — is stopped. RTI brakes a jog when the executor stops answering for 0.5 s. The
@@ -142,6 +152,9 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Changed
 
+- `end_gripper_change(removed=True)` (the gripper taken off the flange) leaves the whole arm not homed, instead of
+  J5 and J6 only: the arm homes again. That homing takes J5's and J6's new spots for this gripper
+  without asking; J1 to J4 are checked as always. J6's spot is stored per gripper, as J5's already was.
 
 - The robotics toolbox is the official `roboticstoolbox-python` 1.5.0 (with `spatialmath-python` 1.1.19) instead of
   our fork `roboticstoolbox-python-source-robotics` 1.3.0.post2. Both install the same `roboticstoolbox` package:

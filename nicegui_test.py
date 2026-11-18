@@ -1056,10 +1056,16 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
 
         # Change the gripper while the arm keeps its homing (gui_gripper_change.py, 2026-11-17); built in a try
         try:
-            from gui_gripper_change import add_change_card
+            from gui_gripper_change import add_change_card, homing_end_pose
+
+            def _chg_pose_deg(steps):
+                pose = homing_end_pose(steps)
+                return None if pose is None else [None if v is None else math.degrees(v) for v in pose]
             _grip_raw_c = _xml_cfg.get('gripper_CAN_gripper', 0)
             add_change_card(shared_data, _exec, not (isinstance(_grip_raw_c, float) and math.isnan(_grip_raw_c))
-                            and int(_grip_raw_c) == 1, current=str(_xml_cfg.get('gripper_name') or ""))
+                            and int(_grip_raw_c) == 1, current=str(_xml_cfg.get('gripper_name') or ""),
+                            # 2026-11-18: Change gripper first moves to the pose a homing ends in (the user)
+                            pose_deg=_chg_pose_deg(_xml_cfg.get('homing_sequence')))
         except Exception:
             logger.exception("the Change-gripper card unavailable")
 

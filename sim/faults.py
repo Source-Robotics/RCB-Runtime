@@ -22,7 +22,7 @@ from utility import sim_mode
 ACTIVITY = os.path.join("temp_data", "sim", "logs", "activity_rti.log")
 ORDER = ("node_lost", "drive_fault", "drive_flags", "reply_loss", "drive_reboot", "hand_push", "push_through",
          "runaway", "tracking_lag", "hold_buzz", "homing_false_stall", "executor_lost", "estop",
-         "motors_off_with_error", "gripper_hold", "stop_after_executor_restart", "rti_lost")
+         "motors_off_with_error", "gripper_hold", "stop_after_executor_restart", "gripper_swap", "rti_lost")
 ARMS = os.path.join("temp_data", "sim", "data", "homing_arms.json")    # the simulated arm table (project_paths)
 # gpio_states (uint8[16], data/shared_data.py) read as a FILE, with the name prefix shared_data applies — never
 # attached (importing data.shared_data attaches every segment). In simulation the inputs live here.
@@ -754,7 +754,45 @@ def stop_after_executor_restart(ctx, notes):
         r.disconnect()
 
 
+def gripper_swap(ctx, notes):
+    """A gripper swap ends in a full homing that re-learns J5 and J6 (2026-11-18, the user: "when changing gripper we
+    just do the full home"): a homed arm disables, the change begins (every joint holding),
+    ends as a swap (removed) — the WHOLE arm not homed — enabled, homed again from the park pose: homed, no homing
+    question, no error, and RTI's log says J5 / J6 were re-learned for the gripper."""
+    r = ctx.robot()
+    try:
+        ctx.ready(r, home=True)
+        # No park move here: the simulated endstops sit where the simulated drives booted (sim/drives.py), not at the
+        # model's park pose — homed from the park pose the simulated J3 never reaches its endstop. The dashboard parks.
+        r.enter_idle_mode(wait=True)
+        r.disable(wait=True)
+        r.begin_gripper_change()
+        if not _wait(lambda: (r.status().get("gripper") or {}).get("answering"), 5.0):
+            notes.append("the gripper did not answer in the change")
+            return False
+        mark = ctx.activity_mark()
+        r.end_gripper_change(removed=True)
+        st = r.get_status()
+        unhomed = st.get("homed") is not True
+        notes.append(f"after the swap: homed={st.get('homed')}")
+        r.enable(wait=True)
+        r.home(wait=True)
+        st = dict(r.get_status(), err=r.status().get("err"))
+        asked = ctx.has(mark, "HOMING_QUESTION")
+        log = open(os.path.join(ctx.root, "temp_data", "sim", "logs", "RTI.log")).read()[-200000:]
+        relearned = "J5, J6 re-learned for" in log
+        notes.append(f"homed again: homed={st.get('homed')} err={st.get('err')} question={asked} "
+                     f"J5/J6 re-learned in RTI.log={relearned}")
+        return unhomed and st.get("homed") is True and st.get("err") == 0 and not asked and relearned
+    finally:
+        try:
+            r.enter_idle_mode(wait=True)
+        except Exception as e:
+            notes.append(f"enter_idle_mode at the end: {e!r}")
+        r.disconnect()
+
+
 SCENARIOS = {f.__name__: f for f in (node_lost, drive_fault, drive_flags, reply_loss, drive_reboot, hand_push,
                                      push_through, runaway, tracking_lag, hold_buzz, homing_false_stall, executor_lost,
                                      estop, rti_lost, motors_off_with_error, gripper_hold,
-                                     stop_after_executor_restart)}
+                                     stop_after_executor_restart, gripper_swap)}

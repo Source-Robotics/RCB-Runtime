@@ -598,6 +598,10 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         cfg['homing_sequence'] = parse_homing_sequence(str(homing_xml_path))
 
     # ---- gripper-dependent home_offset overrides ----
+    # gripper_home_offset_joints (2026-11-18): the arm joints whose home offset the active gripper XML sets — with the
+    # Hall joints, the ones a gripper swap moves (J5 homes against the gripper; PAR6's J4 is flagged but no gripper sets
+    # it). The swap's homing re-learns those without asking.
+    cfg['gripper_home_offset_joints'] = []
     # For joints marked home_offset_gripper_dependent=1, replace the robot XML value
     # with the per-joint offset from the active gripper's <arm_joint_home_offsets> block.
     if gripper_elem is not None:
@@ -618,6 +622,7 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
                 if not np.isnan(flag) and int(flag) == 1:
                     if j in gripper_joint_offsets:
                         home_offsets[j] = gripper_joint_offsets[j]
+                        cfg['gripper_home_offset_joints'].append(j)
                     # If flag is set but gripper has no entry, keep the robot XML fallback
             cfg['home_offset'] = home_offsets
 

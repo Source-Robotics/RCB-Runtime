@@ -471,8 +471,11 @@ def main():
     # 2026-10-09 (TODO/homing_plan.md H1): which arm is connected, and did every joint home where THIS arm's joint always
     # homes (a false stall / skipped belt fails homing). The table is read here; a worker thread off this core re-reads it
     # when a homing starts and writes it when one ends — the loop itself touches no file.
+    # A joint homing to a Hall magnet is stored per gripper too (2026-11-18): J6's magnet sits in the gripper.
+    _per_gripper = [int((g == g and int(g) != 0) or (h == h and int(h) != 0)) for g, h in   # NaN (missing) = 0
+                    zip(cfg['home_offset_gripper_dependent'][:joint_num], cfg['has_hall_sensor'][:joint_num])]
     homing_ctrl.arm_check = HomingArms(
-        TEMP_DATA_DIR / "homing_arms.json", cfg['gear_ratio'][:joint_num], cfg['home_offset_gripper_dependent'][:joint_num],
+        TEMP_DATA_DIR / "homing_arms.json", cfg['gear_ratio'][:joint_num], _per_gripper,
         [2 ** int(b) for b in cfg['motor_encoder'][:joint_num]], cfg['gripper_name'], prefix=cfg['robot_name'])
     homing_ctrl.arm_check.start()
 
@@ -489,15 +492,22 @@ def main():
     _can_raw = cfg['gripper_CAN_gripper']
     active_CAN_gripper = 0 if (isinstance(_can_raw, float) and np.isnan(_can_raw)) else int(_can_raw)
 
-    # Write gripper control mode to shared memory (0=no gripper, 1=motor, 2=firmware)
-    _gripper_ctrl_mode = 0
-    if active_CAN_gripper == 1:
-        _gripper_ctrl_mode = 1  # default: motor mode
-        for _step in cfg.get('homing_sequence', []):
+    def _can_flag(raw):
+        """A gripper XML's <CAN_gripper> as 0 / 1 (missing or NaN = 0: a tool without a drive)."""
+        return 0 if raw is None or (isinstance(raw, float) and np.isnan(raw)) else int(int(raw) == 1)
+
+    def _gripper_ctrl_mode_of(config, drive):
+        """The gripper control mode for shared memory (0 = no gripper, 1 = motor, 2 = firmware): a drive's mode is its
+        homing sequence's (firmware when it calibrates the gripper in firmware), motor otherwise."""
+        if not drive:
+            return 0
+        for _step in config.get('homing_sequence', []):
             if _step.get('gripper_mode') is not None:
-                _gripper_ctrl_mode = 2 if _step['gripper_mode'] == 'firmware' else 1
-                break
-    shared_data.rti['gripper_ctrl_mode'][0] = _gripper_ctrl_mode
+                return 2 if _step['gripper_mode'] == 'firmware' else 1
+        return 1
+
+    # Write gripper control mode to shared memory (0=no gripper, 1=motor, 2=firmware)
+    shared_data.rti['gripper_ctrl_mode'][0] = _gripper_ctrl_mode_of(cfg, active_CAN_gripper)
     if active_CAN_gripper:
         shared_data.gripper['gripper_gear_r'][0] = gripper_gear_r
 
@@ -1790,22 +1800,23 @@ def main():
     def _handle_gripper_change(cmd_msg, cmd_dict):
         """gripper_change:1 | gripper_change:0 — the Change-gripper mode (TODO/live_gripper_swap_plan.md P1, 2026-11-17,
         user: the arm disabled and holding while the gripper is swapped).
-        1: only with a CAN gripper, in IDLE, the arm disabled. The jaws go idle (they let go), a calibration stops, the
+        1: in IDLE, the arm disabled — with any tool (P2b, 2026-11-18: also one without a drive, the Flange, to fit a
+        gripper with one, and back). With a drive: the jaws go idle (they let go), a calibration stops, the
         gripper's homing is gone (gripper_homed 0); its silence is not latched (can_quiet_until) and its faults are not
         collected (_gripper_errors_active), so unplugging it does not un-home the arm. Meanwhile enabling, the
         gripper's commands and every mode but IDLE / SAFETY_STOP are refused; the reconnect path sends a re-plugged
         gripper its config by itself.
-        0: only while the gripper answers (CAN_gripper_connected): its faults cleared, then GRIPPER_CHANGE_GRACE_TICKS
-        before its loss and faults count again; its fault capture armed again."""
+        0: while a fitted drive answers (CAN_gripper_connected) — not needed when the tool kept or applied has none,
+        or the active one has none (RTI does not talk to node 6 then: the new drive's tool check and its loss count
+        after the grace instead): its faults cleared, then GRIPPER_CHANGE_GRACE_TICKS before its loss and faults count
+        again; its fault capture armed again."""
         want = cmd_msg.split(":", 1)[1].strip() if ":" in cmd_msg else ""
         if _gripper_apply["failed"]:
             _refused(log_gripper, "gripper change refused: applying the gripper failed in stage %d — restart the robot "
                                   "service", _gripper_apply["failed"])
             return
         if want == "1":
-            if not active_CAN_gripper:
-                why = "no CAN gripper"
-            elif _gripper_change["on"]:
+            if _gripper_change["on"]:
                 why = "the gripper is already being changed"
             elif shared_data.robot_state.get() == "ENABLED":
                 why = "disable the arm first: the gripper is changed with the arm disabled (its joints still hold)"
@@ -1816,11 +1827,12 @@ def main():
             if why:
                 _refused(log_gripper, "gripper change refused: %s", why)
                 return
-            _gripper_fw_state['action'] = 0
-            _gripper_fw_state['_idle_repeats'] = GRIPPER_IDLE_PACK_REPEATS
-            st._gripper_calibrate_pending = st._gripper_calibrate_running = False
+            if active_CAN_gripper:
+                _gripper_fw_state['action'] = 0
+                _gripper_fw_state['_idle_repeats'] = GRIPPER_IDLE_PACK_REPEATS
+                st._gripper_calibrate_pending = st._gripper_calibrate_running = False
+                can_quiet_until[joint_num] = float("inf")
             shared_data.gripper['gripper_homed'][0] = 0
-            can_quiet_until[joint_num] = float("inf")
             _gripper_change["on"] = True
             shared_data.rti["gripper_change"][0] = 1.0
             log_gripper.info("changing the gripper: its jaws idle, its silence and faults not counted, the arm keeps "
@@ -1843,43 +1855,56 @@ def main():
             if _gripper_apply["stage"]:
                 _refused(log_gripper, "gripper change: a gripper is being applied")
                 return
-            if not shared_data.rti["CAN_gripper_connected"][0]:
-                _refused(log_gripper, "gripper change: the gripper does not answer — plug it in (its drive on CAN "
-                                      "node %d)", joint_num)
-                return
             if name is not None and name != cfg['gripper_name']:
                 why = _gripper_apply_check(name, removed)
                 if why:
                     _refused(log_gripper, "gripper change refused: %s", why)
+                return
+            if active_CAN_gripper and not shared_data.rti["CAN_gripper_connected"][0]:
+                _refused(log_gripper, "gripper change: the gripper does not answer — plug it in (its drive on CAN "
+                                      "node %d)", joint_num)
                 return
             _gripper_change_end(removed)
         else:
             _refused(log_gripper, "gripper_change: %r is not gripper_change:1 / gripper_change:0", cmd_msg)
 
     def _gripper_change_end(removed):
-        """The change ends (the gripper answers): its faults cleared, a 1 s grace, its capture armed; J5 + J6 un-homed
-        when the gripper left the flange."""
+        """The change ends (the gripper answers): its faults cleared, a 1 s grace, its capture armed. The gripper left
+        the flange (`removed`): the whole arm is not homed — it homes again, and that homing re-learns
+        the joints the gripper moves (J5's stop, J6's magnet) for this gripper without asking (2026-11-18, the user:
+        "when changing gripper we just do the full home"; "Re-learn J5+J6 silently")."""
         tick = float(shared_data.rti["loop_tick"][0])
-        for _ in range(CLEAR_ERROR_SEND_REPEATS):
-            Motor[joint_num].Send_Clear_Error()
         _gripper_change["on"] = False
         _gripper_change["errors_from"] = tick + GRIPPER_CHANGE_GRACE_TICKS
-        can_quiet_until[joint_num] = tick + GRIPPER_CHANGE_GRACE_TICKS
         shared_data.rti["CAN_node_connection_error"][joint_num] = 0    # the gripper answers (2026-11-18 review A4)
         shared_data.rti["gripper_change"][0] = 0.0
-        drive_capture.arm([joint_num])
-        if removed and joint_num >= 6:
-            shared_data.rti["homing_status"][4:6] = 0
-            shared_data.rti["joint_homed"][4:6] = 0                    # the Joints table too (review A10)
-            if shared_data.homed_state.get() == "HOMED":
-                shared_data.homed_state.set("NOT HOMED")
-            log_gripper.warning("the gripper left the flange: J5 and J6 are not homed (J6's Hall magnet is on the "
-                                "gripper side) — home them before moving")
-        log_gripper.info("the gripper change ended: the gripper answers; its faults cleared, counted again in %.1f s",
-                         GRIPPER_CHANGE_GRACE_TICKS * delta_t)
+        if active_CAN_gripper:                            # a tool without a drive: no node to clear or watch (P2b)
+            for _ in range(CLEAR_ERROR_SEND_REPEATS):
+                Motor[joint_num].Send_Clear_Error()
+            can_quiet_until[joint_num] = tick + GRIPPER_CHANGE_GRACE_TICKS
+            drive_capture.arm([joint_num])
+        if removed:
+            shared_data.rti["homing_status"][:] = 0
+            shared_data.rti["joint_homed"][:] = 0                      # the Joints table too (review A10)
+            shared_data.homed_state.set("NOT HOMED")
+            # the joints the gripper moves: its Hall joints (J6's magnet) and the ones whose home offset the gripper XML
+            # sets (J5's stop) — not every gripper-dependent flag (PAR6's J4 carries one that no gripper sets)
+            hall = cfg.get('has_hall_sensor')
+            moved = sorted({j for j in range(joint_num) if hall is not None and hall[j] == hall[j] and int(hall[j]) != 0}
+                           | set(cfg.get('gripper_home_offset_joints') or ()))
+            if homing_ctrl.arm_check is not None and moved:
+                homing_ctrl.arm_check.mark_relearn(moved)
+            log_gripper.warning("the gripper left the flange: the arm is not homed — home it again; %s re-learned for "
+                                "%s on that homing", ", ".join(f"J{j + 1}" for j in moved)
+                                or "nothing", cfg['gripper_name'])
+        if active_CAN_gripper:
+            log_gripper.info("the gripper change ended: the gripper answers; its faults cleared, counted again in "
+                             "%.1f s", GRIPPER_CHANGE_GRACE_TICKS * delta_t)
+        else:
+            log_gripper.info("the gripper change ended: %s has no drive (nothing to answer)", cfg['gripper_name'])
         log_activity(_rti_activity_logger, "RTI", "info", "GRIPPER_CHANGE", id=st.command_id,
                      message=f"the gripper change ended ({cfg['gripper_name']}"
-                             + (", J5 / J6 to home" if removed else "") + ")")
+                             + (", the arm to home again" if removed else "") + ")")
 
     def _gripper_apply_check(name, removed):
         """End with ANOTHER gripper (P2a): parse its file in this tick (~3-4 ms) and check it against the fitted drive;
@@ -1896,16 +1921,20 @@ def main():
             link = tool_link_params_of(GRIPPERS_DIR, name)
         except (OSError, ValueError, KeyError, TypeError, read_XML2.ET.ParseError) as e:
             return f"{name}: its file cannot be read ({e})"
-        can = new.get('gripper_CAN_gripper')
-        if isinstance(can, float) and np.isnan(can) or not can or int(can) != 1:
-            return f"{name} is a tool without a drive: not supported live yet (restart the robot service with it)"
-        why = product_mismatch(new.get('gripper_driver_type'), getattr(Motor[joint_num], "product_id", None))
-        if why:
-            return f"{name}: {why}"
-        tid, drive_id = new.get('gripper_tool_id'), getattr(Motor[joint_num], "tool_id", None)
-        if tid is not None and drive_id not in (None, 0) and int(drive_id) != int(tid):
-            return (f"the fitted gripper's drive says tool ID {drive_id} ({tool_name(drive_id)}); {name} describes "
-                    f"{tid} ({tool_name(tid)})")
+        # P2b (2026-11-18): a tool without a drive is applied too. The fitted drive is checked only when RTI talks to
+        # one now (the active tool has a drive) and the new file names one: it must answer, be the file's product and
+        # carry its tool ID (or none). From a tool without a drive RTI hears no node 6 yet — the new drive's tool check
+        # (_gripper_tool_check, re-armed in stage 3) and its loss after the grace speak instead.
+        if _can_flag(new.get('gripper_CAN_gripper')) and active_CAN_gripper:
+            if not shared_data.rti["CAN_gripper_connected"][0]:
+                return f"{name}'s drive does not answer — plug it in (CAN node {joint_num})"
+            why = product_mismatch(new.get('gripper_driver_type'), getattr(Motor[joint_num], "product_id", None))
+            if why:
+                return f"{name}: {why}"
+            tid, drive_id = new.get('gripper_tool_id'), getattr(Motor[joint_num], "tool_id", None)
+            if tid is not None and drive_id not in (None, 0) and int(drive_id) != int(tid):
+                return (f"the fitted gripper's drive says tool ID {drive_id} ({tool_name(drive_id)}); {name} describes "
+                        f"{tid} ({tool_name(tid)})")
         _gripper_apply.update(stage=1, cfg=new, link=link, removed=removed)
         log_gripper.info("applying %s (staged over 3 ticks)", name)
         return None
@@ -1923,11 +1952,26 @@ def main():
             shared_data.rti["gripper_change"][0] = 2.0          # 2 = the apply failed (the status says so)
 
     def _gripper_apply_step():
-        """One stage a tick of applying another gripper (P2a; TODO/live_gripper_swap_plan.md "P2a design")."""
+        """One stage a tick of applying another gripper (P2a; TODO/live_gripper_swap_plan.md "P2a design"; P2b: a tool
+        with or without a drive — stage 1 switches active_CAN_gripper, so RTI talks to node 6 or stops)."""
         nonlocal gripper_kt, gripper_gear_r, homing_ctrl, name_of_the_gripper, _GRIPPER_CALIBRATE_MIN_TICKS
-        nonlocal _payload_model
+        nonlocal _payload_model, active_CAN_gripper
         new, stage = _gripper_apply["cfg"], _gripper_apply["stage"]
         if stage == 1:                                     # its settings and the homing controller
+            drive = _can_flag(new.get('gripper_CAN_gripper'))
+            if drive != active_CAN_gripper:
+                active_CAN_gripper = drive
+                ctx.active_CAN_gripper = drive
+                if not drive:                              # node 6 is no one's now: nothing of it shown or counted
+                    _gripper_fw_state['action'] = 0
+                    shared_data.rti["CAN_gripper_connected"][0] = 0
+                    shared_data.rti["CAN_node_connection_error"][joint_num] = 0
+                if drive:
+                    drive_capture.watch(joint_num)         # RTI may have started with a tool without a drive
+                log_gripper.info("%s: %s", new['gripper_name'],
+                                 "a tool with a drive — RTI talks to CAN node %d again" % joint_num if drive else
+                                 "a tool without a drive — RTI stops talking to CAN node %d" % joint_num)
+            shared_data.rti['gripper_ctrl_mode'][0] = _gripper_ctrl_mode_of(new, drive)
             st.gripper_Ilim, st.gripper_voltage_limit = new['gripper_Ilim'], new['gripper_voltage_limit']
             st.gripper_velocity_limit = new['gripper_velocity_limit']
             st.gripper_KPP, st.gripper_KPV, st.gripper_KIV = new['gripper_KPP'], new['gripper_KPV'], new['gripper_KIV']

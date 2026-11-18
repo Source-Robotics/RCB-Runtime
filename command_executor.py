@@ -1482,15 +1482,10 @@ def _handle_save_drive_parameter_to_xml(args, cid, conn):
 
 
 def _gripper_change_refused(command, args, cid, conn):
-    """The executor's own checks of begin_gripper_change / end_gripper_change: no arguments, a CAN gripper. -> True
-    when it replied (refused)."""
+    """The executor's own checks of begin_gripper_change: no arguments (any tool, with or without a drive, since P2b
+    2026-11-18 — RTI checks the rest). -> True when it replied (refused)."""
     if args:
         _bad_args(cid, conn, command, f"{command} takes no arguments")
-        return True
-    if not _HAS_CAN_GRIPPER:
-        msg = "no CAN gripper: the Change-gripper mode is for a gripper with a drive"
-        _log_exec_reject(cid, "NO_GRIPPER", msg, command=command)
-        reply(conn, {"id": cid, "status": "error", "code": "NO_GRIPPER", "message": msg})
         return True
     return False
 
@@ -1609,10 +1604,7 @@ def _handle_end_gripper_change(args, cid, conn):
     on the gripper side). Replies {"gripper", "restart"} after the outcome."""
     if len(args) > 2:
         return _bad_args(cid, conn, "end_gripper_change", "end_gripper_change takes gripper and removed")
-    if not _HAS_CAN_GRIPPER:
-        refusal = "no CAN gripper: the Change-gripper mode is for a gripper with a drive"
-        _log_exec_reject(cid, "NO_GRIPPER", refusal, command="end_gripper_change")
-        return reply(conn, {"id": cid, "status": "error", "code": "NO_GRIPPER", "message": refusal})
+    # any tool, with or without a drive (P2b, 2026-11-18): RTI decides whether a drive must answer
     name = args[0] if args else None
     removed = args[1] if len(args) > 1 else False
     try:

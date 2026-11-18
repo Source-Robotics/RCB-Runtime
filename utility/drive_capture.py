@@ -56,6 +56,14 @@ class DriveCapture:
         self.last_send = 0
         self.tries = 0
 
+    def watch(self, node) -> None:
+        """Watch one more node from now on (2026-11-18, P2b: a gripper with a drive applied live after RTI started with
+        a tool without one); arm it with arm()."""
+        node = int(node)
+        if node not in self.nodes:
+            self.nodes.append(node)
+            self.prev.extend([0] * (node + 1 - len(self.prev)))
+
     def arm(self, nodes) -> None:
         """Arm `nodes`: the three signals, the divider, the samples kept before the trigger, trigger on an error."""
         for n in nodes:

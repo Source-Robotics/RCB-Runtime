@@ -6428,21 +6428,21 @@ class RobotClient:
         reported, so unplugging it does not un-home the arm; enabling, the
         gripper's commands and every mode but IDLE and motors off are refused.
         A gripper plugged in again gets its settings from the robot by itself.
-        End it with `end_gripper_change()` once the gripper answers;
-        `latest_status()["gripper"]["changing"]` and `["answering"]` show
-        where it is. For now the same kind of gripper must be fitted again: the
-        robot keeps the active gripper XML. The new gripper's jaws need
-        calibrating afterwards (`calibrate_gripper()`).
+        It works with any tool, also one without a drive such as the Flange,
+        to fit a gripper with one or the other way round. End it with
+        `end_gripper_change()`, naming the fitted tool's file when it is
+        another; `latest_status()["gripper"]["changing"]` and `["answering"]`
+        show where it is while the active tool has a drive. The new gripper's
+        jaws need calibrating afterwards (`calibrate_gripper()`).
 
         Raises:
             CommandRejected: The robot refused it: the arm is enabled or not in
-                IDLE, another client holds control, or there is no CAN gripper.
-                Or RTI refused it or did not answer within 1 s (`Errors:`).
+                IDLE, or another client holds control. Or RTI refused it or did
+                not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
-            NO_GRIPPER: The robot has no CAN gripper.
             BAD_ARGS: An argument was given; it takes none.
             RTI_REFUSED: RTI refused it: the arm is enabled, it is not in IDLE,
                 or the gripper is already being changed. The message says why.
@@ -6465,7 +6465,11 @@ class RobotClient:
         The robot clears the gripper drive's faults, then counts its silence
         and faults again after one second. Enabling and the gripper's commands
         work again. Refused while the gripper does not answer: plug it in
-        first.
+        first. A tool without a drive (the Flange, a vacuum tool) answers
+        nothing and is not waited for; and from such a tool the robot cannot
+        hear the new gripper's drive yet: it checks its product and tool ID
+        once it answers, and reports its loss after one second if it never
+        does.
 
         With `gripper`, another gripper's file is applied: the robot takes its
         settings, its tool length, mass and collision model and its homing
@@ -6476,19 +6480,20 @@ class RobotClient:
         restart with it, about 10 s: this client's connection drops and must
         connect again. The reply comes once the file is saved, applied and
         the restart has started; from then until the restart, enabling and
-        moves are refused. The arm keeps holding, and keeps the homing of J1
-        to J4 (of all six joints unless `removed`).
+        moves are refused. The arm keeps holding, and keeps its homing unless
+        `removed`.
         A gripper with a tool ID proposes its file:
-        `latest_status()["gripper"]["proposed"]`. For now only a gripper with a
-        drive can be applied this way.
+        `latest_status()["gripper"]["proposed"]`. Any tool can be applied this
+        way, with a drive or without one.
 
         Args:
             gripper: The name of a gripper file in `grippers/` (without
                 `.xml`), for example `"SSG48"`. `None` keeps the active one.
-            removed: Whether the gripper was taken off the flange. Then J5 and
-                J6 are no longer homed: J6's Hall magnet sits on the gripper
-                side, so its reference moves with a re-fitted gripper. Home
-                the arm before moving.
+            removed: Whether the gripper was taken off the flange. Then the
+                arm is no longer homed: J6's Hall magnet and J5's stop sit on
+                the gripper, so they move with a re-fitted gripper. Home the
+                arm again; that homing takes J5's and J6's new spots for this
+                gripper without asking.
 
         Returns:
             A dict: `gripper` (the active gripper now) and `restart` (whether
@@ -6496,15 +6501,14 @@ class RobotClient:
 
         Raises:
             CommandRejected: The robot refused it: the gripper is not being
-                changed, it does not answer, another client holds control, there
-                is no CAN gripper, or the gripper file is unknown, cannot be
-                read, names another product or another tool ID. Or RTI refused
+                changed, its drive does not answer, another client holds control,
+                or the gripper file is unknown, cannot be read, names another
+                product or another tool ID. Or RTI refused
                 it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
-            NO_GRIPPER: The robot has no CAN gripper.
             BAD_ARGS: An unknown gripper file, a `removed` that is not True or
                 False, or more than two arguments.
             RTI_REFUSED: RTI refused it: the gripper is not being changed, its

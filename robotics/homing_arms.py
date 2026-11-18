@@ -453,6 +453,39 @@ class HomingArms:
         if self._thread is not None:
             self._q.put(("load", None))
 
+    def _by_boards_verdict(self, verdict: dict, latches: dict) -> dict:
+        """A "new" verdict for an arm its drive boards name (2026-11-18): the arm is that one. With a gripper it has
+        not seen, its gripper-dependent joints (J4, J5, J6 on PAR6) have no spot stored yet, so the latches compared
+        only J1-J3 — below SAME_ARM_MIN — and the first homing with the Flange learned a NEW arm (arm-2) beside the one
+        the boards had named. Now the boards' arm is judged on the joints it has; the others are learned into it."""
+        arm_id = (self.by_boards or {}).get("arm") if (self.by_boards or {}).get("kind") == "known" else None
+        arm = next((a for a in self.table["arms"] if a["id"] == arm_id), None) if arm_id else None
+        if verdict["kind"] != "new" or arm is None:
+            return verdict
+        keys = {j: joint_key(j, self.gripper_dependent, self.gripper) for j in latches}
+        agree, compared, off, devs = compare(arm, latches, keys, self.counts, self.gears)
+        if off:
+            kind = "fault" if arm["known"] else "relearn"
+        else:
+            kind = "known" if arm["known"] else "learning"
+        return {"kind": kind, "arm": arm["id"], "agree": agree, "compared": compared, "off": off, "devs": devs,
+                "keys": keys}
+
+    # ---- a gripper swap (2026-11-18): the next homing re-learns the joints the gripper moves --------------------------
+    def mark_relearn(self, joints) -> None:
+        """A gripper was taken off the flange and fitted (RTI's gripper change, `removed`): J6's magnet and J5's stop
+        are in the gripper, so the next homing takes those joints' spots for THIS gripper as their reference without
+        asking (the user, 2026-11-18). Kept in the table (saved): it survives an RTI restart until a homing that
+        recognised the arm used it."""
+        self.table["relearn"] = {"gripper": self.gripper, "joints": sorted(int(j) for j in joints)}
+        if self._thread is not None:
+            self._q.put(("save", copy.deepcopy(self.table)))
+
+    def relearn_joints(self) -> set:
+        """The joints this homing re-learns (mark_relearn), for the active gripper only."""
+        r = self.table.get("relearn") or {}
+        return set(r.get("joints") or ()) if r.get("gripper") == self.gripper else set()
+
     def check_so_far(self, latches: dict, j: int) -> dict:
         """Mid-homing (2026-10-14, user: "check each joint at once"): joint `j` just homed; `latches` = every arm joint
         homed so far. The arm is recognised as soon as one KNOWN arm has every joint homed so far at its usual spot;
@@ -465,6 +498,10 @@ class HomingArms:
             self.table = fresh
         if self._boards_pending:
             self._boards_at_homing()
+        relearn = self.relearn_joints()
+        if j in relearn:
+            return {"kind": "ok", "text": f"J{j + 1}: re-learned for {self.gripper} after a gripper swap — not compared"}
+        latches = {i: v for i, v in latches.items() if i not in relearn}
         if self._so_far_off:
             return {"kind": "skip"}
         keys = {i: joint_key(i, self.gripper_dependent, self.gripper) for i in latches}
@@ -534,7 +571,11 @@ class HomingArms:
             self.table = fresh
         ensure_uids(self.table, self.prefix)
         utc = utc or time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        relearn = self.relearn_joints() & set(latches)
+        swapped = {j: latches[j] for j in relearn}           # judged without them, stored after (mark_relearn)
+        latches = {j: v for j, v in latches.items() if j not in relearn}
         verdict = judge(self.table, latches, self.gripper, self.gears, self.gripper_dependent, self.counts)
+        verdict = self._by_boards_verdict(verdict, latches)
         learn = bool(self.table.pop("learn_next", False)) or self._new_by_boards
         unknown = self._unknown_at_end(latches) if verdict["kind"] == "new" and not learn else None
         if unknown is not None:
@@ -544,6 +585,13 @@ class HomingArms:
             return unknown
         apply(self.table, verdict, latches, self.gripper, utc, stats, self.prefix)
         verdict["text"] = describe(self.table, verdict)
+        arm = next((a for a in self.table["arms"] if a["id"] == verdict.get("arm")), None)
+        if swapped and arm is not None and verdict["kind"] != "fault":
+            for j, v in sorted(swapped.items()):
+                arm["joints"][joint_key(j, self.gripper_dependent, self.gripper)] = [int(v)]
+            self.table.pop("relearn", None)
+            verdict["text"] += (f" — {', '.join(f'J{j + 1}' for j in sorted(swapped))} re-learned for {self.gripper} "
+                                f"after a gripper swap")
         stored = self._store_boards(verdict)
         if stored:
             verdict["text"] += f" — {stored}"
