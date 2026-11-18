@@ -12,10 +12,13 @@
 #     groups     the user in dialout, i2c and gpio (the UART, the OLED's I2C, the GPIO header)
 #     sudo       the commands the runtime runs with sudo, password-free: /etc/sudoers.d/10-rcb-runtime — only when the
 #                user cannot already run them (the reference robot has NOPASSWD: ALL)
-#     priority   cap_sys_nice on the python3 binary: RTI's SCHED_FIFO 99 on its core (without it RTI refuses to start)
+#     priority   cap_sys_nice on the binary the .venv's python3 links to: RTI's SCHED_FIFO 99 on its core (without it
+#                RTI refuses to start); an apt upgrade of Python replaces that binary and removes it — run this again
 #     service    autorun.service + autorun.sh next to the repo folder (systemd/*.in), enabled (not started); the
-#                drop-ins memlock.conf (LimitMEMLOCK=infinity: RTI locks its memory) and, with --allowed-ips,
-#                allowed-ips.conf (RCB_ALLOWED_IPS); an existing unit or autorun.sh is checked, never overwritten
+#                drop-ins memlock.conf (LimitMEMLOCK=infinity: RTI locks its memory), rtprio.conf (LimitRTPRIO=99: RTI's
+#                priority under the service even when an upgrade removed the capability; 2026-11-18) and, with
+#                --allowed-ips, allowed-ips.conf (RCB_ALLOWED_IPS); an existing unit or autorun.sh is checked, never
+#                overwritten
 #     logs       tools/system_log_limits.sh: the journal 200 MB, syslog 50 MB, logrotate hourly
 #
 #   bash scripts/setup_system.sh --check          # report only, no sudo; exit 1 when anything is missing
@@ -38,7 +41,7 @@ while [ $# -gt 0 ]; do
         --check) MODE="check" ;;
         --user) RUN_USER="$2"; shift ;;
         --allowed-ips) ALLOWED_IPS="$2"; shift ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
         *) echo "unknown option: $1 (--check, --user NAME, --allowed-ips LIST)" >&2; exit 2 ;;
     esac
     shift
@@ -243,14 +246,16 @@ fi
 # ------------------------------------------------------------------ priority
 echo "priority"
 if real; then
-    PY_BIN="${PY_BIN:-$(readlink -f "$(command -v python3)")}"      # .venv's python3 resolves to this binary
+    # the binary the robot's interpreter links to — the python section resolved it from .venv/bin/python3 (the
+    # system python3 only without a .venv); never a second lookup of `python3`, which may be another version
+    PY_BIN="${PY_BIN:-$(readlink -f "$(command -v python3)")}"
     if getcap "$PY_BIN" 2>/dev/null | grep -q cap_sys_nice; then
         ok "$PY_BIN has cap_sys_nice (RTI's real-time priority)"
     elif apply; then
         setcap cap_sys_nice=eip "$PY_BIN" && did "cap_sys_nice on $PY_BIN"
     else
-        miss "$PY_BIN has no cap_sys_nice: RTI cannot get SCHED_FIFO 99 and refuses to start"
-        fix "sudo setcap cap_sys_nice=eip $PY_BIN"
+        miss "$PY_BIN has no cap_sys_nice: RTI cannot get SCHED_FIFO 99 and refuses to start (an apt upgrade of Python removes it)"
+        fix "sudo bash $0   (or: sudo setcap cap_sys_nice=eip $PY_BIN)"
     fi
 else
     skip "cap_sys_nice"
@@ -298,6 +303,18 @@ elif apply; then
     write_if_changed "$DROPIN/memlock.conf" "$MEMLOCK" 0644 && did "autorun.service.d/memlock.conf" && RELOAD=1
 else
     miss "no autorun.service.d/memlock.conf: RTI cannot lock its memory"
+fi
+# 2026-11-18: the service's own real-time limit. The capability above lives on the Python binary, and an apt upgrade
+# replaces the binary without it: RTI then refused to start at the next restart. Under the service this limit lets RTI
+# take SCHED_FIFO 99 without the capability. /etc/security/limits.d does not reach a systemd service (PAM sessions only).
+RTPRIO="[Service]
+LimitRTPRIO=99"
+if [ -f "$DROPIN/rtprio.conf" ] && [ "$(cat "$DROPIN/rtprio.conf")" = "$RTPRIO" ]; then
+    ok "LimitRTPRIO=99 (autorun.service.d/rtprio.conf: RTI's real-time priority under the service)"
+elif apply; then
+    write_if_changed "$DROPIN/rtprio.conf" "$RTPRIO" 0644 && did "autorun.service.d/rtprio.conf" && RELOAD=1
+else
+    miss "no autorun.service.d/rtprio.conf: under the service RTI's priority rests on the capability alone (an apt upgrade of Python removes it)"
 fi
 # RCB_ALLOWED_IPS may be set by any drop-in (this robot's is allow-any-ip.conf); systemd reads them in name order and
 # the last one wins

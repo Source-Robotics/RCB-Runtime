@@ -24,12 +24,14 @@ The order that reproduces the reference robot (2026-10-16). Each step names the 
 5. **Python packages**: `./scripts/install.sh` — the repo's `.venv` from `requirements.txt`; the robot AND the
    tests run it — *Python packages: which Python runs the robot*.
 6. **The system part**: `sudo bash scripts/setup_system.sh` — user groups, the password-free sudo rule, the
-   real-time capability on `python3`, `autorun.service` (+ `LimitMEMLOCK=infinity`), the journal / syslog limits.
-   Add `--allowed-ips "IP,IP"` for the PCs that may send commands (`*` = any: isolated networks only).
+   real-time capability on the robot's Python, `autorun.service` (+ `LimitMEMLOCK=infinity`, `LimitRTPRIO=99`), the
+   journal / syslog limits. Add `--allowed-ips "IP,IP"` for the PCs that may send commands (`*` = any: isolated
+   networks only).
 7. **Check everything**: `bash scripts/setup_system.sh --check` (exit 0 = nothing missing; run it with the arm
-   disabled — it starts a Python that imports the runtime's packages).
+   disabled — it starts a Python that imports the runtime's packages). Run it again after every `apt upgrade`: an
+   upgrade of Python removes the real-time capability (*Real-time priority*).
 8. **Reboot**, then read `logs/RTI.log` for `real-time setup OK`, `memory locked`, `interrupt threads ... on core 2
-   alone` and the self-check; home the arm.
+   alone` and the self-check; home the arm. RTI restarting over and over instead: *If RTI keeps restarting*.
 9. **Local material**: `docs/`, `TODO/` and the test nets in `dummy_test_scripts/` are NOT in git (only this README
    and `docs/pin_map.md` are) — copy them from the reference Pi, and back them up now and then.
 
@@ -67,8 +69,9 @@ uname -r                    # expect 6.8.4-rt11-raspi
 cat /sys/kernel/realtime    # expect 1
 ```
 
-`scripts/check_system.py` checks both, plus CAN, I2C, UART, GPIO and RT scheduling
-permission.
+`scripts/check_system.py` checks both, plus CAN (with the bus state and its error counters), I2C, UART, GPIO and the
+real-time priority RTI needs. It is the quick check; on a robot Pi the complete one is
+`bash scripts/setup_system.sh --check` (the checklist's step 7).
 
 ### Boot configuration
 
@@ -155,10 +158,28 @@ USER ALL=(root) NOPASSWD: /usr/bin/systemctl ^set-property --runtime user[.]slic
 The arguments of the last three are regular expressions (sudo 1.9.10+): a plain `*` would let `tee` write any file.
 
 **Real-time priority.** RTI asks for `SCHED_FIFO` 99 on core 3 and refuses to start without it
-(`<realtime_required>` in `config/system.xml`). The reference robot grants it with a file capability on the
-interpreter: `sudo setcap cap_sys_nice=eip $(readlink -f $(command -v python3))` (the setup script does it). Every
-`python3` process may then raise its own priority; a side effect: the C library drops `TMPDIR` / `LD_*` from such a
-process's environment (the test runner passes `RCB_TMPDIR` instead).
+(`<realtime_required>` in `config/system.xml`): a control loop that other programs can delay is not the robot anyone
+tested. The setup script grants it twice:
+
+- a file capability on the binary the robot's interpreter links to (from the repo folder:
+  `sudo setcap cap_sys_nice=eip "$(readlink -f .venv/bin/python3)"`, normally `/usr/bin/python3.11`). Every process
+  of that Python may then raise its own priority; a side effect: the C library drops `TMPDIR` / `LD_*` from such a
+  process's environment (the test runner passes `RCB_TMPDIR` instead). **An `apt upgrade` that updates Python
+  replaces the binary and the capability is gone** — run `bash scripts/setup_system.sh --check` after one;
+- `LimitRTPRIO=99` for the robot service (`/etc/systemd/system/autorun.service.d/rtprio.conf`, since 2026-11-18):
+  under the service RTI gets its priority even when an upgrade removed the capability.
+
+**If RTI keeps restarting**: `logs/supervisor.log` repeats `RTI stopped unexpectedly (exit 1) — restarting it` and
+`logs/RTI.out.log` ends in `real-time scheduling is required and not available` — the line says what RTI got and what
+to do. Usually the setup script never ran, or an upgrade removed the capability: run
+`bash scripts/setup_system.sh --check` (the arm disabled), `sudo bash scripts/setup_system.sh` for anything it reports
+missing, then `sudo systemctl restart autorun.service` and home the arm. Two things that look like fixes but are not:
+
+- `/etc/security/limits.d` (a `realtime` group with `rtprio 99`, or the image's `20-ubuntu-rt.conf`, which covers
+  only the group `ubuntu`, up to 98): it applies to login sessions only (SSH, a terminal), never to a systemd
+  service, and an RTI started from a shell cannot get its core anyway (*Manual Run*);
+- `<realtime_required>0</realtime_required>`: RTI then starts, but the loop runs without real-time guarantees — other
+  programs delay it and the drives' CAN replies come late. For development without the arm only.
 
 ### Wiring and pin map
 
@@ -248,8 +269,9 @@ the system `python3` only when the repo has no `.venv` (an update that came with
 `systemd/autorun.sh.in`; `scripts/setup_system.sh` installs them). It starts `<repo>/../autorun.sh` as the robot's
 user, which starts `<repo>/.venv/bin/python3 supervisor.py` — and first, if an update was staged next to the repo (the folder
 `<repo>_PENDING` and the flag file `ready_to_swap.txt`), swaps it in, keeping the old folder as `<repo>_BACKUP`.
-Two drop-ins in `/etc/systemd/system/autorun.service.d/`: `memlock.conf` (`LimitMEMLOCK=infinity`: RTI locks its
-memory, so a memory shortage cannot stall the loop) and, optionally, `allowed-ips.conf` (`RCB_ALLOWED_IPS`; the
+Drop-ins in `/etc/systemd/system/autorun.service.d/`: `memlock.conf` (`LimitMEMLOCK=infinity`: RTI locks its
+memory, so a memory shortage cannot stall the loop), `rtprio.conf` (`LimitRTPRIO=99`: RTI's real-time priority, also
+after a Python upgrade removed the capability — *Real-time priority*) and, optionally, `allowed-ips.conf` (`RCB_ALLOWED_IPS`; the
 reference robot sets it to `*` in a drop-in named `allow-any-ip.conf` — systemd reads drop-ins in name order, the last
 one wins; the setup script names every one that sets it).
 

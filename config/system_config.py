@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import resource
+import sys
 import psutil
 import platform
 import distro
@@ -64,10 +65,12 @@ def setup_realtime_process(cpu_core=3, priority=99, enforce=False):
     """
     pid = os.getpid()
 
+    setup_error = None
     try:
         psutil.Process(pid).cpu_affinity([cpu_core])
         os.sched_setscheduler(pid, os.SCHED_FIFO, os.sched_param(priority))
     except Exception as e:
+        setup_error = e
         logger.warning(f"real-time setup FAILED to set the real-time parameters: {e} — running without real-time guarantees")
 
     # Verify what actually applied — single source of truth post-call
@@ -86,12 +89,37 @@ def setup_realtime_process(cpu_core=3, priority=99, enforce=False):
     else:
         logger.warning(f"real-time setup DEGRADED — wanted SCHED_FIFO {priority} on core {cpu_core}, got {summary}")
         if enforce:
-            raise RuntimeError(
-                f"[RT setup] real-time scheduling is required and not available (got {summary}). Run under "
-                f"the service (root, PREEMPT_RT), or set <realtime_required>0</realtime_required> in "
-                f"config/system.xml to run without real-time guarantees.")
+            raise RuntimeError(realtime_refusal(summary, priority, cpu_core, actual_aff, setup_error))
         return False
     return True
+
+
+def realtime_refusal(summary, priority, cpu_core, actual_aff, setup_error=None):
+    """RTI's refusal text when it did not get SCHED_FIFO `priority` on `cpu_core`: what it got, and the fix.
+
+    2026-11-18 (a builder's report): the text said "run under the service (root)" or "set <realtime_required>0" —
+    the service runs as the robot's user, not root, and running without real time is what makes the CAN replies late.
+    A core the process may not use (an RTI started from a shell after the first one confined the sessions to the
+    general cores, README "Manual Run") fails the affinity call before the priority is even asked for, so that case
+    gets its own fix; anything else is the permission: the capability on the Python binary, or the service's
+    LimitRTPRIO. Read by RTI's start only (never in the loop).
+    """
+    exe = os.path.realpath(sys.executable)
+    soft, hard = resource.getrlimit(resource.RLIMIT_RTPRIO)
+    why = f" ({setup_error})" if setup_error else ""
+    if sorted(actual_aff) != [cpu_core]:
+        fix = (f"Core {cpu_core} is not available to this process: start RTI through the robot service "
+               f"(sudo systemctl restart autorun.service) — an RTI started from a shell cannot get its core "
+               f"(README 'Manual Run').")
+    else:
+        fix = (f"The Python running RTI ({exe}) lacks the real-time permission (RLIMIT_RTPRIO {soft} / {hard}): run "
+               f"'sudo bash scripts/setup_system.sh' (cap_sys_nice on that binary, LimitRTPRIO=99 for "
+               f"autorun.service) or 'sudo setcap cap_sys_nice=eip {exe}', then restart the service. An apt upgrade "
+               f"of Python replaces the binary and removes cap_sys_nice: run the setup script again after one.")
+    return (f"[RT setup] real-time scheduling is required and not available: wanted SCHED_FIFO {priority} on core "
+            f"{cpu_core}, got {summary}{why}. {fix} Setting <realtime_required>0</realtime_required> in "
+            f"config/system.xml only hides this: the loop then runs without real-time guarantees (other programs "
+            f"delay it and its CAN replies) — for development without the arm.")
 
 
 # <sys/mman.h> on Linux (arm64 and x86 use these values)

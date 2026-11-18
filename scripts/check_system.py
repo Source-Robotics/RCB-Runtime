@@ -3,13 +3,19 @@
 
 The checker is intentionally diagnostic: it does not bring hardware up, start
 services, or modify system state. Missing robot hardware is reported clearly so a
-fresh clone can fail usefully instead of crashing later in RTI startup.
+fresh clone can fail usefully instead of crashing later in RTI startup. The one
+thing it tries for real is RTI's real-time priority, in a short-lived child
+process kept off RTI's core (check_rt_permissions).
+
+On a robot Pi the complete check is `bash scripts/setup_system.sh --check`; this
+one is the quick one (README "OS image").
 """
 
 from __future__ import annotations
 
 import os
 import platform
+import re
 import resource
 import shutil
 import subprocess
@@ -18,12 +24,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from config.cpu_cores import CAN_CPU_CORE, RT_CPU_CORE                        # noqa: E402  (a leaf: no imports)
+from hardware.can_health import format_can_link_stats, read_can_link_stats  # noqa: E402  (stdlib only)
 
-# When users run ./scripts/check_system.py after install, prefer the project
-# virtualenv so the check reflects the runtime environment, not user-site Python.
-VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable).resolve() != VENV_PYTHON.resolve():
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+VENV = ROOT / ".venv"
+VENV_PYTHON = VENV / "bin" / "python"
+RTI_PRIORITY = 99   # RTI.py: setup_realtime_process(cpu_core=RT_CPU_CORE, priority=99, ...)
+RTPRIO_DROPIN = Path("/etc/systemd/system/autorun.service.d/rtprio.conf")   # scripts/setup_system.sh
+
+
+def reexec_in_venv() -> None:
+    """Run the check with the robot's interpreter, the repo's .venv: its packages, its real-time permission.
+
+    2026-11-18: this compared the two interpreters' resolved paths, but .venv/bin/python is a link to the system's
+    python3.11 — the same file — so `python3 scripts/check_system.py` never switched and checked the system Python's
+    packages. A venv is told by its prefix.
+    """
+    if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != VENV.resolve():
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 
 @dataclass
@@ -53,6 +72,11 @@ def file_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8", errors="replace").strip("\x00\n ")
     except OSError:
         return None
+
+
+def on_robot_pi() -> bool:
+    """A Raspberry Pi: the robot's target, where RTI must get its real-time priority (a PC is for development)."""
+    return "Raspberry Pi" in (file_text(Path("/proc/device-tree/model")) or "")
 
 
 def check_python() -> None:
@@ -106,8 +130,45 @@ def check_can() -> None:
         return
     output = result.stdout.replace("\n", " ")
     add("CAN can0 exists", True, "can0 found")
-    add("CAN can0 up", "state UP" in output or "UP" in output.split(), output[:180])
-    add("CAN bitrate 1000000", "bitrate 1000000" in output, output[:180], required=False)
+    up = "state UP" in output or "UP" in output.split()
+    add("CAN can0 up", up, "state UP" if up else output[:180])
+    rate = re.search(r"\bbitrate (\d+)", output)
+    add("CAN bitrate 1000000", rate is not None and rate.group(1) == "1000000",
+        f"bitrate {rate.group(1)}" if rate else "no bitrate in 'ip -details link show can0' (not configured yet)",
+        required=False)
+    check_can_bus_state(read_can_link_stats("can0"))
+
+
+# What a CAN controller state other than ERROR-ACTIVE means. The state counts the frames that failed recently (no
+# acknowledgement, a bit error): a few failures make it ERROR-WARNING, more ERROR-PASSIVE, too many BUS-OFF.
+CAN_STATE_MEANING = {
+    "ERROR-WARNING": "frames are failing on the bus",
+    "ERROR-PASSIVE": "frames keep failing on the bus",
+    "BUS-OFF": "the controller left the bus after too many failed frames",
+    "STOPPED": "the controller is stopped (can0 down?)",
+}
+CAN_STATE_CAUSES = ("usual causes: no drive powered (nothing acknowledges a frame), the termination (about 60 ohm "
+                    "between CAN-H and CAN-L with the power off; about 120 ohm = one terminator missing) or the wiring")
+
+
+def check_can_bus_state(stats: dict | None) -> None:
+    """The CAN controller's state and its error counters since can0 came up.
+
+    2026-11-18 (a builder's report): the CAN lines cut the interface text at 180 characters, so the state read
+    "can state ERR" — the same for ERROR-ACTIVE (healthy) and ERROR-WARNING / ERROR-PASSIVE (frames failing). A few
+    error-passive transitions from start-ups with the drives switched off are normal; totals that grow while the arm
+    runs are not (supervisor.py logs every change, hardware/can_health.py).
+    """
+    if not stats or not stats.get("state"):
+        add("CAN bus state", False, "cannot read it (ip -details -statistics link show can0)", required=False)
+        return
+    state = stats["state"]
+    if state == "ERROR-ACTIVE":
+        add("CAN bus state", True, f"ERROR-ACTIVE (healthy); totals: {format_can_link_stats(stats)}", required=False)
+        return
+    meaning = CAN_STATE_MEANING.get(state, "not the healthy ERROR-ACTIVE")
+    add("CAN bus state", False, f"{state}: {meaning}; {CAN_STATE_CAUSES}; totals: {format_can_link_stats(stats)}",
+        required=False)
 
 
 def check_devices() -> None:
@@ -131,37 +192,71 @@ def check_devices() -> None:
         add("GPIO chip access", False, detail, required=False)
 
 
-def check_rt_permissions() -> None:
+# The real-time test, run by a child of this Python (the robot's interpreter). argv: the priority, the cores to keep
+# off. It pins itself to a core away from RTI's and the CAN path's FIRST — at FIFO 99 on RTI's core it would compete
+# with a running robot's tick — takes SCHED_FIFO at the priority, reads it back and returns to normal scheduling at
+# once (always allowed). Exit 0 = granted and back to normal.
+RT_PROBE = """
+import os, sys
+prio, avoid = int(sys.argv[1]), {int(c) for c in sys.argv[2].split(",")}
+cores = sorted(os.sched_getaffinity(0) - avoid)
+if not cores:
+    print(f"no core outside {sorted(avoid)} to test on (allowed: {sorted(os.sched_getaffinity(0))})")
+    sys.exit(3)
+os.sched_setaffinity(0, {cores[0]})
+ran = sorted(os.sched_getaffinity(0))
+try:
+    os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(prio))
+    got = (os.sched_getscheduler(0), os.sched_getparam(0).sched_priority)
+except OSError as e:
+    print(f"{type(e).__name__}: {e}")
+    sys.exit(1)
+finally:
+    os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+if got != (os.SCHED_FIFO, prio):
+    print(f"asked for SCHED_FIFO {prio}, got policy {got[0]} priority {got[1]}")
+    sys.exit(1)
+if os.sched_getscheduler(0) != os.SCHED_OTHER:
+    print("did not return to normal scheduling")
+    sys.exit(1)
+print(f"SCHED_FIFO {prio} granted (tried on core(s) {ran}, then back to normal)")
+"""
+
+
+def check_rt_permissions(robot_pi: bool) -> None:
+    """RTI's real-time priority (SCHED_FIFO 99), tried for real with this Python — the robot's interpreter.
+
+    2026-11-18 (a builder's report): this tried priority 1 and reported a refusal as a warning, so a Pi on which RTI
+    refuses to start passed the check ("no required failures"). Now it tries RTI's own priority, and on the robot's
+    Pi a refusal is a failure with the fix. Under autorun.service, rtprio.conf (LimitRTPRIO=99) grants it without the
+    capability; a shell — where this check runs — has only the capability, so with rtprio.conf in place a refusal
+    here is a warning: the service's RTI still starts.
+    """
     soft, hard = resource.getrlimit(resource.RLIMIT_RTPRIO)
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import os; "
-                "os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(1)); "
-                "policy=os.sched_getscheduler(0); "
-                "prio=os.sched_getparam(0).sched_priority; "
-                "print(f'policy={policy} prio={prio}')"
-            ),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if probe.returncode == 0:
-        detail = (
-            f"probe ok ({probe.stdout.strip()}); "
-            f"euid={os.geteuid()} RLIMIT_RTPRIO soft={soft} hard={hard}"
-        )
-        add("RT priority permission", True, detail, required=False)
+    binary = os.path.realpath(sys.executable)
+    getcap = run(["getcap", binary])
+    if getcap is None:
+        cap = "getcap not installed"
     else:
-        stderr = " ".join(probe.stderr.split())
-        detail = (
-            f"probe failed: {stderr or f'exit code {probe.returncode}'}; "
-            f"euid={os.geteuid()} RLIMIT_RTPRIO soft={soft} hard={hard}"
-        )
-        add("RT priority permission", False, detail, required=False)
+        cap = "has cap_sys_nice" if "cap_sys_nice" in getcap.stdout else "no cap_sys_nice"
+    facts = f"{binary}: {cap}; RLIMIT_RTPRIO soft={soft} hard={hard}"
+    probe = subprocess.run([sys.executable, "-c", RT_PROBE, str(RTI_PRIORITY), f"{RT_CPU_CORE},{CAN_CPU_CORE}"],
+                           capture_output=True, text=True, check=False)
+    said = " ".join((probe.stdout + probe.stderr).split()) or f"exit code {probe.returncode}"
+    if probe.returncode == 0:
+        add("RT priority permission", True, f"{said}; {facts}")
+        return
+    fix = (f"Fix: sudo bash scripts/setup_system.sh (or: sudo setcap cap_sys_nice=eip {binary}); an apt upgrade of "
+           f"Python removes the capability again")
+    service_ok = "LimitRTPRIO=99" in (file_text(RTPRIO_DROPIN) or "")
+    if service_ok:
+        add("RT priority permission", False,
+            f"this shell cannot get SCHED_FIFO {RTI_PRIORITY} ({said}; {facts}). RTI under autorun.service still gets "
+            f"it ({RTPRIO_DROPIN}), an RTI started any other way does not. {fix}", required=False)
+        return
+    add("RT priority permission", False,
+        f"RTI needs SCHED_FIFO {RTI_PRIORITY} and cannot get it ({said}; {facts}): RTI refuses to start. {fix}",
+        required=robot_pi)
 
 
 def check_imports() -> None:
@@ -213,6 +308,17 @@ def check_imports() -> None:
             add(f"Import {module}", False, detail[:220], required=required)
 
 
+def summary_line(required_failures: int, warnings: int) -> str:
+    """The last line. 2026-11-18: it said "no required failures" alone, and a warning that RTI cannot start went
+    unread; the warnings are counted now."""
+    if required_failures:
+        return (f"System check finished with {required_failures} required failure(s)"
+                + (f" and {warnings} warning(s)." if warnings else "."))
+    if warnings:
+        return f"System check finished with no required failures and {warnings} warning(s): read the WARN lines."
+    return "System check finished with no required failures."
+
+
 def main() -> int:
     print(f"RCB Control Runtime system check\nrepo: {ROOT}\n")
     check_python()
@@ -221,23 +327,24 @@ def main() -> int:
     check_platform()
     check_can()
     check_devices()
-    check_rt_permissions()
+    check_rt_permissions(on_robot_pi())
     check_imports()
 
     required_failures = 0
+    warnings = 0
     for check in checks:
         status = "OK" if check.ok else ("FAIL" if check.required else "WARN")
         print(f"[{status:4}] {check.name}: {check.detail}")
         if check.required and not check.ok:
             required_failures += 1
+        elif not check.ok:
+            warnings += 1
 
     print()
-    if required_failures:
-        print(f"System check finished with {required_failures} required failure(s).")
-        return 1
-    print("System check finished with no required failures.")
-    return 0
+    print(summary_line(required_failures, warnings))
+    return 1 if required_failures else 0
 
 
 if __name__ == "__main__":
+    reexec_in_venv()
     raise SystemExit(main())

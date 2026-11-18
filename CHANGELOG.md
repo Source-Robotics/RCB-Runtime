@@ -134,8 +134,14 @@ What changed in each version of the RCB runtime. The newest version is at the to
   Hall magnet is on the gripper side).
   For now grippers with a drive only. `tools/restart_gui_and_executor.sh --with-self-collision` restarts the checker
   too.
+- `scripts/setup_system.sh` gives the robot service its own real-time limit, `LimitRTPRIO=99`
+  (`/etc/systemd/system/autorun.service.d/rtprio.conf`). RTI gets its priority under the service even after an
+  `apt upgrade` of Python, which removes the capability on the Python binary; before, RTI then refused to start at the
+  next restart. Run `sudo bash scripts/setup_system.sh` once, then restart the service. README *Real-time priority*
+  has a troubleshooting entry for an RTI that keeps restarting.
 
 ### Changed
+
 
 - The robotics toolbox is the official `roboticstoolbox-python` 1.5.0 (with `spatialmath-python` 1.1.19) instead of
   our fork `roboticstoolbox-python-source-robotics` 1.3.0.post2. Both install the same `roboticstoolbox` package:
@@ -156,6 +162,16 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- `scripts/check_system.py` passed a Pi on which RTI cannot start. It tried real-time priority 1 (RTI needs 99) and
+  reported a refusal as a warning under "no required failures". It now tries 99 (on a core away from RTI's, back to
+  normal priority at once), fails on the Pi with the fix, and counts the warnings in its last line. Its CAN lines show
+  the bus state and the error counters (the state was cut to "can state ERR", the same for a healthy and a failing
+  bus). Run as `python3 scripts/check_system.py`, it now switches to the repo's `.venv` as it always meant to (it
+  checked the system Python's packages).
+- RTI's refusal to start without real-time priority gave the wrong fix: "run under the service (root)" (the service
+  runs as the robot's user) or turning `<realtime_required>` off (the loop then runs late). It now names the Python
+  binary, the setup script and the `setcap` command, the `apt upgrade` that removes the capability, or, when RTI's core
+  is not available, starting RTI through the service.
 - The arm no longer drops a little when it is disabled out of gravity compensation or stops on an error. Drive
   firmware 110 starts its speed loop from zero when it takes over from another mode, so the bare zero-speed hold
   (no current) let the joints fall for about 10 ms before it caught them (0.2-0.4 deg on the elbow and the wrist).

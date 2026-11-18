@@ -1,6 +1,7 @@
 # The robot's service (2026-10-16: what the reference robot runs). scripts/setup_system.sh renders it to
-# /etc/systemd/system/autorun.service ({{USER}}, {{AUTORUN_SH}}) and adds two drop-ins in autorun.service.d/:
-# memlock.conf (LimitMEMLOCK=infinity: RTI locks its memory) and, when asked, allowed-ips.conf (RCB_ALLOWED_IPS).
+# /etc/systemd/system/autorun.service ({{USER}}, {{AUTORUN_SH}}) and adds drop-ins in autorun.service.d/:
+# memlock.conf (LimitMEMLOCK=infinity: RTI locks its memory), rtprio.conf (LimitRTPRIO=99: RTI's real-time priority,
+# 2026-11-18) and, when asked, allowed-ips.conf (RCB_ALLOWED_IPS).
 [Unit]
 Description=RCB Runtime (autorun.sh -> supervisor.py)
 After=multi-user.target
