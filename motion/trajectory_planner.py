@@ -492,6 +492,9 @@ class TrajectoryPlanner(Thread):
             # already do the same); this is just one more.
             self._cmd_sock = ctx.socket(zmq.PUSH)
             self._cmd_sock.setsockopt(zmq.LINGER, 0)
+            # only to a running RTI, never queued for a later one (2026-11-18 review B6; command_executor's _rti_sock)
+            self._cmd_sock.setsockopt(zmq.IMMEDIATE, 1)
+            self._cmd_sock.setsockopt(zmq.SNDTIMEO, 200)
             self._cmd_sock.connect(ZMQ_CMD_SOCKET)
 
     # ------------------------------------------------------------------ #
@@ -1430,11 +1433,12 @@ class TrajectoryPlanner(Thread):
             if split is not None and self._body_too_short(split, splice_ctx["family"]):
                 split = None
         if split is None or geometry is None:
-            self._send_blended_chain(chain, sample, boundaries)
-            self._finish_chain(chain, sample)
+            # a send that failed (timed out: reported; or the program stopped) leaves the chain unfinished — its end
+            # point is not where the arm goes (2026-11-18 review F13)
+            if self._send_blended_chain(chain, sample, boundaries):
+                self._finish_chain(chain, sample)
             return
 
-        n = sample.positions.shape[0]
         sent_cmds = sum(1 for b in boundaries if int(b) <= split)
 
         start_idx = 0
@@ -1455,6 +1459,14 @@ class TrajectoryPlanner(Thread):
                                     terminal=False):
                 return
 
+        with self.abort_gate:                    # flush() resets these under the same lock (2026-11-18 review M1)
+            if self._cmd_epoch != self._epoch:
+                return
+            self._hold_tail(chain, sample, boundaries, split, splice_ctx, sent_cmds, geometry, geom_boundaries)
+
+    def _hold_tail(self, chain, sample, boundaries, split, splice_ctx, sent_cmds, geometry, geom_boundaries):
+        """_dispatch_chain's held tail and the end point it leads to (called under abort_gate)."""
+        n = sample.positions.shape[0]
         self._held = {
             "family": splice_ctx["family"],
             "chain": chain,
@@ -1481,6 +1493,11 @@ class TrajectoryPlanner(Thread):
                     f"{n - split} samples / {held_cmds} command(s) held for a splice")
 
     def _finish_chain(self, chain, sample):
+        with self.abort_gate:                    # flush() resets these under the same lock (2026-11-18 review M1)
+            if self._cmd_epoch == self._epoch:
+                self._finish_chain_state(chain, sample)
+
+    def _finish_chain_state(self, chain, sample):
         if sample.positions.shape[0]:
             self._last_endpoint = sample.positions[-1].copy()
         # Zone blending's own exit velocity doesn't map onto exact_velocity's
@@ -1691,7 +1708,9 @@ class TrajectoryPlanner(Thread):
                          id=self._cmd_id(cmds[0]), command=self._fmt_command(cmds[0]),
                          message=reject)
             self._commit_held_tail("splice rejected")
-            self._blend_buffer = list(cmds) + self._blend_buffer   # start a fresh chain
+            with self.abort_gate:                # not a stopped program's commands (2026-11-18 review M1)
+                if self._cmd_epoch == self._epoch:
+                    self._blend_buffer = list(cmds) + self._blend_buffer   # start a fresh chain
             return
 
         # Accepted. The continuation IS the batch blend's remainder.
@@ -3533,13 +3552,15 @@ class TrajectoryPlanner(Thread):
         flags = BATCH_FLAG_BLEND_CONTINUES if v_corner > 1e-9 else 0
         sent = self._send_chunks(sample.positions, sample.velocities, cid, sample.torque_ff, flags=flags)
         if sent:
-            self._last_endpoint = sample.positions[-1].copy()
-            # Gated on sent, same as _last_endpoint above: a failed send means we
-            # don't actually know the arm's exit state, so don't let the next
-            # command inherit a blend assumption that might not hold. delay always
-            # ends at rest (v_corner=0 from the default above), which correctly
-            # breaks any in-flight blend chain once it takes effect.
-            self._last_exit_speed = v_corner if v_corner > 1e-9 else None
+            with self.abort_gate:                # flush() resets these under the same lock (2026-11-18 review M1)
+                if self._cmd_epoch == self._epoch:
+                    self._last_endpoint = sample.positions[-1].copy()
+                    # Gated on sent, same as _last_endpoint above: a failed send means we
+                    # don't actually know the arm's exit state, so don't let the next
+                    # command inherit a blend assumption that might not hold. delay always
+                    # ends at rest (v_corner=0 from the default above), which correctly
+                    # breaks any in-flight blend chain once it takes effect.
+                    self._last_exit_speed = v_corner if v_corner > 1e-9 else None
             logger.info(f"{ctype} id={cid} → {sample.num_points} waypoints "
                         f"({(sample.num_points - 1) * self._dt:.2f}s)")
         # else: _send_chunks already reported the error; leave _last_endpoint and
@@ -3559,7 +3580,9 @@ class TrajectoryPlanner(Thread):
 
         Returns True if all chunks sent, False if a send timed out partway (already
         reported via _report_error — whatever chunks DID send are still valid and
-        will play out on RTI; the client sees an error instead of a hung wait_idle).
+        will play out on RTI; the client sees an error instead of a hung wait_idle),
+        or if the program was stopped meanwhile (nothing reported: the Stop failed its
+        commands; the caller must write nothing back into the planner's state).
         """
         n = pos.shape[0]
         if torque_ff is None:
@@ -3584,6 +3607,18 @@ class TrajectoryPlanner(Thread):
         continuation (or the tail) we send next, rather than completing the command and
         settling. The command's checkpoint fires later, on whichever range does end it.
         """
+        problem = self._range_problem(pos, vel, torque_ff, range_start, range_end)
+        if problem is not None:
+            # 2026-11-18 review M4: every check before this one is a comparison, which a NaN passes; RTI's EXEC handler
+            # then raised on the sample inside its tick and RTI ended. An empty range sent nothing, so its checkpoint
+            # never fired and the client waited for ever. Refused here, where every send passes; nothing of the range
+            # is sent, and the next plan starts from the measured position (earlier ranges may have been sent).
+            logger.error(f"id={cid}: not sent — {problem}")
+            with self.abort_gate:
+                self._last_endpoint = None
+            self._report_error(cid, "PLAN_FAIL", f"the move's samples cannot be played: {problem} — nothing of it "
+                                                 f"was sent")
+            return False
         for start_idx in range(range_start, range_end, self.MAX_CHUNK_SIZE):
             end_idx = min(start_idx + self.MAX_CHUNK_SIZE, range_end)
             is_last = terminal and (end_idx == range_end)
@@ -3601,7 +3636,10 @@ class TrajectoryPlanner(Thread):
                     if self._cmd_epoch != self._epoch:
                         logger.info(f"id={cid}: not sent — the program was stopped (epoch "
                                     f"{self._cmd_epoch} -> {self._epoch})")
-                        return True
+                        # False, not True (2026-11-18 review M1): every caller then writes nothing back — the Stop's
+                        # flush() reset the endpoint / exit speed / held tail, and a stopped command's plan finishing
+                        # afterwards used to put its end point back, so the next move started from there (a step).
+                        return False
                     try:
                         self._traj_sock.send(batch, flags=zmq.NOBLOCK)
                         break
@@ -3615,6 +3653,21 @@ class TrajectoryPlanner(Thread):
                     return False
                 time.sleep(0.002)
         return True
+
+    def _range_problem(self, pos, vel, torque_ff, range_start, range_end):
+        """Why samples [range_start:range_end) cannot go to RTI, or None: no sample in the range, or a value that is
+        not finite (the first one named)."""
+        if range_end <= range_start:
+            return f"no sample in it (samples {range_start} to {range_end}: a repeated target?)"
+        for name, arr in (("position", pos), ("speed", vel), ("torque", torque_ff)):
+            part = np.asarray(arr[range_start:range_end])
+            if part.ndim != 2 or part.shape[1] != self.joint_num:
+                return f"its {name} samples have the shape {part.shape}, not (N, {self.joint_num})"
+            bad = ~np.isfinite(part)
+            if bad.any():
+                k, j = np.argwhere(bad)[0]
+                return f"its {name} at sample {range_start + int(k)} of J{int(j) + 1} is {float(part[k, j])}"
+        return None
 
     def _gripper_values(self, ctype, args):
         """(position, speed, current) of a gripper command, every value checked (2026-10-24: positions and speeds
@@ -3667,7 +3720,11 @@ class TrajectoryPlanner(Thread):
             self._pending_gripper = None
 
         rti_msg = f"gripper_set:{position}:{speed}:{current}:1"
-        self._cmd_sock.send_string(json.dumps({"msg": rti_msg, "id": cid, "source": "planner"}))
+        try:
+            self._cmd_sock.send_string(json.dumps({"msg": rti_msg, "id": cid, "source": "planner"}))
+        except zmq.Again:                  # RTI not running (review B6): not queued for a later RTI
+            self._report_error(cid, "SEND_TIMEOUT", "RTI is not running: the gripper command was not sent")
+            return
         logger.info(f"{ctype} id={cid} → {rti_msg}")
 
         if self._read_gripper_status is None:

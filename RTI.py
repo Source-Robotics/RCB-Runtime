@@ -531,8 +531,17 @@ def main():
         """Hold the jaws where they are (2026-10-24, user: a stop "should freeze it also"). The firmware-mode target
         becomes the measured jaw position, so a gripper still travelling to its last target stops there. Called on a
         stop (the executor's gripper_hold), a disable and an error latching. An idle gripper (action 0) stays idle; in
-        motor mode RTI keeps no gripper target, so there is nothing to hold."""
-        if not active_CAN_gripper or not int(_gripper_fw_state.get('action', 0)):
+        motor mode RTI keeps no gripper target, so there is nothing to hold. A calibration (pending or sweeping) is
+        cancelled: a full idle pack ends it (2026-11-18 review B7: it ran on through every stop for up to 30 s)."""
+        if not active_CAN_gripper:
+            return
+        if st._gripper_calibrate_pending or st._gripper_calibrate_running:
+            st._gripper_calibrate_pending = st._gripper_calibrate_running = False
+            _gripper_fw_state['action'] = 0
+            _gripper_fw_state['_idle_repeats'] = GRIPPER_IDLE_PACK_REPEATS
+            log_gripper.info("the gripper's calibration cancelled (its jaws idle): %s", why)
+            return
+        if not int(_gripper_fw_state.get('action', 0)):
             return
         pos = max(0, min(255, int(round(float(shared_data.gripper['gripper_position'][0])))))
         if pos != int(_gripper_fw_state['position']):
@@ -800,12 +809,27 @@ def main():
         if float(shared_data.rti["error_active"][0]) < 0.5:
             sound.event("boot", _sound_holds(), _sound_axis())
 
-    def _sound_on_error():
-        """The error tune when an error has just latched (error_active rising), if its switch is on."""
+    def _sound_on_error(mode_before):
+        """The error tune when an error has just latched (error_active rising), if its switch is on. On d when the
+        error came out of a move mode (2026-11-18 review B8): the error pass has already switched to ACTIVE_ERROR, so
+        the mode now said "at rest" and a q tone — a joint torque — played while the hold braked the arm."""
         ea = float(shared_data.rti["error_active"][0])
         if ea >= 0.5 and _sound_err_prev[0] < 0.5:
-            sound.event("error", _sound_holds(), _sound_axis())
+            sound.event("error", _sound_holds(), "d" if mode_before in COLLISION_MODES else _sound_axis())
         _sound_err_prev[0] = ea
+
+    def _jog_deadman():
+        """A held jog's dead-man on the executor (2026-11-18 review B4). RTI watched the executor's heartbeat only in
+        EXEC with samples buffered; a jog runs from one jog_set to one jog_stop, so an executor that hung or died
+        while a jog button was held left the joint running to its soft limit. In JOG, the heartbeat stalled for
+        EXEC_LINK_TIMEOUT_S with a jog wanted: its planned braking, as a released button's."""
+        if st.current_mode != RobotMode.JOG or not _exec_link_watchdog.stale:
+            return
+        _jog = MODE_HANDLERS.get(RobotMode.JOG)
+        if _jog is not None and getattr(_jog, "_want_on", False):
+            _jog.stop_jog()
+            log_mode.warning("jog stopped: the executor has not answered for %.1f s (hung or gone) — the joint brakes "
+                             "as at a released button", EXEC_LINK_TIMEOUT_S)
 
     def _arm_captures_at_start():
         """Arm every drive's own recording of a fault (once; again after Clear Errors and after each read)."""
@@ -3066,6 +3090,7 @@ def main():
             in_exec=(st.current_mode == RobotMode.EXEC),
             samples_remaining=float(shared_data.rti["exec_samples_remaining"][0]),
         )
+        _jog_deadman()                             # a held jog brakes when the executor stalls (review B4)
 
         # RT loop health: LOOP_DEGRADED (warning, self-clearing) and LOOP_CRITICAL (hard,
         # latching → DISABLED + hold). Fed p99, so a slow burst only warns; critical = a sustained
@@ -3084,6 +3109,7 @@ def main():
             st.homing_failures.update(homing_ctrl.take_failures())
         _profile_last = _profile_mark(_profile_last, "safety_monitor")
 
+        _mode_before_errors = st.current_mode     # the error tune's axis (_sound_on_error)
         st.clear_error_countdown, st.latched_errors, st.error_metadata, st.current_mode = process_errors_tick(
             shared_data, Motor, Motor_errors_data, joint_num,
             st.clear_error_countdown, st.latched_errors, st.error_metadata,
@@ -3120,7 +3146,7 @@ def main():
         if _err_now and not _gripper_err_prev[0]:  # an error latched: the jaws stop where they are (2026-10-24)
             _freeze_gripper("an error latched")
         _gripper_err_prev[0] = _err_now
-        _sound_on_error()                          # the error tune when one has just latched (utility/sound.py)
+        _sound_on_error(_mode_before_errors)       # the error tune when one has just latched (utility/sound.py)
         _profile_last = _profile_mark(_profile_last, "error_checks")
 
     # Python's garbage collector (2026-10-24, utility/gc_pauses.py). Every object start-up made is frozen, so a full
@@ -3570,6 +3596,8 @@ def main():
                 if (_from_mode == RobotMode.HOMING and new_mode == RobotMode.IDLE
                         and shared_data.homed_state.get() == "HOMED"):
                     sound.event("homing_done", _sound_holds(), _sound_axis())   # the homing chime (utility/sound.py)
+                if new_mode in COLLISION_MODES:
+                    sound.silence_torque()    # a q tone still playing is a joint torque (2026-11-18 review S1)
 
                 if new_mode == RobotMode.SAFETY_STOP:
                     # The motors off hold the jaws too (2026-10-24: the user's "freeze it also" named safety_stop()).

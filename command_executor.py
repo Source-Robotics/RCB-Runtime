@@ -36,6 +36,7 @@ log_stop = logging.getLogger("exec.stop")  # docs/logging.md "Logger names"
 log_tcp = logging.getLogger("exec.tcp")  # docs/logging.md "Logger names"
 import math
 import socket
+import struct
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -582,12 +583,31 @@ def _release_control(conn, why):
 pending_client = {}             # command id -> conn (queued commands awaiting completion)
 _pending_lock = threading.Lock()
 
-_client_send_lock = threading.Lock()   # serialize sendall across threads
+# One send lock PER CONNECTION (2026-11-18 review B5): one global lock let a client that stopped reading (a suspended
+# PC, Ctrl-Z) block every reply to everyone — and, through the stop path's replies, a Stop itself.
+_conn_send_locks: dict = {}
+_conn_send_locks_lock = threading.Lock()
+CLIENT_SEND_TIMEOUT_S = 2           # a send to a client that does not read for this long fails: it is disconnected
+CLIENT_USER_TIMEOUT_MS = 10000      # TCP_USER_TIMEOUT: unacknowledged data for this long = the peer is gone
+
+
+def _send_lock(conn):
+    with _conn_send_locks_lock:
+        lock = _conn_send_locks.get(conn)
+        if lock is None:
+            lock = _conn_send_locks[conn] = threading.Lock()
+        return lock
 _rti_send_lock = threading.Lock()      # ZMQ PUSH socket is not thread-safe
 
 _rti_ctx = zmq.Context.instance()
 _rti_sock = _rti_ctx.socket(zmq.PUSH)
 _rti_sock.setsockopt(zmq.LINGER, 200)
+# Only to a RUNNING RTI (2026-11-18 review B6): without IMMEDIATE the socket queued what was sent while RTI was down (a
+# respawn) and delivered it when RTI came back — an Enable answered "RTI did not answer" ran seconds later. Now such a
+# send fails after RTI_SEND_TIMEOUT_MS (never blocking a stop for longer) and the caller says RTI is not running.
+RTI_SEND_TIMEOUT_MS = 200
+_rti_sock.setsockopt(zmq.IMMEDIATE, 1)
+_rti_sock.setsockopt(zmq.SNDTIMEO, RTI_SEND_TIMEOUT_MS)
 _rti_sock.connect(ZMQ_CMD_SOCKET)
 
 
@@ -602,10 +622,16 @@ def reply(conn, obj):
         if cat is not None:
             obj = {**obj, "number": cat["number"], "title": cat["title"], "fix": cat["fix"]}
     try:
-        with _client_send_lock:
+        with _send_lock(conn):
             conn.sendall((json.dumps(obj) + "\n").encode())
     except Exception as e:
-        log_tcp.error(f"send to client failed: {e}")
+        # a half-sent line breaks the stream for good: the client is disconnected (its handler cleans up) instead of
+        # holding a send that never ends (CLIENT_SEND_TIMEOUT_S, 2026-11-18 review B5)
+        log_tcp.error(f"send to client failed: {e} — disconnecting it")
+        try:
+            conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
 
 def send_to_rti(msg_str, cid, source, answer=None):
@@ -615,10 +641,19 @@ def send_to_rti(msg_str, cid, source, answer=None):
     out = {"msg": msg_str, "id": cid, "source": source, "origin": origin_of(cid)}
     if answer is not None:
         out["answer"] = answer
-    payload = json.dumps(out)
+    return _send_rti_string(json.dumps(out), msg_str, cid)
+
+
+def _send_rti_string(text, what, cid):
+    """One message on RTI's command socket. -> True when sent; False when RTI is not running (logged)."""
     with _rti_send_lock:
-        _rti_sock.send_string(payload)
-    log_forward.info(f"forwarded '{msg_str}' (id={cid})")
+        try:
+            _rti_sock.send_string(text)
+        except zmq.Again:
+            log_forward.error(f"'{what}' (id={cid}) NOT sent: RTI is not running (no connection to it)")
+            return False
+    log_forward.info(f"forwarded '{what}' (id={cid})")
+    return True
 
 
 def send_payload_to_rti(payload, cid, source, answer=None):
@@ -630,9 +665,7 @@ def send_payload_to_rti(payload, cid, source, answer=None):
     """
     extra = {} if answer is None else {"answer": answer}
     out = json.dumps({**payload, "id": cid, "source": source, "origin": origin_of(cid), **extra})
-    with _rti_send_lock:
-        _rti_sock.send_string(out)
-    log_forward.info(f"forwarded '{payload.get('msg')}' (id={cid})")
+    return _send_rti_string(out, payload.get("msg"), cid)
 
 
 # ========================================================================== #
@@ -713,10 +746,12 @@ def _ask_rti(message, cid):
     waiter = [threading.Event(), None, token]
     with _answers_lock:
         _answers[token] = waiter
-    if isinstance(message, dict):
-        send_payload_to_rti(message, cid, "TCP", answer=token)
-    else:
-        send_to_rti(message, cid, "TCP", answer=token)
+    sent = (send_payload_to_rti(message, cid, "TCP", answer=token) if isinstance(message, dict)
+            else send_to_rti(message, cid, "TCP", answer=token))
+    if sent is False:                  # RTI not running: answered at once, nothing left to run later (review B6)
+        waiter[1] = {"status": "error", "code": "RTI_NOT_RUNNING",
+                     "message": "RTI is not running: the command was not sent to it"}
+        waiter[0].set()
     return waiter
 
 
@@ -2076,14 +2111,16 @@ def _on_exec_exit(reason):
     if _planner is None:
         return
     _planner.note_exec_exit()
+    failed = []
     with _abort_gate():
         with _pending_lock:
             busy = bool(pending_client)
         if busy:
             msg = f"the program was interrupted: {reason}"
             _planner.interrupt("ABORTED", msg)
-            _fail_pending("ABORTED", msg + " — clear errors to run motion again")
-    if busy:
+            failed = _take_pending()
+    if busy:                                   # replied outside the gate (2026-11-18 review B5)
+        _reply_failed(failed, "ABORTED", msg + " — clear errors to run motion again")
         log_activity(_exec_activity_logger, "EXEC", "error", "MOTION_ABORTED", message=msg)
 
 
@@ -2106,8 +2143,8 @@ def _stop_motion(cid, ask=False):
     waiters = []
     with _abort_gate():                    # a command being queued right now lands before this, never after
         _planner.flush()                   # drop queued motion + reset endpoint; a new stop epoch + its fence to RTI
-        _fail_pending("STOPPED", "motion stopped")
-        epoch = _planner.epoch
+        failed = _take_pending()           # replied AFTER RTI was told (2026-11-18 review B5): a client that does not
+        epoch = _planner.epoch             # read must never delay the stop
         # The gripper stops too (2026-10-24, user: a stop "should freeze it also"): RTI holds the jaws where they are.
         # In EXEC: brake along the path, drop the program up to the fence, hold there (still in EXEC). Elsewhere
         # (JOG, RTI, ...): IDLE as before.
@@ -2116,6 +2153,7 @@ def _stop_motion(cid, ask=False):
                 waiters.append(_ask_rti(message, cid))
             else:
                 send_to_rti(message, cid, "TCP")
+    _reply_failed(failed, "STOPPED", "motion stopped")
     if in_exec:
         _confirm_exec_stop(epoch, cid)
     return waiters
@@ -2144,6 +2182,12 @@ KEEPALIVE_IDLE_S, KEEPALIVE_INTERVAL_S, KEEPALIVE_PROBES = 5, 2, 3
 
 
 def _keepalive(sock):
+    # a send that cannot go out in CLIENT_SEND_TIMEOUT_S fails (reply() then disconnects the client); data the peer
+    # does not acknowledge for CLIENT_USER_TIMEOUT_MS ends the connection — keepalive probes are not sent while data
+    # is outstanding (2026-11-18 review B5)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", CLIENT_SEND_TIMEOUT_S, 0))
+    if hasattr(socket, "TCP_USER_TIMEOUT"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, CLIENT_USER_TIMEOUT_MS)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     for opt, value in (("TCP_KEEPIDLE", KEEPALIVE_IDLE_S), ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S),
                        ("TCP_KEEPCNT", KEEPALIVE_PROBES)):
@@ -2472,11 +2516,70 @@ _JOINT_TEST_STATES = {0: "idle", 1: "running", 2: "done", 3: "fell_behind", 4: "
 _jog_conn = None
 
 
+# A held jog's dead-man (2026-11-18 review G3; user: "RTI + dashboard"). The dashboard sends jog_alive every 0.2 s
+# while a jog button / joystick is pressed — from the BROWSER, so a lost release (a context menu, a tab switched) or a
+# lost connection stops the alives; the status watcher then stops that connection's jog. A program's jog() sends no
+# alives and is not watched (its jog runs until jog_stop or its disconnect, as before).
+JOG_ALIVE_S = 0.6
+# conn: the connection that sends alives; until: its last alive + JOG_ALIVE_S; jogging: its jog runs (a jog after the
+# alives began, until its jog_stop) — only a running jog is watched (alives may go on a moment after a jog_stop the
+# dashboard sent when the pointer left the button).
+_jog_alive = {"conn": None, "until": 0.0, "jogging": False}
+_jog_alive_lock = threading.Lock()
+
+
+def _handle_jog_alive(args, cid, conn):
+    """jog_alive — keep this connection's jog going JOG_ALIVE_S more; from the first one its jog is stopped when the
+    alives stop (_check_jog_alive). Never forwarded to RTI."""
+    if args:
+        return _bad_args(cid, conn, "jog_alive", "jog_alive takes no arguments")
+    with _jog_alive_lock:
+        if _jog_alive["conn"] is not conn:
+            _jog_alive.update(conn=conn, jogging=False)
+        _jog_alive["until"] = time.monotonic() + JOG_ALIVE_S
+    reply(conn, {"id": cid, "status": "ok"})
+
+
+def _note_jog(conn, running):
+    """A jog started (running) or stopped by `conn`: watched when `conn` sends alives."""
+    with _jog_alive_lock:
+        if _jog_alive["conn"] is conn:
+            _jog_alive["jogging"] = running
+
+
+def _forget_jog_alive(conn):
+    """A gone connection: nothing to keep alive any more."""
+    with _jog_alive_lock:
+        if _jog_alive["conn"] is conn:
+            _jog_alive.update(conn=None, jogging=False)
+
+
+def _check_jog_alive():
+    """The status watcher, every pass: a running watched jog whose alives stopped for JOG_ALIVE_S -> jog_stop (once)."""
+    with _jog_alive_lock:
+        conn = _jog_alive["conn"]
+        if conn is None or time.monotonic() < _jog_alive["until"]:
+            return
+        jogging = _jog_alive["jogging"]
+        _jog_alive.update(conn=None, jogging=False)
+    if jogging and _jog_conn is conn and shared_data.robot_mode.get() == "JOG":
+        send_to_rti("jog_stop", None, "TCP")
+        log_stop.warning("a held jog was not kept alive for %.1f s (its button's release or its connection was lost): "
+                         "jog stopped", JOG_ALIVE_S)
+
+
+def _handle_jog_stop(args, cid, conn):
+    """jog_stop -> RTI: the joint brakes to rest; this connection's jog is no longer watched."""
+    _note_jog(conn, False)
+    _answered(conn, cid, "jog_stop", "jog_stop")
+
+
 def _handle_jog(args, cid, conn):
     """jog [joint, direction, speed %] -> RTI jog_set (each value checked: _arg_jog_joint, _arg_whole,
     _arg_jog_percent)."""
     global _jog_conn
     _jog_conn = conn
+    _note_jog(conn, True)                     # watched when this connection sends alives (2026-11-18 review G3)
     return _forward_fmt("jog_set", "jog", 3, (_arg_jog_joint, _arg_whole, _arg_jog_percent))(args, cid, conn)
 
 
@@ -2935,7 +3038,8 @@ IMMEDIATE_HANDLERS = {
     "enter_flashing_mode": _handle_enter_flashing_mode,
     "exit_flashing_mode":  _forward_to_rti("set_mode:IDLE", "exit_flashing_mode"),
     "jog":          _handle_jog,
-    "jog_stop":         _forward_to_rti("jog_stop", "jog_stop"),
+    "jog_stop":         _handle_jog_stop,
+    "jog_alive":        _handle_jog_alive,
     "set_jog_accel":        _forward_fmt("jog_accel", "set_jog_accel", 1, (_arg_positive,)),
     "set_jog_profile":      _forward_fmt("jog_profile", "set_jog_profile", 1, (_arg_jog_profile,)),
     "set_jog_jerk_factor":  _forward_fmt("jog_jerk_factor", "set_jog_jerk_factor", 1, (_arg_positive,)),
@@ -3021,10 +3125,22 @@ def handle_immediate(cmd, msg, cid, conn):
 
 def _fail_pending(code, message):
     """Fail every queued command still awaiting completion (used on stop/error)."""
+    _reply_failed(_take_pending(), code, message)
+
+
+def _take_pending():
+    """Every queued command still awaiting completion, forgotten: [(cid, conn)] for _reply_failed (2026-11-18 review
+    B5: the replies go out after RTI was told, and never under _pending_lock — a client that does not read blocked
+    every other one)."""
     with _pending_lock:
-        for cid, conn in list(pending_client.items()):
-            reply(conn, {"id": cid, "status": "error", "code": code, "message": message})
+        taken = list(pending_client.items())
         pending_client.clear()
+    return taken
+
+
+def _reply_failed(taken, code, message):
+    for cid, conn in taken:
+        reply(conn, {"id": cid, "status": "error", "code": code, "message": message})
 
 
 # ========================================================================== #
@@ -3221,6 +3337,10 @@ def status_watcher():
             last = evt
             _broadcast_status(evt)
         try:
+            _check_jog_alive()                      # a held jog's dead-man (2026-11-18 review G3)
+        except Exception as e:                      # noqa: BLE001 — never the status stream
+            log_status.error(f"jog keep-alive check failed: {e}")
+        try:
             _check_drive_firmware()                 # logs once per change of the reported firmware (V4)
         except Exception as e:                      # noqa: BLE001 — a log line must never stop the status stream
             if not fw_check_failed:
@@ -3388,6 +3508,7 @@ def handle_client(conn, addr):
         # A dropped TCP connection must never hold the robot hostage.
         _release_control(conn, "disconnected")
         global _jog_conn
+        _forget_jog_alive(conn)                # (its jog is stopped just below)
         if _jog_conn is conn:                  # its jog must not outlive it (2026-10-24)
             _jog_conn = None
             if shared_data.robot_mode.get() == "JOG":
@@ -3395,6 +3516,8 @@ def handle_client(conn, addr):
                 log_tcp.warning(f"{ip}:{port} disconnected while jogging: jog stopped")
         _client_names.pop(conn, None)          # after the release, so its log line still names the client
         _client_versions.pop(conn, None)
+        with _conn_send_locks_lock:
+            _conn_send_locks.pop(conn, None)
         # Drop any of this client's pending completions.
         with _pending_lock:
             for cid in [c for c, cn in pending_client.items() if cn is conn]:

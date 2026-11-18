@@ -3611,6 +3611,43 @@ class RobotClient:
         """
         return self._immediate("jog_stop")
 
+    def jog_alive(self) -> Any:
+        """Keep the jog going while a button is held: a dead-man.
+
+        The robot stops this client's jog 0.6 s after its last `jog_alive()`.
+        Send it every 0.2 s while the jog button or joystick is held, from the
+        place that knows it is held (the dashboard sends it from the browser),
+        so a lost button release or a lost connection stops the joint. From the
+        first `jog_alive()` on, a jog of this client is watched until
+        `jog_stop()`; a program that never sends it jogs until `jog_stop()` or
+        its disconnect, as before. It never moves anything by itself and is
+        accepted from every client, in every mode.
+
+        Returns:
+            `None`: the robot sends no value back.
+
+        Raises:
+            CommandRejected: The robot refused it (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: It was sent with arguments.
+
+        See also:
+            `jog()`, `jog_stop()`
+
+        Examples:
+            >>> import time
+            >>> robot.jog_alive()
+            >>> robot.jog(0, 1, 5)
+            >>> for _ in range(5):
+            ...     time.sleep(0.2)
+            ...     robot.jog_alive()
+            >>> robot.jog_stop()
+        """
+        return self._immediate("jog_alive")
+
     def set_jog_accel(self, accel_time: float) -> Any:
         """Set the jog's ramp time, from rest to a joint's full speed.
 

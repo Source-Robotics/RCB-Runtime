@@ -695,10 +695,33 @@ class ExecHandler:
 
     def _safe_unpack(self, raw):
         try:
-            return unpack_batch(raw)
+            batch = unpack_batch(raw)
         except Exception as e:  # malformed batch — drop it, don't crash the RT loop
             logger.error(f"Dropped malformed trajectory batch: {e}")
             return None
+        why = self._batch_problem(batch)
+        if why is None:
+            return batch
+        # 2026-11-18 review S3: a batch with no sample, another joint count or a NaN / infinite value raised inside
+        # this tick (indexing row 0, a broadcast, int() of NaN in dispatch) and ended RTI. Cold path: refused, its
+        # command fails, and the arm brakes along what it plays to rest, then IDLE — the executor ends the program.
+        logger.error("refused a trajectory batch (%s): %s — braking to rest", batch.get('checkpoint_id') or "no id", why)
+        self._error_checkpoint(batch.get('checkpoint_id') or "", "PLAN_FAIL",
+                               f"RTI refused the move's samples: {why}")
+        self.begin_stop(None)
+        return None
+
+    def _batch_problem(self, batch):
+        """Why RTI cannot play this batch, or None (once per batch, never per tick)."""
+        n, j = int(batch['num_points']), int(batch['joint_num'])
+        if n < 1:
+            return "it holds no sample"
+        if j != self.joint_num:
+            return f"it is for {j} joints, not {self.joint_num}"
+        for key in ('joint_positions', 'joint_velocities', 'torque_ff'):
+            if not np.isfinite(batch[key]).all():
+                return f"its {key.replace('joint_', '')} are not all finite"
+        return None
 
     def _begin_completion(self, checkpoint_id, flags=0):
         """Return True if playback should pause for settle checking."""

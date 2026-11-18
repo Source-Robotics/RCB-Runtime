@@ -28,6 +28,9 @@ from robotclient.constants import DEFAULT_PORT
 _QUEUE_MAX = 256          # bound the backlog so a wedged executor can't grow it without limit
 _POLL_TIMEOUT = 0.5       # s; how often the idle worker re-checks the stop flag
 _STOP_LABELS = frozenset({"jog_stop", "gripper_stop", "stop", "disable", "safety_stop"})
+# One of these waiting is enough: another is dropped, and a stop drops them without counting them as superseded (the
+# held jog's keep-alive, 0.2 s apart — 2026-11-18 review G3).
+_COALESCE_LABELS = frozenset({"jog_alive"})
 
 
 # How long the DASHBOARD may sit idle holding control before it lets go. The executor's own idle
@@ -92,11 +95,13 @@ class ExecCommandSender:
                 for pending_fn, pending_label in self._pending:
                     if pending_label in _STOP_LABELS and pending_label != label:
                         kept.append((pending_fn, pending_label))
-                    elif pending_label not in _STOP_LABELS:
+                    elif pending_label not in _STOP_LABELS and pending_label not in _COALESCE_LABELS:
                         superseded += 1
                 self._pending = kept
                 self._pending.append((fn, label))
                 self._pending_cv.notify()
+            elif label in _COALESCE_LABELS and any(lb == label for _, lb in self._pending):
+                pass                                   # one already waits
             elif len(self._pending) >= self._queue_max:
                 full = True
             else:

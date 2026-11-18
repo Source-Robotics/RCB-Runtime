@@ -15,6 +15,11 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Added
 
+- A held jog has a dead-man. The dashboard's browser tells the robot every 0.2 s while a jog button or joystick is
+  pressed (`jog_alive()`, new); a jog whose keep-alives stop for 0.6 s — a lost button release, a context menu, a tab
+  switched or a lost connection — is stopped. RTI brakes a jog when the executor stops answering for 0.5 s. The
+  jog buttons react to the left mouse button only and work on a touch screen. A program's `jog()` is unchanged.
+
 - The command check: in EXEC, JOG, RTI and SOFT_RTI the robot checks what it commands each tick — the commanded
   speed, the speed of each position step, the acceleration and the position — against the robot's speed and
   acceleration limits times a margin (1.2) and the soft limits. Every mode plans within those limits, so a command
@@ -151,6 +156,19 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- A Stop pressed while the planner was still planning a move was undone by it: the move's plan, finishing after the
+  Stop, wrote its end point back, so the next move started from the cancelled move's end (a step at its start).
+- A move whose samples hold a NaN or an infinite value, or none at all, is refused (`PLAN_FAIL`, nothing of it sent);
+  RTI refuses such a batch too, fails its command and brakes to rest. It used to raise inside RTI's loop and end RTI.
+- One client that stopped reading (a suspended PC, a paused script) could block every reply and, through them, a
+  Stop: the stop path now tells RTI first and replies after, each client has its own send lock, and a client that
+  does not read for 2 s is disconnected.
+- A command sent while RTI was not running (during a restart) was kept and run when RTI came back, after the client
+  had been told RTI did not answer: such a command now fails at once with `RTI_NOT_RUNNING`.
+- A stop, a disable, an error or motors off now also stop a running gripper calibration (it swept on for up to 30 s).
+- The error tune after an error in a move plays on the d axis (no torque) instead of q, and a q tune still playing is
+  silenced when a move mode begins; a new tune replaces what still waits (a program beeping in a loop queued a minute
+  of sound and slowed RTI's other polls).
 - A stop of a running program after the executor alone had restarted (`tools/restart_gui_and_executor.sh`, or a
   gripper change) did not brake: the planner numbered its stops from 0 again while RTI kept the highest number it had
   seen and took the new stop for an older one — yet confirmed it at once, so `stop()` returned "ok" while the arm

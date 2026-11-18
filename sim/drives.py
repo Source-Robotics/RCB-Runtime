@@ -44,13 +44,18 @@ def _num(v, default):
     return float(default) if math.isnan(v) else v
 
 
-def homing_layout(speed, direction, timeout_s, hall):
+def homing_layout(speed, direction, timeout_s, hall, max_travel_ticks=None):
     """(stop, stop_dir, hall_centre) for one actuator starting at 0 ticks: its endstop (or, with a Hall sensor, its
     magnet and no endstop) REACH_S at its homing speed along its homing direction (0 = positive), at most 40 % of its
-    homing timeout away. The joints are ideal (no gravity), so where the arm starts does not matter: homing defines
-    the angles from these stops, as on the arm."""
+    homing timeout away — and at most 40 % of its homing travel limit (`max_travel_ticks`, <homing_max_travel_deg> in
+    ticks; 2026-11-18: 3 s at J4's speed is 222 deg, past its 220 deg limit, and every simulated homing failed). The
+    joints are ideal (no gravity), so where the arm starts does not matter: homing defines the angles from these
+    stops, as on the arm."""
     s = 1 if int(_num(direction, 1)) == 0 else -1
     dist = abs(_num(speed, 5000.0)) * min(REACH_S, 0.4 * _num(timeout_s, 6.0))
+    travel = _num(max_travel_ticks, float("inf"))
+    if travel > 0:
+        dist = min(dist, 0.4 * travel)
     if hall:
         return None, s, s * dist
     return s * dist, s, None
@@ -67,8 +72,10 @@ def build_drives():
     n = int(sysc["joint_num"])
     drives = {}
     for i in range(n):
+        travel_deg = _num(cfg["homing_max_travel_deg"][i], float("inf"))
+        ticks_per_deg = (2.0 ** _num(cfg["motor_encoder"][i], 14)) * abs(_num(cfg["gear_ratio"][i], 1.0)) / 360.0
         stop, s, hall = homing_layout(cfg["homing_speed"][i], cfg["homing_direction"][i], cfg["homing_timeout_s"][i],
-                                      int(_num(cfg["has_hall_sensor"][i], 0)) == 1)
+                                      int(_num(cfg["has_hall_sensor"][i], 0)) == 1, travel_deg * ticks_per_deg)
         drives[i] = SimDrive(i, kt=float(cfg["motor_kt"][i]), stop=stop, stop_dir=s, hall=hall)
     raw = cfg.get("gripper_CAN_gripper")
     if raw is not None and not (isinstance(raw, float) and math.isnan(raw)) and int(raw):

@@ -151,6 +151,7 @@ class SoundPlayer:
     def __init__(self, settings: dict):
         self.settings = dict(settings)
         self.queue: deque = deque()
+        self.on_q = False         # the last tune went out on q (a joint torque): silence_torque() stops it
 
     @property
     def node(self) -> int:
@@ -165,6 +166,10 @@ class SoundPlayer:
         None = the settings' — the robot's own sounds), its queue cleared, the notes, a silence, play."""
         n, current = self.node, int(self.settings.get("current_ma", 250))
         ax = self.settings.get("axis", "q") if axis is None else axis
+        # A new tune REPLACES what still waits (2026-11-18 review S2): the queue never grows past one tune — a program
+        # beeping in a loop queued thousands of frames, played them for a minute and starved RTI's other polls.
+        self.queue.clear()
+        self.on_q = ax == "q"
         self.queue.append(("param", n, P_SOUND_LIMIT_MV, int(self.settings.get("limit_mv", 2500))))
         self.queue.append(("param", n, P_SOUND_AXIS, 1 if ax == "q" else 0))
         self.queue.append(("clear", n))
@@ -172,6 +177,16 @@ class SoundPlayer:
             self.queue.append(("event", n, hz, current if hz else 0, ms))
         self.queue.append(("event", n, 0.0, 0, 0))
         self.queue.append(("play", n))
+
+    def silence_torque(self) -> None:
+        """Before a move (EXEC / JOG / RTI / SOFT_RTI, whose contact checks read the motor current): a tune that went
+        out on q is stopped — what waits dropped, one clear frame (2026-11-18 review S1). Nothing when the last tune
+        was on d."""
+        if not self.on_q:
+            return
+        self.queue.clear()
+        self.queue.append(("clear", self.node))
+        self.on_q = False
 
     def tune(self, event: str) -> list:
         """[(Hz, ms)] of the tune chosen for one of the robot's own sounds (<sound><EVENT_tune>; a name not in the

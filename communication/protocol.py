@@ -76,6 +76,9 @@ ALWAYS_OPEN = frozenset({
     # surface: the rule below was already written in the jog_stop protocol comment
     # ("a released jog button always halts motion") and the gate contradicted it.
     "jog_stop",
+    # A held jog's keep-alive (2026-11-18 review G3): it only extends the SENDING connection's own jog, and must never
+    # be refused while the release it guards is pending.
+    "jog_alive",
     # Giving up control is always allowed. `take_control` is here too, but NOT because it is
     # harmless — because routing it through the gate would make a forced takeover impossible:
     # you would need control in order to take control. It does its own claim, with the force
@@ -246,6 +249,7 @@ COMMAND_RULES = {
     # allowed in any mode so a released jog button always halts motion, even if a mode change raced.
     "jog":         (IMMEDIATE, ["JOG"], None, False),
     "jog_stop":        (IMMEDIATE, None, None, False),
+    "jog_alive":       (IMMEDIATE, None, None, False),     # executor-only: keeps this connection's jog going
     # Jog configuration — persistent on RTI's JOG handler, applied regardless of current mode.
     "set_jog_accel":        (IMMEDIATE, None, None, False),
     "set_jog_profile":      (IMMEDIATE, None, None, False),

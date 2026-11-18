@@ -286,12 +286,14 @@ class ExecLinkWatchdog:
         self._timeout_ticks = timeout_ticks
         self._last_hb = None
         self._last_change_tick = 0
+        self.stale = False        # the heartbeat stalled, whatever the mode (the jog's dead-man reads it, 2026-11-18)
 
     def update(self, heartbeat: float, tick: int, in_exec: bool, samples_remaining: float) -> bool:
         if heartbeat != self._last_hb:
             self._last_hb = heartbeat
             self._last_change_tick = tick
         stale = (tick - self._last_change_tick) > self._timeout_ticks
+        self.stale = stale
         return stale and in_exec and samples_remaining > 0.0
 
 

@@ -87,14 +87,18 @@ SIMULATOR_PORT       = 27890  # Reserved for simulator connection (not yet imple
 
 # ZeroMQ IPC socket paths — Unix domain sockets, same-machine only.
 # IPC avoids the TCP/IP stack, giving ~2–10 µs latency vs ~20–60 µs for tcp://localhost.
-ZMQ_CMD_SOCKET    = "ipc:///tmp/robot_cmd"     # RTI receives commands on this (PULL/bind)
-ZMQ_STATUS_SOCKET = "ipc:///tmp/robot_status"  # RTI sends status on this (PUSH/connect)
+# The paths carry RCB_SHM_PREFIX as shared memory does (2026-11-18): tools/run_nets.py gives every net its own, so a
+# net's commands can never reach the running robot's RTI (one did: test_command_fixes' jog section sent jog_set /
+# jog_stop to the live RTI, which ignored them in IDLE). Unset — the robot, the simulator — the paths are as before.
+_IPC_PREFIX = "".join(c for c in os.environ.get("RCB_SHM_PREFIX", "") if c.isalnum() or c in "_-")
+ZMQ_CMD_SOCKET    = f"ipc:///tmp/{_IPC_PREFIX}robot_cmd"     # RTI receives commands on this (PULL/bind)
+ZMQ_STATUS_SOCKET = f"ipc:///tmp/{_IPC_PREFIX}robot_status"  # RTI sends status on this (PUSH/connect)
 
 # --- EXEC mode trajectory transport (Phase 3) ---
 # Planner thread (in command_executor) PUSHes trajectory batches; RTI PULLs them
 # non-blocking in the RT loop. RTI PUSHes checkpoint completions; command_executor PULLs.
-ZMQ_EXEC_TRAJECTORY_SOCKET = "ipc:///tmp/robot_exec_trajectory"  # planner→RTI batches (RTI PULL/bind)
-ZMQ_EXEC_STATUS_SOCKET     = "ipc:///tmp/robot_exec_status"      # RTI→executor checkpoints (executor PULL/bind)
+ZMQ_EXEC_TRAJECTORY_SOCKET = f"ipc:///tmp/{_IPC_PREFIX}robot_exec_trajectory"  # planner→RTI batches (RTI PULL/bind)
+ZMQ_EXEC_STATUS_SOCKET     = f"ipc:///tmp/{_IPC_PREFIX}robot_exec_status"      # RTI→executor checkpoints (executor PULL)
 
 # You can also add other constants here later
 

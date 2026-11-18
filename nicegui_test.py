@@ -690,6 +690,21 @@ def _jog_start(joint_idx, direction):
 def _jog_stop():
     _exec(lambda r: r.jog_stop(), "jog_stop")
 
+
+def _left_button(e):
+    """A mouse event from the LEFT button (a right press opened the context menu and its release never came: the jog
+    ran on — 2026-11-18 review G3)."""
+    return not isinstance(getattr(e, "args", None), dict) or e.args.get("button", 0) == 0
+
+
+# The held jog's keep-alive from the browser (2026-11-18 review G3; gui_jog_keepalive.py): every element with the
+# class rcb-jog keeps its jog alive while pressed.
+try:
+    from gui_jog_keepalive import install as _install_jog_keepalive
+    _install_jog_keepalive(_exec)
+except Exception:                                   # noqa: BLE001 — a page without it still jogs (no dead-man)
+    logger.exception("the jog keep-alive unavailable")
+
 with ui.card().classes("w-full mb-2") as _jog_card:
     with ui.row().classes("items-center gap-3 flex-wrap px-3 py-2"):
         ui.label("Jog").classes("font-bold text-sm text-gray-500 uppercase tracking-wide")
@@ -791,12 +806,12 @@ with ui.card().classes("w-full mb-2") as _jog_card:
             with ui.column().classes("items-start gap-0"):
                 with ui.row().classes("items-center gap-1"):
                     ui.label(f"J{_ji + 1}").classes("text-sm font-mono text-gray-500 w-5")
-                    _neg = ui.button("◄").props("size=sm flat dense")
-                    _pos = ui.button("►").props("size=sm flat dense")
-                    _neg.on('mousedown',  lambda e, j=_ji: _jog_button_down(j, -1))
+                    _neg = ui.button("◄").props("size=sm flat dense").classes("rcb-jog")
+                    _pos = ui.button("►").props("size=sm flat dense").classes("rcb-jog")
+                    _neg.on('mousedown',  lambda e, j=_ji: _left_button(e) and _jog_button_down(j, -1), ['button'])
                     _neg.on('mouseup',    lambda e: _jog_button_up())
                     _neg.on('mouseleave', lambda e: _jog_button_up())
-                    _pos.on('mousedown',  lambda e, j=_ji: _jog_button_down(j, +1))
+                    _pos.on('mousedown',  lambda e, j=_ji: _left_button(e) and _jog_button_down(j, +1), ['button'])
                     _pos.on('mouseup',    lambda e: _jog_button_up())
                     _pos.on('mouseleave', lambda e: _jog_button_up())
                     _jog_buttons.append({'neg': _neg, 'pos': _pos})
@@ -841,7 +856,7 @@ with ui.card().classes("w-full mb-2") as _jog_card:
                     on_move=lambda e, j=_ji: _on_joystick_move(e, j),
                     on_end=_joystick_end,
                     throttle=0.05,
-                ).style("width:90px; height:90px;")
+                ).style("width:90px; height:90px;").classes("rcb-jog")
                 ui.label("← speed →").classes("text-xs text-gray-400")
 
 # ─────────────────────────────────────────────────────────────
