@@ -156,6 +156,11 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- The arm no longer drops a little when it is disabled out of gravity compensation or stops on an error. Drive
+  firmware 110 starts its speed loop from zero when it takes over from another mode, so the bare zero-speed hold
+  (no current) let the joints fall for about 10 ms before it caught them (0.2-0.4 deg on the elbow and the wrist).
+  Once the arm is homed and every joint answers, the hold now carries the gravity model's torque as the drive's
+  feedforward current.
 - A Stop pressed while the planner was still planning a move was undone by it: the move's plan, finishing after the
   Stop, wrote its end point back, so the next move started from the cancelled move's end (a step at its start).
 - A move whose samples hold a NaN or an infinite value, or none at all, is refused (`PLAN_FAIL`, nothing of it sent);

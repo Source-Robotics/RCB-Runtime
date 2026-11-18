@@ -747,6 +747,10 @@ def stop_after_executor_restart(ctx, notes):
                      f"{travelled:.0%} in all; still {abs(p2 - p1):.1f} ticks in 0.5 s; stop() took {took:.2f} s")
         return after < 0.35 and travelled < 0.9 and abs(p2 - p1) < 5.0
     finally:
+        try:                                             # back to IDLE: the next scenario (rti_lost) homes at once
+            r.enter_idle_mode(wait=True)
+        except Exception as e:
+            notes.append(f"enter_idle_mode at the end: {e!r}")
         r.disconnect()
 
 

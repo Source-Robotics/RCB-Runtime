@@ -88,6 +88,8 @@ _output_vel_zero: ControlOutput = None     # type: ignore[assignment]  # built b
 _output_torque_zero: ControlOutput = None  # type: ignore[assignment]  # (the same)
 _output_idle_gravity = ControlOutput()
 _idle_trq_buf: np.ndarray = None  # type: ignore[assignment]  # gravity (+ walls) + friction comp., preallocated in build
+_hold_trq_buf: np.ndarray = None  # type: ignore[assignment]  # the zero-speed hold's gravity feedforward (_hold_output)
+_output_vel_hold: ControlOutput = None     # type: ignore[assignment]  # Speed 0 + that feedforward, built in build
 
 _MODE_PROFILE_ENABLED = os.environ.get("RTI_MODE_PROFILE", "0") == "1"
 _MODE_PROFILE_INTERVAL = max(1, int(os.environ.get("RTI_MODE_PROFILE_INTERVAL", "500")))
@@ -395,6 +397,29 @@ def handle_booting(ctx):
     return _tick_ok, _output_vel_zero
 
 
+def _hold_output(ctx):
+    """The zero-speed hold of IDLE (disabled, or gravity comp off) and ACTIVE_ERROR: Speed = 0 with the gravity
+    model's torque as the drive's feedforward current, once the arm is homed and every joint answers on CAN.
+
+    Why (2026-11-18, the user: "Homed, IDLE + errors"): drive firmware 110 zeroes its speed loop's integral whenever
+    it enters a speed or position command from another mode (communication_CAN.cpp: "The integral is stale after any
+    other mode"); 106 kept it. Leaving freedrive (a current command) for this hold, the integral starts from zero, and
+    without a feedforward nothing carries the arm for ~10 ms: J3 fell 0.22 deg at up to 12.6 deg/s and J5 0.43 deg
+    before the loop caught them (capture 20261118_162256_disable_sag). With the gravity current the drive starts the
+    hold already carrying the weight; its integral corrects only the model's error. The speed packet's current is that
+    feedforward (Velocity_pi adds it), and the drive still caps it at its own current limit (0 for a freed joint).
+
+    Gravity comp's switch does not matter here (the user's choice): the hold is a speed loop either way, and the
+    feedforward only spares it the fall. Not homed (the pose is not referenced) or a joint lost on CAN (its frozen
+    angle would give the joints below it a wrong gravity): the bare hold, as before."""
+    n = ctx.joint_num
+    rti = ctx.shared_data.rti
+    if not np.all(rti['homing_status'][:n] == 2) or rti['CAN_node_connection_error'][:n].any():
+        return _output_vel_zero
+    np.copyto(_hold_trq_buf[:n], ctx.shared_data.joint['joint_gravity_torque'][:n])
+    return _output_vel_hold
+
+
 def handle_idle(ctx: TickContext) -> tuple[TickResult, ControlOutput]:
     """IDLE: gravity-comp torque hold if homed/enabled/grav-on — velocity-hold otherwise."""
     robot_homed     = bool(np.all(ctx.shared_data.rti['homing_status'][:ctx.joint_num] == 2))
@@ -422,12 +447,12 @@ def handle_idle(ctx: TickContext) -> tuple[TickResult, ControlOutput]:
         else:
             _output_idle_gravity.trq_nm = base
         return _tick_ok, _output_idle_gravity
-    return _tick_ok, _output_vel_zero
+    return _tick_ok, _hold_output(ctx)
 
 
 def handle_active_error(ctx):
-    """ACTIVE_ERROR: velocity-hold at 0 rad/s until errors clear."""
-    return _tick_ok, _output_vel_zero
+    """ACTIVE_ERROR: velocity-hold at 0 rad/s until errors clear (with gravity feedforward when homed: _hold_output)."""
+    return _tick_ok, _hold_output(ctx)
 
 
 def handle_safety_stop(ctx):
@@ -784,7 +809,7 @@ def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn:
     """
     _dyn_buffers(joint_num)                        # the inertia / Coriolis feedforward's buffers, before the loop
     global _zeros_rad, _motor_pos_buf, _motor_vel_buf, _motor_curr_buf, _torque_to_mA_factor
-    global _output_vel_zero, _output_torque_zero, _idle_trq_buf
+    global _output_vel_zero, _output_torque_zero, _idle_trq_buf, _hold_trq_buf, _output_vel_hold
     global _current_ceiling_mA, _curr_abs_buf, _curr_ok_mask, _curr_clamped, _curr_clamp_any
 
     _zeros_rad      = np.zeros(joint_num, dtype=np.float64)
@@ -801,6 +826,8 @@ def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn:
     _curr_clamp_any = False
     _output_vel_zero    = ControlOutput(vel_rad=_zeros_rad)
     _output_torque_zero = ControlOutput(trq_nm=_zeros_rad)
+    _hold_trq_buf       = np.zeros(joint_num, dtype=np.float64)
+    _output_vel_hold    = ControlOutput(vel_rad=_zeros_rad, trq_nm=_hold_trq_buf)
 
     # Pre-compute the per-joint factor that turns joint torque (Nm) into motor
     # current (mA) in one multiply. Shared formula with the per-tick shared-
