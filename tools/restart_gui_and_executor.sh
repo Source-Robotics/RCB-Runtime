@@ -3,6 +3,7 @@
 #
 #   tools/restart_gui_and_executor.sh             # restart both, verify, report
 #   tools/restart_gui_and_executor.sh --dry-run   # show what it WOULD signal, change nothing
+#   tools/restart_gui_and_executor.sh --with-self-collision   # + self_collision_worker.py (a gripper swap)
 #
 # No sudo: the supervisor (autorun.service, User=robot) runs them as you.
 #
@@ -20,9 +21,17 @@
 set -uo pipefail
 
 DRY=0
-[ "${1:-}" = "--dry-run" ] && DRY=1
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPTS=(command_executor nicegui_test)
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY=1 ;;
+    # the gripper swap (2026-11-17, TODO/live_gripper_swap_plan.md): the self-collision worker reads the gripper's
+    # collision model only at its start, so it restarts with the executor and the dashboard
+    --with-self-collision) SCRIPTS+=(self_collision_worker) ;;
+    *) echo "unknown option $arg (--dry-run, --with-self-collision)" >&2; exit 2 ;;
+  esac
+done
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GUI_PORT=8081
 EXEC_PORT=29000
 
@@ -87,4 +96,4 @@ else
   ok=0
 fi
 
-[ "$ok" = 1 ] && echo "DONE: executor and dashboard restarted." || { echo "Something above did not check out." >&2; exit 1; }
+[ "$ok" = 1 ] && echo "DONE: ${SCRIPTS[*]} restarted." || { echo "Something above did not check out." >&2; exit 1; }

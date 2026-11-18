@@ -114,9 +114,21 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - Change the gripper without losing the homing: `begin_gripper_change()` (the Gripper tab's "Change gripper", the arm
   disabled; its joints keep holding) idles the jaws and stops counting the gripper's silence and faults, so unplugging
   it no longer un-homes the arm; enabling, the gripper's commands and every mode but IDLE and motors off are refused
-  meanwhile; a gripper plugged in again gets its settings by itself. `end_gripper_change()` (Done) once it answers; then
-  calibrate its jaws. For now the same kind of gripper is fitted again (the active gripper XML stays);
-  `latest_status()["gripper"]` reports `changing` and `answering`.
+  meanwhile, and so are parameter writes, drive saves and storing a tool ID on the gripper's drive; a gripper plugged
+  in again gets its settings by itself. `end_gripper_change()` (Done) once it answers; then calibrate its jaws. `latest_status()["gripper"]` reports `changing`, `answering`, the fitted drive's `tool_id` and
+  the gripper files it `proposed`.
+- Another gripper, live: `end_gripper_change("SSG48", removed=True)` (the Gripper tab's card: the file its tool ID
+  proposes, confirmed) applies that gripper's file without a restart: RTI takes its settings, its tool length, mass
+  and collision model and its homing set-up within three loop ticks; the gripper's drive must be the product the file
+  names and carry its tool ID (or none). `<active_gripper>` is saved in `config/system.xml` first (put back when RTI
+  refuses the file), then RTI applies it, then the executor, the self-collision checker and the dashboard restart with
+  it (about 10 s); the reply comes after all three, and from the apply until that restart enabling and moves are
+  refused. A step that fails replies `GRIPPER_SWAP_FAILED` (6027) naming it; when RTI fails while applying, the arm
+  cannot be enabled until the robot service restarts. The arm keeps holding and its homing. `removed` (the card's box,
+  unticked by default and confirmed when ticked): the gripper left the flange, so J5 and J6 are no longer homed (J6's
+  Hall magnet is on the gripper side).
+  For now grippers with a drive only. `tools/restart_gui_and_executor.sh --with-self-collision` restarts the checker
+  too.
 
 ### Changed
 
@@ -138,6 +150,15 @@ What changed in each version of the RCB runtime. The newest version is at the to
   click, for example on Enable) instead of skipping the step at once.
 
 ### Fixed
+
+- A stop of a running program after the executor alone had restarted (`tools/restart_gui_and_executor.sh`, or a
+  gripper change) did not brake: the planner numbered its stops from 0 again while RTI kept the highest number it had
+  seen and took the new stop for an older one — yet confirmed it at once, so `stop()` returned "ok" while the arm
+  played out what it had. The planner now numbers its stops from the clock, so a restarted executor always continues
+  above.
+- RTI could not start with any gripper file but `MSG_small_motor_150mm_rail`: a gripper without
+  `<homing_calibration_wait_s>` gave a NaN calibration wait, and the start-up crashed rounding it (since 2026-10-24).
+  An undeclared wait is 2 s again.
 
 - The first-run check's Hall-sensor check (stage 2), its test moves (stage 3) and its by-hand check failed with "the
   check itself failed" when the robot refused to start them; they now report the robot's reason. A test move refused

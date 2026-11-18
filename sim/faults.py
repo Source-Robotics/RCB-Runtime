@@ -22,7 +22,7 @@ from utility import sim_mode
 ACTIVITY = os.path.join("temp_data", "sim", "logs", "activity_rti.log")
 ORDER = ("node_lost", "drive_fault", "drive_flags", "reply_loss", "drive_reboot", "hand_push", "push_through",
          "runaway", "tracking_lag", "hold_buzz", "homing_false_stall", "executor_lost", "estop",
-         "motors_off_with_error", "gripper_hold", "rti_lost")
+         "motors_off_with_error", "gripper_hold", "stop_after_executor_restart", "rti_lost")
 ARMS = os.path.join("temp_data", "sim", "data", "homing_arms.json")    # the simulated arm table (project_paths)
 # gpio_states (uint8[16], data/shared_data.py) read as a FILE, with the name prefix shared_data applies — never
 # attached (importing data.shared_data attaches every segment). In simulation the inputs live here.
@@ -706,6 +706,51 @@ def gripper_hold(ctx, notes):
         r.disconnect()
 
 
+def stop_after_executor_restart(ctx, notes):
+    """stop() brakes a move after the executor ALONE restarted (2026-11-18, review B1): RTI keeps the highest stop
+    number it has seen for its whole life, and an executor that numbered its stops from 0 again sent stops RTI took for
+    older ones — not braked, yet confirmed at once. Now the planner numbers them from the clock. A stop first (RTI sees
+    a number), the executor restarted, a 25 deg J1 move, stop() 0.3 s into its cruise: the arm must stop well short."""
+    r = ctx.robot()
+    ctx.ready(r, home=True)
+    r.enter_exec_mode(wait=True)
+    r.stop(wait=True)                                    # a fence: RTI has now seen a stop number
+    r.disconnect()
+    ctx.kill("executor", signal.SIGTERM)                 # the executor alone, as tools/restart_gui_and_executor.sh
+    time.sleep(1.0)
+    ctx.restart("executor")
+    if not ctx.wait_executor(60.0):
+        notes.append("the executor did not come back")
+        return False
+    r = ctx.robot()
+    try:
+        ctx.ready(r)
+        r.enter_exec_mode(wait=True)
+        full = math.radians(25.0) * _ticks_per_rad(0)
+        q = [float(v) for v in r.get_joints()]
+        q[0] += 25.0
+        p_start = ctx.nodes()[0]["position"]
+        r.move_joints(*q, speed=30)                      # ~3 s
+        _wait(lambda: abs(ctx.nodes()[0]["position"] - p_start) > 0.15 * full, 6.0)
+        time.sleep(0.3)
+        p_stop = ctx.nodes()[0]["position"]
+        t0 = time.monotonic()
+        r.stop(wait=True)
+        took = time.monotonic() - t0
+        time.sleep(1.0)
+        p1 = ctx.nodes()[0]["position"]
+        time.sleep(0.5)
+        p2 = ctx.nodes()[0]["position"]
+        travelled = abs(p2 - p_start) / full             # of the move's length
+        after = abs(p1 - p_stop) / full                  # after the stop was asked
+        notes.append(f"J1 at the stop {abs(p_stop - p_start) / full:.0%} of the move, {after:.0%} more after it, "
+                     f"{travelled:.0%} in all; still {abs(p2 - p1):.1f} ticks in 0.5 s; stop() took {took:.2f} s")
+        return after < 0.35 and travelled < 0.9 and abs(p2 - p1) < 5.0
+    finally:
+        r.disconnect()
+
+
 SCENARIOS = {f.__name__: f for f in (node_lost, drive_fault, drive_flags, reply_loss, drive_reboot, hand_push,
                                      push_through, runaway, tracking_lag, hold_buzz, homing_false_stall, executor_lost,
-                                     estop, rti_lost, motors_off_with_error, gripper_hold)}
+                                     estop, rti_lost, motors_off_with_error, gripper_hold,
+                                     stop_after_executor_restart)}

@@ -603,8 +603,10 @@ class DryRunRobotClient(RobotClient):
     def begin_gripper_change(self) -> None:
         self._record_immediate_event("begin_gripper_change", {"kind": "gripper"})
 
-    def end_gripper_change(self) -> None:
-        self._record_immediate_event("end_gripper_change", {"kind": "gripper"})
+    def end_gripper_change(self, gripper: str | None = None, removed: bool = False) -> dict:
+        self._record_immediate_event("end_gripper_change", {"gripper": gripper, "removed": bool(removed),
+                                                            "kind": "gripper"})
+        return {"gripper": gripper, "restart": False}
 
     def store_gripper_tool_id(self) -> dict:
         # offline nothing is stored in a drive

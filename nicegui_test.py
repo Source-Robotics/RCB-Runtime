@@ -1044,7 +1044,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             from gui_gripper_change import add_change_card
             _grip_raw_c = _xml_cfg.get('gripper_CAN_gripper', 0)
             add_change_card(shared_data, _exec, not (isinstance(_grip_raw_c, float) and math.isnan(_grip_raw_c))
-                            and int(_grip_raw_c) == 1)
+                            and int(_grip_raw_c) == 1, current=str(_xml_cfg.get('gripper_name') or ""))
         except Exception:
             logger.exception("the Change-gripper card unavailable")
 

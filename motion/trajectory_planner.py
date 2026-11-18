@@ -437,8 +437,15 @@ class TrajectoryPlanner(Thread):
         # command from an older epoch is dropped (_send_range, under the gate). So nothing of a stopped program reaches
         # RTI after the fence — a command still being planned when the Stop came used to send its batches afterwards
         # (harmless while a Stop left EXEC; the robot now stays in EXEC, holding).
-        self._epoch = 0
-        self._cmd_epoch = 0          # the epoch of the command the planner thread is working on
+        # Not 0: the clock in ms (2026-11-18, review B1). RTI's EXEC handler keeps the highest fence epoch it has seen
+        # for as long as RTI runs, and takes a stop of a LOWER epoch for one whose program already ended — it does not
+        # brake, yet exec_stop_seq already reads >= it, so the stop is "confirmed" at once. An executor restarted
+        # alone (tools/restart_gui_and_executor.sh, a gripper swap) used to start again at 0. Each stop adds 1 and
+        # takes far longer than 1 ms, so a later process always starts above every epoch an earlier one used (unless
+        # the wall clock steps back by more than the time between the two starts). Fits the fence's uint64 and the
+        # float64 exec_stop_seq exactly.
+        self._epoch = int(time.time() * 1000)
+        self._cmd_epoch = self._epoch    # the epoch of the command the planner thread is working on
         # Set when the arm may have moved by something other than EXEC (another mode, an
         # error, a hand). The next plan then starts from the MEASURED position instead of
         # the last planned endpoint. Consumed by _start_point().

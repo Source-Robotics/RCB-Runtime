@@ -1467,10 +1467,178 @@ def _handle_begin_gripper_change(args, cid, conn):
         _answered(conn, cid, "begin_gripper_change", "gripper_change:1")
 
 
+def _gripper_tool_ids():
+    """{tool id: [gripper file names]} of the gripper XMLs that declare a <tool_id> (the proposal while changing)."""
+    import xml.etree.ElementTree as _ET  # nosec B405 — our own gripper files
+    out = {}
+    for path in sorted(Path(GRIPPERS_DIR).glob("*.xml")):
+        try:
+            text = (_ET.parse(path).getroot().findtext("tool_id") or "").strip()     # nosec B314 — our own files
+        except (OSError, _ET.ParseError):
+            continue
+        if text.isdigit():
+            out.setdefault(int(text), []).append(path.stem)
+    return out
+
+
+_TOOL_FILES = None          # read once, when the first status needs a proposal
+
+
+def _gripper_proposal(drive_id):
+    """The gripper files whose <tool_id> is the fitted drive's (none for 0 / unknown)."""
+    global _TOOL_FILES
+    if drive_id is None or drive_id <= 0:
+        return []
+    if _TOOL_FILES is None:
+        _TOOL_FILES = _gripper_tool_ids()
+    return list(_TOOL_FILES.get(int(drive_id), []))
+
+
+def _arg_gripper_file(v):
+    """A gripper file's name (grippers/<name>.xml exists), or ValueError."""
+    if not isinstance(v, str) or not v or "/" in v or "\\" in v or v.startswith(".") \
+            or not (Path(GRIPPERS_DIR) / f"{v}.xml").is_file():
+        raise ValueError(f"{v!r} is not a gripper file in grippers/")
+    return v
+
+
+def _save_active_gripper(name):
+    """config/system.xml's <active_gripper> = name: only that value edited (comments kept), a backup first, the file
+    read again and put back unless it reads the new name. -> (None or why not, the text before or None)."""
+    import re as _re
+    path = Path(SYSTEM_XML)
+    try:
+        before = path.read_text()
+    except OSError as e:
+        return f"system.xml not changed: {e}", None
+    why = _write_active_gripper(path, name, before, _re)
+    return why, (None if why else before)
+
+
+def _write_active_gripper(path, name, before, _re):
+    """_save_active_gripper's write: -> None or why not (the file as it was)."""
+    try:
+        if len(_re.findall(r"<active_gripper>[^<]*</active_gripper>", before)) != 1:
+            return "system.xml has not exactly one <active_gripper>"
+        after = _re.sub(r"<active_gripper>[^<]*</active_gripper>", f"<active_gripper>{name}</active_gripper>", before)
+        backups = TEMP_DATA_DIR / "xml_backups"
+        backups.mkdir(parents=True, exist_ok=True)
+        (backups / f"system.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.xml").write_text(before)
+        tmp = path.with_suffix(".xml.tmp")
+        tmp.write_text(after)
+        _os.replace(tmp, path)
+        if read_XML2.load_system_config(SYSTEM_XML, ROBOTS_DIR).get("active_gripper") != name:
+            _put_back_system_xml(before)
+            return "system.xml did not read back the new gripper (it is back as it was)"
+    except (OSError, ValueError, KeyError, read_XML2.ET.ParseError) as e:
+        return f"system.xml not changed: {e}"
+    return None
+
+
+def _put_back_system_xml(before):
+    """system.xml back to `before` (a temporary file, then a rename). -> None or why not."""
+    path = Path(SYSTEM_XML)
+    try:
+        tmp = path.with_suffix(".xml.tmp")
+        tmp.write_text(before)
+        _os.replace(tmp, path)
+    except OSError as e:
+        return str(e)
+    return None
+
+
+# Set when another gripper was applied in RTI (or its apply failed): this process still holds the old gripper's model
+# until it restarts, so enable and queued moves are refused (2026-11-18 review A3). The text says why.
+_gripper_swap_pending = None
+
+
+def _restart_for_gripper(delay_s=1.0):
+    """The executor, the self-collision worker and the dashboard restart with the new <active_gripper>
+    (tools/restart_gui_and_executor.sh --with-self-collision, detached: it signals this process too; the supervisor
+    respawns them; RTI is untouched and keeps the arm and its homing). After `delay_s`, so the reply goes out first."""
+    import subprocess  # nosec B404 — our own restart script, no shell input from outside
+    script = PROJECT_ROOT / "tools" / "restart_gui_and_executor.sh"
+    log = TEMP_DATA_DIR / "gripper_swap_restart.log"
+    cmd = f"sleep {float(delay_s):g}; exec bash {script} --with-self-collision"
+    with open(log, "w") as out:
+        subprocess.Popen(["bash", "-c", cmd], stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         start_new_session=True, cwd=str(PROJECT_ROOT))  # nosec B603 B607 — our own script
+
+
 def _handle_end_gripper_change(args, cid, conn):
-    """end_gripper_change -> RTI's gripper_change:0: ends the Change-gripper mode once the gripper answers."""
-    if not _gripper_change_refused("end_gripper_change", args, cid, conn):
-        _answered(conn, cid, "end_gripper_change", "gripper_change:0")
+    """end_gripper_change [gripper [removed]] -> RTI's gripper_change:0[:<gripper>:<0/1>]: ends the Change-gripper
+    mode once the gripper answers. `gripper`: another gripper file -> RTI applies it live (P2a,
+    TODO/live_gripper_swap_plan.md), then system.xml's <active_gripper> is saved and the executor, the self-collision
+    worker and the dashboard restart with it (RTI keeps the arm and its homing) — see _swap_gripper for the order and
+    the failures (GRIPPER_SWAP_FAILED). `removed`: the gripper left the flange -> J5 + J6 not homed (J6's Hall magnet is
+    on the gripper side). Replies {"gripper", "restart"} after the outcome."""
+    if len(args) > 2:
+        return _bad_args(cid, conn, "end_gripper_change", "end_gripper_change takes gripper and removed")
+    if not _HAS_CAN_GRIPPER:
+        refusal = "no CAN gripper: the Change-gripper mode is for a gripper with a drive"
+        _log_exec_reject(cid, "NO_GRIPPER", refusal, command="end_gripper_change")
+        return reply(conn, {"id": cid, "status": "error", "code": "NO_GRIPPER", "message": refusal})
+    name = args[0] if args else None
+    removed = args[1] if len(args) > 1 else False
+    try:
+        name = None if name is None else _arg_gripper_file(name)
+        if not isinstance(removed, bool) and removed not in (0, 1):
+            raise ValueError(f"removed is True / False, not {removed!r}")
+    except ValueError as e:
+        return _bad_args(cid, conn, "end_gripper_change", f"end_gripper_change: {e}")
+    if name is None or name == cfg.get("gripper_name"):
+        _answered(conn, cid, "end_gripper_change", f"gripper_change:0:{name or ''}:{1 if removed else 0}",
+                  data={"gripper": cfg.get("gripper_name"), "restart": False})
+        return
+    _reply_answer(conn, cid, "end_gripper_change", _swap_gripper(name, removed, cid),
+                  {"gripper": name, "restart": True})
+
+
+def _swap_gripper(name, removed, cid):
+    """Another gripper (P2a; the order since 2026-11-18, review A3): system.xml saved FIRST, so it never disagrees with
+    what RTI runs across a restart; then RTI applies it (a refusal puts the old file back); then the executor, the
+    self-collision worker and the dashboard restart with it. From the apply on, enable and queued moves are refused
+    here (_gripper_swap_pending). -> None, or the refusal {"code", "message"} naming the step that failed."""
+    global _gripper_swap_pending
+    why, before = _save_active_gripper(name)
+    if why:
+        return {"code": "GRIPPER_SWAP_FAILED", "message": f"{name} not applied, nothing changed: {why}"}
+    refusal = ask_rti(f"gripper_change:0:{name}:{1 if removed else 0}", cid)
+    state = float(shared_data.rti["gripper_change"][0])
+    if refusal is not None and refusal["code"] == "RTI_NOT_RUNNING" and state < 0.5:
+        refusal = None                                # its answer was lost, but RTI ended the change: applied
+    if refusal is not None:
+        undo = _put_back_system_xml(before)
+        refusal = dict(refusal)
+        refusal["message"] += (" (system.xml is back as it was)" if undo is None else
+                               f" (system.xml still names {name} and could not be put back: {undo} — fix it before "
+                               f"the next restart)")
+        return refusal
+    deadline = time.monotonic() + 1.0                 # RTI applies it over three ticks, then ends the change
+    while time.monotonic() < deadline and 0.5 <= state < 1.5:
+        time.sleep(0.01)
+        state = float(shared_data.rti["gripper_change"][0])
+    if state >= 0.5:
+        failed = state >= 1.5
+        _gripper_swap_pending = (f"applying {name} failed in RTI — restart the robot service" if failed else
+                                 f"RTI did not finish applying {name} within 1 s — restart the robot service")
+        log_tcp.error("end_gripper_change: %s; system.xml names %s", _gripper_swap_pending, name)
+        return {"code": "GRIPPER_SWAP_FAILED",
+                "message": f"{_gripper_swap_pending} (RTI.log says why; system.xml already names {name}, the gripper "
+                           f"fitted). The arm cannot be enabled until then."}
+    _gripper_swap_pending = (f"the gripper was changed to {name}: the executor restarts with it — connect again in a "
+                             f"few seconds")
+    try:
+        _restart_for_gripper()
+    except OSError as e:
+        _gripper_swap_pending = (f"{name} was applied and saved, but the executor's restart did not start ({e}) — "
+                                 f"restart the robot service")
+        log_tcp.error("end_gripper_change: %s", _gripper_swap_pending)
+        return {"code": "GRIPPER_SWAP_FAILED", "message": _gripper_swap_pending + ". Until then enable and moves are "
+                                                                                  "refused."}
+    log_tcp.info("end_gripper_change: %s applied in RTI and saved in system.xml; the executor, the self-collision "
+                 "worker and the dashboard restart now", name)
+    return None
 
 
 def _handle_store_gripper_tool_id(args, cid, conn):
@@ -2388,7 +2556,16 @@ def _gripper_status():
             "code": int(g['gripper_object_detection'][0]),
             # the Change-gripper mode (2026-11-17): the gripper is being swapped; "answering": its drive answers now
             "changing": bool(shared_data.rti["gripper_change"][0] >= 0.5),
-            "answering": bool(shared_data.rti["CAN_gripper_connected"][0] >= 0.5)}
+            "answering": bool(shared_data.rti["CAN_gripper_connected"][0] >= 0.5),
+            # the fitted drive's tool id and the gripper files that declare it (P2a: the proposal), the apply failed
+            "tool_id": _gripper_drive_id(), "proposed": _gripper_proposal(_gripper_drive_id()),
+            "apply_failed": bool(shared_data.rti["gripper_change"][0] >= 1.5)}
+
+
+def _gripper_drive_id():
+    """The fitted gripper drive's tool id as RTI publishes it (rti['gripper_tool'][0]), None while unknown."""
+    v = float(shared_data.rti["gripper_tool"][0])
+    return None if v < 0 else int(v)
 
 
 def _hall_check_status(rti):
@@ -3110,6 +3287,8 @@ def dispatch(msg, conn):
 
     mode, state, homed = read_live_state()
     ok, reason = validate(cmd, mode, state, homed)
+    if ok and _gripper_swap_pending is not None and (cmd == "enable" or kind_of(cmd) != IMMEDIATE):
+        ok, reason = False, f"{cmd}: {_gripper_swap_pending}"   # this process holds the old gripper (review A3)
     if not ok:
         _log_exec_reject(cid, "REJECTED", reason, command=_fmt_command(cmd, args))
         return reply(conn, {"id": cid, "status": "error", "code": "REJECTED",

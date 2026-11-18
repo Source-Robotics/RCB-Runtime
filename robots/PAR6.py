@@ -182,9 +182,9 @@ class PAR6(DHRobot):
         import os
         import glob
         import xml.etree.ElementTree as ET
-        from math import pi
 
-        deg = pi / 180
+        from utility.tool_link import tool_link_params
+
         grippers = {}
         gripper_dir = os.path.join(os.path.dirname(__file__), "..", "grippers")
 
@@ -193,26 +193,16 @@ class PAR6(DHRobot):
                 root = ET.parse(xml_path).getroot()
             except ET.ParseError:
                 continue
-            kin = root.find("kinematics")
-            if kin is None:
+            # one reader of a gripper's tool link for the model and for RTI's live gripper swap (utility/tool_link.py)
+            p = tool_link_params(root)          # a malformed block raises, as the parse always did
+            if p is None:
                 continue
             name = root.get("name")
             if not name:
                 continue
-            d     = float(kin.findtext("d"))
-            a     = float(kin.findtext("a", default="0"))
-            alpha = float(kin.findtext("alpha", default=str(pi)))
-            m     = float(kin.findtext("mass"))
-            r     = [float(x) for x in kin.findtext("com").split()]
-            I     = [float(x) for x in kin.findtext("inertia").split()]
-            Jm    = float(kin.findtext("Jm", default="1.5e-6"))
-            G     = float(kin.findtext("G",  default="10"))
-            B     = float(kin.findtext("B",  default="1e-4"))
-            Tc    = [float(x) for x in kin.findtext("Tc", default="0.02 -0.02").split()]
-            qlim  = [float(x) * deg for x in kin.findtext("qlim_deg").split()]
             grippers[name] = [
-                RevoluteDH(d=d, a=a, alpha=alpha, m=m, r=r, I=I,
-                           Jm=Jm, G=G, B=B, Tc=Tc, qlim=qlim)
+                RevoluteDH(d=p["d"], a=p["a"], alpha=p["alpha"], m=p["m"], r=p["r"], I=p["I"],
+                           Jm=p["Jm"], G=p["G"], B=p["B"], Tc=p["Tc"], qlim=p["qlim"])
             ]
 
         return grippers

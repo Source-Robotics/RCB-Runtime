@@ -6422,7 +6422,7 @@ class RobotClient:
         """
         self._immediate("begin_gripper_change")
 
-    def end_gripper_change(self) -> None:
+    def end_gripper_change(self, gripper: str | None = None, removed: bool = False) -> dict:
         """End changing the gripper once it answers again.
 
         The robot clears the gripper drive's faults, then counts its silence
@@ -6430,30 +6430,68 @@ class RobotClient:
         work again. Refused while the gripper does not answer: plug it in
         first.
 
+        With `gripper`, another gripper's file is applied: the robot takes its
+        settings, its tool length, mass and collision model and its homing
+        set-up at once, without a restart, and saves it as the active gripper
+        in `config/system.xml`. The fitted gripper's drive must be the product
+        that file names, and its tool ID that file's (a drive with none stored
+        passes). Then the executor, the self-collision checker and the dashboard
+        restart with it, about 10 s: this client's connection drops and must
+        connect again. The reply comes once the file is saved, applied and
+        the restart has started; from then until the restart, enabling and
+        moves are refused. The arm keeps holding, and keeps the homing of J1
+        to J4 (of all six joints unless `removed`).
+        A gripper with a tool ID proposes its file:
+        `latest_status()["gripper"]["proposed"]`. For now only a gripper with a
+        drive can be applied this way.
+
+        Args:
+            gripper: The name of a gripper file in `grippers/` (without
+                `.xml`), for example `"SSG48"`. `None` keeps the active one.
+            removed: Whether the gripper was taken off the flange. Then J5 and
+                J6 are no longer homed: J6's Hall magnet sits on the gripper
+                side, so its reference moves with a re-fitted gripper. Home
+                the arm before moving.
+
+        Returns:
+            A dict: `gripper` (the active gripper now) and `restart` (whether
+            the executor, the checker and the dashboard restart).
+
         Raises:
             CommandRejected: The robot refused it: the gripper is not being
-                changed, it does not answer, another client holds control, or
-                there is no CAN gripper. Or RTI refused it or did not answer
-                within 1 s (`Errors:`).
+                changed, it does not answer, another client holds control, there
+                is no CAN gripper, or the gripper file is unknown, cannot be
+                read, names another product or another tool ID. Or RTI refused
+                it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
 
         Errors:
             NO_GRIPPER: The robot has no CAN gripper.
-            BAD_ARGS: An argument was given; it takes none.
-            RTI_REFUSED: RTI refused it: the gripper is not being changed, or
-                its drive does not answer. The message says why.
+            BAD_ARGS: An unknown gripper file, a `removed` that is not True or
+                False, or more than two arguments.
+            RTI_REFUSED: RTI refused it: the gripper is not being changed, its
+                drive does not answer, a gripper is being applied, or the file
+                cannot be read, is a tool without a drive, names another product
+                or another tool ID than the fitted drive's. The message says why.
             RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
                 responding. The command may still have taken effect.
+            GRIPPER_SWAP_FAILED: Another gripper's file was not applied
+                completely: `config/system.xml` could not be saved (nothing
+                changed), RTI failed while applying it, or the restart did not
+                start. In the last two cases the arm cannot be enabled until
+                the robot service restarts. The message names the step.
 
         See also:
-            `begin_gripper_change()`, `calibrate_gripper()`
+            `begin_gripper_change()`, `calibrate_gripper()`, `home()`
 
         Examples:
             >>> robot.end_gripper_change()
-            >>> robot.calibrate_gripper()
+            >>> robot.end_gripper_change("SSG48", removed=True)
+            {'gripper': 'SSG48', 'restart': True}
         """
-        self._immediate("end_gripper_change")
+        args = [gripper, bool(removed)] if gripper is not None or removed else None
+        return self._immediate("end_gripper_change", args)
 
     def store_gripper_tool_id(self) -> dict:
         """Store this gripper's tool ID in its drive.

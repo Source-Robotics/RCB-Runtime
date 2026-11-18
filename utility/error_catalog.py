@@ -548,6 +548,13 @@ CATALOG = {
                       "it. The message gives RTI's reason, for example a setting not allowed in this real-time mode, "
                       "a name it does not know, or a file it could not use.", _REFUSED,
                       "Do what the message says, then send the command again."),
+    "GRIPPER_SWAP_FAILED": _e(6027, "Gripper change not completed",
+                              "Applying another gripper's file did not complete: system.xml could not be saved, RTI "
+                              "could not apply the file, or the restart that follows did not start. The message names "
+                              "the step.",
+                              "When nothing was applied, the active gripper is unchanged. When RTI already applied it, "
+                              "the arm cannot be enabled until the robot service restarts.",
+                              "Do what the message says: fix system.xml and try again, or restart the robot service."),
     "CONTROL_HELD": _e(6101, "Control held by another client", "Another client holds control of the robot.",
                        _REFUSED,
                        "Release control on that client, or take control. A forced takeover asks for confirmation "
