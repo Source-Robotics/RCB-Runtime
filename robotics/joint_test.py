@@ -61,14 +61,22 @@ def ramp_seconds(amplitude, speed):
     return 0.5 * math.pi * abs(amplitude) / speed
 
 
+NO_REPLY_POSITION = -99999999           # utility/data_init.get_default_motor_data's placeholder: no reply stored yet
+
+
 class JointTest:
     """`motors` the CAN library's motor objects (Send_Limits, .position, .current), `joints` the toolbox Joint objects
     (get_encoder_speed), `velocity_limit` / `current_limit` the live per-joint limits (stop() restores them), `ctx` the
     dispatch context (joint_test_joint / _pos / _speed), `rti` the rti shared-memory dict, `dt` the tick (s)."""
 
     def __init__(self, motors, joints, joint_num, velocity_limit, current_limit, ctx, rti, dt, log=None, done=None,
-                 q_meas=None, soft_lo=None, soft_hi=None):
+                 q_meas=None, soft_lo=None, soft_hi=None, motor_data=None):
         self.motors, self.joints, self.joint_num = motors, joints, int(joint_num)
+        # RTI's store of each drive's data replies (utility/data_init: {node: deque of {"position", ...}}): the start
+        # position when the drive object's own field is momentarily empty (2026-11-19 — the CAN library clears every
+        # field at each message from the drive, so after a non-data reply .position is None until the next data
+        # reply; the first-run check met "no position read yet" on 2 of 6 joints)
+        self.motor_data = motor_data
         # On a homed arm the test's travel must stay inside the soft limits (2026-10-24, user): the measured joint
         # angles (rad) and the robot XML's soft limits (rad). Unhomed, the angles mean nothing: no check then.
         self.q_meas, self.soft_lo, self.soft_hi = q_meas, soft_lo, soft_hi
@@ -87,6 +95,19 @@ class JointTest:
         self.ctx.joint_test_joint = -1
         self.ctx.joint_test_pos = None
         self.ctx.joint_test_speed = 0
+
+    RECENT_REPLIES = 8                  # data replies looked back through for a position (~32 ms at 250 Hz)
+
+    def _recent_position(self, j):
+        """The newest position among J(j+1)'s last RECENT_REPLIES data replies in RTI's store, or None."""
+        replies = self.motor_data.get(j) if self.motor_data is not None else None
+        if not replies:
+            return None
+        for k in range(1, min(len(replies), self.RECENT_REPLIES) + 1):
+            pos = replies[-k].get("position")
+            if pos is not None and pos != NO_REPLY_POSITION:
+                return pos
+        return None
 
     def _send_limits(self, j, current):
         for _ in range(LIMIT_REPEATS):
@@ -120,6 +141,8 @@ class JointTest:
                 return (f"J{j + 1} would move to {math.degrees(end):.1f} deg, past its soft limits "
                         f"({math.degrees(lo):.1f} to {math.degrees(hi):.1f} deg) — move it away first")
         pos = self.motors[j].position
+        if pos is None:
+            pos = self._recent_position(j)
         if pos is None:
             return f"no position read from J{j + 1} yet — try again"
         self._k = float(self.joints[j].get_encoder_speed(1.0))          # ticks per rad, signed

@@ -1234,7 +1234,7 @@ def main():
     joint_test = JointTest(Motor, Joint, joint_num, motor_velocity_limit, motor_Ilim, ctx, shared_data.rti, delta_t,
                            q_meas=shared_data.joint['joint_position'],
                            soft_lo=cfg['software_joint_limit_negative'], soft_hi=cfg['software_joint_limit_positive'],
-                           log=log_homing.info,
+                           log=log_homing.info, motor_data=Motor_data,
                            done=lambda text: log_activity(_rti_activity_logger, "RTI", "info", "JOINT_TEST", message=text))
 
     MODE_HANDLERS = build_mode_dispatch(

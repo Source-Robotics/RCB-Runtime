@@ -220,9 +220,10 @@ def main(argv=None, ui=None, ctx=None):
     if hasattr(ui, "finished"):
         ui.finished({"verdict": core.worst(results), "counts": c, "completed": completed, "report": folder,
                      "bundle": zip_path})
-    print()
-    print(f"Result: {core.worst(results)} — " + ", ".join(f"{c[v]} {v}" for v in c if c[v])
-          + ("" if completed else " (stopped before the end)"))
+    if not hasattr(ui, "finished"):     # a UI with its own result line (the dashboard's tab): not twice (2026-11-19)
+        print()
+        print(f"Result: {core.worst(results)} — " + ", ".join(f"{c[v]} {v}" for v in c if c[v])
+              + ("" if completed else " (stopped before the end)"))
     print(f"Report: {os.path.join(folder, 'report.txt')}")
     if zip_path:
         print(f"Support bundle: {zip_path}")

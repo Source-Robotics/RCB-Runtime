@@ -200,6 +200,18 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- The first-run check's small test moves (stage 3) no longer move a joint the way that has no room. On an arm not homed
+  yet, the check asks whether the arm rests folded and moves each joint only its free way from that rest pose (the robot
+  XML's new `<first_run_move from_rest>`, `+` when missing), never the other way automatically; on a homed arm it
+  plans each test move both ways first (joint limits, safety zones, self-collision; nothing moves) and moves only a
+  way that passes. A test move refused with "no position read yet — try again" is retried the same way (it was taken
+  for blocked and the joint was moved the other way), and the robot's joint test takes its start position from the
+  drive's last data reply, so that refusal is rare. The direction question names both ways in words.
+- The first-run check's stage 5 clears a refused plan before it tries the other way (every later move was refused
+  `MOTION_ABORTED`); its stop test waits 0.5 s in EXEC before the move and judges the commanded J1 too (a move that did
+  not play is told apart from a joint that did not follow). The Hall repeat compares both edges of the magnet's field,
+  so a last pass turned the other way no longer reads as 30 deg apart. The dashboard's First run tab showed the result
+  line twice.
 - The Gripper tab's Mode toggle sent a command whenever the display updated it to the robot's mode: right after a
   gripper swap a `NO_GRIPPER` error (the executor still had the old tool), control taken for 5 s on opening the tab,
   and a click undone before the robot confirmed it. Only a click sends now.

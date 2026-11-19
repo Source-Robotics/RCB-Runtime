@@ -18,6 +18,8 @@ self-collision checks guard it.
 """
 from __future__ import annotations
 
+import math
+
 from first_run import shm_files
 from first_run.core import FAIL, INFO, PASS, SKIP, WARN, Aborted, Cancelled, claim, result, step
 from robotclient import CommandRejected, RobotTimeout
@@ -36,6 +38,9 @@ STOP_DEG = 30.0                  # S5.stop's J1 move (2026-11-19, review K8: was
 STOP_AFTER_S = 0.6               # its last part) ... stopped this long after it started: at cruise, about a third in
 HOLD_DRIFT_DEG = 0.5
 STOP_MIN_MOVED_DEG = 0.5     # less when the stop came: J1 had not really started, the stop was not tested
+EXEC_SETTLE_S = 0.5          # the stop test's move starts this long after EXEC is entered (2026-11-19: sent 43 ms
+#                              after the mode change, J1 had moved 0.04 deg when the stop came 0.6 s later)
+FOLLOW_STOP_DEG = 2.0        # the command moved this much more than the measured J1 at the stop: J1 did not follow
 GRIPPER_TIMEOUT_S = 30.0
 SCALE_ANSWERS = ["about that", "clearly less (half or less)", "clearly more (double or more)", "I saw no movement"]
 
@@ -156,6 +161,7 @@ def _turn(ctx, ui, st, j, deg, held_before):
             if e.code not in NOT_PLANNED:
                 raise _Ended(e.code, e.message)
             refused.append(f"{'+' if sign > 0 else '-'}: {e.message}")
+            _clear_refusal(robot)
             continue
         try:
             back = _leg(ctx, ui, j, q0, f"{name} turns back")
@@ -226,6 +232,21 @@ def _homed_exec(ctx, ui, st, ask):
         except CommandRejected as e:
             return result(st, SKIP, f"the robot refused EXEC mode: {e.message}")
     return None
+
+
+def _clear_refusal(robot):
+    """A planned move the robot refused aborts the program (every later move MOTION_ABORTED until clear_errors, as on
+    the real executor): cleared before the other way is tried (2026-11-19: it was not — the other way always failed)."""
+    try:
+        robot.clear_errors(wait=True)
+    except Exception:                  # noqa: BLE001 — the next move then names what is wrong
+        pass
+
+
+def _commanded_j(ctx, j):
+    """J(j+1)'s COMMANDED position in degrees (shared memory read as a file, this Pi), or None."""
+    v = _shm(ctx).floats("joint_position_commanded", j + 1)
+    return None if not v or len(v) <= j else math.degrees(v[j])
 
 
 def _leave_exec(robot):
@@ -315,7 +336,9 @@ def check_stop(ctx, ui):
         return stop
     robot = ctx["robot"]
     try:
+        _pause(ui, "EXEC settles before the move", EXEC_SETTLE_S)
         q0 = _joints_deg(robot)
+        c0 = _commanded_j(ctx, 0)
         for sign in (1, -1):
             target = list(q0)
             target[0] += sign * STOP_DEG
@@ -326,14 +349,17 @@ def check_stop(ctx, ui):
                 break                     # moving: stop it now
             except CommandRejected as e:
                 if e.code in NOT_PLANNED and sign > 0:
+                    _clear_refusal(robot)
                     continue              # no room the + way: the other way
                 return result(st, SKIP, f"J1's move was not possible ({e.code}): {e.message}")
             return result(st, WARN, "J1's move finished before the stop could come — the stop was not tested",
                           hints=["the arm's EXEC speed limits are high: this check's STOP_AFTER_S is too long"])
+        c_stop = _commanded_j(ctx, 0)
         robot.stop(wait=True)
         s = robot.get_status() or {}
         at = _joints_deg(robot)
         moved = abs(at[0] - q0[0])
+        commanded = abs(c_stop - c0) if c0 is not None and c_stop is not None else None
         try:
             _pause(ui, "J1 holds after the stop", 1.0)
         except Cancelled:
@@ -350,8 +376,17 @@ def check_stop(ctx, ui):
         elif moved >= STOP_DEG - 0.5:
             out = result(st, WARN, f"J1 reached its target ({moved:.1f} deg) — the stop came too late to show",
                          value=round(moved, 2))
+        elif commanded is not None and commanded - moved > FOLLOW_STOP_DEG:
+            out = result(st, FAIL, f"J1 was commanded {commanded:.1f} deg but moved only {moved:.2f} deg when the stop "
+                                   "came — it did not follow its command", value=round(moved, 2),
+                         expected=f"within {FOLLOW_STOP_DEG:g} deg of its command",
+                         hints=["the dashboard's Errors tab: a drive fault or a tracking error",
+                                "J1's coupling / belt slipping, or the joint blocked"])
         elif moved < STOP_MIN_MOVED_DEG:
-            out = result(st, WARN, f"J1 had moved only {moved:.2f} deg when the stop came — the stop was not tested",
+            told = (f" (its command had moved {commanded:.2f} deg: the move had not started playing)"
+                    if commanded is not None else "")
+            out = result(st, WARN, f"J1 had moved only {moved:.2f} deg when the stop came — the stop was not "
+                                   f"tested{told}",
                          value=round(moved, 2), hints=["the move started late (the robot was busy planning), or it "
                                                        "was refused: the dashboard's Errors / Activity Log tab"])
         else:

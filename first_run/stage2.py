@@ -35,6 +35,7 @@ ROBOT_REACT_S = 1.0         # RTI latches ESTOP on the tick it reads it: allow a
 OUTPUT_ON_S = 2.0
 OUTPUT_ANSWERS = ("yes", "no", "again", "not wired")   # "again": switch it once more, ask again (a mis-typed answer)
 HALL_REPEAT_DEG = 2.0       # the same edge twice further apart than this: the magnet or the sensor is loose
+HALL_SETTLE_S = 1.0         # the repeat is read once the pin has not changed for this long (the user let go)
 ESTOP_KEYS = ("ESTOP",)
 # The control box's terminal block (docs/pin_map.md): isolated inputs 1-3, outputs 1-3; E-Stop 1 = E2 + E4.
 INPUT_TERMINALS = (11, 10, 9)
@@ -206,6 +207,48 @@ def check_outputs(ctx, ui):
     return out
 
 
+def _settled_after(ctx, changes, interval_s=0.1):
+    """A ui.wait poll (every interval_s): the Hall status once it has `changes` pin changes and none for HALL_SETTLE_S
+    — the user has finished turning; a sensor flickering at an edge counts extra changes (2026-11-19) — else None.
+    Counted in polls, the wait's own clock."""
+    seen = {"n": -1, "still": 0}
+    need = max(1, int(round(HALL_SETTLE_S / interval_s)))
+
+    def poll():
+        h = _hall(ctx)
+        n = int(h.get("changes", 0))
+        if n != seen["n"]:
+            seen["n"], seen["still"] = n, 0
+            return None
+        seen["still"] += 1
+        return h if n >= changes and seen["still"] >= need else None
+    return poll
+
+
+def _repeat_result(st, first_edges, again_edges):
+    """The repeat against the first pass: both edges of the magnet's field (where the pin changed to 0 and to 1). A
+    pass the other way swaps which edge is which (the 2026-11-19 run: 30.5 deg "apart" = the field's two sides), so
+    the closer pairing is judged, and said."""
+    try:
+        a0, a1 = (float(x) for x in first_edges)
+        b0, b1 = (float(x) for x in again_edges)
+    except (TypeError, ValueError):
+        return result(st, WARN, "the trigger angles were not recorded both times", value=again_edges)
+    if not all(math.isfinite(x) for x in (a0, a1, b0, b1)):
+        return result(st, WARN, "the trigger angles were not recorded both times", value=again_edges)
+    same = max(abs(a0 - b0), abs(a1 - b1))
+    swapped = max(abs(a0 - b1), abs(a1 - b0))
+    d = min(same, swapped)
+    how = "" if same <= swapped else " (the repeat went the other way: compared edge for edge)"
+    return result(st, PASS if d <= HALL_REPEAT_DEG else WARN,
+                  f"the magnet's edges {d:.2f} deg apart on the two passes{how}", value=round(d, 3),
+                  expected=f"within {HALL_REPEAT_DEG} deg",
+                  details={"first_deg": [a0, a1], "repeat_deg": [b0, b1], "reversed": same > swapped},
+                  hints=[] if d <= HALL_REPEAT_DEG else
+                  ["the magnet or the sensor is loose, or the gap is so large the sensor triggers late; homing "
+                   "relies on this point"])
+
+
 def _hall(ctx):
     """status()["hall_check"]: {"joint", "pin", "changes", "edge_deg"} (the status stream)."""
     return (ctx["robot"].status() or {}).get("hall_check") or {}
@@ -258,23 +301,12 @@ def check_hall(ctx, ui):
             raise
         if repeat:
             robot.hall_check(True)      # renewed again: the question above may have taken a while
-            again = ui.wait(f"Turn {name} back past the magnet, then through it again the same way",
-                            lambda: (lambda h: h if h.get("changes", 0) >= 6 else None)(_hall(ctx)), HALL_TIMEOUT_S,
-                            0.1)
+            again = ui.wait(f"Turn {name} back past the magnet, then through it again the same way, then let go",
+                            _settled_after(ctx, 6), HALL_TIMEOUT_S, 0.1)
             if again is None:
                 out.append(result(st, WARN, "the repeat was not completed", value=_hall(ctx)))
             else:
-                a, b = (first.get("edge_deg") or [None])[0], (again.get("edge_deg") or [None])[0]
-                if a is None or b is None or not (math.isfinite(a) and math.isfinite(b)):
-                    out.append(result(st, WARN, "the trigger angle was not recorded both times", value=again))
-                else:
-                    d = abs(a - b)
-                    out.append(result(st, PASS if d <= HALL_REPEAT_DEG else WARN,
-                                      f"triggered {d:.2f} deg apart on the two passes", value=round(d, 3),
-                                      expected=f"within {HALL_REPEAT_DEG} deg",
-                                      hints=[] if d <= HALL_REPEAT_DEG else
-                                      ["the magnet or the sensor is loose, or the gap is so large the sensor "
-                                       "triggers late; homing relies on this point"]))
+                out.append(_repeat_result(st, first.get("edge_deg"), again.get("edge_deg")))
         return out
     finally:
         robot.hall_check(False)

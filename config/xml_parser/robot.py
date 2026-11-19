@@ -339,9 +339,11 @@ def _collision_nm(contact: Iterable[float | None], collision: Iterable[float | N
 
 
 def _first_run_moves(joints) -> list:
-    """Per joint <first_run_move amplitude_deg speed_dps current_ma/> as {"amplitude_deg", "speed_dps", "current_ma"}
-    (floats); None where the element is missing or a value is not a positive number (the check then skips that
-    joint's powered move rather than guess a force)."""
+    """Per joint <first_run_move amplitude_deg speed_dps current_ma from_rest/> as {"amplitude_deg", "speed_dps",
+    "current_ma", "from_rest"} (floats); None where the element is missing or a value is not a positive number (the check
+    then skips that joint's powered move rather than guess a force). from_rest (2026-11-19, the user): the way the joint
+    is free to move from the arm's REST pose (folded, as it lies switched off), "+" (the default) or "-" — on an arm not
+    homed yet, where nothing else says where it stands, the check moves it only that way: +1.0 / -1.0."""
     out: list = []
     for joint in joints.findall("joint"):
         el = joint.find("first_run_move")
@@ -349,7 +351,11 @@ def _first_run_moves(joints) -> list:
             d = {k: float(el.get(k)) for k in ("amplitude_deg", "speed_dps", "current_ma")} if el is not None else None
         except (TypeError, ValueError):
             d = None
-        out.append(d if d is not None and all(v == v and v > 0 for v in d.values()) else None)
+        if d is not None and all(v == v and v > 0 for v in d.values()):
+            d["from_rest"] = -1.0 if (el.get("from_rest") or "+").strip().startswith("-") else 1.0
+            out.append(d)
+        else:
+            out.append(None)
     return out
 
 
