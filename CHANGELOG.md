@@ -170,6 +170,9 @@ What changed in each version of the RCB runtime. The newest version is at the to
   swapped, and the runtime, the client's `GripperResult` and the dashboard were built on that; with 1.22 (now pinned)
   every part uses the firmware's meaning. A program that tests `code == 2` after a close must test `1` (or use
   `GripperResult.object_detected`, unchanged). Codes 0 and 3 are unchanged.
+- **Command protocol 3** (was 2), for the gripper codes above: a client and a robot of different command protocols
+  refuse each other at connect, so a 1.1.x client cannot read the codes the old way on a new robot. Update the
+  robotclient on every PC together with the robot. A client that sends raw JSON sends `"protocol": 3`.
 - `open_gripper()` / `close_gripper()`, the dashboard's Open / Close and the blocks' gripper scale use the gripper's
   full stroke, positions 0 and 255 (they were 1 and 254). Gripper firmware 110 sets both calibrated ends clear of the
   mechanical stops, so the jaws arrive there with a few mA instead of pressing into a stop; on older gripper firmware
@@ -179,6 +182,11 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- Every 16.4 s the CAN commands fell up to 20 ms behind for about 80 ms (each joint missed 4-5 replies in a row).
+  The cause was the SD card: in its SDR104 mode the Pi re-tunes it every 16.4 s, about 41 ms of kernel work that
+  ran on the CAN core and held up the CAN send work. `scripts/setup_system.sh` now removes SDR104 and SDR50 from
+  the Pi 5 device trees, so the card runs at DDR50 (no re-tuning, top speed about 50 MB/s), and `--check` reports a
+  device tree a firmware update has put them back in. It takes effect after a reboot.
 - A CAN dropout of 40-200 ms during homing re-sent the drive's full current limit, so the rest of the homing pushed
   into the endstop at full current (and a freed or Hall-checked joint was energised under the user's hand). RTI now
   records the limits it last sent each drive, and a reconnect re-sends those.

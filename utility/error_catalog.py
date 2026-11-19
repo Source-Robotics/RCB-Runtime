@@ -529,7 +529,7 @@ CATALOG = {
                          "angles had another meaning. A pose it sends could turn the tool to another orientation.",
                          _REFUSED,
                          "Use the robotclient that came with the robot's runtime. A client that sends raw JSON adds "
-                         "\"protocol\": 2 to each message."),
+                         "\"protocol\": 3 to each message."),
     "NO_GRIPPER": _e(6023, "No gripper", "The robot has no CAN gripper, so a gripper command cannot run.", _REFUSED,
                      "Leave gripper commands out of the program, or select a CAN gripper as <active_gripper> in "
                      "config/system.xml and restart the robot service."),

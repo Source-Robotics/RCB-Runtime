@@ -20,7 +20,10 @@ functions, importable by both the executor and (later) tests without side effect
 # 2 (2026-10-24, user: "yes, percent + protocol 2"): every share of a limit is a percent, 0 < p <= 100 (jog 0-100) — a
 # move's speed / accel / jerk, set_joint_speed, jog's speed. Under 1 a value <= 1 was a fraction, so "1 %" ran at 100 %;
 # a client and a robot of different numbers refuse each other at connect instead of misreading a speed.
-PROTOCOL_VERSION = 2
+# 3 (2026-11-19, user: "Raise the version to 3"): a gripper result's object codes 1 and 2 swapped their meaning (1 =
+# an object detected while CLOSING, 2 = while OPENING: the driver library 1.22 reads the firmware's bits right) — a
+# program testing a raw code would read the other direction silently; GripperResult.object_detected is unchanged.
+PROTOCOL_VERSION = 3
 
 # The commands whose arguments carry pose ANGLES (2026-10-21, with versioning V5). Pose angles changed their meaning
 # on 2026-10-21 (R = Rx(rx) Ry(ry) Rz(rz)), and a client from before then sends no "protocol" key: the executor refuses

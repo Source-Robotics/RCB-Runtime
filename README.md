@@ -25,7 +25,8 @@ The order that reproduces the reference robot (2026-10-16). Each step names the 
    tests run it — *Python packages: which Python runs the robot*.
 6. **The system part**: `sudo bash scripts/setup_system.sh` — user groups, the password-free sudo rule, the
    real-time capability on the robot's Python, `autorun.service` (+ `LimitMEMLOCK=infinity`, `LimitRTPRIO=99`), the
-   journal / syslog limits. Add `--allowed-ips "IP,IP"` for the PCs that may send commands (`*` = any: isolated
+   journal / syslog limits, the SD card held at DDR50 (the Pi 5 device trees without SDR104 / SDR50: that mode
+   re-tunes the card every 16 s on the CAN core; reboot after it). Add `--allowed-ips "IP,IP"` for the PCs that may send commands (`*` = any: isolated
    networks only).
 7. **Check everything**: `bash scripts/setup_system.sh --check` (exit 0 = nothing missing; run it with the arm
    disabled — it starts a Python that imports the runtime's packages). Run it again after every `apt upgrade`: an
@@ -425,10 +426,12 @@ command or a new field does not change it.
 - Commands that carry pose angles are refused with `CLIENT_TOO_OLD` when the client
   declares no command protocol. Pose angles changed their meaning in 0.9.0, and an
   older client would turn the tool to another orientation. A client that sends raw
-  JSON adds `"protocol": 2` to each message.
+  JSON adds `"protocol": 3` to each message.
 - Command protocol 2: every speed share is a percent (`set_joint_speed()`, a move's
   `speed`, `accel` and `jerk`, `jog()`): 1 means 1 %. A client and a robot of
   different command protocols refuse each other at connect.
+- Command protocol 3: a gripper result's object codes 1 and 2 swapped their meaning
+  (1 = an object detected while closing, 2 = while opening).
 
 ### Hardware versions
 

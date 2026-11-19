@@ -20,6 +20,10 @@
 #                --allowed-ips, allowed-ips.conf (RCB_ALLOWED_IPS); an existing unit or autorun.sh is checked, never
 #                overwritten
 #     logs       tools/system_log_limits.sh: the journal 200 MB, syslog 50 MB, logrotate hourly
+#     sd card    the Pi 5 device trees (/boot/firmware/bcm2712*-rpi-5-b.dtb) without sd-uhs-sdr104 / sd-uhs-sdr50, so
+#                the SD card runs at DDR50 (2026-11-19): at SDR104 it re-tunes every 16.4 s, ~41 ms of kernel work on
+#                the CAN core, and the CAN commands fell up to 20 ms behind (TODO/review_2026-11-18.md E1); a firmware
+#                package update can bring the lines back — run this again; takes effect at the next reboot
 #
 #   bash scripts/setup_system.sh --check          # report only, no sudo; exit 1 when anything is missing
 #   sudo bash scripts/setup_system.sh [--user NAME] [--allowed-ips LIST]
@@ -114,6 +118,32 @@ if real; then
         ok "no login prompt on the UART (serial-getty@ttyAMA0: ${GETTY:-not installed})"
     fi
 fi
+
+# ------------------------------------------------------------------ sd card
+# 2026-11-19 (review E1): the SD card's SDR104 mode re-tunes every 16.4 s in a kernel worker on the CAN core (~41 ms);
+# the controller reports no fast mode itself, so the device tree's two properties are the only source of SDR104/SDR50
+echo "sd card"
+SD_NODE=/axi/mmc@fff000
+for dtb in "$ROOT/boot/firmware/bcm2712-rpi-5-b.dtb" "$ROOT/boot/firmware/bcm2712d0-rpi-5-b.dtb"; do
+    [ -f "$dtb" ] || continue
+    name="$(basename "$dtb")"
+    if ! command -v fdtget > /dev/null 2>&1; then
+        miss "$name: cannot read it (no fdtget)"
+        fix "sudo apt install device-tree-compiler"
+        continue
+    fi
+    props="$(fdtget -p "$dtb" "$SD_NODE" 2>/dev/null | grep -E '^sd-uhs-(sdr104|sdr50)$' | tr '\n' ' ')"
+    if [ -z "$props" ]; then
+        ok "$name: SD card at DDR50 (no SDR104 / SDR50)"
+    elif apply; then
+        [ -f "$dtb.before_sd_ddr50" ] || cp -p "$dtb" "$dtb.before_sd_ddr50"
+        for prop in $props; do fdtput -d "$dtb" "$SD_NODE" "$prop"; done
+        did "$name: removed ${props% } (the SD card at DDR50 from the next reboot; the original: $name.before_sd_ddr50)"
+    else
+        miss "$name: ${props% } — the SD card re-tunes every 16.4 s on the CAN core"
+        fix "sudo bash $0   (then reboot)"
+    fi
+done
 
 # ------------------------------------------------------------------ python
 echo "python"
