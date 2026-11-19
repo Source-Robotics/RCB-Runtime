@@ -20,10 +20,12 @@
 #                --allowed-ips, allowed-ips.conf (RCB_ALLOWED_IPS); an existing unit or autorun.sh is checked, never
 #                overwritten
 #     logs       tools/system_log_limits.sh: the journal 200 MB, syslog 50 MB, logrotate hourly
-#     sd card    the Pi 5 device trees (/boot/firmware/bcm2712*-rpi-5-b.dtb) without sd-uhs-sdr104 / sd-uhs-sdr50, so
-#                the SD card runs at DDR50 (2026-11-19): at SDR104 it re-tunes every 16.4 s, ~41 ms of kernel work on
-#                the CAN core, and the CAN commands fell up to 20 ms behind (TODO/review_2026-11-18.md E1); a firmware
-#                package update can bring the lines back — run this again; takes effect at the next reboot
+#     sd card    the Pi 5 device trees (/boot/firmware/bcm2712*-rpi-5-b.dtb): the SD card's periodic re-tuning off
+#                (the re-tuning timer bits 0x0f00 set in sdhci-caps-mask) and the card at DDR50 (no sd-uhs-sdr104 /
+#                sd-uhs-sdr50) (2026-11-19): the re-tuning ran every 16.4 s, ~41 ms of kernel work that could land on
+#                the CAN core, and the CAN commands fell up to 20 ms behind (TODO/review_2026-11-18.md E1). The card
+#                still tunes at boot and after a checksum error. A firmware package update can replace the files —
+#                run this again; takes effect at the next reboot
 #
 #   bash scripts/setup_system.sh --check          # report only, no sudo; exit 1 when anything is missing
 #   sudo bash scripts/setup_system.sh [--user NAME] [--allowed-ips LIST]
@@ -120,10 +122,15 @@ if real; then
 fi
 
 # ------------------------------------------------------------------ sd card
-# 2026-11-19 (review E1): the SD card's SDR104 mode re-tunes every 16.4 s in a kernel worker on the CAN core (~41 ms);
-# the controller reports no fast mode itself, so the device tree's two properties are the only source of SDR104/SDR50
+# 2026-11-19 (review E1): Linux re-tunes the SD card every 16.4 s (~41 ms of kernel work, on whichever core issues the
+# card's next request — the CAN core too) at SDR104 AND at DDR50 (sdhci tunes both). The period comes from the
+# controller's re-tuning timer count (capabilities-1 bits 8-11); masking those bits in sdhci-caps-mask (the property's
+# first cell = capabilities-1) leaves the period 0: the card tunes at boot and after a checksum error only. DDR50 (no
+# SDR104 / SDR50) keeps the wide timing margin that needs no periodic re-tuning; the controller reports no fast mode
+# itself, so the two sd-uhs properties are the only source of SDR104 / SDR50.
 echo "sd card"
 SD_NODE=/axi/mmc@fff000
+SD_RETUNE_TIMER_BITS=0x0f00
 for dtb in "$ROOT/boot/firmware/bcm2712-rpi-5-b.dtb" "$ROOT/boot/firmware/bcm2712d0-rpi-5-b.dtb"; do
     [ -f "$dtb" ] || continue
     name="$(basename "$dtb")"
@@ -133,14 +140,23 @@ for dtb in "$ROOT/boot/firmware/bcm2712-rpi-5-b.dtb" "$ROOT/boot/firmware/bcm271
         continue
     fi
     props="$(fdtget -p "$dtb" "$SD_NODE" 2>/dev/null | grep -E '^sd-uhs-(sdr104|sdr50)$' | tr '\n' ' ')"
-    if [ -z "$props" ]; then
-        ok "$name: SD card at DDR50 (no SDR104 / SDR50)"
+    read -r mask_hi mask_lo < <(fdtget -t x "$dtb" "$SD_NODE" sdhci-caps-mask 2>/dev/null)
+    mask_hi="${mask_hi:-0}"; mask_lo="${mask_lo:-0}"
+    timer_on=0
+    [ $(( 0x$mask_hi & SD_RETUNE_TIMER_BITS )) -ne $(( SD_RETUNE_TIMER_BITS )) ] && timer_on=1
+    if [ -z "$props" ] && [ "$timer_on" = "0" ]; then
+        ok "$name: SD card at DDR50, no periodic re-tuning"
     elif apply; then
         [ -f "$dtb.before_sd_ddr50" ] || cp -p "$dtb" "$dtb.before_sd_ddr50"
         for prop in $props; do fdtput -d "$dtb" "$SD_NODE" "$prop"; done
-        did "$name: removed ${props% } (the SD card at DDR50 from the next reboot; the original: $name.before_sd_ddr50)"
+        if [ "$timer_on" = "1" ]; then
+            fdtput -t x "$dtb" "$SD_NODE" sdhci-caps-mask \
+                "$(printf '0x%x' $(( 0x$mask_hi | SD_RETUNE_TIMER_BITS )))" "0x$mask_lo"
+        fi
+        did "$name: SD card at DDR50, periodic re-tuning off (from the next reboot; the original: $name.before_sd_ddr50)"
     else
-        miss "$name: ${props% } — the SD card re-tunes every 16.4 s on the CAN core"
+        [ -n "$props" ] && miss "$name: ${props% } — the SD card can run at SDR104 / SDR50"
+        [ "$timer_on" = "1" ] && miss "$name: the SD card re-tunes every 16.4 s (~41 ms of kernel work, the CAN core too)"
         fix "sudo bash $0   (then reboot)"
     fi
 done

@@ -183,10 +183,11 @@ What changed in each version of the RCB runtime. The newest version is at the to
 ### Fixed
 
 - Every 16.4 s the CAN commands fell up to 20 ms behind for about 80 ms (each joint missed 4-5 replies in a row).
-  The cause was the SD card: in its SDR104 mode the Pi re-tunes it every 16.4 s, about 41 ms of kernel work that
-  ran on the CAN core and held up the CAN send work. `scripts/setup_system.sh` now removes SDR104 and SDR50 from
-  the Pi 5 device trees, so the card runs at DDR50 (no re-tuning, top speed about 50 MB/s), and `--check` reports a
-  device tree a firmware update has put them back in. It takes effect after a reboot.
+  The cause was the SD card: Linux re-tunes it every 16.4 s, about 41 ms of kernel work on whichever core uses
+  the card next, the CAN core too, where it held up the CAN send work. `scripts/setup_system.sh` now switches
+  the periodic re-tuning off in the Pi 5 device trees (the card still tunes at boot and after a checksum error)
+  and runs the card at DDR50 (top speed about 50 MB/s; its wide timing margin needs no periodic re-tuning).
+  `--check` reports a device tree a firmware update has replaced. It takes effect after a reboot.
 - A CAN dropout of 40-200 ms during homing re-sent the drive's full current limit, so the rest of the homing pushed
   into the endstop at full current (and a freed or Hall-checked joint was energised under the user's hand). RTI now
   records the limits it last sent each drive, and a reconnect re-sends those.

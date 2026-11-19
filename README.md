@@ -25,9 +25,9 @@ The order that reproduces the reference robot (2026-10-16). Each step names the 
    tests run it — *Python packages: which Python runs the robot*.
 6. **The system part**: `sudo bash scripts/setup_system.sh` — user groups, the password-free sudo rule, the
    real-time capability on the robot's Python, `autorun.service` (+ `LimitMEMLOCK=infinity`, `LimitRTPRIO=99`), the
-   journal / syslog limits, the SD card held at DDR50 (the Pi 5 device trees without SDR104 / SDR50: that mode
-   re-tunes the card every 16 s on the CAN core; reboot after it). Add `--allowed-ips "IP,IP"` for the PCs that may send commands (`*` = any: isolated
-   networks only).
+   journal / syslog limits, the SD card at DDR50 without periodic re-tuning (the Pi 5 device trees: Linux re-tuned
+   the card every 16 s, ~41 ms that could land on the CAN core; reboot after it). Add `--allowed-ips "IP,IP"` for
+   the PCs that may send commands (`*` = any: isolated networks only).
 7. **Check everything**: `bash scripts/setup_system.sh --check` (exit 0 = nothing missing; run it with the arm
    disabled — it starts a Python that imports the runtime's packages). Run it again after every `apt upgrade`: an
    upgrade of Python removes the real-time capability (*Real-time priority*).
