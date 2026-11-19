@@ -193,6 +193,27 @@ def restart_script(name, processes, SCRIPTS):
     logger.info(f"Restarted {name} (PID {processes[name].pid})")
 
 
+# tools/restart_gui_and_executor.sh writes "<unix time> <script> <script> ..." here before it stops those scripts (the
+# gripper swap runs it): their exits within PLANNED_RESTART_S are planned (2026-11-19: they were logged as ERRORs
+# "stopped unexpectedly"). In the repo's own temp_data, not TEMP_DATA_DIR (the simulator moves that).
+PLANNED_RESTART_FILE = PROJECT_ROOT / "temp_data" / "planned_restart"
+PLANNED_RESTART_S = 60.0
+
+
+def _planned_restart(cmd, now=None, path=None):
+    """True when the script `cmd` runs (its last word: the .py path) is named in a planned-restart note at most
+    PLANNED_RESTART_S old. Never raises: no note, an old or unreadable one = not planned."""
+    try:
+        words = (path or PLANNED_RESTART_FILE).read_text().split()
+        stamp = float(words[0])
+    except (OSError, ValueError, IndexError):
+        return False
+    if not -5.0 <= (time.time() if now is None else now) - stamp <= PLANNED_RESTART_S:     # -5: whole-second stamps
+        return False
+    script = os.path.splitext(os.path.basename(str(cmd).split()[-1] if str(cmd).split() else ""))[0]
+    return bool(script) and script in words[1:]
+
+
 def monitor_scripts(emergency_stop, processes, SCRIPTS):
     """
     Monitor running scripts, check responsiveness, and restart if necessary.
@@ -230,6 +251,12 @@ def monitor_scripts(emergency_stop, processes, SCRIPTS):
             continue
 
         if process.poll() is not None:
+            if _planned_restart(SCRIPTS.get(name, "")):
+                logger.info(f"{name} stopped as planned (exit {process.returncode}): tools/restart_gui_and_executor.sh "
+                            f"restarts it (a gripper swap, or a restart by hand) — restarting it")
+                restart_script(name, processes, SCRIPTS)
+                status_dict[name] = {"status": "restarted (planned)"}
+                continue
             logger.error(f"{name} stopped unexpectedly (exit {process.returncode}) — restarting it. "
                         f"See logs/{name}.out.log")
             restart_script(name, processes, SCRIPTS)

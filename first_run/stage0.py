@@ -75,7 +75,8 @@ def check_config(ctx, ui):
                                         active_gripper=sysc["active_gripper"])
     except Exception as e:   # any parse failure is the finding
         return result(st, FAIL, f"the configuration does not load: {type(e).__name__}: {e}",
-                      hints=[f"{SYSTEM_XML}: <robot> must name a file in robots/, <gripper> one in grippers/",
+                      hints=[f"{SYSTEM_XML}: <active_robot> must name a file in robots/, <active_gripper> one in "
+                             "grippers/ ('none' = no gripper)",
                              "an XML syntax error: the message names the file and the line"])
     ok, issues = xp.validate_robot_config(cfg)
     can_gripper = _is_one(cfg.get("gripper_CAN_gripper", 0))        # NaN = no gripper
@@ -95,6 +96,10 @@ def check_config(ctx, ui):
     if not ok:
         return result(st, FAIL, summary + f" — {len(issues)} problem(s) in the robot / gripper XML", value=value,
                       hints=list(issues), details={"issues": list(issues)})
+    warnings = [i for i in issues if i.startswith("[WARNING]")]
+    if warnings:      # 2026-11-19 (review K8): the validator's warnings were hidden under a PASS
+        return result(st, WARN, summary + f" — {len(warnings)} warning(s) in the robot / gripper XML", value=value,
+                      hints=warnings, details={"issues": list(issues)})
     return result(st, PASS, summary, value=value, details={"issues": list(issues)})
 
 

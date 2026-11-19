@@ -49,6 +49,12 @@ RTI_PID="$(pid_of RTI)"
 RTI_START="$(lstart "$RTI_PID")"
 echo "supervisor pid $SUP_PID (group $SUP_PGID)   RTI pid ${RTI_PID:-none} started: ${RTI_START:-n/a}"
 
+# A planned restart (2026-11-19): the supervisor reads this note and logs the exits below as planned, not as an
+# "stopped unexpectedly" ERROR (supervisor/process_manager.py PLANNED_RESTART_FILE; it trusts it for 60 s).
+if [ "$DRY" != 1 ]; then
+  mkdir -p "$ROOT/temp_data" && echo "$(date +%s) ${SCRIPTS[*]}" > "$ROOT/temp_data/planned_restart"
+fi
+
 declare -A OLD_PID
 for s in "${SCRIPTS[@]}"; do
   pid="$(pid_of "$s")"

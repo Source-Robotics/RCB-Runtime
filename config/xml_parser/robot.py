@@ -368,6 +368,35 @@ def _first_run_scale(joints) -> list:
     return out
 
 
+def _apply_gripper_home_offsets(cfg: dict, gripper_elem: ET.Element, gripper_name: str) -> None:
+    """The active gripper's <arm_joint_home_offsets> replace the robot XML's home offset of the joints flagged
+    home_offset_gripper_dependent (and are listed in cfg['gripper_home_offset_joints']); a value that is not a
+    number raises (2026-11-19, review K1)."""
+    offsets_elem = gripper_elem.find('arm_joint_home_offsets')
+    if offsets_elem is not None:
+        gripper_joint_offsets = {}
+        for jelem in offsets_elem.findall('joint'):
+            jid = jelem.get('id')
+            if jid is not None and jelem.text:
+                try:
+                    gripper_joint_offsets[int(jid)] = float(jelem.text.strip())
+                except ValueError:
+                    # 2026-11-19 (review K1): was skipped silently — "-2,070" homed J5 with the robot XML's fallback
+                    raise ValueError(
+                        f"gripper '{gripper_name}': <arm_joint_home_offsets> joint {jid!r} is not a number: "
+                        f"{jelem.text.strip()!r} (radians, a point as the decimal sign)") from None
+
+        dep_flags = cfg['home_offset_gripper_dependent']
+        home_offsets = cfg['home_offset'].copy()
+        for j, flag in enumerate(dep_flags):
+            if not np.isnan(flag) and int(flag) == 1:
+                if j in gripper_joint_offsets:
+                    home_offsets[j] = gripper_joint_offsets[j]
+                    cfg['gripper_home_offset_joints'].append(j)
+                # If flag is set but gripper has no entry, keep the robot XML fallback
+        cfg['home_offset'] = home_offsets
+
+
 def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None = None,
                            active_gripper: str | None = None) -> dict:
     """
@@ -527,6 +556,9 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
         'gripper_collision':      {"file": (gripper_elem.find("collision").get("file") if gripper_elem is not None and gripper_elem.find("collision") is not None else None),
                                    "pairs": _parse_collision_pairs(gripper_elem.find("collision") if gripper_elem is not None else None, "collision", frame_b=6)},
         'gripper_name':           gripper_name,
+        # what the gripper file says was never measured on this gripper (review K4, 2026-11-19): validate warns
+        'gripper_not_measured':   ((gripper_elem.findtext('not_measured') or '').split()
+                                   if gripper_elem is not None else []),
         'gripper_driver_type':    _gstr('driver_type'),
         'gripper_tool_id':        _tool_id(_gstr('tool_id'), gripper_name),     # None = not declared: not checked
         'gripper_stroke':         _gval('Stroke'),
@@ -605,26 +637,7 @@ def load_full_robot_config(xml_path: str | Path, grippers_dir: str | Path | None
     # For joints marked home_offset_gripper_dependent=1, replace the robot XML value
     # with the per-joint offset from the active gripper's <arm_joint_home_offsets> block.
     if gripper_elem is not None:
-        offsets_elem = gripper_elem.find('arm_joint_home_offsets')
-        if offsets_elem is not None:
-            gripper_joint_offsets = {}
-            for jelem in offsets_elem.findall('joint'):
-                jid = jelem.get('id')
-                if jid is not None and jelem.text:
-                    try:
-                        gripper_joint_offsets[int(jid)] = float(jelem.text.strip())
-                    except ValueError:
-                        pass
-
-            dep_flags = cfg['home_offset_gripper_dependent']
-            home_offsets = cfg['home_offset'].copy()
-            for j, flag in enumerate(dep_flags):
-                if not np.isnan(flag) and int(flag) == 1:
-                    if j in gripper_joint_offsets:
-                        home_offsets[j] = gripper_joint_offsets[j]
-                        cfg['gripper_home_offset_joints'].append(j)
-                    # If flag is set but gripper has no entry, keep the robot XML fallback
-            cfg['home_offset'] = home_offsets
+        _apply_gripper_home_offsets(cfg, gripper_elem, gripper_name)
 
         # ---- the tool's homing travel limits (2026-11-16, user: the bare flange's J6 can start anywhere) ----
         # <arm_joint_homing_max_travel_deg><joint id="5">360</joint>: replaces the robot XML's <homing_max_travel_deg>

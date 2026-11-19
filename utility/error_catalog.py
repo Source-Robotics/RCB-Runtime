@@ -326,6 +326,13 @@ CATALOG = {
     "EXEC_LINK_LOST": _e(3101, "Executor stopped responding",
                          "The command executor went silent while the robot ran EXEC motion.", _HARD,
                          "Restart the service. Clear errors, then enable the robot."),
+    "EXEC_DISCONTINUITY": _e(3103, "EXEC trajectory did not continue from the arm",
+                             "A trajectory batch started farther from where the arm was commanded to be than the "
+                             "joints can move in one tick (2 x their speed limit): RTI refused it before it moved and "
+                             "dropped the program. A planner fault, or a program planned from a stale position.",
+                             _HARD,
+                             "Clear errors and run the program again. If it repeats, send the logs (RTI.log names the "
+                             "joint and the distance)."),
     "RTI_LINK_LOST": _e(3102, "External PC stopped sending",
                         "The PC that held RTI control stopped sending setpoints.", _STREAM,
                         "Check the network and the PC's program. " + _AGAIN_RTI),

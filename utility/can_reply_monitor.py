@@ -9,8 +9,10 @@ short for CAN_STALE (10 ticks) or a disconnect (200 ms). This counts them.
 Per joint, a run of ticks without a reply that ENDS (a reply arrives) and was shorter than CAN_STALE's 10 ticks is added
 to a 1 s window — a longer run is CAN_STALE's / CAN_LOST's to report. MISSED_WARN (5, user) or more in the window starts
 a BURST, which lasts until the window is under half that. A burst that lasts SUSTAIN_S (3 s, user) becomes a live
-warning (never a stop); RTI.log gets its peak, how long it lasted and the total since the start when it ends. A shorter
-burst is one INFO line when it ends: on the arm (2026-10-12, after the fix) such bursts come with LOAD — another program
+warning (never a stop); RTI.log gets its peak, how long it lasted and the total since the start when it ends. Shorter
+bursts are ONE INFO line for every joint involved, when the last of them ends (2026-11-19; a line per joint was ~95 % of
+RTI.log). Kernel work on the CAN core causes them too: the SD card's re-tuning every 16.4 s did until 2026-11-19
+(TODO/review_2026-11-18.md E1). On the arm (2026-10-12, after the fix) such bursts come with LOAD — another program
 starting or a heavy job slows RTI's tick (memory traffic), its frames leave later (when it sleeps) and the last joints'
 replies come a tick late for ~1 s; the freezes this was built for were continuous (~10 a second through a whole
 stream). Counted only on ticks whose reads should hold a reply: the previous tick sent every joint a data command (not
@@ -54,6 +56,7 @@ class CanReplyMonitor:
         self._peak = [0] * joint_num
         self._burst = [0] * joint_num        # ticks the joint's burst has lasted (0 = none)
         self._bursting = 0                   # joints in a burst
+        self._episode = []                   # (joint, lasted s, peak) of the bursts ended since no joint was bursting
         self._keys = [f"J{j + 1}:{CAN_REPLY_MISSED_WARNING}" for j in range(joint_num)]
         self.warnings = set()
 
@@ -107,13 +110,25 @@ class CanReplyMonitor:
                     logger.info(f"J{j + 1}: replies back on time after {lasted:.1f} s; the gap peaked at "
                                  f"{self._peak[j]} missed in {self.window} ticks ({self.total[j]} missed since the start)")
                 else:
-                    logger.info(f"J{j + 1}: a {lasted:.1f} s burst of late replies (peak {self._peak[j]} missed in "
-                                 f"{self.window} ticks; {self.total[j]} since the start) — not sustained, no warning "
-                                 f"(usually load on the Pi)")
+                    self._episode.append((j, lasted, self._peak[j]))
                 self._burst[j] = 0
                 self._bursting -= 1
+                if not self._bursting and self._episode:
+                    self._log_episode()
             elif key not in self.warnings and self._burst[j] >= self.sustain_ticks:
                 self.warnings.add(key)
                 logger.warning(f"J{j + 1}: its replies have kept missing RTI's read for "
                                 f"{self._burst[j] * self.delta_t:.1f} s ({c} of the last {self.window}) — its measured "
                                 f"state is a tick old (TODO/servo_mode_options.md §17.23)")
+
+    def _log_episode(self):
+        """Cold: ONE line for the short bursts of every joint since no joint was bursting (2026-11-19, review E2: a line
+        per joint made ~95 % of RTI.log, and the old text blamed load, which the SD card's 16 s re-tuning was not)."""
+        ep = self._episode
+        lasted = max(e[1] for e in ep)
+        joints = ", ".join(f"J{j + 1}" for j, _, _ in ep)
+        peaks = ", ".join(f"J{j + 1} {p}" for j, _, p in ep)
+        logger.info(f"{joints}: a {lasted:.1f} s burst of late replies (peak missed in {self.window} ticks: {peaks}; "
+                     f"{sum(self.total)} missed since the start, all joints) — not sustained, no warning (load on the "
+                     f"Pi, e.g. a program starting, or kernel work on the CAN core)")
+        ep.clear()

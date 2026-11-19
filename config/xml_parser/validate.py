@@ -92,6 +92,35 @@ def _check_encoder_bits(cfg: dict, issues: list[str]) -> None:
                 )
 
 
+DRIVE_CAP_TOLERANCE = 0.02     # a drive cap this far below the joint limit or less is not reported (PAR6's J3-J6: 0.2-1 %)
+
+
+def _check_drive_speed_cap(cfg: dict, issues: list[str]) -> None:
+    """A drive told to cap the motor below the joint's speed limit (a warning; 2026-11-19, review K3).
+
+    The drive's <Velocity_limit> (motor ticks/s) at the joint = ticks/s x 2 pi / 2^encoder / gear ratio. Below
+    <joint_velocity_limit> (the ceiling of EXEC, RTI and jog), a move near the limit asks for more than the drive gives:
+    the joint falls behind its command. PAR6's J2 was 1.23 rad/s against 1.5 until 2026-11-19.
+    """
+    vel = _cfg_array(cfg, "motor_velocity_limit")
+    enc = _cfg_array(cfg, "motor_encoder")
+    gear = _cfg_array(cfg, "gear_ratio")
+    lim = _cfg_array(cfg, "joint_velocity_limit")
+    if vel is None or enc is None or gear is None or lim is None:
+        return
+    for i in range(min(len(vel), len(enc), len(gear), len(lim))):
+        if not all(np.isfinite(x) and x > 0 for x in (vel[i], enc[i], gear[i], lim[i])):
+            continue
+        cap = vel[i] * 2.0 * np.pi / 2.0 ** enc[i] / gear[i]
+        if cap < lim[i] * (1.0 - DRIVE_CAP_TOLERANCE):
+            need = int(np.ceil(lim[i] * gear[i] * 2.0 ** enc[i] / (2.0 * np.pi) / 1000.0) * 1000)
+            issues.append(
+                f"[WARNING] J{i + 1} (joint id {i}): its drive's Velocity_limit {vel[i]:.0f} ticks/s caps the joint at "
+                f"{cap:.2f} rad/s, below its joint_velocity_limit {lim[i]:g} rad/s — a move above "
+                f"{100.0 * cap / lim[i]:.0f} % of it falls behind; raise Velocity_limit to {need} or lower the limit"
+            )
+
+
 def _check_hard_limits(cfg: dict, jn: int, issues: list[str]) -> tuple[np.ndarray | None, np.ndarray | None]:
     """The hard (endstop) joint limits, in either sign convention. Returns the two arrays for the soft check."""
     lim_neg = _cfg_array(cfg, "joint_limit_negative")
@@ -167,9 +196,20 @@ def _check_loop_timing(cfg: dict, issues: list[str]) -> None:
 
 
 def _check_gripper(cfg: dict, issues: list[str]) -> None:
-    """A named gripper must have brought its kt and Gear_r along (its XML present and well-named)."""
+    """A gripper with a drive on the CAN bus must have brought its kt and Gear_r along. A tool without one (the
+    Flange, a vacuum or pneumatic gripper: <CAN_gripper> not 1) has neither, and a missing gripper file stops the start
+    since 2026-11-19 (load_gripper_element) — until then this warned for every tool without a drive."""
     gripper_name = cfg.get("gripper_name", "")
-    if gripper_name and gripper_name.lower() not in ("none", "unknown", ""):
+    missing = list(cfg.get("gripper_not_measured") or [])
+    if missing:          # review K4 (2026-11-19): a variant file whose values are placeholders
+        issues.append(f"[WARNING] gripper '{gripper_name}': not measured on this gripper: {', '.join(missing)} — "
+                      f"placeholder values (its file's <not_measured>); measure them before relying on its forces, "
+                      f"jaw positions or the arm's gravity model")
+    try:
+        on_can = int(float(cfg.get("gripper_CAN_gripper", 0))) == 1
+    except (TypeError, ValueError):
+        on_can = False
+    if on_can and gripper_name and gripper_name.lower() not in ("none", "unknown", ""):
         gripper_kt = cfg.get("gripper_kt")
         if gripper_kt is None or (isinstance(gripper_kt, float) and np.isnan(gripper_kt)):
             issues.append(
@@ -216,6 +256,7 @@ def validate_robot_config(cfg: dict) -> tuple[bool, list[str]]:
     _check_required_arrays(cfg, jn, issues)
     _check_positive(cfg, issues)
     _check_encoder_bits(cfg, issues)
+    _check_drive_speed_cap(cfg, issues)
     lim_neg, lim_pos = _check_hard_limits(cfg, jn, issues)
     _check_soft_limits(cfg, jn, lim_neg, lim_pos, issues)
     _check_loop_timing(cfg, issues)

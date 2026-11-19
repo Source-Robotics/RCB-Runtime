@@ -38,7 +38,8 @@ REPORTS_DIR = os.path.join(str(TEMP_DATA_DIR), "first_run")
 STAGES = {0: "The Pi and the configuration", 1: "Power and CAN", 2: "E-stop, buttons, I/O, Hall sensor",
           3: "Small test moves", 4: "Homing", 5: "The homed arm"}      # first_run.core.STAGE_TITLES (a net compares)
 BUNDLE_MODES = {"ask": "ask at the end", "yes": "yes", "no": "no"}
-VERDICT_COLOURS = {"PASS": "positive", "WARN": "warning", "FAIL": "negative", "SKIP": "grey", "INFO": "info"}
+VERDICT_COLOURS = {"PASS": "positive", "WARN": "warning", "FAIL": "negative", "SKIP": "grey", "INFO": "info",
+                   "INCOMPLETE": "warning"}      # the run's verdict when nothing was judged (first_run/core.py)
 RECENT = 10
 
 

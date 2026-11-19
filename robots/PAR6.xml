@@ -129,20 +129,20 @@
             <Ilim>2800</Ilim>  <!-- 2026-10-09: was 2500 (user's new tune) --> <!-- Current limit in mA -->
             <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
             <Velocity_limit>80000</Velocity_limit>
-            <joint_velocity_limit>1.5</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s -->
+            <joint_velocity_limit>1.2</joint_velocity_limit> <!-- (Joint) Velocity limit in rad/s. 2026-11-19 (review K3, user): was 1.5 — the drive's Velocity_limit 80000 ticks/s caps J2 at 1.23 rad/s (14-bit, 25:1), so above ~82 % it fell behind; this is what J2 always really reached -->
             <joint_acceleration_limit>10.0</joint_acceleration_limit> <!-- (Joint) Acceleration limit in rad/s^2. LIBERAL TEST VALUE 2026-08-06 — was 3.0. See joint 0. Shared with EXEC and JOG. -->
             <joint_jerk_limit>5000.0</joint_jerk_limit> <!-- (Joint) Jerk limit in rad/s^3. LIBERAL TEST VALUE 2026-08-06 — was 150.0. 500x accel; above accel/dt (2500.0) so it does not bind at 250 Hz. See joint 0. -->
             <torque_rate_limit>2005.0</torque_rate_limit> <!-- (Joint) Max commanded-torque slew in Nm/s. LIBERAL TEST VALUE 2026-08-06 — was 200.5. 10x. See joint 0. -->
 
             <!-- Queued motion — pre-liberal; see joint 0. -->
             <exec_limits>
-                <velocity>1.5</velocity>
+                <velocity>1.2</velocity> <!-- 2026-11-19: was 1.5 (K3, see joint_velocity_limit) -->
                 <acceleration>3.0</acceleration>
                 <jerk>9.0</jerk> <!-- Jerk in rad/s^3 — see joint 0. -->
             </exec_limits>
             <!-- Streamed external control — full ceiling; see joint 0. -->
             <rti_limits>
-                <velocity>1.5</velocity>
+                <velocity>1.2</velocity> <!-- 2026-11-19: was 1.5 (K3, see joint_velocity_limit) -->
                 <acceleration>10.0</acceleration>
                 <jerk>5000.0</jerk>
                 <torque_rate>2005.0</torque_rate>

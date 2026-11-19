@@ -3,17 +3,19 @@
     <driver_type>stepfoc</driver_type>  <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
     <tool_id>31</tool_id>  <!-- What the gripper's drive is built into (its parameter 1, firmware 109+): 1 = SSG-48; an MSG 11-33 = tens the rail (1/2/3 = 100/150/200 mm), units the motor (1/2/3 = small 21.5 / medium 40 / large 60 mm). RTI compares the drive's with this one: another = GRIPPER_TOOL_MISMATCH, the arm cannot be enabled; 0 = not stored yet (the Gripper tab stores it). 2026-11-17. -->
     <hardware_revision>v1.0</hardware_revision>  <!-- This gripper's hardware revision (2026-10-21, versioning V4): the Versions card and get_versions show it. -->
+    <not_measured>Stroke mass com inertia</not_measured>  <!-- 2026-11-19 (review K4): same motor as MSG_small_motor_150mm_rail, whose Kt and gains this file carries since 2026-11-19; its jaw travel and mass properties are this rail's, not measured. The robot's configuration check warns while this gripper is active; remove a word once it is measured -->
     <Stroke>200</Stroke>       <!-- Stroke in mm -->
-    <kt>0.111</kt>                 <!-- Torque constant in Nm/A TODO: verify for small motor -->
+    <kt>0.174</kt>                 <!-- Nm/A: MSG_small_motor_150mm_rail's drive reports 0.174 (the same motor; review K4, 2026-11-19 — was the placeholder 0.111) -->
     <Ilim>1700</Ilim>              <!-- Current limit in mA -->
     <voltage_limit>6000</voltage_limit>  <!-- Voltage limit in mV (0 = use VBUS). Requires motor firmware that supports it. -->
     <Velocity_limit>80000</Velocity_limit>
     <watchdog_rate>5000</watchdog_rate>   <!-- Motor velocity limit in ticks/s -->
-    <KPP>5</KPP>
-    <KPV>0.015</KPV>
-    <KIV>0.0005</KIV>
-    <KIIQ>1</KIIQ>
-    <KPIQ>7</KPIQ>
+    <!-- 2026-11-19 (review K4): MSG_small_motor_150mm_rail's tune (2026-10-09, the same motor). Was: KPP 5, KPV 0.015, KIV 0.0005, KIIQ 1, KPIQ 7 -->
+    <KPP>69</KPP>
+    <KPV>0.016</KPV>
+    <KIV>0.0003</KIV>
+    <KIIQ>0.3</KIIQ>
+    <KPIQ>2.2</KPIQ>
     <KP>0.12</KP>
     <KD>0.002</KD>
     <Gear_r>0.0083</Gear_r>
@@ -29,6 +31,11 @@
     <has_hall_sensor>0</has_hall_sensor>
     <home_offset>0.0</home_offset>
     <homing_timeout_s>8.0</homing_timeout_s>
+    <!-- 2026-11-19 (review K4): copied from MSG_small_motor_150mm_rail.xml, where it was measured (2026-10-09): how
+         long homing waits after the firmware calibrate command before it accepts "calibrated". It must cover a WHOLE
+         calibration (the firmware keeps the old "calibrated" while it recalibrates; an abandoned one made every 12th
+         homing fail). ~4.5 s measured on that gripper; missing -> 2.0 s. -->
+    <homing_calibration_wait_s>5.5</homing_calibration_wait_s>
     <homing_two_pass>1</homing_two_pass>
     <homing_two_pass_max_diff>200</homing_two_pass_max_diff>
     <homing_backoff_s>0.8</homing_backoff_s>

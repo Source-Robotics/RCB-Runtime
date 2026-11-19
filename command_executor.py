@@ -75,7 +75,7 @@ from utility.payload import check_payload
 from utility.haptic_walls import (damping_ratio_window, effective_inertia_range, joint_drive_torque,
                                   make_effective_inertia, resolve_joint_walls, wall_dynamics_limits, walls_public)
 from motion.exec_commands import (
-    DEFAULT_PROFILE, MotionOptions, QueuedCommand, normalize_profile_name, normalize_ik_solver_name,
+    DEFAULT_PROFILE, MotionOptions, QueuedCommand, blend_problem, normalize_profile_name, normalize_ik_solver_name,
 )
 from motion.ik_config import DEFAULT_FK_JACOBIAN_BACKEND
 from utility.activity_log import get_exec_activity_logger, log_activity, note_origin, origin_of
@@ -868,6 +868,9 @@ def _build_queued_command(cid, cmd, args, option_overrides):
         # every curve fail CURVE_BLEND_UNSUPPORTED). A blend asked for on the curve itself is still refused.
         defaults = replace(defaults, blend=0.0)
     options = MotionOptions.from_dict(option_overrides, defaults)
+    problem = blend_problem(cmd, options)      # review M2 (2026-11-19): a blend the profile cannot do -> BAD_OPTIONS
+    if problem is not None:
+        raise ValueError(problem)
     return QueuedCommand.build(cid, _next_command_seq(), cmd, args, options)
 
 

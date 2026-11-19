@@ -154,6 +154,34 @@ def normalize_blend_mode_name(mode: object) -> str:
             f"(expected one of {', '.join(SUPPORTED_BLEND_MODES)})")
 
 
+# The moves a blend chain can hold (the planner's _chain_family: move_joints, or the move_linear family).
+BLEND_CHAIN_COMMANDS = ("move_joints", "move_linear", "move_linear_rel_world", "move_linear_rel_tool")
+
+
+def blend_problem(cmd: str, options: "MotionOptions") -> str | None:
+    """Why this move cannot have the blend its options ask for, or None (2026-11-19, review M2).
+
+    A zone / tolerance blend needs profile 'toppra' and ruckig_corner profile 'ruckig' on a move_joints. The planner
+    used to fall back to separate moves with only a log line, and in that fallback read the zone's millimetres as an
+    exact-velocity percent: velocity steps between the moves. The executor refuses the move instead (BAD_OPTIONS),
+    before anything is planned. Only moves that can join a chain are judged: blend 0 or a move that never blends
+    (move_pose, the curves) is never refused for its session defaults.
+    """
+    if cmd not in BLEND_CHAIN_COMMANDS or not options.blend or float(options.blend) <= 0.0:
+        return None
+    mode = options.blend_mode
+    profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
+    if mode in ("zone", "tolerance") and profile != "toppra":
+        return (f"blend_mode='{mode}' (blend {options.blend:g} mm) needs profile='toppra', this move has "
+                f"profile='{profile}' — pass profile='toppra' (or set_profile('toppra')), or blend_mode='exact_velocity'")
+    if mode == "ruckig_corner":
+        if cmd != "move_joints":
+            return f"blend_mode='ruckig_corner' is for move_joints only, not {cmd} — use blend_mode='zone' there"
+        if profile != "ruckig":
+            return (f"blend_mode='ruckig_corner' needs profile='ruckig', this move has profile='{profile}'")
+    return None
+
+
 SUPPORTED_BLEND_CONTINUITY = ("c1", "c2")
 
 

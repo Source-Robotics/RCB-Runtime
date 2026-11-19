@@ -9,7 +9,9 @@ Verifies step 1 of TODO/safety_stack_research.md §8 through the real TCP path:
   3. An async program [legal, illegal, legal]: the first runs, the second is JOINT_LIMIT, the third
      is ABORTED and never runs.
   4. After jogging, the next EXEC move starts from where the arm IS, not from where the last EXEC
-     move ended (before this, J5 would first snap back to the old endpoint).
+     move ended (before this, J5 would first snap back to the old endpoint). Judged on the COMMANDED position
+     (read from shared memory on this Pi): the measured J5 sags a little at the mode changes (0.59 deg toward the
+     old endpoint on 2026-11-19, nothing commanded), so it only has a looser bound.
   5. Leaving EXEC mid-move (enter_idle_mode) fails the pending command at once with ABORTED —
      before this, the client waited out its 120 s timeout for a move RTI had thrown away.
 
@@ -41,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from robotclient import RobotClient                                   # noqa: E402
 from robotclient.exceptions import CommandRejected                    # noqa: E402
 import config.xml_parser as xp                                        # noqa: E402
+from first_run import shm_files                                       # noqa: E402  (the commanded joints, as files)
 
 J = 4                     # J5, 0-based
 _ok, _bad = 0, []
@@ -58,6 +61,12 @@ def check(name, cond, detail=""):
 
 def joints(robot):
     return np.asarray(robot.get_joints(), dtype=float)
+
+
+def commanded_j5():
+    """J5's COMMANDED position in degrees (shared memory read as a file — this Pi only), or None."""
+    v = shm_files.floats("joint_position_commanded", J + 1)
+    return None if v is None else float(np.degrees(v[J]))
 
 
 def with_j5(q, deg):
@@ -218,16 +227,26 @@ def main():
         c = b + 2.0 * np.sign(b - a)
         robot.move_joints(*[float(x) for x in with_j5(joints(robot), c)], speed=args.speed)
         toward_a = 0.0
+        toward_a_cmd = None                 # the same for the COMMANDED position (None: not readable here)
         t_end = time.monotonic() + args.timeout
         while time.monotonic() < t_end:
             now = float(joints(robot)[J])
             toward_a = max(toward_a, (b - now) * np.sign(b - a))     # >0 = moved back toward A
+            qc = commanded_j5()
+            if qc is not None:
+                toward_a_cmd = max(toward_a_cmd or 0.0, (b - qc) * np.sign(b - a))
             st = robot.status().get("planner") or {}
             if not st.get("active_command") and not st.get("queue_depth") and abs(now - c) < 0.3:
                 break
             time.sleep(0.02)
         robot.wait_idle(timeout=args.timeout, raise_on_error=False)
-        check("J5 never snapped back toward the old endpoint A", toward_a < 0.5, f"max {toward_a:.2f} deg toward A")
+        if toward_a_cmd is not None:
+            check("J5's command never snapped back toward the old endpoint A", toward_a_cmd < 0.5,
+                  f"commanded max {toward_a_cmd:.2f} deg toward A; measured {toward_a:.2f}")
+            check("...and the measured J5 stayed within 1.5 deg of where it was jogged to (it sags a little at the "
+                  "mode changes)", toward_a < 1.5, f"measured max {toward_a:.2f} deg toward A")
+        else:                               # not on the robot's Pi: the measured position only, the old bound
+            check("J5 never snapped back toward the old endpoint A", toward_a < 0.5, f"max {toward_a:.2f} deg toward A")
         move(robot, q0, args.speed, args.timeout)
 
         print("\n5. Leaving EXEC mid-move fails the pending command at once")

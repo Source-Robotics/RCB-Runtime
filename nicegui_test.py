@@ -58,6 +58,10 @@ publish_disk_info(shared_data)
 JOINTS = 6
 
 _sys_cfg = load_system_config(SYSTEM_XML, ROBOTS_DIR)
+# The gripper Mode toggle (review G7, 2026-11-19): 'syncing' while the display follows the robot (the handler then
+# sends nothing); the last click's time, so the sync does not undo it before the robot confirms.
+_grp_mode_sync = {'syncing': False, 'clicked_at': 0.0}
+GRIPPER_MODE_CONFIRM_S = 1.0
 # Times shown in the box's chosen zone (config/system.xml <display_timezone>, the System Info tab's "Time" card)
 import utility.display_time as display_time  # noqa: E402
 display_time.set_zone(_sys_cfg.get("display_timezone"))
@@ -482,6 +486,12 @@ with ui.card().classes("w-full mb-2"):
         robot_mode_badge  = ui.badge("MODE: ---")
         robot_state_badge = ui.badge("STATE: ---").props("color=blue outline")
         homed_badge       = ui.badge("NOT HOMED").props("color=orange outline")
+        # The active gripper (2026-11-19, the user): config/system.xml's <active_gripper> as this page was built — every
+        # gripper swap restarts the dashboard, so it is the one in force. "none" = no gripper.
+        tool_badge        = ui.badge(f"TOOL: {_sys_cfg.get('active_gripper') or 'none'}").props(
+            "color=grey-8 outline").tooltip(
+            "The active gripper / tool: config/system.xml <active_gripper>. Change it in the Gripper tab "
+            "(Change gripper); the dashboard restarts after a change.")
         # Shown only while RTI runs the SIMULATED robot (tools/sim_run.py; RTI writes sim_mode at start, 2026-10-13).
         sim_badge         = ui.badge("SIMULATION").props("color=purple").tooltip(
             "RTI runs the SIMULATED robot (tools/sim_run.py): simulated drives on a virtual CAN bus — no arm moves, "
@@ -998,7 +1008,14 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             _gripper_cmd_state['action'] = 1
             _send_gripper_cmd(here, "gripper_stop")
 
+        # Review G7 (2026-11-19): setting the toggle from code fires this same handler, so the 10 Hz display sync sent a
+        # command nobody clicked — a NO_GRIPPER error right after a gripper swap (the executor still had the old tool),
+        # control taken for 5 s on opening the tab, and a click undone before the robot confirmed it. Only a click
+        # sends now; after one the sync waits GRIPPER_MODE_CONFIRM_S for the robot to follow.
         def _on_gripper_ctrl_mode(e):
+            if _grp_mode_sync['syncing']:
+                return                                  # the display following the robot, not a click
+            _grp_mode_sync['clicked_at'] = time.monotonic()
             mode = 2 if e.value == 'firmware' else 1
             _exec(lambda r: r.set_gripper_ctrl_mode(mode), "gripper_ctrl_mode")
 
@@ -4102,10 +4119,17 @@ def update_tables():
             gripper_mode_badge.text = "MODE: ---"
             gripper_mode_badge.props("color=grey outline")
 
-        # Reflect current ctrl_mode in the toggle without re-firing on_change
+        # Reflect current ctrl_mode in the toggle without sending anything (review G7, 2026-11-19: set_value fires
+        # the click handler — the flag tells it apart); not within GRIPPER_MODE_CONFIRM_S of a click (the robot's
+        # answer may not be in shared memory yet: the click would be undone)
         _expected_toggle = 'firmware' if _grp_ctrl == 2 else 'motor'
-        if gripper_ctrl_mode_toggle.value != _expected_toggle:
-            gripper_ctrl_mode_toggle.set_value(_expected_toggle)
+        if (gripper_ctrl_mode_toggle.value != _expected_toggle
+                and time.monotonic() - _grp_mode_sync['clicked_at'] > GRIPPER_MODE_CONFIRM_S):
+            _grp_mode_sync['syncing'] = True
+            try:
+                gripper_ctrl_mode_toggle.set_value(_expected_toggle)
+            finally:
+                _grp_mode_sync['syncing'] = False
 
         # Gripper command status text — derives motion / object detection from
         # gripper_object_detection (the gripper's codes 0–3), gripper_action, and the

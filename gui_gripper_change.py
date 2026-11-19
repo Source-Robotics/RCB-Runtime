@@ -132,8 +132,9 @@ def add_change_card(shared_data, exec_fn, has_gripper: bool, current: str = "", 
         with ui.dialog() as dlg, ui.card().classes("max-w-lg"):
             ui.label(f"Apply {name}?" if other else "Done changing the gripper?").classes("text-lg font-bold")
             ui.label((f"The robot takes {name}'s settings, tool model and homing set-up now and saves it as the active "
-                      f"gripper. Then the executor, the collision checker and this dashboard restart (about 10 s; this "
-                      f"page reloads). " if other else "")
+                      f"gripper. Then the executor, the collision checker and this dashboard restart: this page reloads "
+                      f"within a few seconds, and the robot answers again within about a minute (the executor "
+                      f"rebuilds its models). " if other else "")
                      + "The arm keeps holding but is then not homed: enable it and home it again from here. "
                        "That homing takes J5's and J6's new spots for this gripper without asking.").classes("text-sm")
             with ui.row().classes("gap-2 justify-end w-full mt-2"):

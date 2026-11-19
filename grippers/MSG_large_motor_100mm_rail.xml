@@ -3,6 +3,7 @@
     <driver_type>stepfoc</driver_type>  <!-- Driver board firmware product: stepfoc | spectral-bldc. Used to refuse a mismatched firmware image (docs/firmware_flashing.md). -->
     <tool_id>13</tool_id>  <!-- What the gripper's drive is built into (its parameter 1, firmware 109+): 1 = SSG-48; an MSG 11-33 = tens the rail (1/2/3 = 100/150/200 mm), units the motor (1/2/3 = small 21.5 / medium 40 / large 60 mm). RTI compares the drive's with this one: another = GRIPPER_TOOL_MISMATCH, the arm cannot be enabled; 0 = not stored yet (the Gripper tab stores it). 2026-11-17. -->
     <hardware_revision>v1.0</hardware_revision>  <!-- This gripper's hardware revision (2026-10-21, versioning V4): the Versions card and get_versions show it. -->
+    <not_measured>Stroke kt gains mass com inertia</not_measured>  <!-- 2026-11-19 (review K4): its motor's Kt and gains, its jaw travel and its mass properties were never measured: placeholders (the Kt 0.111, the pre-2026-10-09 gains, the SSG48's or another variant's mass). The robot's configuration check warns while this gripper is active; remove a word once it is measured -->
     <Stroke>100</Stroke>       <!-- Stroke in mm -->
     <kt>0.111</kt>                 <!-- Torque constant in Nm/A TODO: verify for large motor -->
     <Ilim>1700</Ilim>              <!-- Current limit in mA -->
@@ -29,6 +30,11 @@
     <has_hall_sensor>0</has_hall_sensor>
     <home_offset>0.0</home_offset>
     <homing_timeout_s>8.0</homing_timeout_s>
+    <!-- 2026-11-19 (review K4): copied from MSG_small_motor_150mm_rail.xml, where it was measured (2026-10-09): how
+         long homing waits after the firmware calibrate command before it accepts "calibrated". It must cover a WHOLE
+         calibration (the firmware keeps the old "calibrated" while it recalibrates; an abandoned one made every 12th
+         homing fail). ~4.5 s measured on that gripper; missing -> 2.0 s. -->
+    <homing_calibration_wait_s>5.5</homing_calibration_wait_s>
     <homing_two_pass>1</homing_two_pass>
     <homing_two_pass_max_diff>200</homing_two_pass_max_diff>
     <homing_backoff_s>0.8</homing_backoff_s>

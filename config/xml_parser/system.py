@@ -8,6 +8,7 @@ Split out of the single-file config/xml_parser.py on 2026-10-03 (refactor Phase 
 from __future__ import annotations
 
 import logging
+import math
 import os
 logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
@@ -626,41 +627,43 @@ def _parse_rti_defaults(elem: ET.Element | None) -> dict:
 def _parse_jog_defaults(elem: ET.Element | None) -> dict:
     """Read the optional <jog_defaults> section from system.xml.
 
-    Missing or malformed individual fields fall back to _JOG_DEFAULTS_FALLBACK
-    so older system.xml files (without the section) still load cleanly.
+    Missing fields fall back to _JOG_DEFAULTS_FALLBACK so older system.xml files (without the section) still load
+    cleanly. A field that is present but unusable — not a number, not finite, out of its range, an unknown word — also
+    gets the default, with a WARNING naming the field (2026-11-19, review K2: speed_pct 20, as every API speed since
+    protocol 2, or nan was clamped to 1.0 = FULL jog speed without a word, accel_time nan gave the hardest ramp).
     """
     if elem is None:
         return dict(_JOG_DEFAULTS_FALLBACK)
 
     out = dict(_JOG_DEFAULTS_FALLBACK)
 
-    speed = elem.findtext("speed_pct", default="").strip()
-    if speed:
+    def number(tag: str, ok, rule: str) -> None:
+        text = elem.findtext(tag, default="").strip()
+        if not text:
+            return
         try:
-            out["speed_pct"] = max(0.0, min(1.0, float(speed)))
+            value = float(text)
         except ValueError:
-            pass
+            value = math.nan
+        if math.isfinite(value) and ok(value):
+            out[tag] = value
+        else:
+            logger.warning("system.xml <jog_defaults><%s>%s</%s>: must be %s — using %s", tag, text, tag, rule,
+                           _JOG_DEFAULTS_FALLBACK[tag])
 
-    accel = elem.findtext("accel_time", default="").strip()
-    if accel:
-        try:
-            out["accel_time"] = max(0.05, float(accel))
-        except ValueError:
-            pass
+    def word(tag: str, allowed: tuple[str, ...]) -> None:
+        text = elem.findtext(tag, default="").strip().lower()
+        if not text:
+            return
+        if text in allowed:
+            out[tag] = text
+        else:
+            logger.warning("system.xml <jog_defaults><%s>%s</%s>: must be %s — using %s", tag, text, tag,
+                           " or ".join(allowed), _JOG_DEFAULTS_FALLBACK[tag])
 
-    profile = elem.findtext("profile", default="").strip().lower()
-    if profile in ("trapezoidal", "scurve"):
-        out["profile"] = profile
-
-    jerk = elem.findtext("jerk_factor", default="").strip()
-    if jerk:
-        try:
-            out["jerk_factor"] = max(0.5, float(jerk))
-        except ValueError:
-            pass
-
-    control_mode = elem.findtext("control_mode", default="").strip().lower()
-    if control_mode in ("pid", "pd"):
-        out["control_mode"] = control_mode
-
+    number("speed_pct", lambda v: 0.0 < v <= 1.0, "a fraction above 0 and at most 1.0 (0.20 = 20 %)")
+    number("accel_time", lambda v: v >= 0.05, "a number of at least 0.05 s")
+    word("profile", ("trapezoidal", "scurve"))
+    number("jerk_factor", lambda v: v >= 0.5, "a number of at least 0.5")
+    word("control_mode", ("pid", "pd"))
     return out

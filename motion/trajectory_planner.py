@@ -2357,7 +2357,10 @@ class TrajectoryPlanner(Thread):
             "profile": self._current_profile,
             "ik_solver": normalize_ik_solver_name(options.ik_solver or "pinocchio"),
             "speed": self._speed_scale_for(options),
-            "blend": self._blend_pct_for(options),
+            # % under exact_velocity, mm of the corners under zone / tolerance / ruckig_corner (blend_strategy says which)
+            "blend": (self._blend_pct_for(options)
+                      if (options.blend_mode or "exact_velocity") == "exact_velocity"
+                      else float(options.blend or 0.0)),
             "completion_policy": options.completion_policy or "settled",
             # Real now: reflect the command's actual blend mode + singularity policy
             # (blend_strategy previously always logged "exact_velocity" even for zone
@@ -2436,7 +2439,29 @@ class TrajectoryPlanner(Thread):
                 f"longer, or raise the limits.")
         return float(np.clip(fastest / t, 1e-3, 1.0))
 
+    def _successor_target_problem(self, nxt_target, start, nxt_cid):
+        """The next move_joints' target checks (joint limits, zones, self-collision — what _plan_move_joints checks
+        before planning it), run BEFORE this move commits a corner speed into it (2026-11-19, review M3): a successor
+        that fails them would have left the arm to stop dead at the corner from that speed. Returns the PlannerError's
+        code, or None; the successor is refused by name when its own turn comes."""
+        try:
+            self._check_joint_limits(nxt_target, start, f"move_joints id={nxt_cid} target")
+            self._check_zones(nxt_target, start, f"move_joints id={nxt_cid} target", warn=False)
+            self._check_self_collision(
+                np.vstack([np.asarray(start, dtype=np.float64)[None, :], np.asarray(nxt_target, dtype=np.float64)[None, :]]),
+                f"move_joints id={nxt_cid} target")
+        except PlannerError as e:
+            logger.info(f"the next move (id={nxt_cid}) fails its target check ({e.code}): this move ends at rest, "
+                        f"no corner speed into it")
+            return e.code
+        return None
+
     def _blend_pct_for(self, options):
+        """The exact-velocity blend in percent (0 = the move ends at rest). Only blend_mode 'exact_velocity' has one:
+        under 'zone' / 'tolerance' / 'ruckig_corner' `blend` is millimetres of the chain's corners (2026-11-19, review
+        M2: a chain that fell back to single moves read its 2 mm as 2 % and carried corner speeds)."""
+        if (options.blend_mode or "exact_velocity") != "exact_velocity":
+            return 0.0
         if options.blend is None:
             return self._blend_pct
         return float(np.clip(options.blend, 0.0, 100.0))
@@ -2514,13 +2539,14 @@ class TrajectoryPlanner(Thread):
                 nxt_profile = normalize_profile_name(self._cmd_options(nxt).profile or DEFAULT_PROFILE)
                 if nxt_profile == profile and len(nxt_args) >= self.joint_num:
                     nxt_target = np.deg2rad(np.asarray(nxt_args[:self.joint_num], dtype=np.float64))
-                    dist_b = nxt_target - target
-                    v_corner = compute_corner_speed(
-                        dist, dist_b, self._max_vel, self._max_accel, self._dt,
-                        blend_pct / 100.0, speed_scale=speed_scale,
-                        profile=time_parameterizer.profile)
-                    if v_corner > 1e-9:
-                        end_vel = v_corner * dist / np.linalg.norm(dist)
+                    if self._successor_target_problem(nxt_target, target, self._cmd_id(nxt)) is None:
+                        dist_b = nxt_target - target
+                        v_corner = compute_corner_speed(
+                            dist, dist_b, self._max_vel, self._max_accel, self._dt,
+                            blend_pct / 100.0, speed_scale=speed_scale,
+                            profile=time_parameterizer.profile)
+                        if v_corner > 1e-9:
+                            end_vel = v_corner * dist / np.linalg.norm(dist)
 
         # `accel` scales the acceleration limit; `duration` then rescales the whole move to
         # land on exactly `t`. Both were accepted and SILENTLY IGNORED before today.
@@ -4013,10 +4039,11 @@ class TrajectoryPlanner(Thread):
             return [fk(q).ravel().tolist() for q in positions]
         return [np.asarray(robot.fkine(q).A, dtype=np.float64).ravel().tolist() for q in positions]
 
-    def _check_zones(self, positions, start, label):
+    def _check_zones(self, positions, start, label, warn=True):
         """Raise PlannerError('ZONE_LIMIT') if any sample takes a robot sphere into a stop-zone of the
         active cell (with the zone's margin). Same RECOVERY rule as the joint limits: a robot that
-        starts in violation may stay as deep as it is, never deeper. Warn-zones are logged, not refused."""
+        starts in violation may stay as deep as it is, never deeper. Warn-zones are logged, not refused
+        (warn=False: not even logged — a look-ahead check of a move that is checked again when planned)."""
         zones, spheres = self._zone_setup
         if not zones:
             return
@@ -4036,6 +4063,8 @@ class TrajectoryPlanner(Thread):
                 "ZONE_LIMIT",
                 f"{label}: {what} would {side} zone '{zone['name']}' by {1000.0 * pen:.1f} mm "
                 f"(margin {1000.0 * zone['margin']:.0f} mm included) at {where}")
+        if not warn:
+            return
         warn = first_path_violation(zones, poses, spheres, start_pose, reaction="warn")
         if warn is not None:
             zone = warn[0]

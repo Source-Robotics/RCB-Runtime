@@ -16,6 +16,13 @@ S0.config), "hardware" (the last get_hardware() read), "sleep", "monotonic", "ru
 A step that raises Aborted may attach the results it already has as `e.partial`: the runner keeps them (and a SKIP for
 the rest), so stopping the run mid-step loses nothing that was measured.
 
+A step that takes control (claim()) gives it back when it ends (2026-11-19, review K8): holding it between steps made
+the dashboard refuse the Enable the next step asks the user to press, for up to 30 s.
+
+THE RUN'S VERDICT (worst()): FAIL over WARN over INCOMPLETE over PASS. INCOMPLETE = nothing was judged — every step
+skipped or only informative (2026-11-19, review K8: that was a PASS, exit 0). A SKIP beside judged steps keeps the
+verdict (an unwired input is skipped by design).
+
 THE UI CONTRACT — what a front-end (tools/first_run.py's console, the dashboard later, a test's script) provides:
 
     ui.stage(number, title, about)      a stage begins
@@ -34,7 +41,8 @@ from __future__ import annotations
 import traceback
 
 PASS, WARN, FAIL, SKIP, INFO = "PASS", "WARN", "FAIL", "SKIP", "INFO"
-VERDICTS = (PASS, WARN, FAIL, SKIP, INFO)
+VERDICTS = (PASS, WARN, FAIL, SKIP, INFO)       # a step's
+INCOMPLETE = "INCOMPLETE"                       # the run's only: nothing was judged (worst())
 STAGE_TITLES = {0: "The Pi and the configuration", 1: "Power and CAN", 2: "E-stop, buttons, I/O, Hall sensor",
                 3: "Small test moves", 4: "Homing", 5: "The homed arm"}
 STAGE_ABOUT = {
@@ -77,9 +85,14 @@ def result(st, verdict, summary, value=None, expected=None, hints=(), details=No
 
 
 def worst(results) -> str:
-    """FAIL over WARN over the rest; PASS for none."""
+    """The run's verdict: FAIL over WARN over INCOMPLETE (no step PASSed, WARNed or FAILed — all skipped or
+    informative, or none ran) over PASS."""
     verdicts = {r["verdict"] for r in results}
-    return FAIL if FAIL in verdicts else WARN if WARN in verdicts else PASS
+    if FAIL in verdicts:
+        return FAIL
+    if WARN in verdicts:
+        return WARN
+    return PASS if PASS in verdicts else INCOMPLETE
 
 
 def counts(results) -> dict:
@@ -98,6 +111,7 @@ def claim(ctx, ui=None):
         except Exception as e:   # CONTROL_HELD: another client holds it
             last[0] = e
             return None
+        ctx["claimed"] = True    # run_step gives it back when the step ends
         return True
 
     if take():
@@ -136,8 +150,25 @@ def _meet_needs(st, ctx, ui):
     return None
 
 
+def release(ctx) -> None:
+    """Gives back the control a step's claim() took (never raises: a lost connection holds nothing)."""
+    if ctx.pop("claimed", False) and ctx.get("robot") is not None:
+        try:
+            ctx["robot"].release_control()
+        except Exception:   # noqa: BLE001 — the connection is gone or control was taken over: nothing to give back
+            pass
+
+
 def run_step(st, ctx, ui) -> list:
-    """Run one step; never raises but Aborted. A crash of the check itself is a FAIL naming it (and logged)."""
+    """Run one step; never raises but Aborted. A crash of the check itself is a FAIL naming it (and logged). Control a
+    step took is given back when it ends, however it ends."""
+    try:
+        return _run_step(st, ctx, ui)
+    finally:
+        release(ctx)
+
+
+def _run_step(st, ctx, ui) -> list:
     try:
         why = _meet_needs(st, ctx, ui)
         if why is not None:

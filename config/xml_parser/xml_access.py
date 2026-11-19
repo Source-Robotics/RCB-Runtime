@@ -104,15 +104,25 @@ def get_gripper_values(grippers: ET.Element, gripper_name: str, tag: str) -> flo
     return _convert_to_float(element.text.strip())
 
 
+NO_GRIPPER_NAMES = ("", "none", "unknown")   # "unknown": get_active_gripper's value when no file names a gripper
+
+
 def load_gripper_element(grippers_dir: str | Path, gripper_name: str) -> ET.Element | None:
     """
     Parse a standalone gripper XML file from grippers_dir and return its root element.
     File is expected at: grippers_dir / f"{gripper_name}.xml"
-    Returns None if the file does not exist (robot has no gripper).
+    Returns None for no gripper: a name in NO_GRIPPER_NAMES (any case).
+    Raises FileNotFoundError when a named gripper has no file (2026-11-19, review K1: a mistyped <active_gripper> was
+    silently "no gripper" — J5 then homed with the robot XML's fallback offset, ~119 deg off, and RTI started).
     """
+    if (gripper_name or "").strip().lower() in NO_GRIPPER_NAMES:
+        return None
     path = Path(grippers_dir) / f"{gripper_name}.xml"
     if not path.exists():
-        return None
+        known = sorted(p.stem for p in Path(grippers_dir).glob("*.xml"))
+        raise FileNotFoundError(
+            f"the active gripper '{gripper_name}' has no file {path} — a typo in <active_gripper> "
+            f"(config/system.xml)? The grippers there: {', '.join(known) or 'none'}; 'none' = no gripper")
     tree = ET.parse(str(path))
     root = tree.getroot()
     check_schema(root, "gripper", path)         # a newer format than this runtime reads: refused (2026-10-21)

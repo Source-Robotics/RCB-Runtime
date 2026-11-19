@@ -1278,8 +1278,11 @@ def main():
             'stop_accel':   cfg['joint_acceleration_limit'],
             'stop_jerk':    cfg['joint_jerk_limit'],
             'resume_accel': cfg['exec_acceleration_limit'],
+            # the continuity check at a batch swap (2026-11-19, review S9): a batch may start one tick's travel away
+            'jump_speed':   cfg['joint_velocity_limit'],
         },
     )
+    _exec_handler = MODE_HANDLERS[RobotMode.EXEC]     # its error keys (EXEC_DISCONTINUITY) feed the error pass
 
     # RTI mode handler. Replaces the handle_idle placeholder build_mode_dispatch()
     # installs for RobotMode.RTI. Module-level so the TCP command handlers below can
@@ -3182,7 +3185,7 @@ def main():
             # function owns that flag and recomputes it every tick.
             rti_link_lost=rti_handler.take_link_lost(),
             # The strict command checks' keys (J{i}:RTI_*_LIMIT), raised once the controlled stop is at rest.
-            rti_errors=rti_handler.take_command_errors(),
+            rti_errors=rti_handler.take_command_errors() + _exec_handler.take_errors(),
             # J{i}:CAN_REPLY_MISSED_WARNING (warn-only) — a joint's replies missing RTI's read too often.
             can_warnings=can_reply_monitor.warnings,
             # J{n}:KT_MISMATCH_WARNING (the start's Kt check) + J{n}:DRIVE_CHANGED_WARNING (a drive replaced since

@@ -15,6 +15,7 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Added
 
+- The dashboard's status bar shows the active gripper or tool (`TOOL: <name>`, `none` without one).
 - A tool without a drive (the Flange, a vacuum tool, MHZ2-10D) is changed live too, both ways: from a gripper with a
   drive to the Flange and back, without restarting the robot service. The Change-gripper mode works with any tool;
   the card lists every tool file ("(no drive)" marked), and Done does not wait for a drive that is not there. Coming
@@ -152,6 +153,23 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Changed
 
+- A `move_joints()` or `move_linear()` (or its relative forms) whose blend cannot be done with its profile is refused
+  with `BAD_OPTIONS` before anything is planned: `blend_mode="zone"` or `"tolerance"` needs `profile="toppra"`,
+  `"ruckig_corner"` needs `profile="ruckig"` and a `move_joints()`. Such moves used to run one by one with only a log
+  line, and their blend in millimetres was read as an exact-velocity percent, which put velocity steps between them.
+- J2's speed limit is 1.2 rad/s (the joint, EXEC and RTI limits; it was 1.5). Its drive has always capped it at
+  1.23 rad/s, so a move above about 82 % fell behind its command; the arm moves as fast as before. The configuration
+  check now warns when any joint's drive cap is more than 2 % below its speed limit.
+- The first-run check's overall result is INCOMPLETE (exit code 3) when no step passed, warned or failed: every step
+  skipped was a PASS. Its configuration step is a WARN when the configuration loads with warnings (they were hidden
+  under a PASS), and the check gives control back after each step that took it, so the Enable it asks for in the
+  dashboard is not refused. Its stop test moves J1 30 deg instead of 15, so the stop comes mid-move.
+- A configured gripper whose file does not exist stops the start with the list of the gripper files there (it was
+  silently "no gripper": J5 homed with the wrong offset). `none` still means no gripper.
+- RTI.log writes one line for a short burst of late CAN replies, naming every joint in it, instead of one line per
+  joint.
+- The generic gripper file `grippers/MSG.xml` is removed: it could not be used as shipped.
+
 - Drive firmware 110 or newer is what this runtime supports (it said 103): an older drive is a warning at run time, on
   the Versions card, and a FAIL in the first-run check. Every drive of the arm runs 110 since 2026-11-16; the runtime
   relies on it (the watchdog's hold, the board ids, the drive parameters, sound).
@@ -181,6 +199,32 @@ What changed in each version of the RCB runtime. The newest version is at the to
   click, for example on Enable) instead of skipping the step at once.
 
 ### Fixed
+
+- The Gripper tab's Mode toggle sent a command whenever the display updated it to the robot's mode: right after a
+  gripper swap a `NO_GRIPPER` error (the executor still had the old tool), control taken for 5 s on opening the tab,
+  and a click undone before the robot confirmed it. Only a click sends now.
+- After a gripper swap the supervisor logged the planned restart of the executor, the dashboard and the collision
+  checker as three errors "stopped unexpectedly"; `tools/restart_gui_and_executor.sh` now leaves a note, and they are
+  logged as planned. The swap dialog says the robot answers again within about a minute (it said about 10 s).
+- A batch of EXEC trajectory that does not start where the arm is commanded to be (farther than its joints can move
+  in one tick) is refused before it moves: the program is dropped and `EXEC_DISCONTINUITY` (3103) is raised. An EXEC
+  underrun (the path goes on, but no batch arrived) is logged and counted; it was a silent dead stop. A Stop never
+  starts the next command of the stopped program.
+- An exact-velocity blend checks the next move's target (joint limits, safety zones, self-collision) before it plans a
+  corner speed into it: a next move that fails them made the arm stop dead at the corner from that speed.
+- The command check no longer trips on every JOG / EXEC entry when a joint was pushed past its soft limit by hand: a
+  joint that starts past it trips only when it is commanded a tolerance further out, as OUT_OF_RANGE does.
+- The collision check takes a new baseline after the momentum observer restarts (as `set_payload` makes it do): the
+  newly declared payload read as contact on the next move.
+- `<jog_defaults>` in system.xml: a speed of 20 (as every API speed since protocol 2) or `nan` was clamped to full
+  jog speed, and an acceleration time of `nan` gave the hardest ramp, without a word. A value that is not a finite
+  number in its range now gets the default, with a warning naming the field.
+- The configuration check no longer warns "kt not found" for a tool without a drive (the Flange, a vacuum or
+  pneumatic gripper).
+- The MSG gripper files other than the measured `MSG_small_motor_150mm_rail` get its calibration wait (without it
+  every 12th homing failed), the two other small-motor files its measured Kt and gains, the large-motor 150 mm file
+  its inertia in the right order, and each a `<not_measured>` list that makes the configuration check warn while it
+  is active (the medium / large motors' Kt and gains and every variant's jaw travel and mass are placeholders).
 
 - Every 16.4 s the CAN commands fell up to 20 ms behind for about 80 ms (each joint missed 4-5 replies in a row).
   The cause was the SD card: Linux re-tunes it every 16.4 s, about 41 ms of kernel work on whichever core uses

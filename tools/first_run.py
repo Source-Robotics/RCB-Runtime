@@ -25,7 +25,8 @@ and ENABLED for stages 3-5 (each waits for it). Ctrl-C while it
 waits for you skips that step; Ctrl-C at a question stops the run (the report keeps what was done). The report:
 temp_data/first_run/<UTC>/report.txt + report.json, and — when asked for (--bundle ask / yes) — the support bundle
 support_<UTC>.zip next to them (first_run/bundle.py: the report, logs, incident recordings, configuration; it needs
-the arm DISABLED). Exit 0 = no FAIL, 1 = a FAIL, 2 = stopped early.
+the arm DISABLED). Exit 0 = no FAIL, 1 = a FAIL, 2 = stopped early, 3 = INCOMPLETE (nothing was judged: every step
+skipped).
 
 The dashboard's First run tab (gui_first_run_tab.py, 2026-10-27) runs this same program with --ui json: the UI contract
 as JSON lines on stdin / stdout (first_run/json_ui.py), every other output on stderr.
@@ -227,7 +228,8 @@ def main(argv=None, ui=None, ctx=None):
         print(f"Support bundle: {zip_path}")
     if not completed:
         return 2
-    return 1 if core.worst(results) == core.FAIL else 0
+    verdict = core.worst(results)
+    return 1 if verdict == core.FAIL else 3 if verdict == core.INCOMPLETE else 0
 
 
 if __name__ == "__main__":

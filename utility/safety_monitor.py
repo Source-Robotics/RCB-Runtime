@@ -61,7 +61,9 @@ WHAT IT CHECKS (per-joint keys are "J1:KEY".."J6:KEY", the joint's 1-based numbe
                   the tolerance. Every mode plans within those ceilings, so a command beyond them is a bug of ours (a
                   jump), caught one tick after it left. Only a value the MODE computed counts (rti['command_valid'],
                   written by utility/mode_dispatch): a stream of speeds or torques commands no position. Homing (its
-                  own CAN frames) is not checked yet (user, 2026-10-27).
+                  own CAN frames) is not checked yet (user, 2026-10-27). A joint whose first command in a mode is
+                  already past its soft limit + tolerance (pushed there in freedrive) trips only when commanded the
+                  tolerance FURTHER out — OUT_OF_RANGE's "deeper" rule (2026-11-19) — so the way back stays open.
   These four have a MODE in <safety_monitor> (2026-10-01): "off", "warn" or "stop" (legacy 0/1 = off/stop).
   "warn" is for switching a check on before its thresholds are measured (user decision, shipped for
   overspeed, tracking and the command check): a trip is a live "<key>_WARNING" — J{i}:OVERSPEED_WARNING,
@@ -99,7 +101,10 @@ WHAT IT CHECKS (per-joint keys are "J1:KEY".."J6:KEY", the joint's 1-based numbe
                   hand guiding or homing), only while the arm is commanded to move and for <collision_settle_s> after
                   (a joint commanded faster than <hold_still_dps>): at rest the baseline follows the estimate (an EMA
                   of COLLISION_BASELINE_TAU_S), so whatever the arm rests with is not a contact. Sustain
-                  <collision_sustain_s>; nothing for OBSERVER_SETTLE_S after the observer (re)starts. A warning clears
+                  <collision_sustain_s>; nothing for OBSERVER_SETTLE_S after the observer (re)starts (set_payload
+                  restarts it), then — when it restarted at rest — a new baseline (2026-11-19: a move right after a
+                  set_payload read the declared payload as contact); a restart during a move keeps the pre-move
+                  baseline. A warning clears
                   once the joint is under half its contact threshold, or at rest; RTI.log gets the peak. A PC program
                   that pushes on purpose switches it with the collision_detection command (off | warn | stop, until
                   RTI restarts). The thresholds are the measured model error (api_tests/76_external_torque.py): an
@@ -331,6 +336,7 @@ class SafetyMonitor:
         # acceleration, the position past the soft limits + tolerance; their maximum per joint
         self._cc_rv, self._cc_rq, self._cc_ra, self._cc_rp = z(np.float64), z(np.float64), z(np.float64), z(np.float64)
         self._cc_r = z(np.float64)
+        self._cc_ref = z(np.float64)                # how far past a joint may be commanded without a trip (0 = inside; C11)
         self._cc_have = self._cc_vhave = 0          # a previous position / speed to step from (0 = start afresh)
         self._cc_pv = self._cc_vv = False           # what the mode commanded last tick (a change starts afresh)
         self._a_cc = np.ones(n, dtype=bool)         # armed: no excursion live (fires once per excursion)
@@ -773,6 +779,15 @@ class SafetyMonitor:
             np.subtract(self._lim_lo, qc, out=t)
             np.subtract(qc, self._lim_hi, out=self._cc_rp)
             np.maximum(t, self._cc_rp, out=t)
+            # OUT_OF_RANGE's "deeper" rule (review C11, 2026-11-19): a joint whose first command here is already past
+            # (pushed there in freedrive) trips only when commanded a tolerance FURTHER out — else every JOG / EXEC
+            # entry tripped and, in stop mode, blocked the way back; back inside, the normal rule again
+            ref = self._cc_ref
+            np.greater(t, 0.0, out=self._cc_hit)
+            if not had_q:
+                np.add(t, self.tol, out=ref)
+            np.multiply(ref, self._cc_hit, out=ref)
+            np.subtract(t, ref, out=t)
             np.greater(t, 0.0, out=self._cc_hit)
             np.multiply(t, self._inv_tol, out=self._cc_rp)
             np.add(self._cc_rp, 1.0, out=self._cc_rp)
@@ -811,6 +826,7 @@ class SafetyMonitor:
         """Out of COMMAND_MODES: nothing to judge — start afresh next time; a live warning clears (its peak logged)."""
         self._cc_have = self._cc_vhave = 0
         self._cc_r.fill(0.0)
+        self._cc_ref.fill(0.0)
         self._a_cc.fill(True)
         if self._cc_warned:
             self._cc_warned = self._command_track()
@@ -1014,6 +1030,10 @@ class SafetyMonitor:
         if obs is not None and (not obs.running or obs.resets != self._cl_resets):
             self._cl_resets = obs.resets                    # the observer (re)starts: its estimate converges first
             self._cl_hold = self._cl_hold_n
+            if self._cl_since >= self._cl_settle_n:       # restarted at rest: then a new baseline (review C12,
+                self._cl_fresh = True                       # 2026-11-19: set_payload at rest, then a move at once —
+            #   the baseline had not caught up with the declared payload and read it as contact). A reset DURING a
+            #   move keeps the pre-move baseline: a contact in that move must still be found.
         if self._cl_hold > 0:
             self._cl_hold -= 1
             if self._cl_counting:

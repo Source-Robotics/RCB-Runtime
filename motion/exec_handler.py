@@ -18,6 +18,18 @@ Per tick:
   5. Read this tick's waypoint → ControlOutput(pos, vel, torque_ff + gravity).
   6. If no batch available: hold last position (Speed=0) with gravity feedforward.
 
+At a swap (2026-11-19, review S9):
+  - CONTINUITY: a batch whose first sample is farther from the last target than JUMP_MARGIN x the joint's speed limit
+    x dt (jump_speed: the robot XML's <joint_velocity_limit>) is never played — the program is dropped, the hold kept,
+    and EXEC_DISCONTINUITY raised (take_errors(): RTI's error pass -> ACTIVE_ERROR). A planned path moves at most
+    one tick's worth between two samples; a program planned from a stale position jumped there in one tick.
+  - UNDERRUN: running out of samples where the path goes on (a chunk that is not its command's last, or a blended
+    command's end) holds at the last sample — a dead stop from speed. It is counted (`underruns`) and logged, once
+    when it starts and once when motion resumes (it was silent).
+  - A STOP never starts a new command: braking may run on through a seam of the path (a chunk, a blend), never
+    across a command's end at rest into the next command (a Stop during a "settled" hold started the stopped
+    program's next move until 2026-11-19).
+
 Controlled pause / stop (2026-10-13, user's choice: as industrial arms commonly do it). pause() / resume() /
 begin_stop() are called from RTI.py's command dispatch ("exec_pause" / "exec_resume"; a set_mode:IDLE while EXEC plays —
 the client's stop() and enter_idle_mode() — calls begin_stop()), the same single-threaded pattern as
@@ -114,6 +126,10 @@ class ExecHandler:
     # STOP_REST_MAX_S at the latest: IDLE is freedrive, where a still-moving arm would coast.
     STOP_REST_SPEED_RAD_S = 0.02
     STOP_REST_MAX_S = 0.5
+    # A batch may start at most this many times one tick's travel at the joint's speed limit from the last target
+    # (module docstring, "At a swap"). The command check warns at 1.2x the same step and has been quiet at program
+    # starts since 2026-10-27: 2x refuses only a real jump.
+    JUMP_MARGIN = 2.0
     _VEL_EPS = 1e-9            # rad/s: a joint the path does not move at the new playhead sets no bound on the rate
 
     def __init__(
@@ -126,9 +142,12 @@ class ExecHandler:
             *,
             stop_accel,
             stop_jerk,
-            resume_accel):
+            resume_accel,
+            jump_speed=None):
         """stop_accel / stop_jerk: the robot XML's hardware ceilings (rad/s^2, rad/s^3 per joint) a pause or a stop
-        brakes at; resume_accel: EXEC's own acceleration (<exec_limits>), at which a resume speeds back up."""
+        brakes at; resume_accel: EXEC's own acceleration (<exec_limits>), at which a resume speeds back up;
+        jump_speed: the joints' speed limits (rad/s, <joint_velocity_limit>) the continuity check at a swap measures a
+        batch's start against (None: no check — a test harness)."""
         self.joint_num = joint_num
         self._shared_data = shared_data
 
@@ -136,10 +155,23 @@ class ExecHandler:
         self._stop_accel = np.array(stop_accel, dtype=np.float64)
         self._stop_jerk = np.array(stop_jerk, dtype=np.float64)
         self._resume_accel = np.array(resume_accel, dtype=np.float64)
+        self._jump_speed = None if jump_speed is None else np.array(jump_speed, dtype=np.float64)
         for name, lim in (("stop_accel", self._stop_accel), ("stop_jerk", self._stop_jerk),
-                          ("resume_accel", self._resume_accel)):
+                          ("resume_accel", self._resume_accel), ("jump_speed", self._jump_speed)):
+            if lim is None:
+                continue
             if lim.shape != (joint_num,) or not np.all(np.isfinite(lim)) or np.any(lim <= 0.0):
                 raise ValueError(f"ExecHandler {name} must be {joint_num} finite values > 0, got {lim!r}")
+        # The continuity check (S9): the allowed start distance per joint for the dt it was computed for.
+        self._jump_tol = np.zeros(joint_num, dtype=np.float64)
+        self._jump_dt = 0.0
+        self._jump_d = np.zeros(joint_num, dtype=np.float64)
+        self._jump_hit = np.zeros(joint_num, dtype=bool)
+        self._seam_d = np.zeros(joint_num, dtype=np.float64)     # the ramp's crossing check (_locate)
+        self._seam_hit = np.zeros(joint_num, dtype=bool)
+        self._errors = ()                  # error keys for RTI's error pass, taken once (take_errors)
+        self.underruns = 0                 # trajectory underruns since RTI started (S9)
+        self._underrun_ticks = 0           # ticks the current underrun has held (0 = none)
 
         # Pre-allocated buffers — never reallocated inside step().
         self._target_pos     = np.zeros(joint_num, dtype=np.float64)  # rad
@@ -241,6 +273,7 @@ class ExecHandler:
         self._reset_playback()
         self._clear_settling()
         self._mirror_exec_state(ctx)
+        self._underrun_ticks = 0
         self._last_target_pos[:] = ctx.shared_data.joint['joint_position'][:self.joint_num]
         # Filtered, not raw: this seeds trajectory continuity, and a raw (encoder-dither) speed
         # here would put noise into the next move's start velocity. Before the 2026-07-17
@@ -342,32 +375,9 @@ class ExecHandler:
         # 3. SWAP if the current batch is exhausted (or absent). Not while the playhead sits between its last sample
         #    and the next batch's first (a fraction left): the ramped read crosses that seam itself.
         if self._frac == 0.0 and (self._current is None or self._index >= self._current['num_points']):
-            self._keep_tail()
-            if self._current is not None and self._current['is_last_chunk']:
-                if self._begin_completion(self._current['checkpoint_id'], self._current.get('flags', 0)):
-                    self._current = None
-                    self._rate = self._rate_target     # holding: no ramp to run
-                    return TickResult(), self._hold(ctx)
-            # Mark the finished batch consumed so its checkpoint can't re-fire on
-            # subsequent hold ticks (when no next batch is available).
-            self._current = None
-
-            if self._pending and not self._after_stop(self._pending[0]):
-                self._current = self._pending.popleft()
-                self._pending_samples -= self._current['num_points']
-                self._index = 0
-            else:
-                # Nothing pre-fetched (or only a program from after a stop's fence) — one more try, else hold.
-                batch = None if self._pending else self._recv_one()
-                if batch is not None and not self._after_stop(batch):
-                    self._current = batch
-                    self._index = 0
-                else:
-                    if batch is not None:                # from after the stop's fence: it plays once the stop is done
-                        self._pending.append(batch)
-                        self._pending_samples += batch['num_points']
-                    self._rate = self._rate_target     # holding: no ramp to run
-                    return TickResult(), self._hold(ctx)
+            held = self._swap(ctx)
+            if held is not None:
+                return TickResult(), held
 
         if ramp:
             self._read_ramped(ctx)
@@ -384,6 +394,57 @@ class ExecHandler:
         self._last_target_pos[:] = self._target_pos
         self._last_target_vel[:] = self._target_vel
         return TickResult(), self._output(ctx)
+
+    def _swap(self, ctx):
+        """Step 3: the current batch is exhausted (or absent) — completion, the next batch (the continuity check, an
+        underrun, a stop at a command's end: module docstring "At a swap"). Returns the hold output when nothing plays
+        this tick, else None (the new current batch is read)."""
+        self._keep_tail()
+        if self._current is not None and self._current['is_last_chunk']:
+            if self._begin_completion(self._current['checkpoint_id'], self._current.get('flags', 0)):
+                self._current = None
+                self._rate = self._rate_target     # holding: no ramp to run
+                return self._hold(ctx)
+        # The path runs on into the next batch (a chunk, a blend): braking may cross that seam, an underrun is
+        # a dead stop there. Not across a command's end at rest.
+        seam = self._current is not None and self._path_continues(self._current)
+        if self._current is not None and self._underrun_ticks == 0 and seam:
+            self._underrun_ticks = -1          # armed: a hold below, before any batch plays, is an underrun
+        # Mark the finished batch consumed so its checkpoint can't re-fire on
+        # subsequent hold ticks (when no next batch is available).
+        self._current = None
+        if self._stopping and not seam:
+            # A stop never starts the next command (S9): at a command's end the arm is at rest — finish here.
+            self._underrun_ticks = 0
+            self._rate = 0.0
+            self._rate_target = 0.0
+            return self._hold(ctx)
+
+        if self._pending and not self._after_stop(self._pending[0]):
+            self._current = self._pending.popleft()
+            self._pending_samples -= self._current['num_points']
+            self._index = 0
+        else:
+            # Nothing pre-fetched (or only a program from after a stop's fence) — one more try, else hold.
+            batch = None if self._pending else self._recv_one()
+            if batch is not None and not self._after_stop(batch):
+                self._current = batch
+                self._index = 0
+            else:
+                if batch is not None:                # from after the stop's fence: it plays once the stop is done
+                    self._pending.append(batch)
+                    self._pending_samples += batch['num_points']
+                self._rate = self._rate_target     # holding: no ramp to run
+                if self._underrun_ticks:
+                    self._underrun_hold(ctx)
+                return self._hold(ctx)
+        if self._starts_away(self._current, ctx):
+            return self._hold(ctx)
+        if self._underrun_ticks > 0:
+            logger.warning("EXEC trajectory flowing again after a %.0f ms underrun (%d since RTI started)",
+                           self._underrun_ticks * ctx.delta_t * 1000.0, self.underruns)
+        self._underrun_ticks = 0
+        return None
 
     def _output(self, ctx):
         """The tick's ControlOutput from the _target_* buffers just read."""
@@ -414,9 +475,18 @@ class ExecHandler:
         self._pending.clear()
         self._pending_samples = 0
         self._index = 0
+        self._underrun_ticks = 0
         self._reset_playback()
         self._clear_settling()
         self._mirror_exec_state(ctx)
+
+    def take_errors(self):
+        """One-shot read of the error keys the handler raised (EXEC_DISCONTINUITY), for RTI.py's error pass;
+        () when none."""
+        e = self._errors
+        if e:
+            self._errors = ()
+        return e
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -533,6 +603,66 @@ class ExecHandler:
         np.multiply(self._resume_accel, dt, out=self._resume_band)
         self._rest_wait_max = max(1, int(round(self.STOP_REST_MAX_S / dt))) if dt > 0 else 1
         self._band_dt = dt
+        self._set_jump_tol(dt)
+
+    @staticmethod
+    def _path_continues(batch):
+        """The planned path goes on past `batch` without coming to rest: a chunk that is not its command's last, or a
+        command blended into the next (BATCH_FLAG_BLEND_CONTINUES)."""
+        return (not batch['is_last_chunk']) or bool(batch.get('flags', 0) & BATCH_FLAG_BLEND_CONTINUES)
+
+    def _underrun_hold(self, ctx):
+        """Cold path: the path should have gone on and nothing is there — counted and logged once (S9)."""
+        if self._underrun_ticks < 0:
+            self.underruns += 1
+            self._underrun_ticks = 0
+            logger.warning("EXEC trajectory underrun: the path goes on but no batch is here — holding at the last "
+                           "sample, a dead stop from speed (%d since RTI started; the planner fell behind)",
+                           self.underruns)
+        self._underrun_ticks += 1
+
+    def _starts_away(self, batch, ctx):
+        """True when `batch` starts too far from the last target to be played (S9's continuity check): it, everything
+        pending and the playback are dropped, EXEC_DISCONTINUITY is raised, the hold stays. No check without
+        jump_speed."""
+        if self._jump_speed is None:
+            return False
+        self._set_jump_tol(ctx.delta_t)
+        d = self._jump_d
+        np.subtract(batch['joint_positions'][0], self._last_target_pos, out=d)
+        np.abs(d, out=d)
+        np.greater(d, self._jump_tol, out=self._jump_hit)
+        if not self._jump_hit.any():
+            return False
+        j = int(np.argmax(d - self._jump_tol))              # cold from here
+        logger.error("EXEC_DISCONTINUITY: a trajectory batch (checkpoint %r) starts %.2f deg from the last target on "
+                     "J%d (at most %.2f deg in one tick) — refused before it moved, the program dropped, holding",
+                     batch.get('checkpoint_id', ''), math.degrees(d[j]), j + 1, math.degrees(self._jump_tol[j]))
+        self._current = None
+        self._index = 0
+        self._pending.clear()
+        self._pending_samples = 0
+        self._underrun_ticks = 0
+        self._clear_settling()
+        self._rate = self._rate_target
+        self._errors = ("EXEC_DISCONTINUITY",)
+        return True
+
+    def _set_jump_tol(self, dt):
+        """The continuity check's allowed start distance per joint for `dt` (JUMP_MARGIN x speed limit x dt)."""
+        if self._jump_speed is not None and dt != self._jump_dt and dt > 0:
+            np.multiply(self._jump_speed, dt * self.JUMP_MARGIN, out=self._jump_tol)
+            self._jump_dt = dt
+
+    def _seam_breaks(self, prev, nxt):
+        """True when `nxt` does not start where `prev` ends (the continuity check's tolerance): the ramped read
+        never crosses that seam — it stops on prev's last sample, and the swap then refuses nxt (_starts_away)."""
+        if self._jump_speed is None or self._jump_dt <= 0.0:
+            return False
+        np.subtract(nxt['joint_positions'][0], prev['joint_positions'][prev['num_points'] - 1], out=self._seam_d)
+        np.abs(self._seam_d, out=self._seam_d)
+        np.greater(self._seam_d, self._jump_tol, out=self._seam_hit)
+        return bool(self._seam_hit.any())
 
     def _keep_tail(self):
         """The sample before the next batch's first: this batch's last, or (no batch) the hold point at rest."""
@@ -564,7 +694,8 @@ class ExecHandler:
         b = self._current
         j = 0
         while k >= b['num_points']:
-            if j >= len(self._pending) or not self._continues(b) or self._after_stop(self._pending[j]):
+            if (j >= len(self._pending) or not self._continues(b) or self._after_stop(self._pending[j])
+                    or self._seam_breaks(b, self._pending[j])):        # S9: never into a batch that jumps
                 return None, 0
             k -= b['num_points']
             b = self._pending[j]

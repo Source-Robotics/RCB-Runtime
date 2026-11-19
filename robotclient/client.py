@@ -2995,7 +2995,10 @@ class RobotClient:
         - `"ruckig_corner"`: the size of the corner cut, in millimetres.
 
         `"zone"` and `"tolerance"` need the `"toppra"` profile, `"ruckig_corner"`
-        the `"ruckig"` profile; see Per-move settings. The setting is the robot's:
+        the `"ruckig"` profile on a `move_joints()`: a `move_joints()` or
+        `move_linear()` (or its relative forms) that asks for one of them with
+        another profile and a blend above 0 is refused with `BAD_OPTIONS`;
+        see Per-move settings. The setting is the robot's:
         it applies to the moves every client sends after it, and moves already sent
         keep their value. It lasts until it is changed or the robot software
         restarts.
