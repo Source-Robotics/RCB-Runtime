@@ -224,6 +224,13 @@ def main():
         check("jogged about 3 deg away from A", abs(b - a) > 1.5, f"A={a:.2f} B={b:.2f}")
         robot.enter_idle_mode(wait=True)
         robot.enter_exec_mode(wait=True)
+        # Where EXEC starts holding (2026-11-19): IDLE between the two modes is gravity-compensated freedrive, so J5
+        # may settle a little there; EXEC holds where it finds the arm and the next move starts from that point. The
+        # snap-back bug is the COMMAND stepping back from it, toward A.
+        time.sleep(0.1)
+        e_meas = float(joints(robot)[J])
+        e_cmd = commanded_j5()
+        sag = (b - e_meas) * np.sign(b - a)                       # >0 = settled toward A in IDLE
         c = b + 2.0 * np.sign(b - a)
         robot.move_joints(*[float(x) for x in with_j5(joints(robot), c)], speed=args.speed)
         toward_a = 0.0
@@ -233,16 +240,18 @@ def main():
             now = float(joints(robot)[J])
             toward_a = max(toward_a, (b - now) * np.sign(b - a))     # >0 = moved back toward A
             qc = commanded_j5()
-            if qc is not None:
-                toward_a_cmd = max(toward_a_cmd or 0.0, (b - qc) * np.sign(b - a))
+            if qc is not None and e_cmd is not None:
+                toward_a_cmd = max(toward_a_cmd or 0.0, (e_cmd - qc) * np.sign(b - a))   # from where EXEC started
             st = robot.status().get("planner") or {}
             if not st.get("active_command") and not st.get("queue_depth") and abs(now - c) < 0.3:
                 break
             time.sleep(0.02)
         robot.wait_idle(timeout=args.timeout, raise_on_error=False)
+        print(f"  INFO  J5 between the jog's end and EXEC's start (IDLE: freedrive): {sag:+.2f} deg toward A")
         if toward_a_cmd is not None:
-            check("J5's command never snapped back toward the old endpoint A", toward_a_cmd < 0.5,
-                  f"commanded max {toward_a_cmd:.2f} deg toward A; measured {toward_a:.2f}")
+            check("J5's command never snapped back toward the old endpoint A (from where EXEC started holding)",
+                  toward_a_cmd < 0.5, f"commanded max {toward_a_cmd:.2f} deg toward A from EXEC's start; "
+                  f"measured {toward_a:.2f} from the jog's end, of which {sag:.2f} in IDLE")
             check("...and the measured J5 stayed within 1.5 deg of where it was jogged to (it sags a little at the "
                   "mode changes)", toward_a < 1.5, f"measured max {toward_a:.2f} deg toward A")
         else:                               # not on the robot's Pi: the measured position only, the old bound
