@@ -751,8 +751,15 @@ def _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, 
                 and current_mode not in KEEP_MODE_ON_ERROR):
             if current_mode == RobotMode.HOMING:
                 homing_ctrl.exit(Motor, joint_num)
+                # 2026-11-18 (review C7): an open homing question ends with the homing (the dialog kept reopening and
+                # Accept was refused), and the Joints table's per-joint flags go with homed_state
+                drop = getattr(homing_ctrl, "drop_question", None)
+                if drop is not None:
+                    drop(shared_data)
                 shared_data.homed_state.set("NOT HOMED")
                 shared_data.rti["homing_status"][:] = 0
+                if "joint_homed" in shared_data.rti:
+                    shared_data.rti["joint_homed"][:] = 0
                 logger.error("Error during homing — homing aborted, homed state cleared.")
                 log_activity(get_rti_activity_logger(), "RTI", "warning", "HOMING_ABORTED",
                              message="an error latched during homing")

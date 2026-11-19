@@ -456,8 +456,18 @@ class FastCanReader:
             cf, ancillary, _, _ = self._sock.recvmsg(self._mtu, self._anc, socket.MSG_DONTWAIT)
         except (BlockingIOError, InterruptedError):
             return None, None
-        except OSError as error:                     # as python-can: the interface went down, ...
-            raise self._op_error(f"Error receiving: {error.strerror}", error.errno) from error
+        except OSError as error:                     # the interface went down, ...
+            # 2026-11-18 (review D4): it raised (as python-can does) and ended RTI in read-first mode, the default —
+            # homing lost. Now "no frames", logged once per episode: the drives go stale and RTI latches CAN_LOST
+            # with RTI alive, which says what happened.
+            if not getattr(self, "_read_error", False):
+                self._read_error = True
+                logging.getLogger("rti.can").error("CAN read failed (%s) — reading nothing until the interface answers "
+                                                   "again", error.strerror or error)
+            return None, None
+        if getattr(self, "_read_error", False):
+            self._read_error = False
+            logging.getLogger("rti.can").warning("CAN read works again")
         can_id, dlc, _ = self._hdr.unpack_from(cf)
         seconds, nanoseconds = self._ts.unpack_from(ancillary[0][2])
         frame = CanFrame()

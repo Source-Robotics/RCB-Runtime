@@ -133,7 +133,19 @@ SCRIPTS = {
 # ==========================================================================
 # Hardware init
 # ==========================================================================
-disp = init_display()[0]     # UI builds its own frames; we only need the device
+class _NoDisplay:
+    """The OLED's stand-in when it does not open (2026-11-18, review D2): every call does nothing. The supervisor
+    opened the display at import with no guard, so a dead display or cable started nothing of the robot."""
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+try:
+    disp = init_display()[0]     # UI builds its own frames; we only need the device
+except Exception:
+    logger.exception("the OLED display did not open — the robot starts without it (the control box menu is dark)")
+    disp = _NoDisplay()
 led1 = GpioLED(LED1_PIN)
 led2 = GpioLED(LED2_PIN)
 
@@ -191,6 +203,15 @@ def _power_off(command):
     subprocess.run(["sudo", "-n", command], check=False)
 
 
+def _robot_enabled() -> bool:
+    """The arm is ENABLED (shared memory); False when it cannot be read."""
+    try:
+        rs = shared_data.robot_state
+        return rs is not None and rs.get() == "ENABLED"
+    except Exception:
+        return False
+
+
 def _drain_actions():
     """Run queued menu actions here (single thread that mutates `state.processes`)."""
     while True:
@@ -200,12 +221,21 @@ def _drain_actions():
             return
         try:
             if cmd[0] == "restart":
+                if cmd[1] == "RTI" and _robot_enabled():
+                    # 2026-11-18 (review G2): restarting RTI drops the drives' hold (0.1 s after it stops) — never with
+                    # the arm enabled; disable it (or park / support it) first
+                    logger.warning("Restart RTI refused from the menu: the arm is ENABLED — disable it first")
+                    continue
+                state.scripts_stopped = False          # a restart after "Stop all" brings the scripts back
                 restart_script(cmd[1], state.processes, SCRIPTS)
             elif cmd[0] == "stop_all":
+                state.scripts_stopped = True           # the monitor leaves them stopped (review I1)
                 stop_scripts(state.processes)
             elif cmd[0] == "reboot":
+                state.scripts_stopped = True
                 _power_off("reboot")
             elif cmd[0] == "shutdown":
+                state.scripts_stopped = True
                 _power_off("poweroff")
         except Exception:
             logger.exception(f"Menu action failed: {cmd}")
@@ -252,6 +282,13 @@ def update_script_supervisor():
     while True:
         try:
             _drain_actions()
+            if state.scripts_stopped:
+                # 2026-11-18 (review I1): "Stop all" / Reboot / Shutdown empty the process table, and the monitor read
+                # an empty table as "emergency stop lifted" and started everything again in the same pass — Stop all
+                # was "restart all, arm un-homed", and a reboot started a fresh RTI while the Pi shut down
+                state.global_monitor_data = {name: {"status": "stopped (menu)"} for name in SCRIPTS}
+                time.sleep(SCRIPT_MONITOR_TIME)
+                continue
             state.global_monitor_data = monitor_scripts(
                 emergency_stop=False, processes=state.processes, SCRIPTS=SCRIPTS
             )
@@ -335,35 +372,20 @@ def main():
     threading.Thread(target=update_script_supervisor, daemon=True).start()
     threading.Thread(target=monitor_can_link, daemon=True).start()
 
+    last_error = {"text": None, "at": 0.0}
     try:
         while True:
             start_time = time.perf_counter()
-
-            # Takeover-prompt latch brackets the button checks — arm BEFORE (so a press
-            # that starts during the prompt is caught from its first edge), release AFTER
-            # (so a short press, which fires on release INSIDE check_button, still sees it
-            # set). See app._modal_latch for why checking "is the prompt up" is not enough.
-            app.modal_latch_arm()
-            button1.check_button()
-            button2.check_button()
-            app.modal_latch_release(button1._stable, button2._stable)
-
-            # Publish the buttons EVERY loop (50 Hz), not in the blink tick. They used to
-            # be written only in on_blink_tick(), i.e. once per `blink_time` — 1.0 s by
-            # default and settable up to 5 s — so the executor, which reads them from shared
-            # memory to confirm or refuse a forced control takeover, could miss a quick DENY
-            # tap entirely and needed an ALLOW hold of up to two blink periods to see it at
-            # all. Active-low on purpose (0 = pressed); every reader already assumes that.
-            shared_data.gpio_states[BUTTON1] = 0 if button1.gz_button.is_pressed else 1
-            shared_data.gpio_states[BUTTON2] = 0 if button2.gz_button.is_pressed else 1
-            read_uart()
-
-            if time.perf_counter() - last_led_toggle >= state.settings["blink_time"]:
-                on_blink_tick()
-                last_led_toggle = time.perf_counter()
-
-            app.idle_check()   # auto-return to Home after inactivity
-
+            try:
+                _main_pass()
+            except Exception as exc:
+                # 2026-11-18 (review I2): any error here (a serial error on the PCB's UART, a button read) ran
+                # shutdown(), which stops RTI — the drives let go, homing lost, because of a UART fault. Logged (the
+                # same error at most once a minute) and the loop goes on.
+                text = f"{type(exc).__name__}: {exc}"
+                if text != last_error["text"] or time.monotonic() - last_error["at"] > 60.0:
+                    logger.exception("supervisor main loop pass failed — going on")
+                    last_error.update(text=text, at=time.monotonic())
             # Pace the loop to LOOP_TIME (never sleep negative).
             elapsed = time.perf_counter() - start_time
             time.sleep(max(LOOP_TIME - elapsed, 0))
@@ -371,6 +393,36 @@ def main():
         logger.info("Supervisor interrupted by user")
     finally:
         shutdown()
+
+
+def _main_pass():
+    """One pass of the main loop: the buttons, the UART, the blink tick, the menu's idle check."""
+    global last_led_toggle
+
+    # Takeover-prompt latch brackets the button checks — arm BEFORE (so a press
+    # that starts during the prompt is caught from its first edge), release AFTER
+    # (so a short press, which fires on release INSIDE check_button, still sees it
+    # set). See app._modal_latch for why checking "is the prompt up" is not enough.
+    app.modal_latch_arm()
+    button1.check_button()
+    button2.check_button()
+    app.modal_latch_release(button1._stable, button2._stable)
+
+    # Publish the buttons EVERY loop (50 Hz), not in the blink tick. They used to
+    # be written only in on_blink_tick(), i.e. once per `blink_time` — 1.0 s by
+    # default and settable up to 5 s — so the executor, which reads them from shared
+    # memory to confirm or refuse a forced control takeover, could miss a quick DENY
+    # tap entirely and needed an ALLOW hold of up to two blink periods to see it at
+    # all. Active-low on purpose (0 = pressed); every reader already assumes that.
+    shared_data.gpio_states[BUTTON1] = 0 if button1.gz_button.is_pressed else 1
+    shared_data.gpio_states[BUTTON2] = 0 if button2.gz_button.is_pressed else 1
+    read_uart()
+
+    if time.perf_counter() - last_led_toggle >= state.settings["blink_time"]:
+        on_blink_tick()
+        last_led_toggle = time.perf_counter()
+
+    app.idle_check()   # auto-return to Home after inactivity
 
 
 if __name__ == "__main__":

@@ -476,6 +476,12 @@ def _do_step_post_move(self, Motor, Joint, shared_data) -> str:
 
 
 # ------------------------------------------------------------------
+# A homing move_to that times out with a joint further than this from its target FAILS the homing (2026-11-18, review
+# B3): it used to advance anyway, and J4 / J6 then homed in a pose nobody checked (a blocked J2 / J3). Its normal
+# misses are 0.09-0.55 deg (100 motor ticks on J2 / J4, 2026-10-09).
+MOVE_TO_FAIL_DEG = 2.0
+
+
 def _do_step_move_to(self, Motor, Joint, shared_data) -> str:
     """Execute smooth interpolated move_to commands for the current step.
 
@@ -559,13 +565,25 @@ def _do_step_move_to(self, Motor, Joint, shared_data) -> str:
     if self._move_to_tick > timeout_ticks:
         # which joints did not arrive, and how far short (2026-10-09: the arrival rule is 100 motor ticks — 0.09 deg on
         # J2, 0.55 deg on J4 — and most move_to steps time out; this decides the tolerance per joint, in degrees)
-        short = []
+        short, far = [], []
         for j, info in self._move_to_targets.items():
             pos = Motor[j].position if Motor[j].position is not None else info.get('last_pos')   # the last VALID read
             if not info.get('done') and pos is not None and info.get('end_ticks') is not None and j < len(Joint):
                 jt = Joint[j]
                 deg = (int(pos) - info['end_ticks']) * 360.0 / (jt.encoder_max_counts * jt.gear_ratio)
                 short.append(f"{self._jlabel(j, Motor).split(' ')[0]} {deg:+.3f} deg")
+                if abs(deg) > MOVE_TO_FAIL_DEG:
+                    far.append((j, deg))
+        if far:
+            # 2026-11-18 (TODO/review_2026-11-18.md B3): a joint this far from its target did NOT get there — blocked on
+            # the way, or too weak — and the next steps would home in a pose nobody checked: the homing FAILS
+            for j, deg in far:
+                self._fail(j, shared_data, f"its move_to ended {deg:+.1f} deg from its target {math.degrees(self._move_to_targets[j]['position_rad']):.1f} deg "
+                                           f"(more than {MOVE_TO_FAIL_DEG:.0f} deg: blocked on the way, or something in "
+                                           f"the way) — check the arm can move there, then home again")
+            for j in active_joints:
+                self._hold_after_move_to(Motor, j, shared_data)
+            return 'failed'
         logger.warning("move_to timed out — advancing"
                         + (f" (not within {self._MOVE_TOL_TICKS} ticks: {', '.join(short)} from the target)" if short else ""))
         for j in active_joints:

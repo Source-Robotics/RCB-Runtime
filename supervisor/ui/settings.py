@@ -63,9 +63,10 @@ def value_str(item):
 # ==========================================================================
 number("Contrast",   "contrast",   0,   255, step=16,  fmt="{:.0f}")
 number("Blink rate",  "blink_time", 0.1, 5.0, step=0.1, fmt="{:.1f}s")
-action("Restart RTI", lambda: state.action_queue.put(("restart", "RTI")))
-action("Restart GUI", lambda: state.action_queue.put(("restart", "GUI")))
-action("Restart HL",  lambda: state.action_queue.put(("restart", "HIGH_LEVEL")))
+# confirmed since 2026-11-18 (review G2: one hold restarted RTI — the drives let go; it is refused while ENABLED)
+action("Restart RTI", lambda: state.action_queue.put(("restart", "RTI")), confirm=True)
+action("Restart GUI", lambda: state.action_queue.put(("restart", "GUI")), confirm=True)
+action("Restart HL",  lambda: state.action_queue.put(("restart", "HIGH_LEVEL")), confirm=True)
 # --- destructive: gated behind the CONFIRM screen ---
 action("Stop all",    lambda: state.action_queue.put(("stop_all",)),  confirm=True)
 action("Reboot Pi",   lambda: state.action_queue.put(("reboot",)),    confirm=True)

@@ -1557,7 +1557,9 @@ def _write_active_gripper(path, name, before, _re):
         tmp = path.with_suffix(".xml.tmp")
         tmp.write_text(after)
         _os.replace(tmp, path)
-        if read_XML2.load_system_config(SYSTEM_XML, ROBOTS_DIR).get("active_gripper") != name:
+        read_XML2.load_system_config(SYSTEM_XML, ROBOTS_DIR)            # the file still parses as a whole
+        # its own <active_gripper> (2026-11-18: not the parser's answer, which a test's RCB_ACTIVE_GRIPPER replaces)
+        if (read_XML2.ET.parse(str(path)).getroot().findtext("active_gripper") or "").strip() != name:  # nosec B314
             _put_back_system_xml(before)
             return "system.xml did not read back the new gripper (it is back as it was)"
     except (OSError, ValueError, KeyError, read_XML2.ET.ParseError) as e:
@@ -3530,16 +3532,33 @@ def tcp_server(host="0.0.0.0", port=TCP_PORT):
                             "not the IP list, is what stops two parties commanding at once.",
                             host, port)
         while True:
-            conn, addr = s.accept()
-            ip, _ = addr
-            if not ALLOW_ANY_IP and ip not in ALLOWED_IPS:
-                log_tcp.warning(f"rejected connection from {ip}")
-                try:
-                    conn.sendall(b'{"status":"error","code":"FORBIDDEN"}\n')
-                finally:
-                    conn.close()
+            # 2026-11-18 (review D3): one bad connection never ends the executor — a reset from a refused IP raised out of
+            # sendall (no except), and accept / the thread start were unguarded; every other thread is a daemon, so the
+            # executor exited (and was respawned without its state).
+            try:
+                conn, addr = s.accept()
+            except OSError as e:
+                log_tcp.warning(f"accept failed ({e}) — listening on")
+                time.sleep(0.05)
                 continue
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            try:
+                ip, _ = addr
+                if not ALLOW_ANY_IP and ip not in ALLOWED_IPS:
+                    log_tcp.warning(f"rejected connection from {ip}")
+                    try:
+                        conn.sendall(b'{"status":"error","code":"FORBIDDEN"}\n')
+                    except OSError:
+                        pass
+                    finally:
+                        conn.close()
+                    continue
+                threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+            except (OSError, RuntimeError) as e:
+                log_tcp.warning(f"a connection from {addr} could not be served ({e}) — listening on")
+                try:
+                    conn.close()
+                except OSError:
+                    pass
 
 
 # ========================================================================== #

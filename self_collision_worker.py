@@ -67,6 +67,11 @@ STATS_EVERY_S = 60.0
 _stop = False
 
 
+
+# The longest stretch of a jog's ray scanned (radians along the ray): above every joint's soft range (J6 458 deg), and
+# finite for a joint without soft limits (2026-11-18, review C13).
+RAY_HORIZON_MAX = 4.0 * math.pi
+
 def _on_term(_s, _f):
     global _stop
     _stop = True
@@ -148,7 +153,9 @@ def ray_cycle(model, rti, joint_num, soft_lo, soft_hi, state) -> None:
         d = rti["jog_dir"][:joint_num]
         if float(np.dot(d, d)) > 0.25:                    # a unit vector: a jog direction (zeros: none)
             ref = np.array(rti["jog_ref"][:joint_num])
-            state["scan"] = model.ray_start(ref, d, min(ray_soft_free(ref, d, soft_lo, soft_hi), 2.0 * math.pi))
+            # the horizon: the soft limits along the ray, at most RAY_HORIZON_MAX (2026-11-18, review C13: it was 2 pi,
+            # and J6's soft range is 458 deg — a J6 jog stopped after exactly 360 deg with a false SELF_COLLISION_BLOCK)
+            state["scan"] = model.ray_start(ref, d, min(ray_soft_free(ref, d, soft_lo, soft_hi), RAY_HORIZON_MAX))
             state["model"] = model
             rti["sc_ray_free"][0], rti["sc_ray_done"][0] = 0.0, 0.0
             rti["sc_ray_session"][0] = sess

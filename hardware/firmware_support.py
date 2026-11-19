@@ -7,7 +7,9 @@
 A property of THE RUNTIME, not of an arm: it is what this runtime's CAN code works with, the same for every robot
 that uses these drives — so it lives here, changes with a runtime release, and goes into the compatibility table; the
 robot XML says only which driver each joint has (<driver_type>). The user, 2026-10-21: "103 and forward are
-supported" (every joint and the gripper ran 103 then; the flasher's newest cached release was 106).
+supported" (every joint and the gripper ran 103 then; the flasher's newest cached release was 106). 2026-11-18 (the
+user: "yea bump to 110+"): 110 and newer — the runtime assumes 110 since 2026-11-15 (the watchdog hold / descend, the
+board ids, the drive parameters, sound; TODO/review_2026-11-18.md K8), and every drive of the arm runs it.
 
 A drive outside the range is a WARNING at run time (the executor logs it, the Versions card marks it) and a FAIL in
 the first-run check (tools/first_run.py) — never a stop: an older firmware may well run, it is just not what this
@@ -16,8 +18,8 @@ runtime was made for. A version <= 0 is one the drive has not reported yet (shar
 from __future__ import annotations
 
 SUPPORTED: dict[str, tuple[int, int | None]] = {
-    "stepfoc": (103, None),          # the joints' drives (and the MSG gripper's)
-    "spectral-bldc": (103, None),    # the SSG48 gripper's drive
+    "stepfoc": (110, None),          # the joints' drives (and the MSG gripper's)
+    "spectral-bldc": (110, None),    # the SSG48 gripper's drive
 }
 
 

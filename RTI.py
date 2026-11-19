@@ -651,6 +651,23 @@ def main():
 
     Motor        = motor_system['Motor']
     Joint        = motor_system['Joint']
+
+    # The limits IN FORCE per drive (2026-11-18, TODO/review_2026-11-18.md B2): every Send_Limits RTI makes is
+    # recorded, and a reconnect reload re-sends that drive's last limits instead of the robot XML's — homing's reduced
+    # current (and J3's approach / brake limits), a freed or Hall-checked joint's 0 mA, the joint test's current. A
+    # dropout of 40-200 ms mid-homing gave the joint its full current against its endstop.
+    _limits_in_force: dict = {}
+
+    def _recording_limits(node, send):
+        def send_limits(*args, **kwargs):
+            vel = kwargs.get("Velocity_limit", args[0] if args else None)
+            cur = kwargs.get("Current_limit", args[1] if len(args) > 1 else None)
+            _limits_in_force[node] = (vel, cur)
+            return send(*args, **kwargs)
+        return send_limits
+
+    for _node, _drive in enumerate(Motor):
+        _drive.Send_Limits = _recording_limits(_node, _drive.Send_Limits)
     dummy_device = motor_system['dummy_device']
 
     # Selectable per-signal, per-joint filters (config/filters.xml, hot-reloadable). Replaces the
@@ -3802,6 +3819,7 @@ def main():
                 gripper_KPIQ=st.gripper_KPIQ, gripper_KIIQ=st.gripper_KIIQ,
                 gripper_KPV=st.gripper_KPV, gripper_KIV=st.gripper_KIV,
                 gripper_KPP=st.gripper_KPP,
+                limits_in_force=_limits_in_force,
             )
         _profile_last = _profile_mark(_profile_last, "motor_reconnect")
 

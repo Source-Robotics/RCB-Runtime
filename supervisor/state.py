@@ -34,3 +34,4 @@ ui = {
 processes = {}
 global_monitor_data = {}
 action_queue = queue.Queue()   # UI -> monitor thread (single owner of `processes`)
+scripts_stopped = False        # "Stop all" / Reboot / Shutdown from the menu: the monitor restarts nothing (2026-11-18)

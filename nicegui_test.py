@@ -526,10 +526,10 @@ with ui.card().classes("w-full mb-2"):
                               on_click=lambda: handle_limp_toggle()).props("color=deep-orange size=sm")
         ui.separator().props("vertical")
 
-        _grav_comp_state = [True]
         def _handle_grav_comp_toggle():
-            _grav_comp_state[0] = not _grav_comp_state[0]
-            enabled = _grav_comp_state[0]
+            # the robot's state, not this page's (2026-11-18, review G4: the button always started "ON" and toggled a
+            # page flag — after a reload, or on a second page, a click sent the same state again)
+            enabled = not (shared_data.rti["gravity_comp_enabled"][0] > 0.5)
             _exec(lambda r: r.set_gravity_comp(enabled), "gravity_comp")
             _grav_comp_btn.props(f"color={'positive' if enabled else 'grey'}")
             _grav_comp_btn.set_text("Grav Comp ON" if enabled else "Grav Comp OFF")
@@ -1705,6 +1705,11 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                             min=_min, max=_max, step=_step,
                         ).classes("w-full").bind_value(_pts, _key)
 
+            # 2026-11-18 (TODO/review_2026-11-18.md G1, SAFETY): the fields are loaded FOR a joint; Apply sends them only
+            # to that joint. They were loaded once, for J1, and a change of the selector did not reload them: Apply sent
+            # J1's gains and current limit to whichever joint was selected.
+            _pid_loaded = {"joint": None}
+
             def _load_pid_from_robot():
                 ji = _pid_joint_sel.value
                 for _key, _lbl, _shm, *_ in _GAIN_DEFS:
@@ -1713,8 +1718,10 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                         setattr(_pts, _key, float(shared_data.motor_config[shm_key][0]))
                     else:
                         setattr(_pts, _key, float(shared_data.motor_config[_shm][ji]))
+                _pid_loaded["joint"] = ji
 
             ui.timer(0, _load_pid_from_robot, once=True)
+            _pid_joint_sel.on_value_change(lambda e: _load_pid_from_robot())
 
             def _load_default_pid():
                 ji = _pid_joint_sel.value
@@ -1725,10 +1732,20 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                     else:
                         xml_key = _shm.replace('cfg_', 'motor_', 1)
                         setattr(_pts, _key, float(_xml_cfg[xml_key][ji]))
+                _pid_loaded["joint"] = ji
 
             def _apply_pid_to_joint():
                 ji = _pid_joint_sel.value
                 gains = {_key: getattr(_pts, _key) for _key, *_ in _GAIN_DEFS}
+                if _pid_loaded["joint"] != ji:
+                    _load_pid_from_robot()
+                    ui.notify("The fields were not this joint's: they are loaded from it now — check them, then Apply "
+                              "again.", type="warning", timeout=8000)
+                    return
+                if not any(float(v) for v in gains.values()) or float(gains.get("Ilim", 0.0)) <= 0.0:
+                    ui.notify("Not sent: the current limit is 0 (the drives had not reported their values when this "
+                              "page loaded?) — press Load from Robot.", type="negative", timeout=10000)
+                    return
                 _exec(lambda r: r.set_pid_gains(ji, **gains), "set_pid_gains")
 
             with ui.row().classes("gap-3 mt-4"):
@@ -3847,6 +3864,19 @@ def update_tables():
     _limped = shared_data.robot_mode.get() == "SAFETY_STOP"
     _limp_btn.text = "RESTORE MOTORS" if _limped else "MOTORS OFF"
     _limp_btn.props(f"color={'positive' if _limped else 'deep-orange'} size=sm")
+    # SW E-STOP and Grav Comp (2026-11-18, review G4): the robot's state on every page. The E-stop's label was per page
+    # and never synced: page A asserted it, page B (or A after a reload) still read "SW E-STOP", and pressing it there
+    # RELEASED the E-stop. The toggle reads shared memory, so the label now says what a press does.
+    _es_on = bool(shared_data.rti["software_estop"][0])
+    _es_text = "Release E-Stop" if _es_on else "SW E-STOP"
+    if _sw_estop_btn is not None and _sw_estop_btn.text != _es_text:
+        _sw_estop_btn.text = _es_text
+        _sw_estop_btn.props("color=orange" if _es_on else "color=red size=sm")
+    _gc_on = shared_data.rti["gravity_comp_enabled"][0] > 0.5
+    _gc_text = "Grav Comp ON" if _gc_on else "Grav Comp OFF"
+    if _grav_comp_btn.text != _gc_text:
+        _grav_comp_btn.set_text(_gc_text)
+        _grav_comp_btn.props(f"color={'positive' if _gc_on else 'grey'} outline size=sm")
     # Inertia / Coriolis feedforward buttons: the robot's real state (RTI starts both OFF; a script may toggle them).
     for _dbtn, _dkey, _dname in ((_inertia_btn, "inertia_comp_enabled", "Inertia"),
                                  (_coriolis_btn, "coriolis_comp_enabled", "Coriolis")):

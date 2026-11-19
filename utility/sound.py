@@ -22,6 +22,8 @@ names, a tune's checks, the <sound> block's text edit.
 """
 from __future__ import annotations
 
+import logging
+
 import re
 from collections import deque
 
@@ -217,6 +219,17 @@ class SoundPlayer:
         if not self.queue:
             return
         item = self.queue.popleft()
+        if not 0 <= int(item[1]) < len(motors):
+            # 2026-11-18 (review D1): a node this robot does not have (a hand-edited <sound><node> of 7-15 passes the
+            # parser's 0-15) indexed past the drives in RTI's unguarded poll slot and ended RTI at the boot chime, 12.8 s
+            # after every start. The tune is dropped, once logged.
+            self.queue.clear()
+            if not getattr(self, "_bad_node_logged", False):
+                self._bad_node_logged = True
+                logging.getLogger("rti").warning(
+                    "sound: node %s is no drive of this robot (0-%d) — no tune played; fix system.xml <sound><node>",
+                    item[1], len(motors) - 1)
+            return
         m = motors[item[1]]
         kind = item[0]
         if kind == "param":

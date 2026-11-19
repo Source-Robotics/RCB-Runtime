@@ -8,6 +8,7 @@ Split out of the single-file config/xml_parser.py on 2026-10-03 (refactor Phase 
 from __future__ import annotations
 
 import logging
+import os
 logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -77,6 +78,11 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
     active_gripper = root.findtext("active_gripper", default="").strip()
     if not active_gripper:
         active_gripper = get_active_gripper(robot_root)
+    # RCB_ACTIVE_GRIPPER (2026-11-18): the nets' reference tool, set by tools/run_nets.py for every net — so a test does
+    # not depend on the tool this robot has fitted (with the Flange on, nine nets failed). The robot's processes never
+    # set it, so they run with system.xml's <active_gripper>.
+    if os.environ.get("RCB_ACTIVE_GRIPPER"):
+        active_gripper = os.environ["RCB_ACTIVE_GRIPPER"]
 
     kt_source = root.findtext("kt_source", default="auto").strip().lower()
     if kt_source not in ("auto", "xml"):

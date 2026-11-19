@@ -177,8 +177,10 @@ class JointHomingState:
         self._settle_count     = 0
         self._stall_ref_pos    = None   # position at start of stall window
         self._stall_count      = 0      # ticks since stall_ref_pos was set
-        self._current_count    = 0      # ticks with current above threshold
-        self._current_above    = 0      # total ticks above threshold in current window
+        self._current_count    = 0      # ticks in the current window (at most its length)
+        self._current_above    = 0      # of them, ticks above the threshold
+        self._current_ring = [0] * self._current_threshold   # the last N ticks: 1 = above (C1, 2026-11-18)
+        self._current_i = 0
         self._backoff_count    = 0
         self._dwell_count      = 0
         self._pause_count      = 0
@@ -245,6 +247,8 @@ class JointHomingState:
         self._stall_count      = 0
         self._current_count    = 0
         self._current_above    = 0
+        self._current_ring = [0] * self._current_threshold   # the last N ticks: 1 = above (C1, 2026-11-18)
+        self._current_i = 0
         self._backoff_count    = 0
         self._dwell_count      = 0
         self._pause_count      = 0
@@ -529,12 +533,17 @@ class JointHomingState:
         curr_current = motor.current if motor.current is not None else 0
         abs_current = abs(curr_current)
         if self._tick_count > self._startup_guard:
-            if abs_current >= self._current_detect_ma:
+            # 2026-11-18 (TODO/review_2026-11-18.md C1): a SLIDING window of the last _current_threshold ticks. The
+            # counts were cumulative over the whole pass: 12 high-current ticks anywhere in an approach kept the current
+            # half of the test true for the rest of it, and any 80 ms without progress then read as the endstop (a
+            # false stall). A preallocated ring and a running sum: nothing allocated per tick.
+            above = 1 if abs_current >= self._current_detect_ma else 0
+            ring, i = self._current_ring, self._current_i
+            self._current_above += above - ring[i]
+            ring[i] = above
+            self._current_i = (i + 1) % len(ring)
+            if self._current_count < len(ring):
                 self._current_count += 1
-                self._current_above += 1
-            else:
-                self._current_count += 1
-                # Don't increment _current_above
 
             # Check if we have enough samples in the window
             current_window_ok = (
@@ -585,6 +594,8 @@ class JointHomingState:
             self._stall_count     = 0
             self._current_count   = 0
             self._current_above   = 0
+            self._current_ring = [0] * self._current_threshold   # the last N ticks: 1 = above (C1, 2026-11-18)
+            self._current_i = 0
             self._last_pos        = None
             self._triggered_pos   = None
             self._pre_clear_count = 0
@@ -638,6 +649,8 @@ class JointHomingState:
             self._stall_count   = 0
             self._current_count = 0
             self._current_above = 0
+            self._current_ring = [0] * self._current_threshold   # the last N ticks: 1 = above (C1, 2026-11-18)
+            self._current_i = 0
             self._last_pos      = None
             self._triggered_pos = None
             self._pass2_stall_pos = None

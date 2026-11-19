@@ -152,6 +152,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Changed
 
+- Drive firmware 110 or newer is what this runtime supports (it said 103): an older drive is a warning at run time, on
+  the Versions card, and a FAIL in the first-run check. Every drive of the arm runs 110 since 2026-11-16; the runtime
+  relies on it (the watchdog's hold, the board ids, the drive parameters, sound).
+
 - `end_gripper_change(removed=True)` (the gripper taken off the flange) leaves the whole arm not homed, instead of
   J5 and J6 only: the arm homes again. That homing takes J5's and J6's new spots for this gripper
   without asking; J1 to J4 are checked as always. J6's spot is stored per gripper, as J5's already was.
@@ -174,6 +178,32 @@ What changed in each version of the RCB runtime. The newest version is at the to
   click, for example on Enable) instead of skipping the step at once.
 
 ### Fixed
+
+- A CAN dropout of 40-200 ms during homing re-sent the drive's full current limit, so the rest of the homing pushed
+  into the endstop at full current (and a freed or Hall-checked joint was energised under the user's hand). RTI now
+  records the limits it last sent each drive, and a reconnect re-sends those.
+- A homing move that timed out with a joint far from its target carried on, and J4 / J6 then homed in a pose nobody
+  checked. A joint more than 2 deg from its target now fails the homing, naming it and how far it was.
+- The homing's endstop detection counted high current over the whole approach: a burst early on armed it, and any
+  short pause later read as the endstop (a false stall). It now looks at the last 80 ms only.
+- The arm check recognised a known arm from one homed joint alone, even when the drive boards said it was a new arm;
+  it now needs two joints, and never when the boards say "new".
+- An error while the homing question waited left the question open (the dialog kept reopening, Accept was refused),
+  and the Joints table kept "homed" after a failed homing.
+- The PID tuner sent J1's values to whichever joint was selected: its fields were loaded once. They now reload when
+  the joint changes, and Apply refuses fields loaded for another joint or a current limit of 0.
+- The dashboard's SW E-STOP button showed each page's own idea of the E-stop: on another page, or after a reload,
+  pressing "SW E-STOP" released it. It and Grav Comp now show the robot's state on every page.
+- The control box's "Stop all", "Reboot Pi" and "Shutdown" restarted every script in the same pass. "Restart RTI" /
+  GUI / HL ask for confirmation, and "Restart RTI" is refused while the arm is enabled.
+- The supervisor stopped RTI on any error in its main loop (a UART fault dropped the arm), and started nothing when
+  the OLED did not open: both are logged now, and the robot runs on.
+- A sound node the robot does not have (`<sound><node>` 7-15) ended RTI at the boot chime after every start; the tune
+  is dropped and logged.
+- A reset from a refused IP ended the executor; a CAN read error ended RTI (read-first mode, the default) — now it
+  reads nothing, the drives go stale and CAN_LOST latches with RTI running.
+- A J6 jog stopped after exactly 360 deg with a false self-collision block (the scan stopped at one turn; J6's soft
+  range is 458 deg).
 
 - `scripts/check_system.py` passed a Pi on which RTI cannot start. It tried real-time priority 1 (RTI needs 99) and
   reported a refusal as a warning under "no required failures". It now tries 99 (on a core away from RTI's, back to

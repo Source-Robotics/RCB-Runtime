@@ -394,7 +394,8 @@ def hand_push(ctx, notes):
 def push_through(ctx, notes):
     """A hand pushes J5 through everything freedrive has (IDLE): past its soft limit -> SOFT_LIMIT_WARNING, through its
     wall's breakthrough -> JOINT_WALL_WARNING (both warnings, no stop), past its hard limit + the endstop tolerance ->
-    BEYOND_ENDSTOP (an error: the robot disables and homing is invalidated). Pushed back, cleared and re-homed, the
+    BEYOND_ENDSTOP (an error: the robot disables and homing is invalidated). Pushed back where it stood, cleared and
+    re-homed, the
     robot works. (Found by accident 2026-10-13, when a scenario pushed the wrong way — the stack behaved; now pinned.)"""
     r = ctx.robot()
     try:
@@ -404,6 +405,7 @@ def push_through(ctx, notes):
         soft, hard = (math.degrees(float(c["software_joint_limit_positive"][4])),
                       math.degrees(float(c["joint_limit_positive"][4])))
         wall = soft + min(hard - soft, 15.0)                  # the auto breakthrough (docs/safety_zones.md §2b)
+        start = float(r.get_joints()[4])                       # where the re-homing starts from: J5 goes back here
         mark = ctx.activity_mark()
         _push_to(ctx, r, 4, soft + 2.0)
         w1 = _wait(lambda: ctx.has(mark, "SOFT_LIMIT_WARNING", 5), 2.0)
@@ -414,7 +416,9 @@ def push_through(ctx, notes):
         e3 = _wait(lambda: ctx.has(mark, "BEYOND_ENDSTOP", 5), 2.0)
         _wait(lambda: r.status().get("err") == 1, 2.0)
         st = r.status()
-        _push_to(ctx, r, 4, soft - 5.0)
+        # back where it stood (2026-11-18): from soft - 5 deg J5's homing (its nudges, then its search) passed its
+        # 240 deg travel limit (<homing_max_travel_deg>, 2026-11-16) and failed — rightly: start it where homings start
+        _push_to(ctx, r, 4, start)
         r.clear_errors(wait=True)
         st2 = ctx.ready(r, home=True)
         notes.append(f"soft {soft:.1f} / wall {wall:.1f} / hard {hard:.1f} deg: SOFT_LIMIT_WARNING {w1}, JOINT_WALL_WARNING "
@@ -521,9 +525,9 @@ def _alias_deg(ctx, j):
 def homing_false_stall(ctx, notes):
     """J2 cannot reach its endstop while homing — an obstacle where it starts (2026-10-14, the user's case: J2 left
     away from its park pose, a load the homing current cannot lift; or something in the way). It stalls there, backs
-    off, stalls there again: the two passes agree, so only the arm check can tell. With a known arm J2 must FAIL as soon
-    as it homes — J2:HOMING_FAILED latched as an ERROR (disabled, in the status' errors), its reason in the activity
-    log, not homed; then the obstacle gone + Clear Errors + Enable + Home -> homed. Starts from a fresh homing, so the
+    off, stalls there again: the two passes agree, so only the arm check can tell. With a known arm homing must ASK
+    about J2 as soon as it homes (the homing question, since 2026-11-16; it failed before); Stop answers it — the
+    homing ends, not homed; then the obstacle gone + Clear Errors + Enable + Home -> homed. Starts from a fresh homing, so the
     obstacle sits at the homing sequence's own end pose (deterministic)."""
     r = ctx.robot()
     try:
@@ -543,32 +547,35 @@ def homing_false_stall(ctx, notes):
                      f"(what the arm check sees; > 1 deg needed)")
         ctx.ready(r)
         r.enter_idle_mode(wait=True)
-        mark = ctx.activity_mark()
         ctx.sim(cmd="physics", node=1, kind="block", ms=600000)
         r.home(wait=False)
         if not _wait(lambda: r.status().get("mode") == "HOMING", 3.0):
             notes.append(f"the homing never started (mode {r.status().get('mode')})")
             return False
-        failed = _wait(lambda: [e for e in ctx.activity_since(mark) if e.get("code") == "HOMING_FAILED"], 90.0)
-        _wait(lambda: r.status().get("err") == 1 and r.status().get("mode") != "HOMING", 2.0)
+        # Since 2026-11-16 (the user: "pause and ask") a joint off the recognised arm's spot does not fail the homing:
+        # homing holds the arm and ASKS (status homing_question). The false stall is caught when J2 is asked about;
+        # Stop is the "no" — the homing ends, the arm not homed (it used to be J2:HOMING_FAILED, an error).
+        asked = _wait(lambda: "J2" in (r.status().get("homing_question") or {}), 90.0)
+        q = r.status().get("homing_question") or {}
+        notes.append(f"homing question: {q}")
+        r.stop(wait=True)
+        _wait(lambda: r.status().get("mode") != "HOMING", 5.0)
         st = r.status()
-        msg = failed[0].get("message", "") if failed else ""
-        notes.append(f"activity: {failed[0].get('level') if failed else None} HOMING_FAILED '{msg[:150]}'")
-        notes.append(f"status: err={st.get('err')} state={st.get('state')} mode={st.get('mode')} "
-                     f"homed={st.get('homed')} errors={st.get('errors')}")
-        caught = (bool(failed) and failed[0].get("level") == "error" and msg.startswith("joint 2:")
-                  and "checked as soon as it homed" in msg and st.get("err") == 1 and st.get("homed") is not True
-                  and st.get("state") != "ENABLED" and "J2:HOMING_FAILED" in (st.get("errors") or []))
+        notes.append(f"after Stop: mode={st.get('mode')} homed={st.get('homed')} question={st.get('homing_question')}")
+        caught = (bool(asked) and abs(float(q.get("J2", 0.0))) > 1.0 and st.get("mode") != "HOMING"
+                  and st.get("homed") is not True and not st.get("homing_question"))
     finally:
         ctx.sim(cmd="physics", node=1, kind="clear")
-    r.clear_errors(wait=True)
-    time.sleep(0.3)
-    r.enable(wait=True)
-    r.enter_idle_mode(wait=True)
-    r.home(wait=True)
-    st = r.status()
-    notes.append(f"obstacle gone + Clear Errors + Enable + Home: homed={st.get('homed')} err={st.get('err')}")
-    r.disconnect()
+    try:
+        r.clear_errors(wait=True)
+        time.sleep(0.3)
+        r.enable(wait=True)
+        r.enter_idle_mode(wait=True)
+        r.home(wait=True)
+        st = r.status()
+        notes.append(f"obstacle gone + Clear Errors + Enable + Home: homed={st.get('homed')} err={st.get('err')}")
+    finally:
+        r.disconnect()        # 2026-11-18: a raise here left control held and failed every scenario after it
     return caught and seen > 1.0 and st.get("homed") is True and st.get("err") == 0
 
 

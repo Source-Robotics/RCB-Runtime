@@ -486,6 +486,46 @@ class HomingArms:
         r = self.table.get("relearn") or {}
         return set(r.get("joints") or ()) if r.get("gripper") == self.gripper else set()
 
+    def _recognise_so_far(self, latches: dict, keys: dict) -> dict:
+        """check_so_far before an arm is recognised: recognise it from the joints homed so far, or say why not
+        (skip / an unknown-arm fault). Split out of check_so_far (2026-11-18, its complexity)."""
+        # 2026-11-18 (review C6): not at all when the drive boards say this is a new arm — a first joint homed at
+        # a known arm's spot by chance recognised THAT arm, and an Accept then overwrote its spots and boards. (A
+        # known arm is still recognised from its first joint otherwise: the user's 2026-10-14 rule, so a false
+        # stall of the first joint fails at once.)
+        if self._new_by_boards:
+            self._so_far_off = True
+            return {"kind": "skip", "text": "the first joint(s) homed are not compared — learning a new arm (no "
+                                            "known arm has these drive boards)"}
+        known = [a for a in self.table["arms"] if a.get("known")]
+        closest = None
+        for arm in known:
+            _, compared, off, devs = compare(arm, latches, keys, self.counts, self.gears)
+            if compared and not off:
+                self._so_far_arm = arm["id"]
+                return {"kind": "ok", "text": f"arm recognised from the joints homed so far: "
+                                              f"{arm_label(arm)} — each joint homed from now on is checked at once"}
+            if compared and (closest is None or max(abs(d) for _, d in off) < closest[0]):
+                closest = (max(abs(d) for _, d in off), arm, off)
+        self._so_far_off = True
+        if closest is None:                 # still learning the first arm (or nothing comparable): the end check
+            return {"kind": "skip"}
+        if self.table.get("learn_next") or self._new_by_boards:
+            because = ("no known arm has these drive boards" if self._new_by_boards
+                       else "requested: 'learn a new arm on the next homing'")
+            return {"kind": "skip", "text": f"the first joint(s) homed match none of the known arms — "
+                                            f"learning a new arm ({because})"}
+        # 2026-10-14 (user): no longer "another arm?" — a joint that false-stalled first (J1 could not turn in a
+        # folded pose) made every later joint unchecked and the sequence went on to the gripper on wrong references
+        _, arm, off = closest
+        why = (f"homed where no known arm's {', '.join(f'J{i + 1}' for i, _ in off)} homes (closest: "
+               f"{arm_label(arm)}, {', '.join(f'J{i + 1} {d:+.2f} deg' for i, d in off)}) — a false stall (could it "
+               f"move from where it was? the arm touching itself or something?), or a different arm. Move the arm "
+               f"to its park pose and home again; a different arm: System Info > 'Arms (homing)' > 'Learn a new arm "
+               f"on the next homing'")
+        return {"kind": "fault", "unknown": True, "off": off, "reason": f"it {why}",
+                "text": f"FAILED: {', '.join(f'J{i + 1}' for i, _ in off)} — it {why}"}
+
     def check_so_far(self, latches: dict, j: int) -> dict:
         """Mid-homing (2026-10-14, user: "check each joint at once"): joint `j` just homed; `latches` = every arm joint
         homed so far. The arm is recognised as soon as one KNOWN arm has every joint homed so far at its usual spot;
@@ -506,34 +546,7 @@ class HomingArms:
             return {"kind": "skip"}
         keys = {i: joint_key(i, self.gripper_dependent, self.gripper) for i in latches}
         if self._so_far_arm is None:
-            known = [a for a in self.table["arms"] if a.get("known")]
-            closest = None
-            for arm in known:
-                _, compared, off, devs = compare(arm, latches, keys, self.counts, self.gears)
-                if compared and not off:
-                    self._so_far_arm = arm["id"]
-                    return {"kind": "ok", "text": f"arm recognised from the joints homed so far: "
-                                                  f"{arm_label(arm)} — each joint homed from now on is checked at once"}
-                if compared and (closest is None or max(abs(d) for _, d in off) < closest[0]):
-                    closest = (max(abs(d) for _, d in off), arm, off)
-            self._so_far_off = True
-            if closest is None:                 # still learning the first arm (or nothing comparable): the end check
-                return {"kind": "skip"}
-            if self.table.get("learn_next") or self._new_by_boards:
-                because = ("no known arm has these drive boards" if self._new_by_boards
-                           else "requested: 'learn a new arm on the next homing'")
-                return {"kind": "skip", "text": f"the first joint(s) homed match none of the known arms — "
-                                                f"learning a new arm ({because})"}
-            # 2026-10-14 (user): no longer "another arm?" — a joint that false-stalled first (J1 could not turn in a
-            # folded pose) made every later joint unchecked and the sequence went on to the gripper on wrong references
-            _, arm, off = closest
-            why = (f"homed where no known arm's {', '.join(f'J{i + 1}' for i, _ in off)} homes (closest: "
-                   f"{arm_label(arm)}, {', '.join(f'J{i + 1} {d:+.2f} deg' for i, d in off)}) — a false stall (could it "
-                   f"move from where it was? the arm touching itself or something?), or a different arm. Move the arm "
-                   f"to its park pose and home again; a different arm: System Info > 'Arms (homing)' > 'Learn a new arm "
-                   f"on the next homing'")
-            return {"kind": "fault", "unknown": True, "off": off, "reason": f"it {why}",
-                    "text": f"FAILED: {', '.join(f'J{i + 1}' for i, _ in off)} — it {why}"}
+            return self._recognise_so_far(latches, keys)
         arm = next((a for a in self.table["arms"] if a["id"] == self._so_far_arm), None)
         if arm is None:
             return {"kind": "skip"}

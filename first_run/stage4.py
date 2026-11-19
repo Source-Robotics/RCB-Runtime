@@ -21,6 +21,10 @@ HOMING_KEYS = ("HOMING_FAILED", "GRIPPER_HOMING_FAILED", "HOMING_ABORTED")
 
 # (words in RTI's reason, the builder's hints) — the first match wins; the reasons' own wording in robotics/homing/
 REASON_HINTS = [
+    (("its move_to ended",),                        # 2026-11-18 (review B3): a homing move that did not arrive
+     ["something in the way of the arm's move to its homing pose, or a cable caught",
+      "a joint too weak to carry the arm there (its current limit, a heavy tool or payload)",
+      "move the arm to its park pose by hand, clear the space, then home again"]),
     (("did not reach its endstop", "timeout ("),
      ["the joint started far from its endstop: move the arm to its park pose by hand before homing",
       "something in the way, or a cable caught",

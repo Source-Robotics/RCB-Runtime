@@ -128,8 +128,14 @@ def handle_motor_reconnect(
     gripper_KPIQ=None, gripper_KIIQ=None,
     gripper_KPV=None, gripper_KIV=None,
     gripper_KPP=None,
+    limits_in_force=None,
 ):
     """Reload motor/gripper config when a CAN node recovers after being stale.
+
+    limits_in_force (2026-11-18, TODO/review_2026-11-18.md B2): {node: (velocity limit, current limit)} — the last
+    limits RTI SENT that node (RTI.py records every Send_Limits). The reload re-sends those, not the robot XML's: a
+    40-200 ms dropout mid-homing used to give the joint its full current against the endstop, and a freed / Hall-check
+    joint (0 mA) its full current under the user's hand. None / a node not in it: the XML's, as before.
 
     Detects stale→fresh edge on old_data_warning per node and re-sends
     watchdog, limits, and gains to that node only (motor_index=i, num_repeats=2).
@@ -165,12 +171,21 @@ def handle_motor_reconnect(
             reload_pending[i] = False
             reload_last_tick[i] = tick
             if i < joint_num:
-                _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, motor_velocity_limit,
-                              motor_Ilim, motor_KPP, motor_KP, motor_KD, motor_KPIQ, motor_KIIQ, motor_KPV,
+                vel, cur = motor_velocity_limit, motor_Ilim
+                sent = (limits_in_force or {}).get(i)
+                if sent is not None and None not in sent:
+                    vel, cur = list(motor_velocity_limit), list(motor_Ilim)
+                    vel[i], cur[i] = sent
+                _reload_motor(i, shared_data, Motor, joint_num, motor_watchdog_rate, vel,
+                              cur, motor_KPP, motor_KP, motor_KD, motor_KPIQ, motor_KIIQ, motor_KPV,
                               motor_KIV, motor_voltage_limit)
             else:
-                _reload_gripper(shared_data, Motor, joint_num, gripper_watchdog_rate, gripper_velocity_limit,
-                                gripper_Ilim, gripper_voltage_limit, gripper_KP, gripper_KD, gripper_KPIQ,
+                g_vel, g_cur = gripper_velocity_limit, gripper_Ilim
+                sent = (limits_in_force or {}).get(i)
+                if sent is not None and None not in sent:
+                    g_vel, g_cur = sent
+                _reload_gripper(shared_data, Motor, joint_num, gripper_watchdog_rate, g_vel,
+                                g_cur, gripper_voltage_limit, gripper_KP, gripper_KD, gripper_KPIQ,
                                 gripper_KIIQ, gripper_KPV, gripper_KIV, gripper_KPP)
             return
 

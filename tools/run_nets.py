@@ -77,6 +77,10 @@ FAIL_MARKERS = re.compile(r"(?m)^\s*(?:(?!0 )\d+ (?:failed|FAILED|FAILURE)|FAILE
 COVERAGE_SKIP = re.compile(r"(?m)^SKIP .*\(coverage run:")
 
 
+
+# The tool every net sees (RCB_ACTIVE_GRIPPER): the one the nets were written and pinned with (2026-11-18).
+REFERENCE_GRIPPER = "MSG_small_motor_150mm_rail"
+
 def robot_state(timeout=2.0):
     """'ENABLED' / 'DISABLED' / ... from the executor, or None when nothing answers (then no robot is running)."""
     try:
@@ -129,6 +133,9 @@ def run_one(path, index, timeout, coverage=False):
     os.makedirs(tmp, exist_ok=True)
     env = dict(os.environ, RCB_SHM_PREFIX=prefix, PYTHONUNBUFFERED="1", PYTHONPATH=os.pathsep.join((NET_SITE, ROOT)),
                RCB_LOGS_DIR=logs, RCB_TMPDIR=tmp, TMPDIR=tmp)
+    # RCB_ACTIVE_GRIPPER (config/xml_parser/system.py, 2026-11-18): every net sees the REFERENCE tool, whatever this
+    # robot has fitted — the nets were written (and their pins made) with it
+    env.setdefault("RCB_ACTIVE_GRIPPER", REFERENCE_GRIPPER)
     cmd = [sys.executable, path]
     if coverage:                                       # measured: lines + branches, its subprocesses too
         cmd = quality.coverage_command(path)
