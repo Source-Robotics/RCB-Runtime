@@ -12,8 +12,14 @@ Every single button, input and output can be skipped on its own (a build without
 only some I/O wired): Cancelled from a wait (Ctrl-C in the console) skips that one — at its press / switch AND at its
 release / switch back (2026-10-27) — and an output's question has "not wired". A skipped one is a SKIP in the report,
 never a FAIL. A run stopped at a question (Aborted) keeps the results already measured in the step (e.partial).
-    hall      the Hall-sensor joint limp (robot.hall_check), the user turns it by hand through the magnet: the sensor
-              changes and changes back; optionally twice, to see it trigger at the same angle
+    hall      the Hall-sensor joint limp (robot.hall_check), turned by hand in short steps by the + / - signs on the
+              joint, each switch said and beeped (2026-11-20, the user: "homing's edge, 3 times" and "a sound
+              indicator"): find the magnet (either way until the sensor switches ON — it works), then HALL_TRIES
+              times: back until OFF, then slowly the way the joint HOMES until ON — the point homing stops at. Judged:
+              those ON points within HALL_REPEAT_DEG. An ON reached turning the other way is not counted (said, tried
+              again). Replaces the old pass + repeat question, whose "the same way" was hard to follow and whose
+              comparison read RTI's two latest-edge slots (2026-11-19 / 11-20: "30.5" / "31.33 deg apart" on a good
+              sensor)
 
 The arm is DISABLED for this stage (a pressed E-stop disables it anyway). Read through robot.get_hardware(can=False)
 — the polls skip the CAN interface's counters.
@@ -34,8 +40,13 @@ SETTLE_S = 0.5              # after the press, before the channels are read agai
 ROBOT_REACT_S = 1.0         # RTI latches ESTOP on the tick it reads it: allow a second for the status to show it
 OUTPUT_ON_S = 2.0
 OUTPUT_ANSWERS = ("yes", "no", "again", "not wired")   # "again": switch it once more, ask again (a mis-typed answer)
-HALL_REPEAT_DEG = 2.0       # the same edge twice further apart than this: the magnet or the sensor is loose
-HALL_SETTLE_S = 1.0         # the repeat is read once the pin has not changed for this long (the user let go)
+HALL_REPEAT_DEG = 2.0       # the ON points further apart than this: the magnet or the sensor is loose
+HALL_TRIES = 3              # the ON point approached the way homing comes, this often (2026-11-20, the user)
+HALL_ON = 0                 # the pin level with the magnet at the sensor: homing's trigger (robotics/homing/joint.py,
+#                             motor.HALL_trigger == 0); the arm 2026-11-20: entering the field the pin went to 0
+HALL_TONES = {HALL_ON: (1320.0, 0.15), 1 - HALL_ON: (660.0, 0.15)}   # a beep at each switch: ON high, OFF low (Hz, s)
+HALL_POLL_S = 0.1
+HALL_WAY_MIN_DEG = 0.05     # a joint that moved less between two polls: its way at the switch is not judged
 ESTOP_KEYS = ("ESTOP",)
 # The control box's terminal block (docs/pin_map.md): isolated inputs 1-3, outputs 1-3; E-Stop 1 = E2 + E4.
 INPUT_TERMINALS = (11, 10, 9)
@@ -207,46 +218,57 @@ def check_outputs(ctx, ui):
     return out
 
 
-def _settled_after(ctx, changes, interval_s=0.1):
-    """A ui.wait poll (every interval_s): the Hall status once it has `changes` pin changes and none for HALL_SETTLE_S
-    — the user has finished turning; a sensor flickering at an edge counts extra changes (2026-11-19) — else None.
-    Counted in polls, the wait's own clock."""
-    seen = {"n": -1, "still": 0}
-    need = max(1, int(round(HALL_SETTLE_S / interval_s)))
+def hall_approach(homing_direction, motor_dir):
+    """The joint's way into its Hall trigger when it homes: +1 / -1, None when unreadable. <homing_direction> 0 = the
+    motor's + way, 1 = its - way (robotics/homing/joint.py _signed_speed); <dir> 1 = the joint turns against its motor
+    (robotics/dynamics.py: motor_signs = 1 - 2 dir). PAR6 J6: 0 and 1 -> -1, it homes turning -, onto the field's top
+    edge (its home_offset 106.66 deg; the arm 2026-11-20: ON at 106.59 deg turning -)."""
+    try:
+        hd, d = int(float(homing_direction)), int(float(motor_dir))
+    except (TypeError, ValueError):
+        return None
+    if hd not in (0, 1) or d not in (0, 1):
+        return None
+    return (1 if hd == 0 else -1) * (1 - 2 * d)
+
+
+def _until(ctx, ui, joint, level, prompt):
+    """Waits until the Hall pin switches to `level`: (the angle it switched at — RTI's edge_deg[level] —, the joint's
+    way of turning then: +1 / -1, 0 when it barely moved), or None after HALL_TIMEOUT_S. Cancelled on a skip."""
+    robot = ctx["robot"]
+    start = int(_hall(ctx).get("changes") or 0)
+    before = [None]                      # the joint's angle at the last poll before the switch
 
     def poll():
         h = _hall(ctx)
-        n = int(h.get("changes", 0))
-        if n != seen["n"]:
-            seen["n"], seen["still"] = n, 0
-            return None
-        seen["still"] += 1
-        return h if n >= changes and seen["still"] >= need else None
-    return poll
+        if h.get("pin") == level and int(h.get("changes") or 0) > start:
+            edge = (list(h.get("edge_deg") or []) + [None, None])[level]
+            if edge is None or not math.isfinite(float(edge)):
+                return None
+            edge = float(edge)
+            way = 0
+            if before[0] is not None and abs(edge - before[0]) >= HALL_WAY_MIN_DEG:
+                way = 1 if edge > before[0] else -1
+            return edge, way
+        try:
+            before[0] = float(robot.get_joints()[joint])
+        except (TypeError, ValueError, IndexError, AttributeError):
+            pass
+        return None
+    return ui.wait(prompt, poll, HALL_TIMEOUT_S, HALL_POLL_S)
 
 
-def _repeat_result(st, first_edges, again_edges):
-    """The repeat against the first pass: both edges of the magnet's field (where the pin changed to 0 and to 1). A
-    pass the other way swaps which edge is which (the 2026-11-19 run: 30.5 deg "apart" = the field's two sides), so
-    the closer pairing is judged, and said."""
+def _beep(ctx, ui, level, sound):
+    """A tone through the arm's playing motor at a switch (ON high, OFF low; the user, 2026-11-20). Best effort: a
+    refusal (programs' sounds switched off, another client's control) is said once, then the check goes on silently."""
+    if sound.get("off"):
+        return
+    hz, secs = HALL_TONES[level]
     try:
-        a0, a1 = (float(x) for x in first_edges)
-        b0, b1 = (float(x) for x in again_edges)
-    except (TypeError, ValueError):
-        return result(st, WARN, "the trigger angles were not recorded both times", value=again_edges)
-    if not all(math.isfinite(x) for x in (a0, a1, b0, b1)):
-        return result(st, WARN, "the trigger angles were not recorded both times", value=again_edges)
-    same = max(abs(a0 - b0), abs(a1 - b1))
-    swapped = max(abs(a0 - b1), abs(a1 - b0))
-    d = min(same, swapped)
-    how = "" if same <= swapped else " (the repeat went the other way: compared edge for edge)"
-    return result(st, PASS if d <= HALL_REPEAT_DEG else WARN,
-                  f"the magnet's edges {d:.2f} deg apart on the two passes{how}", value=round(d, 3),
-                  expected=f"within {HALL_REPEAT_DEG} deg",
-                  details={"first_deg": [a0, a1], "repeat_deg": [b0, b1], "reversed": same > swapped},
-                  hints=[] if d <= HALL_REPEAT_DEG else
-                  ["the magnet or the sensor is loose, or the gap is so large the sensor triggers late; homing "
-                   "relies on this point"])
+        ctx["robot"].beep(hz, secs)
+    except Exception as e:             # noqa: BLE001 — a sound never fails the check
+        sound["off"] = True
+        ui.say(f"(no sound: {getattr(e, 'message', None) or e})")
 
 
 def _hall(ctx):
@@ -260,6 +282,10 @@ def check_hall(ctx, ui):
     if joint is None:
         return result(st, SKIP, "this robot has no Hall-sensor joint")
     name = f"J{joint + 1}"
+    approach = (ctx.get("config") or {}).get("hall_approach")
+    if approach not in (1, -1):
+        return result(st, SKIP, f"{name}'s homing direction is not readable in the robot XML (<homing_direction>, "
+                                "<dir>)")
     status = ctx["robot"].get_status() or {}
     if status.get("mode") != "IDLE":
         return result(st, SKIP, f"the Hall check needs IDLE (the robot is in {status.get('mode')})")
@@ -276,44 +302,79 @@ def check_hall(ctx, ui):
                           3.0, 0.1)
         if started is None:
             return result(st, FAIL, "the robot did not start the Hall check", hints=["logs/RTI.log"])
-        robot.hall_check(True)          # renews the check's 2 minutes for the wait below (2026-10-24)
-        first = ui.wait(f"{name} is limp now (hold the gripper if its weight could turn it). Turn {name} SLOWLY by "
-                        "hand through its magnet and a little past it",
-                        lambda: (lambda h: h if h.get("changes", 0) >= 2 else None)(_hall(ctx)), HALL_TIMEOUT_S,
-                        0.1)
-        if first is None:
-            h = _hall(ctx)
-            stuck = h.get("changes", 0) == 1
-            return result(st, FAIL, "the sensor " + ("changed once and stayed" if stuck else "never changed"),
-                          value=h, expected="it changes at the magnet and changes back after it",
-                          hints=(["the sensor stays triggered: the magnet too close, or the sensor's output shorted"]
-                                 if stuck else
-                                 ["the sensor's cable to the drive (its connector on the drive)",
-                                  "the magnet: present, its gap to the sensor (a few mm), the right pole facing it",
-                                  "turn through the whole range once: the magnet may sit elsewhere"]))
-        out = [result(st, PASS, f"the sensor changes at the magnet and back ({name} at "
-                                f"{_fmt(first.get('edge_deg'))})", value=first)]
+        sound: dict = {}
+        off = 1 - HALL_ON
+        toward, back = ("+" if approach > 0 else "-"), ("-" if approach > 0 else "+")
+        robot.hall_check(True)          # renews the check's 2 minutes before each wait (2026-10-24)
+        if _hall(ctx).get("pin") == HALL_ON:
+            ui.say(f"The sensor is ON already: {name} stands at the magnet.")
+            out = [result(st, PASS, f"the sensor is ON at the magnet ({name} stands there)")]
+        else:
+            first = _until(ctx, ui, joint, HALL_ON, f"{name} is limp now (hold the gripper if its weight could turn it). "
+                           f"Find the magnet: turn {name} SLOWLY either way until the sensor switches ON")
+            if first is None:
+                return result(st, FAIL, "the sensor never changed", value=_hall(ctx),
+                              expected="it switches ON at the magnet",
+                              hints=["the sensor's cable to the drive (its connector on the drive)",
+                                     "the magnet: present, its gap to the sensor (a few mm), the right pole facing it",
+                                     "turn through the whole range once: the magnet may sit elsewhere"])
+            _beep(ctx, ui, HALL_ON, sound)
+            ui.say(f"ON at {first[0]:.1f} deg")
+            out = [result(st, PASS, f"the sensor switches ON at the magnet ({name} at {first[0]:.1f} deg)",
+                          value=round(first[0], 2))]
+        ons: list = []
+        offs: list = []
+        tries = 0
         try:
-            repeat = ui.confirm(f"Check that it triggers at the same place? Turn {name} back past the magnet, then "
-                                "through it again the SAME way as before.")
-        except Aborted as e:            # the run stops here: keep the first pass's result
-            e.partial = out
-            raise
-        if repeat:
-            robot.hall_check(True)      # renewed again: the question above may have taken a while
-            again = ui.wait(f"Turn {name} back past the magnet, then through it again the same way, then let go",
-                            _settled_after(ctx, 6), HALL_TIMEOUT_S, 0.1)
-            if again is None:
-                out.append(result(st, WARN, "the repeat was not completed", value=_hall(ctx)))
-            else:
-                out.append(_repeat_result(st, first.get("edge_deg"), again.get("edge_deg")))
+            while len(ons) < HALL_TRIES and tries < 2 * HALL_TRIES:
+                tries += 1
+                k = len(ons) + 1
+                robot.hall_check(True)
+                got_off = _until(ctx, ui, joint, off, f"{k} of {HALL_TRIES}: turn {name} toward its {back} sign until "
+                                 "the sensor switches OFF")
+                if got_off is None:
+                    out.append(result(st, FAIL, "the sensor switched ON and stays ON", value=_hall(ctx),
+                                      expected="it switches OFF past the magnet",
+                                      hints=["the sensor stays triggered: the magnet too close, or the sensor's output "
+                                             "shorted"]))
+                    return out
+                _beep(ctx, ui, off, sound)
+                offs.append(round(got_off[0], 2))
+                robot.hall_check(True)
+                got_on = _until(ctx, ui, joint, HALL_ON, f"{k} of {HALL_TRIES}: now turn {name} SLOWLY toward its "
+                                f"{toward} sign until the sensor switches ON (where homing stops)")
+                if got_on is None:
+                    break
+                _beep(ctx, ui, HALL_ON, sound)
+                if got_on[1] == -approach:      # reached turning the other way: another edge, not homing's
+                    ui.say(f"ON at {got_on[0]:.1f} deg, but turning toward its {back} sign — homing comes the "
+                           f"{toward} way: not counted, again")
+                    continue
+                ons.append(round(got_on[0], 2))
+                ui.say(f"ON at {got_on[0]:.1f} deg ({k} of {HALL_TRIES})")
+        except Cancelled:
+            pass
+        if len(ons) < HALL_TRIES:
+            out.append(result(st, WARN, f"the {HALL_TRIES} tries were not completed ({len(ons)} done"
+                                        + (f": ON at {', '.join(f'{x:.1f}' for x in ons)} deg)" if ons else ")"),
+                              value=ons, expected=f"{HALL_TRIES} ON points"))
+            return out
+        spread = max(ons) - min(ons)
+        details = {"on_deg": ons, "off_deg": offs, "approach": toward}
+        if spread <= HALL_REPEAT_DEG:
+            out.append(result(st, PASS, f"the sensor switches ON at the same place each time {name} comes the "
+                                        f"{toward} way (as homing does): {sum(ons) / len(ons):.1f} deg, the "
+                                        f"{HALL_TRIES} within {spread:.2f} deg", value=round(spread, 3),
+                              expected=f"within {HALL_REPEAT_DEG} deg", details=details))
+        else:
+            out.append(result(st, WARN, f"the sensor switched ON {spread:.2f} deg apart coming the {toward} way "
+                                        f"({', '.join(f'{x:.1f}' for x in ons)} deg)", value=round(spread, 3),
+                              expected=f"within {HALL_REPEAT_DEG} deg", details=details,
+                              hints=["the magnet or the sensor is loose, or the gap is so large the sensor triggers "
+                                     "late; homing relies on this point"]))
         return out
     finally:
         robot.hall_check(False)
-
-
-def _fmt(edges):
-    return ", ".join(f"{e:.1f} deg" for e in (edges or []) if e is not None and math.isfinite(e)) or "?"
 
 
 ESTOP = step("S2.estop", 2, "The E-stop", check_estop, needs=("robot", "disabled"),

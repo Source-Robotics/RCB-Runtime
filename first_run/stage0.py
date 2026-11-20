@@ -65,8 +65,17 @@ def check_setup(ctx, ui):
                   details=details)
 
 
+def _at(values, i):
+    """values[i], None when missing."""
+    try:
+        return list(values)[i]
+    except (TypeError, IndexError):
+        return None
+
+
 def check_config(ctx, ui):
     import config.xml_parser as xp   # here, not at import: a test of the other stages needs no XML parser
+    from first_run.stage2 import hall_approach
 
     st = CONFIG
     try:
@@ -86,9 +95,9 @@ def check_config(ctx, ui):
                      "hall_joint": hall[0] if hall else None, "pcb_version": int(sysc["pcb_version"]),
                      "positive_direction": list(cfg.get("positive_direction") or []),
                      "first_run_move": list(cfg.get("first_run_move") or []),
-                     # stage 5 (2026-10-27): each joint's visible turn, the friction model it is measured against
-                     "friction_coulomb_nm": [float(v) for v in cfg.get("friction_coulomb_nm", [])],
-                     "friction_viscous_nm_s": [float(v) for v in cfg.get("friction_viscous_nm_s", [])]}
+                     # the Hall check (2026-11-20): the way the Hall joint homes into its trigger, +1 / -1
+                     "hall_approach": (hall_approach(_at(cfg.get("homing_direction"), hall[0]),
+                                                     _at(cfg.get("motor_dir"), hall[0])) if hall else None)}
     value = {k: ctx["config"][k] for k in ("robot", "gripper", "joint_num", "can_gripper")}
     summary = (f"robot {sysc['active_robot']} ({cfg['joint_num']} joints), gripper {sysc['active_gripper']}"
                f"{' (on CAN)' if can_gripper else ''}")

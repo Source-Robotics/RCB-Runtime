@@ -260,7 +260,7 @@
             <gear_efficiency>0.95</gear_efficiency> 
             <dir>1</dir>
             <positive_direction>the elbow opens: the forearm swings away from the upper arm (with the arm parked: the forearm lifts)</positive_direction>
-            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="800" from_rest="+"/> <!-- from_rest: the way off its endstop at the rest pose (folded) -->
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="1000" from_rest="+"/> <!-- from_rest: the way off its endstop at the rest pose (folded). current_ma 1000 (user, 2026-11-20; was 800 = 1.5 x the worst gravity torque alone): J3's friction (~0.5 Nm) comes on top — three healthy runs needed 723-751 of 800 mA, a WARN every time -->
             <joint_type>revolute</joint_type>
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
             <friction_coulomb_nm>0.541</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 18 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough; poses left out (over 1.5x the others): +354.0 deg). Was <friction_sliding_nm>0.369 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->

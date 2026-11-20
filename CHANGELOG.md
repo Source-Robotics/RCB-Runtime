@@ -205,9 +205,14 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - The first-run check's stop test (stage 5) clears a refused plan before it tries the other way (every later move was
   refused `MOTION_ABORTED`); it stops J1 once it has turned 10 deg of its 30 (it stopped at a fixed 0.6 s, when the
   slow, gently accelerating move had barely started, so the stop was never tested) and judges the commanded J1 too (a
-  move that did not play is told apart from a joint that did not follow). The Hall repeat compares both edges of the
-  magnet's field, so a last pass turned the other way no longer reads as 30 deg apart. The dashboard's First run tab
-  showed the result line twice.
+  move that did not play is told apart from a joint that did not follow). The dashboard's First run tab showed the
+  result line twice.
+- The first-run check's Hall-sensor step guides in short steps by the + and - signs on the joint, with a beep through
+  the arm at every switch (ON high, OFF low): find the magnet (either way until the sensor switches ON), then three
+  times back until OFF and slowly the way the joint homes until ON — the point homing stops at. The three ON points
+  must lie within 2 deg. An ON reached turning the other way is said and not counted. The repeat question is gone: it
+  asked to turn the joint "the SAME way" and compared the robot's latest edge angles, which read about 30 deg apart on
+  a good sensor when the joint was turned the other way or overshot.
 - The Gripper tab's Mode toggle sent a command whenever the display updated it to the robot's mode: right after a
   gripper swap a `NO_GRIPPER` error (the executor still had the old tool), control taken for 5 s on opening the tab,
   and a click undone before the robot confirmed it. Only a click sends now.
