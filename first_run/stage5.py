@@ -1,18 +1,10 @@
 """S5 — the homed arm (2026-10-27, TODO/first_run_plan.md P3; user: the scale of motion, the gripper + a move-and-stop,
-friction + quiet holds — all four).
+friction + quiet holds — all four; 2026-11-20 the user removed S5.joints, the scale / friction / holding turn of every
+joint: "i dont want these steps at all". The gear-ratio question it asked goes to mastering, TODO/mastering_plan.md).
 
 The arm homed and ENABLED; every move is a normal EXEC move (move_joints), so the planner's limit / zone /
 self-collision checks guard it.
 
-    S5.joints   per joint, wrist first: it turns <first_run_move scale_deg> (robot XML) and back at SPEED_PCT, then
-                holds HOLD_S. Judged: the user says how far it turned (a wrong gear ratio or encoder setting turns it
-                clearly more or less; the coupling: not at all); its friction — RTI's external-torque estimate
-                (shared memory torque_external = measured minus model, so friction above the robot XML's model reads
-                + in the direction of motion) averaged over the steady part of both legs: the same poses both ways,
-                so a gravity-model error cancels and what stays is friction the model lacks; a WARN above
-                FRICTION_WARN_SHARE of the model (at least FRICTION_WARN_MIN_NM) — never a FAIL: the reference values
-                come from one arm; the hold: no new J<n>:HOLD_OSCILLATION_WARNING (RTI's monitor: >25 Hz current
-                ripple while still) while it holds.
     S5.gripper  open, close (the user confirms each), the jaws left open.
     S5.stop     J1 starts a slow move, a Stop comes mid-move: it must stop short, stay in EXEC and hold; then back.
 """
@@ -21,45 +13,29 @@ from __future__ import annotations
 import math
 
 from first_run import shm_files
-from first_run.core import FAIL, INFO, PASS, SKIP, WARN, Aborted, Cancelled, claim, result, step
+from first_run.core import FAIL, PASS, SKIP, WARN, Aborted, Cancelled, claim, result, step
 from robotclient import CommandRejected, RobotTimeout
 
-ORDER = (5, 4, 3, 0, 2, 1)       # J6, J5, J4, J1, J3, J2 — as stage 3
 SPEED_PCT = 10.0                 # every move at 10 % of the EXEC speed limits
 LEG_TIMEOUT_S = 60.0
-POLL_S = 0.05
-HOLD_S = 2.0                     # the hold-oscillation warning needs 1.5 s of buzzing (375 ticks)
-CRUISE_SHARE = 0.7               # friction samples: where the joint moves at >= 70 % of the leg's top speed
-MIN_SAMPLES = 5                  # per leg, else the friction is not judged
-FRICTION_WARN_SHARE = 0.5        # friction above the model by more than half of it: WARN
-FRICTION_WARN_MIN_NM = 0.1
 NOT_PLANNED = ("JOINT_LIMIT", "SELF_COLLISION", "ZONE_LIMIT", "ZONE_CHECK_UNAVAILABLE")   # refused before it moved
-STOP_DEG = 30.0                  # S5.stop's J1 move (2026-11-19, review K8: was 15 — a ~0.8 s move, the stop came in
-STOP_AFTER_S = 0.6               # its last part) ... stopped this long after it started: at cruise, about a third in
+STOP_DEG = 30.0                  # S5.stop's J1 move (2026-11-19, review K8: was 15)
+STOP_AT_DEG = 10.0               # the stop comes once J1 has turned this far (a third of the move) ...
+STOP_WAIT_S = 20.0               # ... or this long after the move was sent, whichever comes first (2026-11-20, the arm:
+#                                  the move at 10 % is planned jerk-limited as ~8.4 s; the old fixed 0.6 s came when J1
+#                                  had turned 0.05 deg, so the stop was never tested)
+WATCH_S = 0.05
 HOLD_DRIFT_DEG = 0.5
 STOP_MIN_MOVED_DEG = 0.5     # less when the stop came: J1 had not really started, the stop was not tested
 EXEC_SETTLE_S = 0.5          # the stop test's move starts this long after EXEC is entered (2026-11-19: sent 43 ms
-#                              after the mode change, J1 had moved 0.04 deg when the stop came 0.6 s later)
+#                              after the mode change, J1 had moved 0.04 deg when the stop came 0.6 s later; 2026-11-20:
+#                              not the cause — the move's slow jerk-limited start was, see STOP_WAIT_S)
 FOLLOW_STOP_DEG = 2.0        # the command moved this much more than the measured J1 at the stop: J1 did not follow
 GRIPPER_TIMEOUT_S = 30.0
-SCALE_ANSWERS = ["about that", "clearly less (half or less)", "clearly more (double or more)", "I saw no movement"]
-
-
-class _Ended(Exception):
-    """A move ended with a failure other than a refusal before moving: the stage cannot go on (an error latched)."""
-
-    def __init__(self, code, message):
-        super().__init__(message)
-        self.code, self.message = code, message
 
 
 def _shm(ctx):
     return ctx.get("shm") or shm_files
-
-
-def _visual(deg):
-    return {90.0: "a quarter turn", 45.0: "half of a right angle", 30.0: "a third of a right angle",
-            180.0: "half a turn"}.get(float(deg), f"{deg:g} deg")
 
 
 def _pause(ui, prompt, seconds, interval=0.25):
@@ -75,142 +51,6 @@ def _pause(ui, prompt, seconds, interval=0.25):
 
 def _joints_deg(robot):
     return [float(v) for v in robot.get_joints()]
-
-
-def _hold_keys(robot):
-    return {str(e.get("key")) for e in (robot.errors() or []) if str(e.get("key", "")).endswith("HOLD_OSCILLATION_WARNING")}
-
-
-def _leg(ctx, ui, j, target, prompt):
-    """One queued move to `target` (deg), sampled while it runs: [(speed rad/s, external torque Nm)] of joint j.
-    Raises CommandRejected when the robot refused or failed it."""
-    robot, shm, n = ctx["robot"], _shm(ctx), len(target)
-    robot.move_joints(*target, speed=SPEED_PCT)
-    samples: list = []
-
-    def poll():
-        v, t = shm.floats("joint_speed", n), shm.floats("torque_external", n)
-        if v is not None and t is not None:
-            samples.append((v[j], t[j]))
-        try:
-            robot.wait_motion_complete(timeout=0.02)
-        except RobotTimeout:
-            return None
-        return True
-
-    try:
-        done = ui.wait(prompt, poll, LEG_TIMEOUT_S, POLL_S)
-    except Cancelled:
-        robot.stop(wait=True)
-        raise
-    if done is None:
-        robot.stop(wait=True)
-        raise _Ended("TIMEOUT", f"the move did not finish within {LEG_TIMEOUT_S:.0f} s")
-    return samples
-
-
-def leg_friction(samples):
-    """The mean of torque x sign(speed) over the leg's steady part (|speed| >= CRUISE_SHARE x its top), with the mean
-    |speed| there; None when fewer than MIN_SAMPLES."""
-    top = max((abs(v) for v, _ in samples), default=0.0)
-    steady = [(v, t) for v, t in samples if top > 0 and abs(v) >= CRUISE_SHARE * top]
-    if len(steady) < MIN_SAMPLES:
-        return None
-    return (sum(t * (1 if v > 0 else -1) for v, t in steady) / len(steady),
-            sum(abs(v) for v, _ in steady) / len(steady))
-
-
-def friction_excess(out_samples, back_samples):
-    """(friction above the model, mean speed rad/s) from the two legs over the same poses: a gravity-model error
-    adds the same torque on both legs, the direction flips, so it cancels in the mean of torque x sign(speed)."""
-    a, b = leg_friction(out_samples), leg_friction(back_samples)
-    if a is None or b is None:
-        return None
-    return (a[0] + b[0]) / 2, (a[1] + b[1]) / 2
-
-
-def model_friction(cfg, j, speed):
-    """The robot XML's friction model at this speed, without its load term (Nm): Coulomb + viscous x speed."""
-    c = list(cfg.get("friction_coulomb_nm") or [])
-    v = list(cfg.get("friction_viscous_nm_s") or [])
-    return (float(c[j]) if j < len(c) else 0.0) + (float(v[j]) if j < len(v) else 0.0) * abs(speed)
-
-
-def _joint(ctx, ui, st, j, deg, held_before):
-    name = f"J{j + 1}"
-    if not deg:
-        return [result(st, SKIP, f"{name}: no <first_run_move scale_deg> in the robot XML — its turn is not defined")]
-    if ui.choose(f"{name}: turns {deg:g} deg ({_visual(deg)}) and back, slowly. Go?", ["go", "skip this joint"]) != "go":
-        return [result(st, SKIP, f"{name}: skipped by the user")]
-    try:
-        return _turn(ctx, ui, st, j, deg, held_before)
-    except Cancelled:                    # skips this joint only (its move stopped where it was); the next one follows
-        return [result(st, SKIP, f"{name}: skipped by the user (its move stopped where it was)")]
-
-
-def _turn(ctx, ui, st, j, deg, held_before):
-    robot, cfg, name = ctx["robot"], ctx.get("config") or {}, f"J{j + 1}"
-    q0 = _joints_deg(robot)
-    refused, legs = [], None
-    for sign in (1, -1):
-        target = list(q0)
-        target[j] += sign * deg
-        try:
-            out = _leg(ctx, ui, j, target, f"{name} turns {sign * deg:+g} deg — watch how far")
-        except CommandRejected as e:
-            if e.code not in NOT_PLANNED:
-                raise _Ended(e.code, e.message)
-            refused.append(f"{'+' if sign > 0 else '-'}: {e.message}")
-            _clear_refusal(robot)
-            continue
-        try:
-            back = _leg(ctx, ui, j, q0, f"{name} turns back")
-        except CommandRejected as e:
-            raise _Ended(e.code, e.message)
-        legs = (sign, out, back)
-        break
-    if legs is None:
-        return [result(st, SKIP, f"{name}: the robot refused its turn both ways (" + "; ".join(refused) + ")")]
-    _pause(ui, f"{name} holds still for {HOLD_S:g} s", HOLD_S)
-    buzz = sorted(_hold_keys(robot) - held_before)
-    held_before |= set(buzz)
-    answer = ui.choose(f"Did {name} turn about {deg:g} deg ({_visual(deg)}) and back?", SCALE_ANSWERS)
-    sign, out, back = legs
-    way = "+" if sign > 0 else "-"
-    res = []
-    if answer == SCALE_ANSWERS[3]:
-        res.append(result(st, FAIL, f"{name} was commanded {way}{deg:g} deg but did not move", hints=[
-            "the motor turns but the joint does not: the coupling between motor and gearbox, a belt, a grub screw"]))
-    elif answer in SCALE_ANSWERS[1:3]:
-        less = answer == SCALE_ANSWERS[1]
-        res.append(result(st, FAIL, f"{name} turned clearly {'LESS' if less else 'MORE'} than the {deg:g} deg commanded",
-                          expected=f"{deg:g} deg ({_visual(deg)})", hints=[
-                              f"{name}'s gear ratio in the robot XML does not match its gearbox",
-                              "the drive's encoder setting (its resolution)"]
-                          + (["a belt or coupling that slips under load"] if less else [])))
-    fr = friction_excess(out, back)
-    if fr is not None:
-        excess, speed = fr
-        ref = model_friction(cfg, j, speed)
-        if excess > max(FRICTION_WARN_SHARE * ref, FRICTION_WARN_MIN_NM):
-            res.append(result(st, WARN, f"{name} needs about {ref + excess:.2f} Nm to turn; the robot XML's friction "
-                                        f"model says {ref:.2f} Nm", value=round(excess, 3),
-                              expected=f"about {ref:.2f} Nm",
-                              hints=["a belt or gearbox too tight, a bearing, a cable pulling on the joint",
-                                     "the model was measured on one arm: a new gearbox can run stiffer for its "
-                                     "first hours"]))
-    for key in buzz:
-        res.append(result(st, WARN, f"{key.split(':')[0]} buzzed while holding (its motor current ripples)", value=key,
-                          hints=["the joint's gains (the dashboard's PID Config): too high for this arm",
-                                 "the encoder's magnet on the motor shaft: loose or too far from the drive"]))
-    if not res:
-        fr_txt = (f"; friction {model_friction(cfg, j, fr[1]) + fr[0]:.2f} Nm (reference "
-                  f"{model_friction(cfg, j, fr[1]):.2f})" if fr is not None else "; friction not measured")
-        res.append(result(st, PASS, f"{name}: turned {way}{deg:g} deg as commanded{fr_txt}; held quietly",
-                          value=None if fr is None else round(fr[0], 3)))
-    elif fr is None:
-        res.append(result(st, INFO, f"{name}: friction not measured (too few readings while it moved)"))
-    return res
 
 
 def _homed_exec(ctx, ui, st, ask):
@@ -254,33 +94,6 @@ def _leave_exec(robot):
         robot.enter_idle_mode(wait=True)
     except Exception:                  # a stage end must never hide its results
         pass
-
-
-def check_joints(ctx, ui):
-    st = JOINTS
-    stop = _homed_exec(ctx, ui, st, "Each joint now turns a visible amount and back, slowly, J6 first: you judge how "
-                                    "far it turned; the robot measures its friction and checks that it holds quietly. "
-                                    "Clear the space around the arm and keep a hand on the E-stop.")
-    if stop is not None:
-        return stop
-    robot, cfg = ctx["robot"], ctx.get("config") or {}
-    scale = list(cfg.get("first_run_scale_deg") or [])
-    n = int(cfg.get("joint_num") or 6)
-    held = _hold_keys(robot)
-    out: list = []
-    try:
-        for j in (k for k in ORDER if k < n):
-            out += _joint(ctx, ui, st, j, scale[j] if j < len(scale) else None, held)
-    except _Ended as e:
-        out.append(result(st, FAIL, f"a move did not finish ({e.code}): {e.message}", value=e.code, hints=[
-            "an error stopped it: the dashboard's Errors tab names it (a collision, a limit, a drive fault)",
-            "clear the errors, then run stage 5 again"]))
-    except Aborted as e:
-        e.partial = out
-        raise
-    finally:
-        _leave_exec(robot)
-    return out
 
 
 def check_gripper(ctx, ui):
@@ -327,6 +140,29 @@ def check_gripper(ctx, ui):
     return out
 
 
+def _watch_j1(ui, robot, j1_start):
+    """While J1's move runs: "at" once J1 has turned STOP_AT_DEG from j1_start, "done" when the move finished first,
+    None after STOP_WAIT_S (the stop comes anyway; the result says how far J1 got). A failure of the move raises its
+    CommandRejected after the wait (a poll that raises would leave the dashboard's wait open); a skip, Cancelled."""
+    failed: list = []
+
+    def poll():
+        try:
+            robot.wait_motion_complete(timeout=0.01)
+            return "done"
+        except RobotTimeout:
+            pass
+        except CommandRejected as e:
+            failed.append(e)
+            return "failed"
+        return "at" if abs(_joints_deg(robot)[0] - j1_start) >= STOP_AT_DEG else None
+
+    seen = ui.wait(f"J1 turns — the stop comes once it has turned {STOP_AT_DEG:g} deg", poll, STOP_WAIT_S, WATCH_S)
+    if failed:
+        raise failed[0]
+    return seen
+
+
 def check_stop(ctx, ui):
     st = STOP
     stop = _homed_exec(ctx, ui, st, f"J1 now starts a slow {STOP_DEG:g} deg move and is stopped part-way (as a "
@@ -344,16 +180,20 @@ def check_stop(ctx, ui):
             target[0] += sign * STOP_DEG
             try:
                 robot.move_joints(*target, speed=SPEED_PCT)    # refused at once (MOTION_ABORTED, ...) is caught too
-                robot.wait_motion_complete(timeout=STOP_AFTER_S)
-            except RobotTimeout:
-                break                     # moving: stop it now
+                seen = _watch_j1(ui, robot, q0[0])
+            except Cancelled:
+                robot.stop(wait=True)
+                return result(st, SKIP, "skipped by the user while J1 turned (stopped where it was; not judged)")
             except CommandRejected as e:
                 if e.code in NOT_PLANNED and sign > 0:
                     _clear_refusal(robot)
                     continue              # no room the + way: the other way
                 return result(st, SKIP, f"J1's move was not possible ({e.code}): {e.message}")
-            return result(st, WARN, "J1's move finished before the stop could come — the stop was not tested",
-                          hints=["the arm's EXEC speed limits are high: this check's STOP_AFTER_S is too long"])
+            if seen == "done":
+                return result(st, WARN, "J1's move finished before the stop could come — the stop was not tested",
+                              hints=[f"J1 finished its {STOP_DEG:g} deg before it had turned {STOP_AT_DEG:g} deg: "
+                                     "it moved the other way or stopped short — the dashboard's Activity Log tab"])
+            break
         c_stop = _commanded_j(ctx, 0)
         robot.stop(wait=True)
         s = robot.get_status() or {}
@@ -387,8 +227,9 @@ def check_stop(ctx, ui):
                     if commanded is not None else "")
             out = result(st, WARN, f"J1 had moved only {moved:.2f} deg when the stop came — the stop was not "
                                    f"tested{told}",
-                         value=round(moved, 2), hints=["the move started late (the robot was busy planning), or it "
-                                                       "was refused: the dashboard's Errors / Activity Log tab"])
+                         value=round(moved, 2), hints=[f"J1 did not turn within {STOP_WAIT_S:g} s of its move: the "
+                                                       "move did not start (refused, an error) or J1 is blocked — the "
+                                                       "dashboard's Errors / Activity Log tab"])
         else:
             out = result(st, PASS, f"J1 stopped after {moved:.1f} of {STOP_DEG:g} deg and held (drift "
                                    f"{drift:.2f} deg)", value=round(moved, 2))
@@ -402,11 +243,8 @@ def check_stop(ctx, ui):
         _leave_exec(robot)
 
 
-JOINTS = step("S5.joints", 5, "Each joint: how far, friction, holding", check_joints, needs=("robot", "enabled"),
-              about="each joint turns a visible amount and back; you judge how far, the robot measures its friction "
-                    "and checks it holds quietly")
 GRIPPER = step("S5.gripper", 5, "The gripper", check_gripper, needs=("robot", "enabled"),
                about="the gripper closes and opens; you say whether it did")
 STOP = step("S5.stop", 5, "A stop mid-move", check_stop, needs=("robot", "enabled"),
             about="J1 is stopped part-way through a slow move; it must stop and hold")
-STEPS = [JOINTS, GRIPPER, STOP]
+STEPS = [GRIPPER, STOP]

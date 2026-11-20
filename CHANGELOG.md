@@ -40,15 +40,7 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - `tools/run_nets.py --changed [REF]` runs only the tests a change touches.
 - The first-run check (`tools/first_run.py`) has stages 4 and 5, and runs stages 0-5 by default. Stage 4 homes the
   arm and explains a failed homing for a builder: the robot's own reason, with what to check for that kind of failure.
-  Stage 5 checks the homed arm:
-  - each joint turns a visible amount and back, and the user judges how far it turned (a wrong gear ratio or encoder
-    setting);
-  - meanwhile the robot measures the joint's friction against the robot XML's friction model, and checks that the
-    joint holds without buzzing;
-  - the gripper closes and opens;
-  - a slow J1 move is stopped part-way.
-
-  New robot XML attribute: `<first_run_move scale_deg="...">`, the size of each joint's turn.
+  Stage 5 checks the homed arm: the gripper closes and opens, and a slow J1 move is stopped part-way.
 - The dashboard's **First run** tab runs the first-run check: choose the stages, Start; its questions are buttons,
   a wait has a Skip button, Stop the run ends it early; the transcript shows every result with what to check; the
   report and earlier reports can be downloaded. The check runs as its own process (`tools/first_run.py --ui json`),
@@ -200,18 +192,22 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
-- The first-run check's small test moves (stage 3) no longer move a joint the way that has no room. On an arm not homed
-  yet, the check asks whether the arm rests folded and moves each joint only its free way from that rest pose (the robot
-  XML's new `<first_run_move from_rest>`, `+` when missing), never the other way automatically; on a homed arm it
-  plans each test move both ways first (joint limits, safety zones, self-collision; nothing moves) and moves only a
-  way that passes. A test move refused with "no position read yet — try again" is retried the same way (it was taken
-  for blocked and the joint was moved the other way), and the robot's joint test takes its start position from the
-  drive's last data reply, so that refusal is rare. The direction question names both ways in words.
-- The first-run check's stage 5 clears a refused plan before it tries the other way (every later move was refused
-  `MOTION_ABORTED`); its stop test waits 0.5 s in EXEC before the move and judges the commanded J1 too (a move that did
-  not play is told apart from a joint that did not follow). The Hall repeat compares both edges of the magnet's field,
-  so a last pass turned the other way no longer reads as 30 deg apart. The dashboard's First run tab showed the result
-  line twice.
+- The first-run check's small test moves (stage 3) no longer move a joint the way that has no room. On an arm not
+  homed yet, the check asks whether the arm rests folded and moves each joint only its free way from that rest pose
+  (the robot XML's new `<first_run_move from_rest>`, `+` when missing), never the other way automatically; on a homed
+  arm it plans each test move both ways first (joint limits, safety zones, self-collision; nothing moves) and moves
+  only a way that passes. A test move refused with "no position read yet — try again" is retried the same way (it was
+  taken for blocked and the joint was moved the other way), and the robot's joint test takes its start position from
+  the drive's last data reply, so that refusal is rare. The direction question is answered by the + and - signs on the
+  joint (+, -, I saw no movement, or show me again: the same move once more, up to 3 times), and the by-hand variant
+  asks to turn each joint toward its + sign; the robot XML's `<positive_direction>` words now say where the + sign
+  belongs and appear in a backwards FAIL's hint.
+- The first-run check's stop test (stage 5) clears a refused plan before it tries the other way (every later move was
+  refused `MOTION_ABORTED`); it stops J1 once it has turned 10 deg of its 30 (it stopped at a fixed 0.6 s, when the
+  slow, gently accelerating move had barely started, so the stop was never tested) and judges the commanded J1 too (a
+  move that did not play is told apart from a joint that did not follow). The Hall repeat compares both edges of the
+  magnet's field, so a last pass turned the other way no longer reads as 30 deg apart. The dashboard's First run tab
+  showed the result line twice.
 - The Gripper tab's Mode toggle sent a command whenever the display updated it to the robot's mode: right after a
   gripper swap a `NO_GRIPPER` error (the executor still had the old tool), control taken for 5 s on opening the tab,
   and a click undone before the robot confirmed it. Only a click sends now.

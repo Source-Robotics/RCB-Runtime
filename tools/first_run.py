@@ -11,9 +11,7 @@ the arm; stage 5 moves the homed arm (2026-10-27, P3).
                                          slowly, its force limited; you say which way it went (--by-hand: you turn
                                          each joint yourself instead, one at a time limp)
     S4  homing                           the arm ENABLED: the normal homing; a failure is explained with what to check
-    S5  the homed arm                    each joint turns a visible amount and back (you judge how far; its friction
-                                         against the robot XML's model and a quiet hold are measured), the gripper
-                                         closes and opens, a slow J1 move is stopped part-way
+    S5  the homed arm                    the gripper closes and opens, a slow J1 move is stopped part-way
 
     cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/first_run.py                 # every stage
     cd ~/Desktop/RCB-Runtime && .venv/bin/python tools/first_run.py --stages 3

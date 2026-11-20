@@ -87,7 +87,6 @@ def check_config(ctx, ui):
                      "positive_direction": list(cfg.get("positive_direction") or []),
                      "first_run_move": list(cfg.get("first_run_move") or []),
                      # stage 5 (2026-10-27): each joint's visible turn, the friction model it is measured against
-                     "first_run_scale_deg": list(cfg.get("first_run_scale_deg") or []),
                      "friction_coulomb_nm": [float(v) for v in cfg.get("friction_coulomb_nm", [])],
                      "friction_viscous_nm_s": [float(v) for v in cfg.get("friction_viscous_nm_s", [])]}
     value = {k: ctx["config"][k] for k in ("robot", "gripper", "joint_num", "can_gripper")}

@@ -13,11 +13,14 @@ the user: "it can crash into itself", J2 / J3 rest against an endstop):
                  switched off), and each joint moves only its <first_run_move from_rest> way ("+" by default), never the
                  other way automatically; blocked that way: a FAIL with the hints (or the arm is not at rest)
 A refusal saying "try again" (no position read from the drive yet) is retried the same way. The user then says which
-way it moved FIRST — both ways named in words — against the robot XML's <positive_direction>. Judged:
+way it moved FIRST, by the + and - signs on the joint (2026-11-20, the user: the words were confusing; every PAR6
+joint carries its signs) — judged only where the robot XML says where + is (<positive_direction>: the words the signs
+must match, named in a FAIL's hint); "show me again" runs the same move once more and asks again (up to MAX_REPEATS;
+the move judged is the last one that moved it). Judged:
 
     the motor drives the joint   it followed the command (else: the motor's wiring, the drive, the joint blocked, the
                                  test current too low for its load)
-    the direction                the user saw it move the + way (else <dir> — or the words)
+    the direction                the user saw it move the + way (else <dir> — or the signs on the arm)
     the coupling                 the encoder moved but the user saw nothing: the coupling / belt / grub screw slips
     effort                       the peak current against the test limit (binding, a tight belt or gearbox), how far it
                                  fell behind, whether it came back to its start
@@ -42,6 +45,11 @@ TRY_AGAIN_TRIES = 5              # a "try again" refusal is retried the same way
 TRY_AGAIN_PAUSE_S = 0.1          # ... this far apart
 DRY_RUN_TIMEOUT_S = 10.0
 PLAN_SPEED_PCT = 10.0
+NO_MOVEMENT = "I saw no movement"
+DIRECTION_ANSWERS = ["+", "-", NO_MOVEMENT]      # the + and - signs on the joint (2026-11-20, the user)
+BY_SIGNS = "by the + and - signs on the joint"
+SHOW_AGAIN = "show me again"     # the same test move once more, then the question again (2026-11-20, the user)
+MAX_REPEATS = 3                  # ... at most this often per joint
 FAIL_HINTS = [
     "the motor's wiring: its phase wires / connector to the drive",
     "the drive's motor calibration (the drive's configuration tool)",
@@ -166,7 +174,8 @@ def _check_joint(ctx, ui, st, j, words, mv, plan=None, homed=False):
                 return [result(st, SKIP, f"{name}: the test move was stopped (the arm disabled, an error, a mode "
                                          "change)", value=res)]
             if not _blocked(res, amp):
-                return _judge(st, ui, name, words, amp, cur, sign, res, first=tried[0][1] if tried else None)
+                return _judge(st, ui, name, words, amp, cur, sign, res, first=tried[0][1] if tried else None,
+                              again=lambda s=sign: _move_retrying(ctx, ui, j, s * amp, mv))
             tried.append((sign, res))
     except Cancelled:
         return [result(st, SKIP, f"{name}: skipped by the user (its test move stopped)")]
@@ -195,38 +204,67 @@ def _check_joint(ctx, ui, st, j, words, mv, plan=None, homed=False):
                    value=value, expected=f"{amp:g} deg", hints=hints)]
 
 
-def _judge(st, ui, name, words, amp, cur, sign, res, first=None):
+def backwards_hints(name, words):
+    """A joint seen (or counted) going the wrong way: its <dir>, or the signs on the arm on the wrong sides — + is
+    where the robot XML's <positive_direction> words say (the kinematic model decides; stage3_hand too)."""
+    return [f"{name}'s <dir> in the robot XML has the wrong value (0 <-> 1) — fix it and restart the robot service",
+            f"or {name}'s + and - signs are on the wrong sides — + is: {words} (its <positive_direction>; the kinematic "
+            "model decides which way + is) — move the signs instead"]
+
+
+def _question(name, words, first, repeated):
+    """Both ways by the signs on the joint (2026-11-20, the user: the words — "counter-clockwise, seen from ..." — were
+    confusing; 2026-11-19 before: "the other way" was abstract). A first try that did not move it is said as it was,
+    without which way it went; after "show me again" the question says the joint moved again."""
+    if not words:
+        return f"Did you see {name} move{' this time' if repeated else ''}?"
+    ask = f"Which way did {'it' if repeated or first is not None else name} move FIRST, {BY_SIGNS}?"
+    if repeated:
+        return f"{name} moved again. {ask}"
+    if first is None:
+        return ask
+    if _refused(first):
+        return (f"{name}'s first try was refused by the robot ({first.get('why')}) and did not move it; then it moved. "
+                f"{ask}")
+    return f"{name}'s first try was blocked and stopped at once; then it moved. {ask}"
+
+
+def _ask_seen(ui, name, words, amp, res, first, again):
+    """The question; "show me again" (offered up to MAX_REPEATS times) runs `again()` — the same test move — and asks
+    again. A repeat that did not move the joint is said and ends the repeats; the answer then is about the move seen
+    before. Returns (answer, the result to judge: the last move that moved the joint)."""
+    options = list(DIRECTION_ANSWERS) if words else ["yes", NO_MOVEMENT]
+    repeats, repeated = 0, False
+    while True:
+        offer = options + ([SHOW_AGAIN] if again is not None and repeats < MAX_REPEATS else [])
+        answer = ui.choose(_question(name, words, first, repeated), offer)
+        if answer != SHOW_AGAIN:
+            return answer, res
+        repeats += 1
+        rep = again()
+        if rep is None or rep.get("state") == "stopped" or _blocked(rep, amp):
+            why = (f"refused: {rep.get('why')}" if _refused(rep) else "stopped" if rep and rep.get("state") == "stopped"
+                   else "it did not get far")
+            ui.say(f"{name}'s repeat did not move it ({why}) — answer for the move you saw before")
+            repeats = MAX_REPEATS
+            continue
+        res, repeated = rep, True
+
+
+def _judge(st, ui, name, words, amp, cur, sign, res, first=None, again=None):
+    way = "+" if sign > 0 else "-"
+    answer, res = _ask_seen(ui, name, words, amp, res, first, again)
+    right = way if words else "yes"
     moved, err = float(res.get("moved_deg", 0)), float(res.get("max_error_deg", 0))
     peak, end = float(res.get("peak_current_ma", 0)), float(res.get("end_error_deg", 0))
-    way = "+" if sign > 0 else "-"
-    if words:
-        # Both ways in words (2026-11-19: "the other way" was abstract, and the only words offered were the + way's —
-        # twice picked for a - move). A first try that did not move it is said as it was, without which way it went.
-        if first is None:
-            ask = f"Which way did {name} move FIRST?"
-        elif _refused(first):
-            ask = (f"{name}'s first try was refused by the robot ({first.get('why')}) and did not move it; then it "
-                   "moved. Which way did it move FIRST?")
-        else:
-            ask = f"{name}'s first try was blocked and stopped at once; then it moved. Which way did it move FIRST?"
-        options = [words, f"the opposite of: {words}", "I saw no movement"]
-        answer = ui.choose(ask, options)
-        right = options[0] if sign > 0 else options[1]
-    else:
-        answer = ui.choose(f"Did you see {name} move?", ["yes", "I saw no movement"])
-        right = "yes"
-    if answer == "I saw no movement":
+    if answer == NO_MOVEMENT:
         return [result(st, FAIL, f"{name}: the encoder read {moved:+.1f} deg but the joint did not move",
                        value=res, hints=["the motor turns but the joint does not: the coupling between motor and "
                                          "gearbox, a belt, a loose grub screw"])]
     out = []
     if answer != right:
         out.append(result(st, FAIL, f"{name} moves BACKWARDS: commanded {way}{abs(amp):g} deg, seen the opposite",
-                          value=res, expected=words if sign > 0 else f"the opposite of: {words}",
-                          hints=[f"{name}'s <dir> in the robot XML has the wrong value (0 <-> 1) — fix it and restart "
-                                 "the robot service",
-                                 f"or the words in {name}'s <positive_direction> do not match this arm — fix those "
-                                 "instead (the kinematic model decides which way + is)"]))
+                          value=res, expected=way, hints=backwards_hints(name, words)))
     if peak >= CURRENT_WARN_FRACTION * cur:
         out.append(result(st, WARN, f"{name} needed {peak:.0f} of its {cur:.0f} mA test current", value=res,
                           hints=["binding: a belt or gearbox too tight, a bearing, a cable pulling",

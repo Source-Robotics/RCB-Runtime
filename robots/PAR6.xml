@@ -112,8 +112,8 @@
             <gear_ratio>6.4</gear_ratio> <!-- Gear ratio of the joint -->
             <gear_efficiency>0.98</gear_efficiency> <!-- Gear efficiency of the joint -->
             <dir>0</dir> <!-- is positive rotation of the joint matched to the one in kinematic definiton of the robot 0 yes 1 no -->
-            <positive_direction>the whole arm turns counter-clockwise, seen from above</positive_direction> <!-- what + looks like on the arm, in words: the first-run check (tools/first_run.py, stage 3) asks the builder to turn the joint this way by hand and checks the encoder counts up. From the kinematic model at the park pose (2026-10-18). If the arm counts the other way, <dir> above is wrong. -->
-            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="600" scale_deg="45"/> <!-- the first-run check's powered test move before homing (tools/first_run.py, stage 3; robotics/joint_test.py): this far from where the joint stands and back, peaking at this speed, the drive's current limited to this meanwhile (1.5 x the joint's worst gravity torque with the MSG gripper; user, 2026-10-18). scale_deg: stage 5's turn of the HOMED joint, a visible amount the user judges by eye (a wrong gear ratio / encoder setting turns it clearly more or less), at 10 % of the EXEC speed (2026-10-27). from_rest (2026-11-19, the user): the way the joint is free to move from the REST pose (the arm folded, as it lies switched off; "+" when missing) — before the first homing nothing says where the arm stands, so stage 3 moves each joint only that way, never the other way automatically (J2 / J3 rest against an endstop) -->
+            <positive_direction>the whole arm turns counter-clockwise, seen from above</positive_direction> <!-- what + looks like on the arm, in words: the + sign on each joint must point this way. The first-run check (tools/first_run.py, stage 3) asks by those signs (2026-11-20) and names these words in a FAIL's hint. From the kinematic model at the park pose (2026-10-18). If the arm counts the other way, <dir> above is wrong. -->
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="600"/> <!-- the first-run check's powered test move before homing (tools/first_run.py, stage 3; robotics/joint_test.py): this far from where the joint stands and back, peaking at this speed, the drive's current limited to this meanwhile (1.5 x the joint's worst gravity torque with the MSG gripper; user, 2026-10-18). from_rest (2026-11-19, the user): the way the joint is free to move from the REST pose (the arm folded, as it lies switched off; "+" when missing) — before the first homing nothing says where the arm stands, so stage 3 moves each joint only that way, never the other way automatically (J2 / J3 rest against an endstop) -->
             <joint_type>revolute</joint_type> <!-- Type of the joint. Options: revolute, prismatic, continuous_revolute -->
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured yet; api_tests/54, 2026-10-02). 0 = not measured: no friction compensation -->
             <friction_coulomb_nm>0.190</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.177 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -186,7 +186,7 @@
             <gear_efficiency>0.9482</gear_efficiency> <!-- calibrated with hung weights (78 20261017_164505, 2026-10-17): was 0.9, the torque scale k 0.9491 (measured / true) — Kt x ratio x this is what counts -->
             <dir>0</dir>
             <positive_direction>the upper arm leans forward (toward where the arm reaches when parked) and the gripper goes down</positive_direction>
-            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="1500" scale_deg="30" from_rest="+"/> <!-- from_rest: the way off its endstop at the rest pose (folded) -->
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="1500" from_rest="+"/> <!-- from_rest: the way off its endstop at the rest pose (folded) -->
             <joint_type>revolute</joint_type>
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
             <friction_coulomb_nm>0.609</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 26 slides at 4 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive [/0.9491: the torque scale of 78 20261017_164505] -->
@@ -260,7 +260,7 @@
             <gear_efficiency>0.95</gear_efficiency> 
             <dir>1</dir>
             <positive_direction>the elbow opens: the forearm swings away from the upper arm (with the arm parked: the forearm lifts)</positive_direction>
-            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="800" scale_deg="30" from_rest="+"/> <!-- from_rest: the way off its endstop at the rest pose (folded) -->
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="800" from_rest="+"/> <!-- from_rest: the way off its endstop at the rest pose (folded) -->
             <joint_type>revolute</joint_type>
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
             <friction_coulomb_nm>0.541</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 18 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough; poses left out (over 1.5x the others): +354.0 deg). Was <friction_sliding_nm>0.369 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -334,7 +334,7 @@
             <gear_efficiency>0.98</gear_efficiency>
             <dir>1</dir>
             <positive_direction>the forearm rolls counter-clockwise, seen from the elbow looking toward the gripper</positive_direction>
-            <first_run_move amplitude_deg="10" speed_dps="5" current_ma="600" scale_deg="90"/>
+            <first_run_move amplitude_deg="10" speed_dps="5" current_ma="600"/>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.13</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.26; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.190</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.163 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -408,7 +408,7 @@
             <gear_efficiency>0.98</gear_efficiency>
             <dir>1</dir>
             <positive_direction>the wrist bends so the gripper tips up (with the arm parked)</positive_direction>
-            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="600" scale_deg="45"/>
+            <first_run_move amplitude_deg="5" speed_dps="5" current_ma="600"/>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.06</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.05-0.12; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.093</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.080 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
@@ -488,7 +488,7 @@
             <gear_efficiency>0.95</gear_efficiency>
             <dir>1</dir>
             <positive_direction>the gripper turns counter-clockwise, seen from the elbow looking toward it</positive_direction>
-            <first_run_move amplitude_deg="10" speed_dps="5" current_ma="400" scale_deg="90"/>
+            <first_run_move amplitude_deg="10" speed_dps="5" current_ma="400"/>
             <joint_type>revolute</joint_type>
             <friction_static_nm>0.111</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.19; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.109</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.070 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->

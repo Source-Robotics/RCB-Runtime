@@ -5,10 +5,11 @@ so stage 3 is the powered first_run/stage3.py and this stays an option, e.g. for
 unhomed arm).
 
 Per joint, wrist first (ORDER): robot.free_joint(n) (robotics/free_joint.py: its drive's current limit 0, every other
-joint still held), the user turns it about TURN_DEG so that <positive_direction> (the robot XML's words) happens and
-holds it still, robot.free_joint(0). Judged:
+joint still held), the user turns it about TURN_DEG toward its + sign (2026-11-20, the user: every PAR6 joint carries
+its + and - signs; the robot XML's <positive_direction> words say where + is) and holds it still, robot.free_joint(0).
+Judged:
 
-    the direction   the encoder counted the + way (else the robot XML's <dir> for that joint is wrong — or the words)
+    the direction   the encoder counted the + way (else the robot XML's <dir> for that joint is wrong — or the signs)
     counting at all no reading while the user turned it: the motor does not turn with the joint (the coupling, a belt,
                     a grub screw) or the encoder (its magnet, the drive)
     the amount      the user confirms the angle read is about what they turned (a wrong gear ratio or encoder setting
@@ -20,6 +21,7 @@ homing is the first powered motion and has its own checks.
 from __future__ import annotations
 
 from first_run.core import FAIL, INFO, PASS, SKIP, Aborted, Cancelled, claim, result, step
+from first_run.stage3 import backwards_hints
 from robotclient import CommandRejected
 
 ORDER = (5, 4, 3, 0, 2, 1)       # J6, J5, J4, J1, J3, J2: the wrist first, the joints carrying the arm last
@@ -85,7 +87,7 @@ def _check_joint(ctx, ui, st, j, words):
                        lambda: True if (robot.status() or {}).get("free_joint") == j + 1 else None, 3.0, 0.1) is None:
                 return [result(st, FAIL, f"{name}: the robot did not free it",
                                hints=["logs/RTI.log says why (IDLE only)"])]
-            how = (f"so that {words}" if words else "either way (the robot XML has no <positive_direction> for it)")
+            how = ("toward its + sign" if words else "either way (the robot XML has no <positive_direction> for it)")
             poll = turn_watcher(lambda: (lambda q: q[j] if len(q) > j else None)(_joints(ctx)),
                                 max(2, int(round(STILL_S / POLL_S))))
             got = ui.wait(f"Turn {name} by hand about {TURN_DEG:.0f} degrees {how}, then hold it still. (At its end "
@@ -109,12 +111,8 @@ def _check_joint(ctx, ui, st, j, words):
                               "the encoder: its magnet on the motor shaft, the drive's encoder setting"])]
     out = []
     if words and got < 0:
-        out.append(result(st, FAIL, f"{name} counts BACKWARDS: turned so that {words}, the robot read {got:+.1f} deg",
-                          value=round(got, 2), expected="a + reading",
-                          hints=[f"{name}'s <dir> in the robot XML has the wrong value (0 <-> 1) — fix it and restart "
-                                 "the robot service",
-                                 f"or the words in {name}'s <positive_direction> do not match this arm — fix those "
-                                 "instead (the kinematic model decides which way + is)"]))
+        out.append(result(st, FAIL, f"{name} counts BACKWARDS: turned toward its + sign, the robot read {got:+.1f} deg",
+                          value=round(got, 2), expected="a + reading", hints=backwards_hints(name, words)))
     amount = ui.choose(f"The robot read {name} {got:+.0f} degrees. Is that about what you turned it?",
                        ["yes", "it read much less", "it read much more"])
     if amount == "it read much less":

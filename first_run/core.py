@@ -54,8 +54,7 @@ STAGE_ABOUT = {
     3: "The arm ENABLED, homed or not: each joint moves a few degrees and back, slowly, its force limited, the "
        "others holding; you say which way it went. (--by-hand: you turn each joint yourself instead.)",
     4: "The arm ENABLED: the normal homing, each joint to its endstop; a failure is explained with what to check.",
-    5: "The arm homed: each joint turns a visible amount and back (you judge how far; its friction and a quiet hold "
-       "are measured), the gripper closes and opens, and a slow move is stopped part-way.",
+    5: "The arm homed: the gripper closes and opens, and a slow move is stopped part-way.",
 }
 DISABLE_WAIT_S = 180.0
 # The dashboard holds control for 5 s after its last command (gui_command_sender.GUI_IDLE_RELEASE_S) — and the user
