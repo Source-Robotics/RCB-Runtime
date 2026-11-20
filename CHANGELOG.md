@@ -13,6 +13,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-20
+
 ### Added
 
 - The dashboard's status bar shows the active gripper or tool (`TOOL: <name>`, `none` without one).

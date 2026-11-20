@@ -22,7 +22,7 @@ import warnings
 
 from .exceptions import VersionMismatch, VersionWarning
 
-__version__ = "1.1.1"
+__version__ = "2.0.0"
 
 PROTOCOL_VERSION = 3        # the command protocol (newline JSON over TCP to the executor); 2: speeds in percent;
                             # 3: the gripper's object codes 1 / 2 swapped their meaning
