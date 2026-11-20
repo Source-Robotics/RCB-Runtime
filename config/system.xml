@@ -101,7 +101,11 @@
              40 ms is 10 ticks at 250 Hz, chosen because 20 ms would be only 5 ticks
              and a single non-RT scheduling hiccup on the controlling PC would then be
              indistinguishable from a dead link.
-             Also acts as a MINIMUM COMMAND RATE: 1/0.040 = 25 Hz. -->
+             Also acts as a MINIMUM COMMAND RATE: 1/0.040 = 25 Hz.
+             Hard RTI's watchdog, set at every entry into RTI mode; at most 0.040 (a larger value is
+             logged and 0.040 used: a stale velocity / torque command keeps driving for the whole
+             window). A PC can tighten it further, never widen it. SOFT_RTI sizes its own from the
+             PC's rate. -->
         <command_timeout_s>0.040</command_timeout_s>
         <!-- Hold position this long after any stop, clean or error. -->
         <stopping_hold_s>0.5</stopping_hold_s>

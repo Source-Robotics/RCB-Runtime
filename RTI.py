@@ -65,7 +65,7 @@ import config.xml_parser as read_XML2
 from utility.selfcheck import run_selfcheck
 from utility.state_machine import RobotMode, request_mode_change, request_enable, MAINTENANCE_MODES
 from utility.error_checks import (
-    process_errors_tick, clear_errors, send_clear_errors, ExecLinkWatchdog,
+    process_errors_tick, clear_errors, send_clear_errors, note_clear, ExecLinkWatchdog,
     LoopDegradationMonitor,
     CLEAR_ERROR_SETTLE_TICKS, CLEAR_ERROR_SEND_REPEATS, BOOT_CLEAR_TICK, _WARNING_SUFFIXES,
 )
@@ -113,7 +113,7 @@ from utility.sound import SoundPlayer
 from utility.safety_monitor import COLLISION_MODES
 from utility.kt_init import resolve_and_preload_kt
 from utility.tick_types import TickContext, TickResult
-from utility.mode_dispatch import build_mode_dispatch, dispatch_step
+from utility.mode_dispatch import build_mode_dispatch, dispatch_step, take_command_errors as _dispatch_errors
 from utility.kinematics_backend import set_kinematics_backend
 from utility.pinocchio_attach import attach_pinocchio
 
@@ -1623,6 +1623,7 @@ def main():
     def _handle_clear_errors(cmd_msg, cmd_dict):
         send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
                           Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper)
+        note_clear(st.latched_errors)              # only these are wiped after the settle (review C3, 2026-11-20)
         st.clear_error_countdown = CLEAR_ERROR_SETTLE_TICKS
         if shared_data.rti["loop_tick"][0] > CAPTURE_ARM_TICK:   # the fault captures again (a drive that rebooted lost it)
             drive_capture.rearm(range(joint_num + (1 if active_CAN_gripper else 0)))
@@ -3185,7 +3186,8 @@ def main():
             # function owns that flag and recomputes it every tick.
             rti_link_lost=rti_handler.take_link_lost(),
             # The strict command checks' keys (J{i}:RTI_*_LIMIT), raised once the controlled stop is at rest.
-            rti_errors=rti_handler.take_command_errors() + _exec_handler.take_errors(),
+            # + J{n}:COMMAND_NOT_A_NUMBER: a commanded position / speed that was not a number (review D5, 2026-11-20)
+            rti_errors=rti_handler.take_command_errors() + _exec_handler.take_errors() + _dispatch_errors(),
             # J{i}:CAN_REPLY_MISSED_WARNING (warn-only) — a joint's replies missing RTI's read too often.
             can_warnings=can_reply_monitor.warnings,
             # J{n}:KT_MISMATCH_WARNING (the start's Kt check) + J{n}:DRIVE_CHANGED_WARNING (a drive replaced since

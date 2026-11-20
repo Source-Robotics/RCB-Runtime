@@ -298,19 +298,22 @@ class Connection:
                 self._last_gripper = (cid, int(msg["gripper_object"]))
         # clear from outstanding + wake wait_idle (outside _lock to avoid nesting)
         if status in ("complete", "error"):
-            with self._idle_cv:
-                self._outstanding.discard(cid)
-                self._idle_cv.notify_all()
+            # A failure is RECORDED BEFORE wait_idle wakes (review P3, 2026-11-20): woken first, a waiter could read
+            # take_motion_errors() before the append and report [] for a move that failed.
             # p.queued (set on the earlier "queued" ack) confirms this was a motion
             # command, not just any pending happening to see status=="complete".
-            if status == "complete" and p.queued and self.on_motion_complete:
-                self._call_back("on_motion_complete", self.on_motion_complete, cid)
-            elif status == "error" and p.queued:
+            failure = None
+            if status == "error" and p.queued:
                 failure = {"id": cid, "code": p.error[0], "message": p.error[1], **p.error_info}
                 with self._lock:
                     self._motion_errors.append(failure)
-                if self.on_motion_error:
-                    self._call_back("on_motion_error", self.on_motion_error, dict(failure))
+            with self._idle_cv:
+                self._outstanding.discard(cid)
+                self._idle_cv.notify_all()
+            if status == "complete" and p.queued and self.on_motion_complete:
+                self._call_back("on_motion_complete", self.on_motion_complete, cid)
+            elif failure is not None and self.on_motion_error:
+                self._call_back("on_motion_error", self.on_motion_error, dict(failure))
         p.ack.set()
         p.done.set()
 

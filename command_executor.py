@@ -303,6 +303,8 @@ _owner_conn = None              # the owning connection object, or None
 _owner_label = None             # "ip:port", for humans and for the refusal message
 _owner_since = 0.0
 _owner_last = 0.0               # last owned command from the holder
+# Both on time.monotonic() (review D11, 2026-11-20): on the wall clock an NTP step expired the holder at once (a step
+# forward) or kept a silent holder for the length of the step (a step back).
 
 
 def _client_label(conn):
@@ -400,10 +402,13 @@ def _owner_stale_locked():
     if _owner_conn is None:
         return False
     # A non-empty queue means the holder is still mid-programme even if it has not spoken
-    # for a while — never time out underneath a running sequence. Same for a live RTI session.
-    if not motion_queue.empty() or _rti_driving():
+    # for a while — never time out underneath a running sequence. Same for a live RTI session,
+    # and (review C2, 2026-11-20) while the holder's moves still run: the planner empties the
+    # queue within milliseconds, so the queue alone let control expire 30 s into a long program
+    # and another client take it with no force and no button.
+    if not motion_queue.empty() or _rti_driving() or _has_moves(_owner_conn):
         return False
-    return (time.time() - _owner_last) > CONTROL_IDLE_TIMEOUT_S
+    return (time.monotonic() - _owner_last) > CONTROL_IDLE_TIMEOUT_S
 
 
 def control_holder():
@@ -422,7 +427,7 @@ def _claim_control(conn, force=False):
     with _owner_lock:
         if _owner_conn is not None and _owner_conn is not conn:
             if not force and not _owner_stale_locked():
-                held = time.time() - _owner_since
+                held = time.monotonic() - _owner_since
                 return False, (f"control is held by {_client_origin(_owner_conn)} (for {held:.0f}s). "
                                f"It frees automatically after "
                                f"{CONTROL_IDLE_TIMEOUT_S:.0f}s idle, or call "
@@ -433,9 +438,9 @@ def _claim_control(conn, force=False):
         if _owner_conn is not conn:
             _owner_conn = conn
             _owner_label = _client_label(conn)
-            _owner_since = time.time()
+            _owner_since = time.monotonic()
             log_control.info("control acquired by %s", _client_origin(conn))
-        _owner_last = time.time()
+        _owner_last = time.monotonic()
     _restore_collision(lost, "control taken over")
     return True, None
 
@@ -580,8 +585,16 @@ def _release_control(conn, why):
         _owner_label = None
     _restore_collision(conn, why)           # outside the owner lock: it sends to RTI
     return True
-pending_client = {}             # command id -> conn (queued commands awaiting completion)
+pending_client = {}             # str(command id) -> conn (queued commands awaiting completion; review C15: the id as
+                                # text, as the planner reports it back — a numeric id was never completed)
 _pending_lock = threading.Lock()
+
+
+def _has_moves(conn):
+    """Does `conn` have queued commands still awaiting completion? Takes _pending_lock: never call it with _pending_lock
+    held. Inside _owner_lock is fine (review C2): no path takes _owner_lock while holding _pending_lock."""
+    with _pending_lock:
+        return any(c is conn for c in pending_client.values())
 
 # One send lock PER CONNECTION (2026-11-18 review B5): one global lock let a client that stopped reading (a suspended
 # PC, Ctrl-Z) block every reply to everyone — and, through the stop path's replies, a Stop itself.
@@ -1001,9 +1014,15 @@ def _note_rti_tick():
         _rti_tick["value"], _rti_tick["at"] = tick, time.monotonic()
 
 
+def _rti_alive():
+    """False once RTI's loop has not ticked for RTI_STALE_S (the status watcher notes the tick at 50 Hz); True before
+    the watcher's first look (unknown). The status field `rti_alive` (review C16, 2026-11-20)."""
+    return _rti_tick["value"] is None or time.monotonic() - _rti_tick["at"] <= RTI_STALE_S
+
+
 def _measured_values_stale():
     """Why the measured values in shared memory are stale, or None. Unknown before the status watcher's first look."""
-    if _rti_tick["value"] is not None and time.monotonic() - _rti_tick["at"] > RTI_STALE_S:
+    if not _rti_alive():
         return f"RTI is not running: its loop has not ticked for over {RTI_STALE_S:g} s, so the values would be stale"
     if shared_data.robot_mode.get() == "FLASHING":
         return "the robot is in flashing mode: RTI reads no drive, so the values would be stale"
@@ -1043,6 +1062,9 @@ def _handle_get_status(args, cid, conn):
     planner = _planner_status()
     reply(conn, {"id": cid, "status": "ok", "data": {
         "mode": mode, "state": state, "homed": homed,
+        # False once RTI's loop has stopped ticking (review C16, 2026-11-20): mode, state and every measured value
+        # here are then the last ones RTI wrote, not live.
+        "rti_alive": _rti_alive(),
         "homing_question": _homing_question(),
         # The pose angles this executor parses and returns (2026-10-21: "xyz-mobile" = R = Rx(rx) Ry(ry) Rz(rz)). A block
         # program refuses an executor without it — one from before the change would read its points another way.
@@ -2162,8 +2184,7 @@ def _stop_if_left_moving(conn, who):
     wait_idle() before disconnecting. Called before the holder's control is released."""
     with _owner_lock:
         holder = _owner_conn is conn
-    with _pending_lock:
-        running = any(c is conn for c in pending_client.values())
+    running = _has_moves(conn)
     if not (holder and running):
         return
     why = f"{who} disconnected with its moves still running: the arm stops"
@@ -2966,7 +2987,16 @@ def _restore_collision(conn, why):
 
 
 def _handle_release_control(args, cid, conn):
-    """release_control() — give up control. Always allowed, never refused."""
+    """release_control() — give up control. Refused while the caller holds control with its own moves still running
+    (review C14, 2026-11-20, user: refuse): released, they played on with nobody responsible for them, and the
+    stop-on-disconnect rule (2026-10-24) no longer applied. Otherwise always allowed."""
+    with _owner_lock:
+        holder = _owner_conn is conn
+    if holder and _has_moves(conn):
+        why = ("release_control: your moves are still running — wait for them (wait_idle()) or stop them (stop()) "
+               "first, then release control")
+        _log_exec_reject(cid, "REJECTED", why, command="release_control()")
+        return reply(conn, {"id": cid, "status": "error", "code": "REJECTED", "message": why})
     released = _release_control(conn, "explicit release")
     if released:
         _broadcast_status(current_status())
@@ -3143,11 +3173,39 @@ def _reply_failed(taken, code, message):
 # ========================================================================== #
 # Checkpoint listener — routes RTI/planner status back to the owning client
 # ========================================================================== #
+class _LoopErrors:
+    """A background loop's unexpected errors (review D11, 2026-11-20): the first logged with its traceback, later ones
+    at most one line a minute with the count — and the loop goes on. Call note() inside the except block.
+
+    Why: the status watcher and the checkpoint listener are daemon threads with no top-level guard. One exception ended
+    either silently: no queued move ever completed again (clients wait out their timeout), RTI's answers stopped, and a
+    dead watcher stops noting RTI's tick, so every queued command would be refused RTI_NOT_RUNNING (review C16)."""
+
+    LOG_EVERY_S = 60.0
+
+    def __init__(self, log, what):
+        self.log = log
+        self.what = what
+        self.count = 0
+        self.logged_at = None
+
+    def note(self):
+        self.count += 1
+        now = time.monotonic()
+        if self.logged_at is None:
+            self.log.exception(f"{self.what} failed — carrying on (further failures: at most one line a minute)")
+            self.logged_at = now
+        elif now - self.logged_at >= self.LOG_EVERY_S:
+            self.log.error(f"{self.what} has failed {self.count} time(s) so far; the latest:", exc_info=True)
+            self.logged_at = now
+
+
 def checkpoint_listener():
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.PULL)
     sock.bind(ZMQ_EXEC_STATUS_SOCKET)
     logger.info(f"checkpoint listener bound to {ZMQ_EXEC_STATUS_SOCKET}")
+    errors = _LoopErrors(logger, "the checkpoint listener's routing")
 
     while True:
         try:
@@ -3155,29 +3213,37 @@ def checkpoint_listener():
         except Exception as e:
             logger.error(f"checkpoint recv error: {e}")
             continue
+        try:
+            _route_checkpoint(status)
+        except Exception:                      # noqa: BLE001 — logged; the listener must outlive any one message
+            errors.note()
 
-        if "answer" in status:             # RTI's answer to a command passed to it (2026-10-25)
-            deliver_rti_answer(status)
-            continue
-        cid = status.get("checkpoint_id")
-        with _pending_lock:
-            conn = pending_client.pop(cid, None)
-        if conn is None:
-            logger.info(f"status for unknown/closed id={cid}: {status.get('status')}")
-            continue
 
-        out = {"id": cid, "status": status.get("status", "complete")}
-        if status.get("status") == "error":
-            out["code"] = status.get("code", "EXEC_ERROR")
-            out["message"] = status.get("message", "")
-        # Gripper completions carry the settle reason (the gripper's status code: 1/2 = an
-        # object stopped the jaws, 3 = reached the target with nothing there).
-        # Forwarded verbatim so the client can tell a successful pick from a
-        # gripper that closed on air. Absent for every non-gripper command.
-        if "gripper_object" in status:
-            out["gripper_object"] = status["gripper_object"]
-        reply(conn, out)
-        logger.info(f"routed {out['status']} for id={cid}")
+def _route_checkpoint(status):
+    """One message from RTI's status socket: an answer to a command passed to RTI, or a queued command's checkpoint
+    routed to the client that sent it."""
+    if "answer" in status:             # RTI's answer to a command passed to it (2026-10-25)
+        deliver_rti_answer(status)
+        return
+    cid = status.get("checkpoint_id")
+    with _pending_lock:
+        conn = pending_client.pop(cid, None)
+    if conn is None:
+        logger.info(f"status for unknown/closed id={cid}: {status.get('status')}")
+        return
+
+    out = {"id": cid, "status": status.get("status", "complete")}
+    if status.get("status") == "error":
+        out["code"] = status.get("code", "EXEC_ERROR")
+        out["message"] = status.get("message", "")
+    # Gripper completions carry the settle reason (the gripper's status code: 1/2 = an
+    # object stopped the jaws, 3 = reached the target with nothing there).
+    # Forwarded verbatim so the client can tell a successful pick from a
+    # gripper that closed on air. Absent for every non-gripper command.
+    if "gripper_object" in status:
+        out["gripper_object"] = status["gripper_object"]
+    reply(conn, out)
+    logger.info(f"routed {out['status']} for id={cid}")
 
 
 # ========================================================================== #
@@ -3206,6 +3272,9 @@ def current_status():
         "mode": mode,
         "state": state,
         "homed": homed,
+        # False once RTI's loop has stopped ticking (review C16, 2026-11-20): the fields here are then the last ones
+        # RTI wrote, not live. A change pushes a status event like any other field.
+        "rti_alive": _rti_alive(),
         # Homing's open question (2026-11-16): {"J6": 2.42} or None — homing holds the arm until it is answered
         "homing_question": _homing_question(),
         "err": int(shared_data.rti["error_active"][0]),
@@ -3318,21 +3387,25 @@ def status_watcher():
     last = None
     last_mode = None
     fw_check_failed = False
+    errors = _LoopErrors(log_status, "the status watcher")    # review D11: never ends the thread
     log_status.info(f"watcher running ({STATUS_POLL_HZ:.0f} Hz check, push-on-change)")
     while True:
-        _note_rti_tick()
-        evt = current_status()
-        mode = evt.get("mode")
-        if last_mode == "EXEC" and mode != "EXEC":
-            # RTI-initiated exits (an error, E-stop, link loss) land in ACTIVE_ERROR, which
-            # holds until clear_errors — far longer than one watcher period, so none is missed.
-            errs = evt.get("errors") or []
-            _on_exec_exit(f"robot left EXEC (now {mode}" + (f", errors: {errs}" if errs else "") + ")")
-            evt = current_status()                  # publish the abort in this same push
-        last_mode = mode
-        if evt != last:
-            last = evt
-            _broadcast_status(evt)
+        try:
+            _note_rti_tick()
+            evt = current_status()
+            mode = evt.get("mode")
+            if last_mode == "EXEC" and mode != "EXEC":
+                # RTI-initiated exits (an error, E-stop, link loss) land in ACTIVE_ERROR, which
+                # holds until clear_errors — far longer than one watcher period, so none is missed.
+                errs = evt.get("errors") or []
+                _on_exec_exit(f"robot left EXEC (now {mode}" + (f", errors: {errs}" if errs else "") + ")")
+                evt = current_status()                  # publish the abort in this same push
+            last_mode = mode
+            if evt != last:
+                last = evt
+                _broadcast_status(evt)
+        except Exception:                           # noqa: BLE001 — logged; the status stream must go on
+            errors.note()
         try:
             _check_jog_alive()                      # a held jog's dead-man (2026-11-18 review G3)
         except Exception as e:                      # noqa: BLE001 — never the status stream
@@ -3365,19 +3438,71 @@ def executor_heartbeat():
 # ========================================================================== #
 # Per-client TCP handling
 # ========================================================================== #
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024   # one message (a line) at most; a 100 000-point spline is ~12 MB (review D11)
+
+
+class _MessageTooLong(Exception):
+    """A client sent more than MAX_MESSAGE_BYTES without a newline (review D11): the framing is lost."""
+
+
 def _read_lines(conn):
-    """Yield decoded newline-delimited messages from a blocking socket."""
-    buf = b""
+    """Yield decoded newline-delimited messages from a blocking socket.
+
+    Review D11 (2026-11-20): bounded — more than MAX_MESSAGE_BYTES without a newline raises _MessageTooLong (the buffer
+    grew without limit) — and linear: a bytearray searched only where new bytes arrived (the old `bytes +=` plus a
+    scan of the whole buffer per 4 KB chunk was quadratic in a long message). Bytes that are not UTF-8 are replaced, so
+    the line fails as BAD_JSON instead of raising out of the reader (which dropped the connection)."""
+    buf = bytearray()
     while True:
         data = conn.recv(4096)
         if not data:
             return
+        start = len(buf)                   # the bytes before hold no newline: search only the new ones
         buf += data
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            line = line.strip()
+        nl = buf.find(b"\n", start)
+        while nl >= 0:
+            line = bytes(buf[:nl]).strip()
+            del buf[:nl + 1]
             if line:
-                yield line.decode()
+                yield line.decode("utf-8", errors="replace")
+            nl = buf.find(b"\n")
+        if len(buf) > MAX_MESSAGE_BYTES:
+            raise _MessageTooLong(len(buf))
+
+
+def _message_shape_problem(msg):
+    """(code, why) when a parsed message has the wrong shape, else None (review D11, 2026-11-20). Each of these raised
+    inside dispatch() and dropped the connection — which stops that client's running moves (stop-on-disconnect)."""
+    if not isinstance(msg, dict):
+        return "BAD_JSON", f"a message must be a JSON object ({{...}}), not a {type(msg).__name__}"
+    cid = msg.get("id")
+    if cid is not None and not isinstance(cid, (str, int, float)):
+        return "BAD_JSON", '"id" must be text or a number'
+    if not isinstance(msg.get("cmd"), (str, type(None))):
+        return "BAD_JSON", '"cmd" must be text'
+    args = msg.get("args")
+    if args and not isinstance(args, (list, dict)):    # an object: set_pid_gains / set_sound take settings by name
+        return "BAD_ARGS", f'"args" must be a list (or an object of named settings), not a {type(args).__name__}'
+    return None
+
+
+def _dispatch_guarded(msg, conn):
+    """dispatch() behind the shape check and one guard (review D11, 2026-11-20): a wrong-shaped message is refused, and
+    an unexpected error in any handler answers INTERNAL with the connection kept — as handle_immediate's own guard
+    does since 2026-10-24. Before, both left through handle_client, which closed the connection."""
+    problem = _message_shape_problem(msg)
+    if problem is not None:
+        code, why = problem
+        cid = msg.get("id") if isinstance(msg, dict) and isinstance(msg.get("id"), (str, int, float)) else None
+        _log_exec_reject(cid, code, why, command="(a malformed message)")
+        return reply(conn, {"id": cid, "status": "error", "code": code, "message": why})
+    try:
+        dispatch(msg, conn)
+    except Exception as e:                     # noqa: BLE001 — answered and logged; the connection stays
+        logger.exception(f"{msg.get('cmd')} failed in dispatch")
+        why = f"{msg.get('cmd')} failed on the robot ({type(e).__name__}: {e})"
+        _log_exec_reject(msg.get("id"), "INTERNAL", why, command=str(msg.get("cmd")))
+        reply(conn, {"id": msg.get("id"), "status": "error", "code": "INTERNAL", "message": why})
 
 
 def dispatch(msg, conn):
@@ -3435,6 +3560,13 @@ def dispatch(msg, conn):
 
 def _submit_queued(cmd, args, msg, cid, conn):
     """A queued command's check -> register -> queue -> ack. dispatch() holds _abort_gate() around it."""
+    if not _rti_alive():
+        # Review C16 (2026-11-20): with RTI's loop stopped a queued command was accepted and the client waited out its
+        # timeout (120 s) for a completion nothing would send. Refused at once.
+        why = (f"RTI is not running: its loop has not ticked for over {RTI_STALE_S:g} s, so nothing would play "
+               f"this command")
+        _log_exec_reject(cid, "RTI_NOT_RUNNING", why, command=_fmt_command(cmd, args))
+        return reply(conn, {"id": cid, "status": "error", "code": "RTI_NOT_RUNNING", "message": why})
     if cmd in _QUEUED_GRIPPER_COMMANDS:
         problem = _queued_gripper_problem()
         if problem is not None:
@@ -3460,13 +3592,15 @@ def _submit_queued(cmd, args, msg, cid, conn):
     # picking it up (a JOINT_LIMIT target is refused before any planning), and an error for
     # an id not yet registered is dropped as "unknown" — the client then hangs until its
     # timeout. A rejected (full-queue) command is unregistered again below.
+    # Keyed by the id AS TEXT (review C15, 2026-11-20): the planner reports str(id) back (exec_commands), so a raw JSON
+    # client's numeric id was acknowledged and then never completed or failed. Its completion carries the id as text.
     with _pending_lock:
-        pending_client[cid] = conn
+        pending_client[str(cid)] = conn
     try:
         motion_queue.put_nowait(queued)
     except Full:
         with _pending_lock:
-            pending_client.pop(cid, None)
+            pending_client.pop(str(cid), None)
         _log_exec_reject(cid, "QUEUE_FULL", f"motion queue full (max {MOTION_QUEUE_MAXSIZE})",
                           command=_fmt_command(cmd, args))
         return reply(conn, {"id": cid, "status": "error", "code": "QUEUE_FULL",
@@ -3493,7 +3627,12 @@ def handle_client(conn, addr):
             except json.JSONDecodeError as e:
                 reply(conn, {"status": "error", "code": "BAD_JSON", "message": str(e)})
                 continue
-            dispatch(msg, conn)
+            _dispatch_guarded(msg, conn)
+    except _MessageTooLong as e:
+        why = (f"a message of over {MAX_MESSAGE_BYTES // (1024 * 1024)} MB without a newline ({e} bytes so far) — "
+               f"the connection is closed")
+        log_tcp.warning(f"{ip}:{port}: {why}")
+        reply(conn, {"status": "error", "code": "BAD_JSON", "message": why})
     except ConnectionResetError:
         log_tcp.info(f"{ip}:{port} reset")
     except Exception as e:

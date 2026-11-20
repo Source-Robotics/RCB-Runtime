@@ -494,6 +494,12 @@ def add_incidents_tab(is_visible, fmt_time, capture_fn, joint_num, robot_state_f
         other.selected = []                       # one file at a time, from either list
         other.update()
         path = rows[0]["path"]
+        # The path comes from the browser's selection event: only a recording is loaded (review G9, 2026-11-20 — it
+        # loaded and offered for download any file the robot user can read). The same check as Delete.
+        if not deletable(path):
+            state["selected"] = None
+            info.text = "not a recording"
+            return
         state["selected"] = path
         state["loaded"] = None
         info.text = "loading…"
@@ -512,7 +518,7 @@ def add_incidents_tab(is_visible, fmt_time, capture_fn, joint_num, robot_state_f
         draw()
 
     def download():
-        if state["selected"]:
+        if state["selected"] and deletable(state["selected"]):      # a recording only (review G9)
             ui.download(state["selected"])
 
     async def delete():

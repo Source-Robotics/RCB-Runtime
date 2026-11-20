@@ -217,7 +217,13 @@ async def handle_take_control():
     Taking control does NOT stop what the previous holder already queued: ownership gates
     NEW commands only. The dialog says so, because "take control" reads as "and stop them".
     """
+    # The holder's label is a client's own name: shown as plain text in the Markdown below (review G9, 2026-11-20 — raw
+    # HTML in a name passed through). Defined here, not imported: the dashboard re-runs this script per page load
+    # while imported modules stay as first imported, so a new import would break page loads until a GUI restart.
+    import html as _html
+    import re as _re
     holder = _ctl_view["holder"] or "another client"
+    holder = _re.sub(r"([\\`*_{}\[\]()#+\-.!|~])", r"\\\1", _html.escape(str(holder), quote=False))
     gate = bool(float(shared_data.rti["force_confirm_enabled"][0]) >= 0.5)
     with ui.dialog() as dlg, ui.card().classes("max-w-xl"):
         ui.label("Take control?").classes("text-lg font-bold")

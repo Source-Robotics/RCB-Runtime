@@ -316,10 +316,14 @@ class RTIClient:
     When commands stop coming or a stream breaks a limit, the arm brakes to
     rest within its limits, then the robot latches an error and disables:
     `RTI_LINK_LOST`, `RTI_START_POSE` (a first command too far from the arm),
-    `RTI_NO_SEND_TIME`, `RTI_BAD_VALUE` (a NaN or infinite value in a
+    `RTI_NO_SEND_TIME` (a position target without its send time, or send
+    times that stop advancing), `RTI_BAD_VALUE` (a NaN or infinite value in a
     command), or per joint `RTI_POSITION_LIMIT`,
     `RTI_VELOCITY_LIMIT`, `RTI_ACCELERATION_LIMIT` or `RTI_JERK_LIMIT`. Its
-    state stream then ends, and `control()` raises `ControlLost`.
+    state stream then ends, and `control()` raises `ControlLost`. RTI mode
+    takes joint position, velocity and torque commands, SOFT_RTI joint position
+    commands only; any other packet is refused and counts as no command, so a
+    stream of them ends in `RTI_LINK_LOST`.
 
     Attributes:
         robot: The `RobotClient` that carries the handshake.

@@ -77,6 +77,13 @@ _curr_ok_mask        = None  # bool scratch: |current| <= its ceiling (False for
 _curr_clamped        = None  # per joint: this excursion is logged already (re-armed once back inside)
 _curr_clamp_any      = False
 _tick_ok             = TickResult()
+# Review D5 (2026-11-20): a commanded position or speed that is not a number. The joint holds where it is measured
+# (a speed: 0), and J{n}:COMMAND_NOT_A_NUMBER waits here for RTI's error pass (take_command_errors) — a hard error:
+# one joint frozen while the others play on would leave the path. Logged at most once a second per joint.
+COMMAND_NOT_A_NUMBER = "COMMAND_NOT_A_NUMBER"
+NAN_LOG_EVERY_TICKS  = 250
+_nan_errors: tuple   = ()
+_nan_logged_at: dict = {}    # joint index -> the tick it was last logged
 
 # The drive frame carries a current as a signed 16-bit number (mA). Spectral_BLDC 1.20 wrapped a larger value
 # (40000 mA went out as -25536: full current the wrong way); 1.21 raises inside the send instead.
@@ -235,16 +242,23 @@ def _to_motor_space(ctx, output):
     """
     n = ctx.joint_num
 
+    # A value that is not a number ended RTI in int() (review D5): the cold helper holds the joint and latches the error.
     if output.pos_rad is not None:
         for i in range(n):
-            _motor_pos_buf[i] = ctx.Joint[i].get_encoder_position(output.pos_rad[i])
+            q = output.pos_rad[i]
+            if not math.isfinite(q):
+                q = _not_a_number(ctx, i, "position", q)
+            _motor_pos_buf[i] = ctx.Joint[i].get_encoder_position(q)
         pos_out = _motor_pos_buf
     else:
         pos_out = None
 
     if output.vel_rad is not None:
         for i in range(n):
-            _motor_vel_buf[i] = ctx.Joint[i].get_encoder_speed(output.vel_rad[i])
+            v = output.vel_rad[i]
+            if not math.isfinite(v):
+                v = _not_a_number(ctx, i, "speed", v)
+            _motor_vel_buf[i] = ctx.Joint[i].get_encoder_speed(v)
         vel_out = _motor_vel_buf
     else:
         vel_out = None
@@ -265,6 +279,37 @@ def _to_motor_space(ctx, output):
         curr_out = None
 
     return pos_out, vel_out, curr_out
+
+
+def _not_a_number(ctx, i, what, value):
+    """Cold path of _to_motor_space (review D5, 2026-11-20): joint i's commanded `what` ("position" / "speed") is not a
+    number. Returns what goes to the drive instead — the measured position (never the last sent value: 0 on the first
+    tick), or a speed of 0 — and queues J{n}:COMMAND_NOT_A_NUMBER for RTI's error pass (a hard error: the robot stops).
+    Every mode computes finite values, so this is a software fault upstream; RTI keeps running."""
+    global _nan_errors
+    key = f"J{i + 1}:{COMMAND_NOT_A_NUMBER}"
+    if key not in _nan_errors:
+        _nan_errors = _nan_errors + (key,)
+    tick = int(ctx.current_tick)
+    last = _nan_logged_at.get(i)
+    if last is None or tick - last >= NAN_LOG_EVERY_TICKS:
+        _nan_logged_at[i] = tick
+        logger.critical("J%d: the commanded %s is not a number (%s) — the joint %s and COMMAND_NOT_A_NUMBER "
+                        "latches. A bug upstream of the drive conversion; RTI keeps running.", i + 1, what, value,
+                        "holds where it is measured" if what == "position" else "gets speed 0")
+    if what == "position":
+        return float(ctx.shared_data.joint['joint_position'][i])
+    return 0.0
+
+
+def take_command_errors():
+    """One-shot read of the J{n}:COMMAND_NOT_A_NUMBER keys _to_motor_space queued (review D5), for RTI's error pass
+    (process_errors_tick(rti_errors=)); () when none."""
+    global _nan_errors
+    e = _nan_errors
+    if e:
+        _nan_errors = ()
+    return e
 
 
 def _clamp_currents(n):

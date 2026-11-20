@@ -46,6 +46,12 @@ from communication.rti_protocol import (
 )
 from data.data_recipe import build_payload
 from utility.kinematics_backend import should_use_pinocchio
+
+_CMD_NAMES = {CMD_JOINT_POSITION: "position", CMD_JOINT_VELOCITY: "velocity", CMD_JOINT_TORQUE: "torque",
+              CMD_CARTESIAN_POSE: "Cartesian pose", CMD_CARTESIAN_VELOCITY: "Cartesian velocity"}   # log text only
+# The packet types each contract runs (review S8, 2026-11-20); anything else is refused on receipt.
+_HARD_RTI_TYPES = (CMD_JOINT_POSITION, CMD_JOINT_VELOCITY, CMD_JOINT_TORQUE, CMD_STOP)
+_SOFT_RTI_TYPES = (CMD_JOINT_POSITION, CMD_STOP)
 from utility.signal_filters import create_filter_bank, apply_filter_bank
 from utility.tick_types import TickResult, ControlOutput
 
@@ -204,6 +210,8 @@ PT_DELAY_RATE_TICKS = 0.002       # per tick: the replay delay drifts at most th
 # controlled stop).
 PT_GATE = 1.5                     # a curvature above 1.5x the acceleration limit is a jump: plan to stop on the aim
 PT_MAX_GAP_TICKS = 25.0           # samples further apart (100 ms) or out of order: a new start
+PT_MAX_GUESSES = 4                # guessed spacings in a row (each within the last one's skip window): the PC's send
+                                  #   time does not advance — refused, RTI_NO_SEND_TIME (review S5, 2026-11-20)
 
 # STRICT COMMAND CHECKS (2026-10-11, user: as industrial 1 kHz interfaces do). A hard-RTI stream with send times must be motion the arm
 # can do: a sample that moves a joint past its soft limit (or faster than it can still stop before it), faster than its
@@ -376,7 +384,12 @@ SEQ_WRAP_HALF = 0x80000000
 # to catch. Velocity/torque commands get the analogous "must start near rest" check.
 DEFAULT_START_POSE_TOL_RAD = 0.1
 START_VEL_TOL_FRACTION = 0.10    # first velocity command <= 10% of the joint velocity limit
-START_TRQ_TOL_FRACTION = 0.25    # first torque command <= 25% of one tick of torque-rate budget
+# First torque command <= the torque-rate limit x one tick / 0.25 = FOUR ticks of torque slew (review S8, 2026-11-20,
+# user: fix the comment, keep the check). The comment said "25 % of one tick" — 16x tighter than the code ever was.
+# With PAR6's RTI torque-rate limits (the 10x "liberal test values" of 2026-08-06) that is J1 5.8, J2 32, J3 24, J4 / J5
+# 2.8, J6 3.2 Nm: in effect off. What bounds a bad first torque is the slew limiter (the torque rises at the
+# torque-rate limit) and the drives' current limits. Gravity is added by RTI, so a PC's first torque is normally ~0.
+START_TRQ_TOL_FRACTION = 0.25
 
 
 class RTIModeHandler:
@@ -414,7 +427,25 @@ class RTIModeHandler:
         # Policy values come from <rti_defaults> in config/system.xml via RTI.py; the
         # module constants above are the fallback when that block is absent, so there is
         # still exactly one definition of each default.
-        self.timeout_ticks = max(1, int(round(command_timeout_s / delta_t)))
+        # Hard RTI's watchdog (review S7, 2026-11-20, user: "s7 a"): <rti_defaults><command_timeout_s>, set again at every
+        # hard-RTI entry — it was a dead setting, every entry overwrote it with COMMAND_TIMEOUT_S. It can only TIGHTEN
+        # that 40 ms: a stale velocity / torque command keeps driving for the whole window. It is also hard RTI's
+        # ceiling (timeout_ceiling): a PC can tighten it further, never widen it past the configured value.
+        try:
+            _hard = float(command_timeout_s)
+        except (TypeError, ValueError):
+            _hard = _NAN
+        if not _hard > 0.0:                               # not a number, or not positive
+            logger.warning("RTI: command timeout %r is not a positive number — %.3f s used", command_timeout_s,
+                           COMMAND_TIMEOUT_S)
+            _hard = COMMAND_TIMEOUT_S
+        elif _hard > COMMAND_TIMEOUT_S:
+            logger.warning("RTI: <rti_defaults><command_timeout_s> %.3f s is above hard RTI's %.3f s ceiling — %.3f s "
+                           "used (a stale velocity / torque command keeps driving for the whole window)", _hard,
+                           COMMAND_TIMEOUT_S, COMMAND_TIMEOUT_S)
+            _hard = COMMAND_TIMEOUT_S
+        self.hard_timeout_s = _hard
+        self.timeout_ticks = max(1, int(round(_hard / delta_t)))
         self.stopping_ticks = max(1, int(round(stopping_hold_s / delta_t)))
         self.success_window_ticks = int(success_window_ticks)
         self.success_warn = float(success_warn)
@@ -551,6 +582,7 @@ class RTIModeHandler:
         self._pt_ok = np.zeros(joint_num, dtype=bool)
         self._pt_imd = np.zeros(joint_num, dtype=np.float64)
         self._pt_skip_checks = 0          # samples whose spacing was guessed (a clock jump): not checked
+        self._pt_guessed = 0              # guessed spacings, each within the previous one's skip window (review S5)
         self._chk_v = np.zeros(joint_num, dtype=np.float64)       # strict checks' scratch
         self._chk_a = np.zeros(joint_num, dtype=np.float64)
         self._chk_j = np.zeros(joint_num, dtype=np.float64)
@@ -576,6 +608,13 @@ class RTIModeHandler:
         self._rl_dist = np.zeros(joint_num, dtype=np.float64)  # distance to target
         self._rl_vstop = np.zeros(joint_num, dtype=np.float64) # max stoppable speed
         self._start_pose_checked = False
+        # The motion type the PC streamed before this packet's, when the packet changed it (review S1): set by
+        # _receive_command, handled once by _switch_command_type in _step_active.
+        self._switch_from = None
+        # Review S2 (2026-11-20): a position packet's speed feedforward beyond the RTI speed limit is clipped to it on
+        # receipt (it reaches the drives as is in SOFT_RTI and with the rate limiter off); warned once per claim.
+        self._ff_excess = np.zeros(joint_num, dtype=np.float64)
+        self._ff_clip_warned = False
 
         # ------------------------------------------------------------------ #
         # Braking bound for VELOCITY and TORQUE commands (open defect A).
@@ -659,6 +698,10 @@ class RTIModeHandler:
         # the RobotMode being entered; reported in telemetry so a reader knows whether the
         # success-rate metric means anything (it does not below ~125 Hz).
         self.soft_mode = False
+        # The contract last applied: None until apply_mode_contract() ran, then "hard" / "soft". Hard RTI refuses
+        # every generator but the pass-through (review S5, 2026-11-20, user: "s5 a"): only it runs the strict checks.
+        # None (a handler no mode entered yet, the offline nets' bare handlers) refuses nothing.
+        self._contract = None
         # Operator's ceiling on how far a client may widen the SOFT_RTI watchdog (seconds). Kept
         # inside [the hard-RTI timeout, the absolute maximum]: below the hard value it would make
         # SOFT_RTI stricter than RTI, above the maximum it would exceed the safety bound.
@@ -824,6 +867,7 @@ class RTIModeHandler:
         self._rx_acc = 0
         self.tx_bytes_per_s = 0.0
         self.rx_bytes_per_s = 0.0
+        self._send_failures = 0           # state sends failed since the last one that went out (review S4: logged once)
         # Over-rate accounting. Only the newest command per tick can be applied, so a PC
         # sending faster than the loop ticks has the remainder thrown away — and nothing
         # else shows it: success rate reads 100% (a command DID arrive) and misses read 0.
@@ -862,6 +906,11 @@ class RTIModeHandler:
         if self.sub_state in ('control_active', 'stopping_clean', 'stopping_error'):
             logger.info("Left RTI mode while control was claimed — claim dropped")
             self.sub_state = 'connected'
+        if self._ramp_errors or self._ramp_link_lost:
+            # Review S8 (2026-11-20): an error stop raises its error once the arm is at rest; leaving the mode while it
+            # still braked (a Stop, Disable, another mode) dropped it — the claim was reset before anything read it.
+            logger.warning("Left RTI mode during an error stop's braking — its error is raised now")
+            self._raise_stop_errors()
         self.stopping_counter = 0
         self._publish(ctx)
 
@@ -955,13 +1004,31 @@ class RTIModeHandler:
         self._rl_a[:] = 0.0
         self._rl_t[:] = 0.0
         self._start_pose_checked = False
+        self._switch_from = None
+        self._ff_clip_warned = False
+        self._cmd_ts = _NAN
+        self._ramp_on = False
+        self._ramp_errors = ()
+        self._ramp_link_lost = False
+        self._restart_stream(current_tick)
 
+        logger.info("Control claimed — timeout %d ticks, rate limiter %s, start-pose check %s",
+                    self.timeout_ticks,
+                    "ON" if self.rate_limit_enabled else "OFF",
+                    "ON" if self.start_pose_check_enabled else "OFF")
+        return True
+
+    def _restart_stream(self, tick):
+        """Start the generator's helpers afresh from _rl_q: at a claim, and when the PC changes the command type within
+        one (review S1, 2026-11-20). `tick` is the last tick that belongs to no packet of the new stream — the claim's
+        own tick, or the tick before the switching packet — so the stream's first packet is the first one they see.
+        Cold path (it allocates: the gap list, the low-pass bank)."""
         # Tracker state, cleared for the same reason the limiter state is: a target-velocity
-        # estimate carried over from the previous session would extrapolate this session's
-        # first setpoint toward wherever the last PC was going.
+        # estimate carried over from the previous stream would extrapolate this stream's
+        # first setpoint toward wherever the last one was going.
         self._trk_prev_tgt[:] = self._rl_q
         self._trk_vtgt[:] = 0.0
-        self._trk_cmd_tick = current_tick
+        self._trk_cmd_tick = tick
         self._trk_gap = 1.0
         self._trk_gaps = []
         self._trk_ideal = 0.0
@@ -969,29 +1036,44 @@ class RTIModeHandler:
         self._trk_vtgt_from_pc = False
         self._trk_seeded = False
         self._trk_interval_s = self.delta_t
-        self._cmd_ts = self._ts_prev = self._ts_off = _NAN
+        self._ts_prev = self._ts_off = _NAN
         self._ts_prev_seq = 0
-        self._pt_reset(current_tick)
+        self._pt_reset(tick)
         self._pt_skip_checks = 0
-        self._chk_tick = current_tick                   # the strict checks start fresh with this session
+        self._chk_tick = tick                           # the strict checks start fresh with this stream
         self._chk_t_prev = self._chk_ts_prev = _NAN
-        self._ramp_on = False
-        self._ramp_errors = ()
-        self._ramp_link_lost = False
-        self._reset_stream_acceleration(current_tick)
+        self._reset_stream_acceleration(tick)
 
-        # Rebuild the low-pass so it seeds from THIS session's first command. The engine
+        # Rebuild the low-pass so it seeds from THIS stream's first command. The engine
         # seeds an ema from its first sample rather than ramping from zero, but that only
-        # helps if the state is actually fresh — carrying the previous session's last
-        # output into a new claim would drag the first setpoint toward a stale pose.
+        # helps if the state is actually fresh — carrying the previous stream's last
+        # output into a new one would drag the first setpoint toward a stale pose (or, after
+        # a change of command type, mix speeds into positions).
         if self._lp_bank is not None:
             self.set_lowpass_filter(self._lp_cutoff_hz)
 
-        logger.info("Control claimed — timeout %d ticks, rate limiter %s, start-pose check %s",
-                    self.timeout_ticks,
-                    "ON" if self.rate_limit_enabled else "OFF",
-                    "ON" if self.start_pose_check_enabled else "OFF")
-        return True
+    def _switch_command_type(self, ctx):
+        """The PC changed the command type within one claim (review S1, 2026-11-20). A torque stream never moves the
+        position generator, so its first position packet was planned from wherever the limiter was BEFORE the torque
+        stream — a torque stream that moved the arm 30 deg, then a position packet: a 30 deg step, and no check judged
+        it. Now the limiter starts again from the MEASURED position, at the speed the arm is commanded to move (from a
+        velocity or position stream: the limiter's own; from torque, which commands no speed: the measured, filtered
+        speed), with no PC torque carried over; and a switch TO position runs the start-pose check on that packet, as
+        a claim's first packet does. Cold path: only on the switching packet."""
+        was, now = self._switch_from, self.last_cmd_type
+        self._switch_from = None
+        n = self.joint_num
+        self._rl_q[:] = ctx.shared_data.joint['joint_position'][:n]
+        if was == CMD_JOINT_TORQUE:
+            self._rl_v[:] = ctx.shared_data.joint['joint_speed_filtered'][:n]
+            self._rl_a[:] = 0.0
+        self._rl_t[:] = 0.0
+        self._restart_stream(ctx.current_tick - 1)
+        if now == CMD_JOINT_POSITION:
+            self._start_pose_checked = False
+        logger.info("RTI: the PC switched from %s to %s commands — the limiter restarts from the measured pose%s",
+                    _CMD_NAMES.get(was, was), _CMD_NAMES.get(now, now),
+                    " and the start-pose check runs again" if now == CMD_JOINT_POSITION else "")
 
     def request_release(self):
         """TCP rti_release: begin a CLEAN stop. Returns True if it was accepted."""
@@ -1066,7 +1148,11 @@ class RTIModeHandler:
                 logger.info("Motion finished by PC")
                 return self._step_stopping(ctx)
 
-            # Validate the FIRST command of this claim before it can reach a motor.
+            if self._switch_from is not None:      # the PC changed the command type (review S1): rare, cold
+                self._switch_command_type(ctx)
+
+            # Validate the FIRST command of this claim — and the first after a switch to position — before it can
+            # reach a motor.
             if not self._start_pose_checked:
                 self._start_pose_checked = True
                 if self.start_pose_check_enabled and not self._start_pose_ok(ctx):
@@ -1863,6 +1949,7 @@ class RTIModeHandler:
         """Empty the pass-through ring (a claim, a generator switch): the next three stamped packets start it again."""
         self._pt_k = 0
         self._pt_shift = 0.0
+        self._pt_guessed = 0
         self._pt_last_tick = current_tick
         self._pt_restore_rk()
 
@@ -1984,6 +2071,18 @@ class RTIModeHandler:
                      "default), or use SOFT_RTI (rti_connect with a rate) for a sender without them.")
         self._begin_stop('stopping_error', errors=("RTI_NO_SEND_TIME",))
 
+    def _refuse_stuck_clock(self, ds):
+        """Cold path (review S5, 2026-11-20): the PC's send times stopped advancing — PT_MAX_GUESSES guessed spacings,
+        each inside the last one's skip window, so the strict checks never ran. A controlled stop, then
+        RTI_NO_SEND_TIME (the same answer as a packet without a send time: the pass-through has no timeline)."""
+        if self.sub_state != 'control_active':
+            return
+        logger.error("Hard-RTI send times do not advance: %d packets close together did not move on by their send "
+                     "times as they arrived (the last %+.2f ticks after the one before; a clock that stands still or "
+                     "is too coarse) — refused, braking to rest. Stamp each packet with a fine-grained clock "
+                     "(RTIClient uses time.perf_counter()).", PT_MAX_GUESSES, ds)
+        self._begin_stop('stopping_error', errors=("RTI_NO_SEND_TIME",))
+
     def _refuse_bad_value(self):
         """Cold path: a command packet with a value that is not a finite number (NaN or infinite) — a controlled stop,
         then RTI_BAD_VALUE (once: the stop has begun, later packets are not read). Outside an active session the
@@ -2091,11 +2190,20 @@ class RTIModeHandler:
                             # The PC's CLOCK jumped (the packets kept coming): carry its timeline on at the arrival
                             # spacing. A restart would hand two ticks to the planner, which brakes — ~1 deg lost at
                             # 60 deg/s (simulated). That spacing is a guess: the strict checks skip it.
+                            # A JUMP is one event: the samples after it space normally on the carried timeline. A
+                            # guess inside the previous guess's skip window is a clock that stands still or is too
+                            # coarse (review S5, 2026-11-20) — every packet re-armed the skip and the checks never ran.
+                            # PT_MAX_GUESSES of them: refused like a packet without a send time.
+                            self._pt_guessed = self._pt_guessed + 1 if self._pt_skip_checks > 0 else 1
+                            if self._pt_guessed >= PT_MAX_GUESSES:
+                                self._refuse_stuck_clock(ds)
+                                return self._rl_q              # refused: a controlled stop has begun
                             self._pt_shift += ds - arr_gap
                             s = s_prev + arr_gap
                             self._pt_skip_checks = 4
                         else:
                             k = 0                          # a silence: start again from this sample
+                            self._pt_guessed = 0
                 self._pt_arrival = self.last_cmd_tick
                 i = k % PT_RING
                 self._pt_s[i] = s
@@ -2300,8 +2408,10 @@ class RTIModeHandler:
             # The soft limits are NOT part of the rate limiter and must hold with it off,
             # exactly as they do on the position path. Only the v/a/j smoothing is optional.
             # The TCP cap is a limit too, so it applies here as well — before the brake,
-            # which always has the last word.
-            self._rl_v[:] = v_des
+            # which always has the last word. So is the speed limit (review S6, 2026-11-20: with the limiter off the
+            # PC's speeds went to the drives unclamped, though this docstring and set_vel_scale's said otherwise).
+            np.negative(self.vel_limit, out=self._neg)
+            _clip(v_des, self._neg, self.vel_limit, out=self._rl_v)
             self._tcp_scale_velocity(self._rl_v, ctx)
             if q_meas is not None:
                 self._rl_v[:] = self._brake_at_limits(self._rl_v, q_meas)
@@ -2583,10 +2693,11 @@ class RTIModeHandler:
         if not soft:
             # Flags first: the timeout ceiling depends on which contract this is.
             self.soft_mode = False
+            self._contract = "hard"
             self._soft_rate_hz = None
             self._soft_refused = 0
             self.dynamics_ff_source = DYNAMICS_FF_DEFAULT   # every entry (a PC may choose: rti_set_dynamics_ff)
-            self.set_command_timeout(COMMAND_TIMEOUT_S)
+            self.set_command_timeout(self.hard_timeout_s)   # system.xml's <command_timeout_s> (review S7: was 40 ms)
             self.set_servo_generator(SERVO_PASSTHROUGH)     # needs send times: an unstamped position is refused
             self.set_pace(0.0)
             self.set_min_duration(0.0)
@@ -2613,6 +2724,7 @@ class RTIModeHandler:
         # Flags first: timeout_ceiling() keeps the declared rate's own 3 intervals even when the
         # operator's ceiling is lower (a 5 Hz stream needs 600 ms just to be healthy).
         self.soft_mode = True
+        self._contract = "soft"
         self._soft_rate_hz = hz
         self._soft_refused = 0
         self.dynamics_ff_source = DYNAMICS_FF_DEFAULT       # every entry (a PC may choose: rti_set_dynamics_ff)
@@ -2840,6 +2952,13 @@ class RTIModeHandler:
             self._refuse_setting("Servo generator 'passthrough' refused in SOFT_RTI: it replays a target EVERY tick "
                            "(hard RTI); sparse targets need a generator that fills in between them.")
             return
+        if key != SERVO_PASSTHROUGH and self._contract == "hard":
+            # Review S5 (2026-11-20, user: "s5 a"): only the pass-through runs hard RTI's strict checks (the speed,
+            # acceleration, jerk and soft-limit errors on the stream); another generator absorbed a bad stream within
+            # the limits and the checks never ran.
+            self._refuse_setting("Servo generator %r refused in RTI mode: only 'passthrough' checks the stream itself "
+                                 "there. The other generators are for SOFT_RTI (rti_connect with a rate).", key)
+            return
         if key == SERVO_TRACKER and self.rate_limit_enabled is False:
             logger.warning("Servo generator 'tracker' selected while the rate limiter "
                            "is OFF — the limiter-off path streams commands through "
@@ -2927,7 +3046,8 @@ class RTIModeHandler:
     def timeout_ceiling(self):
         """The most the watchdog may be set to RIGHT NOW, in seconds.
 
-        RTI:       COMMAND_TIMEOUT_S. A client can only tighten it — see the note above
+        RTI:       system.xml's <command_timeout_s> (hard_timeout_s, at most COMMAND_TIMEOUT_S;
+                   review S7). A client can only tighten it — see the note above
                    DEFAULT_SOFT_TIMEOUT_CEILING_S for why a stale velocity/torque makes any
                    widening unsafe there.
         SOFT_RTI:  the operator's ceiling, but never less than the declared rate's own 3
@@ -2935,7 +3055,7 @@ class RTIModeHandler:
                    maximum. The ceiling limits EXTRA slack; it must not break the rate contract.
         """
         if not self.soft_mode:
-            return COMMAND_TIMEOUT_S
+            return self.hard_timeout_s
         own = 3.0 / self._soft_rate_hz if self._soft_rate_hz else 0.0
         return min(max(self.soft_timeout_ceiling, own), MAX_COMMAND_TIMEOUT_S)
 
@@ -3186,15 +3306,13 @@ class RTIModeHandler:
         # ever sends velocity trips LINK_LOST rather than moving the arm.
         # The stop packet is no stale command: it ends the motion (2026-10-24: RTIClient.stop() and MotionFinished
         # were refused here, so a SOFT_RTI session ended in RTI_LINK_LOST instead of a clean stop).
-        if self.soft_mode and cmd_type not in (CMD_JOINT_POSITION, CMD_STOP):
+        # HARD RTI likewise refuses what it cannot run (review S8, 2026-11-20): a Cartesian or unknown type was taken,
+        # fed the watchdog and only held the arm — the PC believed it was driving, with no error. Not "received" now,
+        # so a PC sending only those trips RTI_LINK_LOST after the watchdog, with this warning naming why.
+        if cmd_type not in (_SOFT_RTI_TYPES if self.soft_mode else _HARD_RTI_TYPES):
             self._soft_refused += 1
             if self._soft_refused == 1:               # once per session — never per tick
-                logger.warning(
-                    "SOFT_RTI accepts position targets only; refusing a %s packet. "
-                    "Velocity/torque streaming needs hard RTI (rti_connect without a rate), "
-                    "whose 40 ms watchdog is what makes a stale command safe.",
-                    "velocity" if cmd_type == CMD_JOINT_VELOCITY else
-                    "torque" if cmd_type == CMD_JOINT_TORQUE else f"type-{cmd_type}")
+                self._warn_refused_type(cmd_type)
             return False
 
         # Sequence numbers only detect loss/reorder; they are not a filter. A
@@ -3236,12 +3354,46 @@ class RTIModeHandler:
         self._cmd_ts = _NAN if _ts is None else _ts
         self.last_cmd_type = cmd_type
         if cmd_type != CMD_STOP:
+            if self._last_motion_type is not None and cmd_type != self._last_motion_type:
+                self._switch_from = self._last_motion_type      # handled by _step_active (review S1)
             self._last_motion_type = cmd_type      # what the arm was DOING when a stop arrives (the stop ramp's seed)
             # A stop's payload is no target (2026-10-24): the last target stays (the stop brakes from where the arm
             # is commanded; nothing reads the target after a stop, and now nothing could read zeros there).
             self._payload[:] = payload[:self.joint_num]
             self._feedforward[:] = feedforward[:self.joint_num]
+            if cmd_type == CMD_JOINT_POSITION:
+                # Review S2 (2026-11-20): a position packet's feedforward is a SPEED, and in SOFT_RTI and with the rate
+                # limiter off it goes to the drives as it came (a client sending deg/s: 57x too fast). Clipped to the
+                # RTI speed limit here, so every consumer sees the clipped value. Allocation-free; over: cold.
+                np.abs(self._feedforward, out=self._ff_excess)
+                np.subtract(self._ff_excess, self.vel_limit, out=self._ff_excess)
+                if self._ff_excess.max() > 0.0:
+                    self._clip_feedforward()
         return True
+
+    def _warn_refused_type(self, cmd_type):
+        """Cold path of _receive_command: the first refused packet type of a session, named (review S8)."""
+        name = _CMD_NAMES.get(cmd_type, f"type-{cmd_type}")
+        if self.soft_mode:
+            logger.warning("SOFT_RTI accepts position targets only; refusing a %s packet. Velocity/torque streaming "
+                           "needs hard RTI (rti_connect without a rate), whose 40 ms watchdog is what makes a stale "
+                           "command safe.", name)
+        else:
+            logger.warning("RTI mode accepts joint position, velocity and torque packets only; refusing a %s packet "
+                           "(Cartesian commands are not supported). A refused packet is no command: a stream of "
+                           "them ends in RTI_LINK_LOST.", name)
+
+    def _clip_feedforward(self):
+        """Cold path of _receive_command: a position packet's speed feedforward beyond the RTI speed limit — clipped to
+        it, warned once per claim (review S2)."""
+        if not self._ff_clip_warned:
+            self._ff_clip_warned = True
+            j = int(np.argmax(self._ff_excess))
+            logger.warning("RTI: the PC's speed feedforward for J%d is %.3f rad/s, beyond the RTI speed limit %.3f "
+                           "rad/s — clipped to the limit (logged once per claim). Feedforward is in rad/s: a client "
+                           "sending deg/s sends 57x too much.", j + 1, self._feedforward[j], self.vel_limit[j])
+        np.negative(self.vel_limit, out=self._neg)
+        _clip(self._feedforward, self._neg, self.vel_limit, out=self._feedforward)
 
     def _update_success_rate(self, got):
         """Roll the moving window forward one tick and track consecutive misses.
@@ -3362,7 +3514,17 @@ class RTIModeHandler:
             encoded = payload.encode()
             ctx.socket_sender.sendto(encoded, self.pc_addr)
             self._tx_acc += len(encoded)
+            if self._send_failures:
+                self._sent_again()
         except OSError as exc:
-            # Transient send failure (unreachable host, buffer full). Never kill the
-            # RT loop over it; the PC-side timeout is the real backstop.
-            logger.warning("State send failed: %s", exc)
+            # Transient send failure (unreachable host, buffer full — the socket is non-blocking since review S4).
+            # Never kill the RT loop over it; the PC-side timeout is the real backstop. Logged ONCE per outage (review
+            # S4, 2026-11-20): a pulled cable while paired logged this every tick, 250 lines a second.
+            self._send_failures += 1
+            if self._send_failures == 1:
+                logger.warning("State send failed: %s (not logged again until a send goes out)", exc)
+
+    def _sent_again(self):
+        """Cold path of _send_state: the first send after failed ones — one line with the count (review S4)."""
+        logger.info("State sends going out again after %d failed send(s)", self._send_failures)
+        self._send_failures = 0

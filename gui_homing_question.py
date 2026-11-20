@@ -12,9 +12,17 @@ stay reachable while it waits — either ends the homing (the question goes with
 """
 from __future__ import annotations
 
+import html
 import os
+import re
 
 import robotics.homing_arms as ha
+
+
+def md_plain(text) -> str:
+    """`text` shown as itself inside ui.markdown (review G9, 2026-11-20): HTML escaped, Markdown's special characters
+    backslash-escaped — an arm named left_arm_2 rendered in italics, and raw HTML in a name passed through."""
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|~])", r"\\\1", html.escape(str(text), quote=False))
 
 
 def question_now(rti, joint_num: int) -> dict:
@@ -32,7 +40,7 @@ def arm_name(path) -> str:
         table = ha.load_table(path)
         last = table.get("last_failed") or {}
         arm = next((a for a in table["arms"] if a["id"] == last.get("arm")), None)
-        return f"arm {ha.arm_label(arm)}" if arm else "this arm"
+        return f"arm {md_plain(ha.arm_label(arm))}" if arm else "this arm"     # shown in Markdown (review G9)
     except Exception:       # noqa: BLE001 — a name is a nicety; the question still shows
         return "this arm"
 

@@ -465,7 +465,9 @@ class RobotClient:
         Returns:
             The status, a dict. The fields used most: `mode` (the robot mode, such
             as `"IDLE"` or `"EXEC"`), `state` (`"ENABLED"` or `"DISABLED"`),
-            `homed`, `err` (1 while an error is latched), `errors` (the latched
+            `homed`, `rti_alive` (false once the real-time loop has stopped: the
+            other fields are then its last values), `err` (1 while an error is
+            latched), `errors` (the latched
             error keys) and `error_details` (as `errors()` returns them),
             `control_holder`, `exec_paused` and `exec_stopping` (1 while a program
             is paused or brakes for a stop), `queue_depth` (queued moves not started
@@ -841,7 +843,8 @@ class RobotClient:
 
         From now on the robot applies the commands your PC streams, and its
         watchdog runs at once: the first command must arrive within the command
-        timeout (40 ms in RTI mode, three of your intervals in SOFT_RTI), and so
+        timeout (in RTI mode `config/system.xml` `<command_timeout_s>`, 40 ms as
+        shipped; three of your intervals in SOFT_RTI), and so
         must every next one. Otherwise the arm brakes to rest within its limits,
         then the robot latches `RTI_LINK_LOST`, which disables it. The first
         command is checked against the arm (`rti_set_start_pose_check()`): one too
@@ -1985,8 +1988,10 @@ class RobotClient:
         velocity or a torque command unchanged. It takes effect at once, also
         mid-stream.
 
-        In RTI mode it can only shorten the 40 ms: a stale velocity or torque must
-        not drive on for longer. In SOFT_RTI, which takes position targets only, it
+        In RTI mode it can only shorten `config/system.xml`
+        `<rti_defaults><command_timeout_s>` (0.04 s as shipped, never more): a stale
+        velocity or torque must not drive on for longer. In SOFT_RTI, which takes
+        position targets only, it
         can be widened up to the operator's ceiling, the robot XML
         `<safety><max_soft_rti_timeout>` (0.25 s on PAR6), or up to three of your
         intervals when that is longer, never above 1 s. Below 8 ms (two ticks)
@@ -1997,10 +2002,11 @@ class RobotClient:
                 above 0 and limited as described.
 
         Defaults:
-            Set at every `rti_connect()`: 0.04 s in RTI mode; in SOFT_RTI three of
-            your intervals (3 / `rate_hz`), at least 8 ms and at most 1 s. Before
-            the first one it is `config/system.xml`
-            `<rti_defaults><command_timeout_s>`, 0.04 s, read at start.
+            Set at every `rti_connect()`: in RTI mode `config/system.xml`
+            `<rti_defaults><command_timeout_s>`, read at start (0.04 s as shipped; a
+            larger value is logged and 0.04 s used); in SOFT_RTI three of your
+            intervals (3 / `rate_hz`), at least 8 ms and at most 1 s. Before the
+            first one it is that `system.xml` value.
 
         Raises:
             CommandRejected: The robot refused it: `seconds` is not a number above 0, or
@@ -2148,8 +2154,9 @@ class RobotClient:
         take control from another client.
 
         Control is released by `release_control()`, when the client disconnects,
-        or after 30 s without a command that takes control, with nothing queued
-        and no real-time stream running. When control leaves a client this way
+        or after 30 s without a command that takes control, with none of its
+        moves queued or still running and no real-time stream running. When
+        control leaves a client this way
         or by a takeover, a collision-detection change it made returns to the
         start value (`set_collision_detection()`).
 
@@ -2244,18 +2251,23 @@ class RobotClient:
     def release_control(self) -> Any:
         """Give up control of the robot.
 
-        Another client can then take control. It is never refused: a client that
-        does not hold control gets `released` false. Moves already queued keep
-        running. A collision-detection change this client made returns to its
-        start value.
+        Another client can then take control. A client that does not hold
+        control gets `released` false. It is refused while this client holds
+        control and its own moves are still queued or running: wait for them
+        (`wait_idle()`) or stop them (`stop()`) first. A collision-detection
+        change this client made returns to its start value.
 
         Returns:
             `{"released": bool, "holder": label or None}`: whether this client held
             control and gave it up, and who holds control now ("ip:port").
 
         Raises:
+            CommandRejected: The robot refused it; its error code says why.
             RobotTimeout: The robot did not answer within 5 s.
             RobotConnectionError: The client is not connected.
+
+        Errors:
+            REJECTED: This client's moves are still queued or running.
 
         See also:
             `take_control()`, `control_holder()`
@@ -2535,16 +2547,18 @@ class RobotClient:
         a look-ahead that is not finite is refused, and nothing changes.
 
         Args:
-            name: `"passthrough"`: RTI mode only; replays your stamped targets
-                exactly, one tick behind, by their send times, and checks every
-                sample against the limits. `"ruckig_advancing"`: plans toward where
-                your target is moving and passes through it at its speed; the
-                closest tracking of a sparse stream. `"ruckig"`: plans a
-                jerk-limited move to each target and stops on it; exact and never
-                overshoots, but on a sparse stream it sprints and waits.
-                `"tracker"`: a servo law that never plans to stop; smooth on any
-                stream, but a large step can overshoot. Any case. The robot ignores
-                another name, and `"passthrough"` in SOFT_RTI.
+            name: `"passthrough"`: RTI mode only, and the only one there; replays
+                your stamped targets exactly, one tick behind, by their send times,
+                and checks every sample against the limits. SOFT_RTI only:
+                `"ruckig_advancing"`: plans toward where your target is moving and
+                passes through it at its speed; the closest tracking of a sparse
+                stream. `"ruckig"`: plans a jerk-limited move to each target and
+                stops on it; exact and never overshoots, but on a sparse stream it
+                sprints and waits. `"tracker"`: a servo law that never plans to
+                stop; smooth on any stream, but a large step can overshoot. Any
+                case. The robot refuses another name, `"passthrough"` after an
+                `rti_connect()` into SOFT_RTI, and every other name after one into
+                RTI mode.
             gain: The tracker's bandwidth in rad/s, from 1 to 150 (clamped); above
                 about 20 a large step overshoots. `None` keeps the current value.
                 Only the tracker uses it.
@@ -2577,15 +2591,18 @@ class RobotClient:
             BAD_ARGS: `name` is empty or holds a colon, a number is not finite, or
                 the message did not carry exactly four values.
             RTI_REFUSED: `"passthrough"` in SOFT_RTI (it needs a send time with every
-                target), or RTI could not use a value. The message says why.
+                target), any other generator in RTI mode (only the pass-through
+                checks the stream there), or RTI could not use a value. The message
+                says why.
             RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
                 responding. The command may still have taken effect.
 
         Note:
             In RTI mode only `"passthrough"` checks the stream itself (the speed,
-            acceleration, jerk and soft-limit errors); the others absorb a jump
-            within the limits instead. Every one still needs each position
-            target's send time in RTI mode.
+            acceleration, jerk and soft-limit errors), so it is the only generator
+            there; the others, which absorb a jump within the limits instead, are
+            for SOFT_RTI. Every position target in RTI mode needs its send time,
+            and the send times must advance from packet to packet.
 
         See also:
             `rti_set_min_duration()`, `rti_set_pace()`, `rti_set_vel_scale()`
@@ -7014,6 +7031,9 @@ class RobotClient:
         Returns:
             A dict:
             `mode`, `state` and `homed`: as in `latest_status()`.
+            `rti_alive`: false once the robot's real-time loop has stopped
+                (no tick for 0.5 s): every other value is then the last one it
+                wrote, and moves are refused with `RTI_NOT_RUNNING`.
             `pose_angles`: `"xyz-mobile"`, the pose angles R = Rx Ry Rz that this
                 robot reads and returns.
             `runtime_version`: the robot software's version, such as `"0.10.0"`.

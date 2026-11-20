@@ -13,6 +13,66 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+### Added
+
+- `get_status()` and the status stream carry `rti_alive`: false once the robot's real-time loop has not ticked for
+  0.5 s. Every other value is then the last one it wrote, not live.
+- A new error, `COMMAND_NOT_A_NUMBER` (1209): what the robot commanded a joint, its position or its speed, was not a
+  number. The robot stops; meanwhile the joint holds where it is measured.
+
+### Changed
+
+- `release_control()` is refused (`REJECTED`) while the client holds control and its own moves are still queued or
+  running: wait for them (`wait_idle()`) or stop them (`stop()`) first. Released, they played on with nobody
+  responsible for them, and a disconnect no longer stopped them.
+- Control no longer expires after 30 s idle while the holder's moves are still running (it expired 30 s into a long
+  program, and another client could take control without force).
+- With the robot's real-time loop stopped, a move or any other queued command is refused at once with
+  `RTI_NOT_RUNNING` (it was accepted and the client waited out its timeout).
+- In RTI mode, a change of command type within one claim restarts the rate limiter from the measured pose, and a
+  change to position commands runs the start-pose check on that packet, as a claim's first packet does.
+- RTI mode refuses every servo generator but `"passthrough"` (`RTI_REFUSED`): only the pass-through checks the stream
+  itself (speed, acceleration, jerk, soft limits). The others are for SOFT_RTI.
+- RTI mode: position targets whose send times stop advancing (a clock that stands still, or one too coarse for the
+  stream) end the stream with `RTI_NO_SEND_TIME`, as a target without a send time does. The strict checks skipped
+  every such packet.
+- RTI mode refuses Cartesian and unknown packet types (no command: a stream of them ends in `RTI_LINK_LOST`). They
+  were taken, kept the link alive and only held the arm.
+- `config/system.xml` `<rti_defaults><command_timeout_s>` sets RTI mode's watchdog at every entry and is its ceiling;
+  at most 0.04 s (a larger value is logged and 0.04 s used). Every entry overwrote it with 0.04 s.
+- The executor refuses a message of the wrong shape (not a JSON object, a list `id` or `cmd`: `BAD_JSON`; `args` that
+  is neither a list nor an object: `BAD_ARGS`) and answers an unexpected error with `INTERNAL`, keeping the connection. Both closed it,
+  which stops that client's running moves. A message over 16 MB without a newline closes the connection.
+
+### Fixed
+
+- RTI: a position packet after a torque stream was planned from where the arm was before the torque stream: a step
+  as large as the torque had moved the arm, which no check judged.
+- RTI: the PC's speed feedforward reached the drives unclamped in SOFT_RTI and with the rate limiter off (a client
+  sending deg/s sent 57 times too much); it is clipped to the RTI speed limit, with a warning once per claim. With the
+  rate limiter off, velocity commands are clipped to the speed limit too, as documented.
+- A commanded position or speed that is not a number ended RTI (the drives let go, homing was lost); the joint now
+  holds and `COMMAND_NOT_A_NUMBER` latches.
+- Clear Errors also wiped an error that latched during its 0.15 s settle, leaving the robot disabled with no error
+  shown; it now wipes only what was latched when it was pressed. A fault still present no longer reads "no error"
+  for a few ticks before latching again (with the error tune and the gripper freeze a second time).
+- A queued command with a numeric id (raw JSON clients) was acknowledged and never completed or failed.
+- The dashboard's Recordings tab loaded and offered for download any file the robot's user can read, when the
+  browser named it; it takes recordings only. Arm and client names in its dialogs are shown as plain text.
+- Block programs saved before 0.9.0: a POSE block's typed angles are converted to today's angle convention, as the
+  taught points already were (the tool turned to another orientation).
+- RTI: a host flooding the RTI port held the real-time loop in its UDP read (now at most 64 packets a tick); the state
+  and telemetry packets went out on blocking sockets (a full send buffer could stall the loop); a failing state send
+  logged a warning every tick (250 a second with a pulled cable; now once, then one line when sends resume).
+- RTI: an error stop's error (a refused value, a lost link) was dropped when the mode changed while the arm was still
+  braking (a Stop or Disable meanwhile); it is raised then.
+- EXEC: a pause during a move's settle hold kept that move from completing until resume.
+- The executor's status watcher and completion listener ended silently on an unexpected error: no move completed any
+  more and the status stream froze. They log it and carry on.
+- Control's 30 s idle expiry used the wall clock: a clock step (time sync) could expire the holder at once.
+- `RobotClient.wait_idle()` could return no failure for a move that had just failed (the failure was recorded after the
+  waiter woke).
+
 ## [2.0.0] - 2026-11-20
 
 ### Added

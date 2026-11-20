@@ -145,6 +145,7 @@ def check_program(program, name=None):
     if fmt == 1:
         program["points"] = {pname: dict(point, pose=pose_from_format_1(point["pose"]))
                              for pname, point in program["points"].items()}
+        pose_blocks_from_format_1(workspace)
     program["format"] = FORMAT
     for key in ("robot", "gripper"):
         if program.get(key) is not None and not isinstance(program[key], str):
@@ -172,6 +173,25 @@ def pose_from_format_1(pose):
     [x, y, z, c, b, a] (R = Rx(rx) Ry(ry) Rz(rz)): the same position and orientation, the first and third angle
     swapped — exact, no rounding."""
     return [float(v) for v in pose[:3]] + [float(pose[5]), float(pose[4]), float(pose[3])]
+
+
+def pose_blocks_from_format_1(node):
+    """Every POSE block (rcb_pose) anywhere in a format-1 workspace — nested in inputs, `next`, shadows — gets its typed
+    angles in today's convention, in place: RX and RZ swapped, the same exact swap as pose_from_format_1 (review K7,
+    2026-11-20: the points were converted, the typed angles were not, so the tool went to another orientation). A
+    block without both fields is left as it is (the generator's own defaults then apply)."""
+    if isinstance(node, list):
+        for item in node:
+            pose_blocks_from_format_1(item)
+        return
+    if not isinstance(node, dict):
+        return
+    fields = node.get("fields")
+    if node.get("type") == "rcb_pose" and isinstance(fields, dict) and "RX" in fields and "RZ" in fields:
+        fields["RX"], fields["RZ"] = fields["RZ"], fields["RX"]
+    for value in node.values():
+        if isinstance(value, (dict, list)):
+            pose_blocks_from_format_1(value)
 
 
 def check_point_name(pname):

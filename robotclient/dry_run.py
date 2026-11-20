@@ -559,6 +559,7 @@ class DryRunRobotClient(RobotClient):
             "mode": self._mode,
             "state": self._state,
             "homed": self._homed,
+            "rti_alive": True,            # the robot's status field (review C16): offline there is no loop to stop
             "pose_angles": POSE_CONVENTION,
             "dry_run": True,
             "simulated": False,

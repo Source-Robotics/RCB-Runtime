@@ -141,6 +141,13 @@ CATALOG = {
                                "the margin, or past its soft limits. The check runs in warn-only mode.", _WARN,
                                "Send RTI.log (it has the value and the peak) to the developers before the check is "
                                "set to stop."),
+    "COMMAND_NOT_A_NUMBER": _e(1209, "Commanded value not a number",
+                               "What the robot commanded a joint, its position or its speed, was not a number (NaN "
+                               "or infinite). Every mode computes finite values, so this is a fault in the robot's "
+                               "software; RTI.log names the joint and the value.",
+                               _HARD + " Meanwhile the joint holds where it is measured, and RTI keeps running.",
+                               "Send RTI.log and the support bundle to the developers. Clear errors, then enable "
+                               "the robot."),
     "ZONE_VIOLATION": _e(1301, "Safety zone violated",
                          "The tool or a tool sphere left an allowed zone or entered a forbidden zone of the active "
                          "cell. The message names the zone.",
@@ -593,11 +600,12 @@ CATALOG = {
                          "refuses a session that would begin with a jump.", _STREAM,
                          "Start the stream from the arm's measured position (the state packets give it). "
                          + _AGAIN_RTI),
-    "RTI_NO_SEND_TIME": _e(6205, "PC packet without its send time",
-                           "A hard-RTI position command arrived without the PC's send time. Hard RTI follows the PC's "
-                           "own timing and needs it.", _STREAM,
-                           "Keep send times on in the client (the default), or use SOFT_RTI for a sender without "
-                           "them. " + _AGAIN_RTI),
+    "RTI_NO_SEND_TIME": _e(6205, "PC packet without a usable send time",
+                           "A hard-RTI position command arrived without the PC's send time, or the send times stopped "
+                           "advancing from one packet to the next (a clock that stands still or is too coarse). Hard "
+                           "RTI follows the PC's own timing and needs it.", _STREAM,
+                           "Keep send times on in the client (the default; it stamps a fine-grained clock), or use "
+                           "SOFT_RTI for a sender without them. " + _AGAIN_RTI),
     "RTI_BAD_VALUE": _e(6207, "PC packet with a value that is not a number",
                         "A command packet from the PC carried a value that is not a finite number (NaN or "
                         "infinite).", _STREAM,

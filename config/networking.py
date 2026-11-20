@@ -81,6 +81,9 @@ RTI_PORT_STREAM_TCP  = 30003  # Robot binds and listens here for the SOFT_RTI TC
 RTI_TCP_BACKLOG_MAX  = 262144 # bytes of unsent state before the link is declared failed
 RTI_TCP_MAX_READS    = 64     # recv() calls per tick; bounds the drain so a flooding PC
                                #   cannot hold the RT loop inside it (see drain_rti_tcp)
+RTI_UDP_MAX_READS    = 64     # recvfrom() calls per tick, the same bound for UDP (review S4, 2026-11-20): any
+                               #   host sending to RTI_PORT_RECEIVE could hold the loop in an unbounded drain
+RTI_OVERSIZE_LOG_S   = 10.0   # at most one "dropped an oversized datagram" line per this many seconds
 
 # --- Future / other ---
 SIMULATOR_PORT       = 27890  # Reserved for simulator connection (not yet implemented)
@@ -383,7 +386,7 @@ def send_rti_tcp(conn, out, payload):
 def udp_socket_send_setup():
 
     # --- RTI socket send---
-    RTI_socket_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+    RTI_socket_sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     # RTI_socket_sender.bind((sender_ip, source_port))  # Bind to the fixed (LOCAL) send port and IP, otherwise it uses ephemeral port (ie it is autoassigned)
 
 
@@ -394,7 +397,17 @@ def udp_socket_send_setup():
     telemetry_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     telemetry_socket.bind(('0.0.0.0', SOURCE_PORT_BROADCAST))
 
+    # NON-BLOCKING, both (review S4, 2026-11-20): RTI sends on them inside its tick. A blocking UDP send waits when the
+    # socket's send buffer is full (a slow Wi-Fi link), holding the loop; non-blocking, that tick's packet is dropped
+    # instead (BlockingIOError, an OSError: the senders already catch it). A state packet is worthless a tick late.
+    RTI_socket_sender.setblocking(False)
+    telemetry_socket.setblocking(False)
+
     return RTI_socket_sender, telemetry_socket
+
+
+_oversize_logged_at = -RTI_OVERSIZE_LOG_S   # drain_rti_udp's rate limit for its oversize warning (review S4)
+_oversize_dropped = 0
 
 
 def drain_rti_udp(sock, allowed_ip, allowed_port):
@@ -423,10 +436,16 @@ def drain_rti_udp(sock, allowed_ip, allowed_port):
         silently discarded — success rate still reads 100%, misses still read 0, and half the
         operator's control effort vanishes with nothing to show it. Callers that only want
         the data can ignore the second element.
+
+    BOUNDED (review S4, 2026-11-20): at most RTI_UDP_MAX_READS packets a tick, like drain_rti_tcp. It read until the
+    socket was empty, and the sender is filtered only AFTER a read (UDP cannot refuse one before), so any host
+    sending to this port held the loop in here — one syscall per packet. Past the bound the rest waits for the next
+    tick (the kernel's receive buffer caps how far behind that can get; normal use is one or two packets a tick).
     """
+    global _oversize_logged_at, _oversize_dropped
     latest_data = None
     received = 0          # every packet pulled off the socket, accepted or not
-    while True:
+    while received < RTI_UDP_MAX_READS:
         try:
             # RECV_BUF is far larger than the 101-byte command packet on purpose. UDP
             # truncates SILENTLY: a datagram bigger than the buffer loses its tail with no
@@ -444,8 +463,14 @@ def drain_rti_udp(sock, allowed_ip, allowed_port):
         if len(data) >= RTI_RECV_BUF:
             # Cannot distinguish "exactly buffer-sized" from "truncated", so treat both as
             # suspect rather than feeding a possibly-headless packet to the unpacker.
-            logger.warning("dropped a %d-byte datagram — at or over the %d-byte "
-                            "receive buffer, so it may be truncated", len(data), RTI_RECV_BUF)
+            # Logged at most once per RTI_OVERSIZE_LOG_S with a count (review S4): a flood of them was a line each.
+            _oversize_dropped += 1
+            now = time.monotonic()
+            if now - _oversize_logged_at >= RTI_OVERSIZE_LOG_S:
+                logger.warning("dropped %d datagram(s) at or over the %d-byte receive buffer (the last was %d bytes) — "
+                               "they may be truncated", _oversize_dropped, RTI_RECV_BUF, len(data))
+                _oversize_logged_at = now
+                _oversize_dropped = 0
             continue
         if ((allowed_ip is None or addr[0] == allowed_ip) and
                 (allowed_port is None or addr[1] == allowed_port)):

@@ -344,6 +344,12 @@ class ExecHandler:
         #    batch and playhead untouched, so resume() continues seamlessly.
         if self._stopping:
             self._stop_ticks += 1
+        # A PAUSE during a settle hold (review S8, 2026-11-20): the settle goes on — nothing moves while settling, the arm
+        # holds the final target either way — and the pause holds from the next tick. Checked after it, a pause stopped
+        # the settle check, and the move's completion waited for resume(). A STOP still takes the at-rest path below.
+        if self._settling and not self._stopping:
+            self._rate = self._rate_target     # nothing moves while settling: no ramp to run
+            return TickResult(), self._tick_settling(ctx)
         ramp = self._rate != 1.0 or self._rate_target != 1.0 or self._frac != 0.0
         if ramp and self._rate == 0.0 and self._rate_target == 0.0:
             return self._tick_at_rest(ctx)

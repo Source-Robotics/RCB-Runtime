@@ -128,28 +128,16 @@ def _cause_text(short_key: str, fallback: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Motor error field names — single source of truth used by both the deque
-# zeroing (Motor_errors_data entries) and the shared-memory zeroing.
+# Motor error field names in the poll deques (Motor_errors_data entries), zeroed when the clear is sent. The
+# shared-memory flags are no longer zeroed after the settle (review C3, 2026-11-20): they mirror these entries.
 # ---------------------------------------------------------------------------
 _MOTOR_ERROR_DEQUE_KEYS = (
     "temperature_error", "encoder_error", "vbus_error",  "driver_error",
     "velocity_error",    "current_error", "estop_error", "watchdog_error",
 )
-# Corresponding shared_data.motor keys (same names with "motor_" prefix).
-_MOTOR_ERROR_SHARED_KEYS = tuple(f"motor_{k}" for k in _MOTOR_ERROR_DEQUE_KEYS)
 
-# Gripper error fields in Gripper_data deques → shared_data.gripper keys.
+# Gripper error fields in Gripper_data deques.
 _GRIPPER_ERROR_DEQUE_KEYS  = ("g_tim_err", "g_estop_err", "g_err")
-_GRIPPER_ERROR_SHARED_KEYS = ("gripper_timeout_error", "gripper_estop_error", "gripper_error")
-
-# Gripper motor-level error fields in shared_data.gripper (same faults as arm motors).
-# Note: temp and encoder use shortened names (temp_error, enc_error) in shared memory.
-_GRIPPER_MOTOR_ERROR_SHARED_KEYS = (
-    "gripper_motor_temp_error",     "gripper_motor_enc_error",
-    "gripper_motor_vbus_error",     "gripper_motor_driver_error",
-    "gripper_motor_velocity_error", "gripper_motor_current_error",
-    "gripper_motor_estop_error",    "gripper_motor_watchdog_error",
-)
 
 
 def _joint_key(joint_index: int, short_key: str) -> str:
@@ -217,21 +205,20 @@ def tick_clear_countdown(
     countdown: int,
     latched_errors: set,
     shared_data,
-    active_CAN_gripper: int = 0,
 ) -> tuple:
     """
     Decrement the clear-error settle countdown.  When it reaches zero, wipe
-    the error latch and zero shared motor and gripper error flags so
-    check_errors() gets a clean read on the same tick.
+    the errors that were latched when Clear Errors was pressed (review C3,
+    2026-11-20: one that latched during the settle stays).
 
-    Any error that is still genuinely present in the hardware will be written
-    back by the next poll cycle and re-latched by check_errors() automatically.
+    An error that is still present is re-latched by check_errors() on the same
+    tick: the drives' fault flags hold only what they reported since the clear
+    was sent (its poll entries were zeroed then), so they are not zeroed here.
 
     Args:
         countdown:          Current countdown value (ticks remaining).
         latched_errors:     The current latched error set.
         shared_data:        Shared memory module.
-        active_CAN_gripper: 1 if a CAN gripper is configured, 0 if not.
 
     Returns:
         (new_countdown, new_latched_errors)
@@ -241,33 +228,60 @@ def tick_clear_countdown(
 
     countdown -= 1
     if countdown == 0:
-        latched_errors = clear_errors(latched_errors, shared_data)
-        for k in _MOTOR_ERROR_SHARED_KEYS:
-            shared_data.motor[k][:] = 0
-        if active_CAN_gripper:
-            for k in _GRIPPER_ERROR_SHARED_KEYS:
-                shared_data.gripper[k][:] = 0
-            for k in _GRIPPER_MOTOR_ERROR_SHARED_KEYS:
-                shared_data.gripper[k][:] = 0
+        # Review C3 (2026-11-20): only what was latched when Clear Errors was pressed is wiped — an error that latched
+        # once during the settle (a homing failure, an RTI refusal) used to vanish here, leaving the robot disabled
+        # with no error shown. And the drives' / the gripper's fault flags are NOT zeroed any more: the clear zeroed
+        # their poll entries when it was sent, so after the settle they hold only what the drives reported SINCE
+        # (refreshed every 5 ticks). Zeroing them made a persisting fault read "no error, IDLE" for up to 5 ticks,
+        # then latch again with the error tune and the gripper freeze a second time.
+        global _clear_snapshot
+        keys, _clear_snapshot = _clear_snapshot, None
+        latched_errors = clear_errors(latched_errors, shared_data, keys=keys)
         logger.info(
-            "Settle period complete — latch and error flags cleared. "
-            "check_errors() will re-latch any still-active faults on the next poll cycle."
+            "Settle period complete — the errors latched at Clear Errors are cleared. "
+            "check_errors() re-latches any fault that is still present."
         )
     return countdown, latched_errors
 
 
-def clear_errors(latched_errors: set, shared_data=None) -> set:
-    """
-    Wipe the error latch. Called when the user presses "Clear Errors".
+# The keys latched when Clear Errors was pressed (review C3): set by note_clear (the dashboard's signal, RTI's
+# clear_errors command), wiped by tick_clear_countdown. None = wipe every key.
+_clear_snapshot = None
 
-    Also zeros CAN_node_connection_error in shared memory so that motors/gripper
-    that have since recovered are not immediately re-latched. Any nodes that are
-    still actually silent will re-set their CAN_node_connection_error within
-    ~50 ticks and re-latch the error automatically.
+
+def note_clear(latched_errors):
+    """Clear Errors was pressed: remember what is latched NOW — only that is wiped once the settle is over (review C3,
+    2026-11-20). Every path that starts the settle calls it; a second press during the settle takes the latch again,
+    which still holds the first press's keys (they are wiped only at the end)."""
+    global _clear_snapshot
+    _clear_snapshot = frozenset(latched_errors)
+
+
+def clear_errors(latched_errors: set, shared_data=None, keys=None) -> set:
     """
-    latched_errors.clear()
+    Wipe the error latch. Called when the user presses "Clear Errors" (after the settle).
+
+    keys (review C3, 2026-11-20): the keys to wipe — those latched when Clear Errors was pressed; an error that latched
+    during the settle stays. None = every key.
+
+    Also zeros CAN_node_connection_error in shared memory for every node that answers again, so that motors / the
+    gripper that have recovered are not immediately re-latched. A node still silent (its live old_data_warning set:
+    no data for 10 ticks) keeps its flag — zeroing it made the robot read "no error, IDLE" for one tick and then latch
+    the loss again (review C3).
+    """
+    if keys is None:
+        latched_errors.clear()
+    else:
+        kept = latched_errors - keys
+        latched_errors.difference_update(keys)
+        if kept:
+            logger.warning("Errors latched during the clear's settle are kept: %s", ", ".join(sorted(kept)))
     if shared_data is not None:
-        shared_data.rti["CAN_node_connection_error"][:] = 0
+        flags = shared_data.rti["CAN_node_connection_error"]
+        silent = shared_data.rti["old_data_warning"]
+        for i in range(len(flags)):
+            if not silent[i]:
+                flags[i] = 0
     logger.info("Error latch cleared by user. Active errors will re-latch immediately.")
     return latched_errors
 
@@ -671,11 +685,17 @@ def check_errors(
 # ---------------------------------------------------------------------------
 
 def _handle_clear_signal(shared_data, Motor, Motor_errors_data, joint_num, clear_error_countdown,
-                         Gripper_data, active_CAN_gripper):
-    """The clear-error signal: send the CAN clear to the errored motors and start the settle countdown.
-    Returns the countdown (unchanged when there was no signal)."""
+                         Gripper_data, active_CAN_gripper, latched_errors=None):
+    """The clear-error signal: send the CAN clear to the errored motors, remember what is latched now (review C3: only
+    that is wiped after the settle) and start the settle countdown. Returns the countdown (unchanged when there was no
+    signal)."""
+    global _clear_snapshot
     # ── Clear-error signal: send CAN clear to errored motors, start settle countdown ──
     if shared_data.clear_error_signal.get() == "1":
+        if latched_errors is not None:
+            note_clear(latched_errors)
+        else:
+            _clear_snapshot = None              # no latch passed: wipe every key, as before
         send_clear_errors(
             shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
             Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper,
@@ -919,11 +939,12 @@ def process_errors_tick(
         (clear_error_countdown, latched_errors, error_metadata, current_mode)
     """
     clear_error_countdown = _handle_clear_signal(shared_data, Motor, Motor_errors_data, joint_num,
-                                                 clear_error_countdown, Gripper_data, active_CAN_gripper)
+                                                 clear_error_countdown, Gripper_data, active_CAN_gripper,
+                                                 latched_errors)
 
     # ── Settle countdown: wipe latch only after N clean verification ticks ──
     clear_error_countdown, latched_errors = tick_clear_countdown(
-        clear_error_countdown, latched_errors, shared_data, active_CAN_gripper,
+        clear_error_countdown, latched_errors, shared_data,
     )
 
     # ── Detect errors ────────────────────────────────────────────────────────
