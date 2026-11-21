@@ -45,8 +45,9 @@ class HallCheck:
     """One joint limp + its Hall pin read every tick. `motors` are the CAN library's motor objects (Send_Limits,
     additional_pin2), `ctx` the dispatch context (hall_check_joint), `rti` the rti shared-memory dict."""
 
-    def __init__(self, motors, joint, velocity_limit, current_limit, ctx, rti, joint_position, log=None):
+    def __init__(self, motors, joint, velocity_limit, current_limit, ctx, rti, joint_position, log=None, restore=None):
         self.motors = motors
+        self.restore = restore                  # robotics/limit_restore.RestoreResend, shared by the three (review D14)
         self.joint = joint                      # None: this robot has no Hall-sensor joint
         self.velocity_limit = velocity_limit    # per joint, the robot XML's (what stop() restores)
         self.current_limit = current_limit
@@ -84,6 +85,8 @@ class HallCheck:
             return "only in IDLE (enabled or not, homed or not)"
         if booting:
             return "RTI is still configuring the drives (the first ~1.2 s after its start)"
+        if self.restore is not None and self.restore.joint == self.joint:
+            self.restore.cancel()               # a pending restore of this joint must not undo the 0 mA (review D14)
         self._send_limits(0)                    # BEFORE the first Hall command (this tick's dispatch)
         self.motors[self.joint].additional_pin2 = None
         self._ticks = 0
@@ -103,6 +106,8 @@ class HallCheck:
             return
         self.ctx.hall_check_joint = -1          # this tick's dispatch sends the joint its normal command again
         self._send_limits(self.current_limit[self.joint])
+        if self.restore is not None:
+            self.restore.arm(self.joint)        # sent again over the next second (review D14)
         self.active = False
         changes = int(self.rti["hall_check_changes"][0])
         self._publish_off()

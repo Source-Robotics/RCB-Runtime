@@ -75,12 +75,15 @@ def main():
         print("\nA. COMMAND WATCHDOG — stream, then go deliberately silent.")
         print("   SOFT_RTI sizes the timeout at 3 command intervals, so the expected stop")
         print("   time DIFFERS per rate. That is the part RTI's fixed 40 ms cannot test.\n")
+        rti = None    # one client at a time: the next pass closes the last one's port first
         for rate in rates:
             why = sc.preflight(robot)
             if why:
                 print(f"   {rate:5.0f} Hz  SKIP — {why}")
                 continue
             expect = 3.0 / rate
+            if rti is not None:
+                rti.close()    # a second RTIClient on the same UDP port is refused (2026-11-20)
             rti = RTIClient(robot, clock="pc")
             rti.connect(rate_hz=rate); time.sleep(0.4)
             rti.read_once(timeout=2.0)
@@ -116,6 +119,8 @@ def main():
             if why:
                 print(f"   {rate:5.0f} Hz  SKIP — {why}")
                 continue
+            if rti is not None:
+                rti.close()    # a second RTIClient on the same UDP port is refused (2026-11-20)
             rti = RTIClient(robot, clock="pc")
             rti.connect(rate_hz=rate); time.sleep(0.4)
             rti.read_once(timeout=2.0)

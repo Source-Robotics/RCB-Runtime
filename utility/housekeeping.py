@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 
 # The folders of temp_data the api_tests measurement scripts write their runs into (recordings, re-creatable by
 # running the test again). Nothing else is ever deleted by enforce_budget.
@@ -49,6 +50,11 @@ KEPT_DIRS = {"calibration": "the arms' calibration-screw readings (api_tests/65)
 # 500 MB since 2026-10-25 (user: the 15 GB SD card filled up); 1 GB from 2026-10-15. On a Pi with a larger card
 # (32 GB or more) set it back to 1_000_000_000 — the only place the number lives (supervisor, disk_cleanup read it).
 RECORDINGS_BUDGET_BYTES = 500_000_000
+# The SD card nearly full (review I6, 2026-11-20): under DISK_LOW_BYTES free the supervisor raises DISK_LOW_WARNING
+# (the health check's WARN line too); it clears above DISK_OK_BYTES (no flicker at the line). The card ran full on
+# 2026-10-24 and was at 99 % on 2026-11-20, with nothing saying so unless the health card was open.
+DISK_LOW_BYTES = 500_000_000
+DISK_OK_BYTES = 550_000_000
 _RUN_STAMP = re.compile(r"^(?:[a-z]+_)?(\d{8}_\d{6})")
 
 def _shift(path, keep):
@@ -71,13 +77,35 @@ def rotate_by_size(path, max_bytes, keep=3) -> bool:
         return False
 
 
-def copy_truncate(path, max_bytes, keep=3) -> bool:
-    """For a file a running process appends to: when over max_bytes, copy it to <path>.1 and truncate it. True if done."""
+COPY_RETRY_S = 600.0                     # a copy that failed (a full card) is tried again after this, not every pass
+_copy_failed_until: dict = {}
+
+
+def copy_truncate(path, max_bytes, keep=3, now=None) -> bool:
+    """For a file a running process appends to: when over max_bytes, copy it to <path>.1 and truncate it. True if done.
+
+    Review I6 (2026-11-20): the copy is made FIRST (<path>.1.tmp), and only once it is complete are the older copies
+    shifted and it renamed to .1 — a copy that fails (a full SD card) changes nothing, and is tried again only after
+    COPY_RETRY_S. Before, the shift came first: each failed attempt pushed one more old copy out (.1 - .3 gone within
+    6 s on a full card) and retried a 20 MB copy every pass."""
+    now = time.monotonic() if now is None else now
+    if now < _copy_failed_until.get(path, 0.0):
+        return False
     try:
         if not os.path.exists(path) or os.path.getsize(path) <= max_bytes:
             return False
+        tmp = f"{path}.1.tmp"
+        try:
+            shutil.copyfile(path, tmp)
+        except OSError:
+            _copy_failed_until[path] = now + COPY_RETRY_S
+            try:
+                os.unlink(tmp)
+            except OSError:  # nosec B110 — never made; the copy's failure is what counts
+                pass
+            return False
         _shift(path, keep)
-        shutil.copyfile(path, f"{path}.1")
+        os.replace(tmp, f"{path}.1")
         os.truncate(path, 0)
         return True
     except OSError:

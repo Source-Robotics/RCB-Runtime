@@ -403,7 +403,7 @@ _GRIPPER_MOTOR_ERROR_FIELDS = (
 
 def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
                            loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings=(),
-                           config_warnings=()):
+                           config_warnings=(), estop_channel_fault=False, disk_low=False):
     """E-STOP, the EXEC / RTI link watchdogs, RT loop health and the safety monitor's events. The caller
     pre-computes every flag; this only turns them into keys."""
     # ------------------------------------------------------------------
@@ -412,6 +412,13 @@ def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_
     if estop_active:
         sw_flag = bool(shared_data.rti["software_estop"][0])
         current_errors.add("SW_ESTOP" if sw_flag else "ESTOP")
+    # The two channels disagreed past the limit (a broken wire or contact): its own key next to ESTOP, so the error
+    # list says why the E-stop reads pressed (review D15, 2026-11-20; it was a log line only).
+    if estop_channel_fault:
+        current_errors.add("ESTOP_CHANNEL_FAULT")
+    # The SD card nearly full (review I6, 2026-11-20): the supervisor's flag; a live warning, gone when space is freed
+    if disk_low:
+        current_errors.add("DISK_LOW_WARNING")
 
     # ------------------------------------------------------------------
     # EXEC control-link lost — command_executor went silent while EXEC motion
@@ -609,6 +616,8 @@ def check_errors(
     can_warnings=(),
     homing_errors=None,
     config_warnings=(),
+    estop_channel_fault: bool = False,
+    disk_low: bool = False,
 ) -> tuple:
     """
     Inspect all error sources and update the latched error set.
@@ -622,6 +631,8 @@ def check_errors(
         latched_errors:     The set returned by the previous call (pass set() on the first call).
         estop_active:       Result of check_estop_active() — passed in so this module
                             stays independent of the GPIO import.
+        estop_channel_fault: Result of gpio_handler.estop_channel_fault() (review D15): ESTOP_CHANNEL_FAULT.
+        disk_low:           The supervisor's rti['disk_low'][0] (review I6): DISK_LOW_WARNING.
         active_CAN_gripper: 1 if a CAN gripper is configured, 0 if not.
         driver_faults:      False = the faults the motor drivers and the gripper REPORT are not read (connection
                             losses, the E-stop, the monitor and every system error still are). RTI passes False
@@ -637,7 +648,7 @@ def check_errors(
     current_errors = set()
     _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
                            loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings,
-                           config_warnings)
+                           config_warnings, estop_channel_fault, disk_low)
     if driver_faults:
         _collect_motor_errors(shared_data, joint_num, current_errors)
     _collect_can_errors(shared_data, joint_num, current_errors)
@@ -685,10 +696,10 @@ def check_errors(
 # ---------------------------------------------------------------------------
 
 def _handle_clear_signal(shared_data, Motor, Motor_errors_data, joint_num, clear_error_countdown,
-                         Gripper_data, active_CAN_gripper, latched_errors=None):
+                         Gripper_data, active_CAN_gripper, latched_errors=None, quiet_bus=False):
     """The clear-error signal: send the CAN clear to the errored motors, remember what is latched now (review C3: only
     that is wiped after the settle) and start the settle countdown. Returns the countdown (unchanged when there was no
-    signal)."""
+    signal). quiet_bus (review C4, 2026-11-20: a maintenance mode — FLASHING): the latch only, no CAN clear."""
     global _clear_snapshot
     # ── Clear-error signal: send CAN clear to errored motors, start settle countdown ──
     if shared_data.clear_error_signal.get() == "1":
@@ -696,13 +707,16 @@ def _handle_clear_signal(shared_data, Motor, Motor_errors_data, joint_num, clear
             note_clear(latched_errors)
         else:
             _clear_snapshot = None              # no latch passed: wipe every key, as before
-        send_clear_errors(
-            shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
-            Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper,
-        )
+        if not quiet_bus:
+            send_clear_errors(
+                shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
+                Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper,
+            )
         clear_error_countdown = CLEAR_ERROR_SETTLE_TICKS
         shared_data.clear_error_signal.set("0")
         logger.info(
+            "the latch is cleared after the settle — no CAN clear sent: the bus stays quiet in a maintenance mode"
+            if quiet_bus else
             f"CAN clear sent to errored motors. "
             f"Settling for {CLEAR_ERROR_SETTLE_TICKS} ticks before wiping latch."
         )
@@ -906,6 +920,8 @@ def process_errors_tick(
     homing_errors=None,
     detail_of=None,
     config_warnings=(),
+    estop_channel_fault: bool = False,
+    disk_low: bool = False,
 ) -> tuple:
     """Run one tick of error processing in the RTI superloop.
 
@@ -925,7 +941,8 @@ def process_errors_tick(
         current_mode:           Current RobotMode value.
         homing_ctrl:            HomingController instance (needed to abort homing on error).
         estop_active:           Result of check_estop_active() — pre-computed by caller.
-        Gripper_data:           Per-node deques of gripper CAN dicts.
+        estop_channel_fault:    gpio_handler.estop_channel_fault(), read after check_estop_active (review D15).
+        Gripper_data:          Per-node deques of gripper CAN dicts.
         on_hard_error:          Optional callable(new_hard_keys, tick), called on the ONE tick a hard error
                                 first latches (utility/incident_dump.py saves the last two seconds).
         driver_faults:          False until the settle after RTI's start-up clear is over (check_errors).
@@ -940,7 +957,7 @@ def process_errors_tick(
     """
     clear_error_countdown = _handle_clear_signal(shared_data, Motor, Motor_errors_data, joint_num,
                                                  clear_error_countdown, Gripper_data, active_CAN_gripper,
-                                                 latched_errors)
+                                                 latched_errors, quiet_bus=current_mode in MAINTENANCE_MODES)
 
     # ── Settle countdown: wipe latch only after N clean verification ticks ──
     clear_error_countdown, latched_errors = tick_clear_countdown(
@@ -963,6 +980,8 @@ def process_errors_tick(
         can_warnings=can_warnings,
         homing_errors=homing_errors,
         config_warnings=config_warnings,
+        estop_channel_fault=estop_channel_fault,
+        disk_low=disk_low,
     )
     shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
     # rti['safety_violation'] (the status event's "safety" field) finally means something: 1 while

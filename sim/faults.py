@@ -144,6 +144,13 @@ def _ticks_per_rad(j):
     return (2 ** float(c["motor_encoder"][j])) * abs(float(c["gear_ratio"][j])) / (2 * math.pi)
 
 
+def _after_homing_deg(j):
+    """Where a homing leaves joint j (0-based), in degrees: its last <move_to> in the homing sequence — where every
+    re-homing in the simulator starts from (and succeeds)."""
+    moves = [m for step in _cfg()["homing_sequence"] for m in step.get("move_to", []) if m["joint"] == j]
+    return math.degrees(moves[-1]["position_rad"])
+
+
 def _push_to(ctx, robot, j, target_deg, deg_per_s=15.0, timeout=25.0):
     """Turn joint j (0-based) by HAND (the simulator's push: a limp joint only) until it reads target_deg. The motor's
     direction is found by trying: a short push of +ticks, and whether the joint's ANGLE went up or down."""
@@ -405,7 +412,7 @@ def push_through(ctx, notes):
         soft, hard = (math.degrees(float(c["software_joint_limit_positive"][4])),
                       math.degrees(float(c["joint_limit_positive"][4])))
         wall = soft + min(hard - soft, 15.0)                  # the auto breakthrough (docs/safety_zones.md §2b)
-        start = float(r.get_joints()[4])                       # where the re-homing starts from: J5 goes back here
+        home_pose = _after_homing_deg(4)                       # where the re-homing starts from: J5 goes back here
         mark = ctx.activity_mark()
         _push_to(ctx, r, 4, soft + 2.0)
         w1 = _wait(lambda: ctx.has(mark, "SOFT_LIMIT_WARNING", 5), 2.0)
@@ -417,13 +424,25 @@ def push_through(ctx, notes):
         _wait(lambda: r.status().get("err") == 1, 2.0)
         st = r.status()
         # back where it stood (2026-11-18): from soft - 5 deg J5's homing (its nudges, then its search) passed its
-        # 240 deg travel limit (<homing_max_travel_deg>, 2026-11-16) and failed — rightly: start it where homings start
-        _push_to(ctx, r, 4, start)
+        # 240 deg travel limit (<homing_max_travel_deg>, 2026-11-16) and failed — rightly: start it where homings start.
+        # 2026-11-20 (review batch 9): with BEYOND_ENDSTOP latched the robot is in ACTIVE_ERROR and HOLDS every joint,
+        # and the simulator's push moves only a limp joint — so the push back never moved J5: it stayed ~10 deg past
+        # its endstop and the re-homing searched away from it (J5:HOMING_FAILED after 240 deg in every run since
+        # 11-18). As at the arm: the motors off (safety_stop, allowed with an error latched), J5 pushed back by hand,
+        # the motors on again (release -> ACTIVE_ERROR), then Clear Errors.
+        # 2026-11-21: "where it stood" was not where homings start — hand_push runs just before and leaves J5 near its
+        # soft limit (88 deg), so the re-homing still ran out of travel. J5 now goes back to where a homing leaves it.
+        r.safety_stop()
+        off = _wait(lambda: r.status().get("mode") == "SAFETY_STOP", 2.0)
+        back_at = _push_to(ctx, r, 4, home_pose)
+        r.release_safety_stop()
+        _wait(lambda: r.status().get("mode") == "ACTIVE_ERROR", 2.0)
         r.clear_errors(wait=True)
         st2 = ctx.ready(r, home=True)
         notes.append(f"soft {soft:.1f} / wall {wall:.1f} / hard {hard:.1f} deg: SOFT_LIMIT_WARNING {w1}, JOINT_WALL_WARNING "
                      f"{w2} (err {err_mid}), BEYOND_ENDSTOP {e3} (err {st.get('err')}, homed {st.get('homed')}); "
-                     f"pushed back, cleared, re-homed: err={st2.get('err')} homed={st2.get('homed')}")
+                     f"motors off {'entered' if off else 'NOT entered'}, pushed back to {back_at:.1f} deg (where a homing "
+                     f"leaves it: {home_pose:.1f}), cleared, re-homed: err={st2.get('err')} homed={st2.get('homed')}")
         return (bool(w1) and bool(w2) and err_mid == 0 and bool(e3) and st.get("err") == 1 and st.get("homed") is not True
                 and st2.get("err") == 0 and st2.get("homed") is True)
     finally:
@@ -547,6 +566,7 @@ def homing_false_stall(ctx, notes):
                      f"(what the arm check sees; > 1 deg needed)")
         ctx.ready(r)
         r.enter_idle_mode(wait=True)
+        j5_before = float(r.get_joints()[4])               # where this homing begins: J5 goes back here after the Stop
         ctx.sim(cmd="physics", node=1, kind="block", ms=600000)
         r.home(wait=False)
         if not _wait(lambda: r.status().get("mode") == "HOMING", 3.0):
@@ -561,17 +581,35 @@ def homing_false_stall(ctx, notes):
         r.stop(wait=True)
         _wait(lambda: r.status().get("mode") != "HOMING", 5.0)
         st = r.status()
-        notes.append(f"after Stop: mode={st.get('mode')} homed={st.get('homed')} question={st.get('homing_question')}")
+        notes.append(f"after Stop: mode={st.get('mode')} homed={st.get('homed')} question={st.get('homing_question')} "
+                     f"J5 {float(r.get_joints()[4]):.1f} deg")
         caught = (bool(asked) and abs(float(q.get("J2", 0.0))) > 1.0 and st.get("mode") != "HOMING"
                   and st.get("homed") is not True and not st.get("homing_question"))
     finally:
         ctx.sim(cmd="physics", node=1, kind="clear")
     try:
+        # 2026-11-21: the Stop comes between J5's two nudges (+108 deg, then -52 deg once J3 has homed), so J5 stood
+        # 108 deg above where this homing began, and the re-homing from there needs more than J5's 240 deg of travel
+        # (<homing_max_travel_deg>, 2026-11-16) — because the simulator re-homes from the homing's END pose, ~90 deg
+        # above the park pose the arm homes from (at the arm the same re-homing fits). As at the arm: the motors off,
+        # J5 back by hand, the motors on.
+        r.safety_stop()
+        _wait(lambda: r.status().get("mode") == "SAFETY_STOP", 2.0)
+        back_at = _push_to(ctx, r, 4, j5_before)
+        r.release_safety_stop()
+        _wait(lambda: r.status().get("mode") != "SAFETY_STOP", 2.0)
+        notes.append(f"motors off, J5 pushed back to {back_at:.1f} deg (where the homing began: {j5_before:.1f})")
         r.clear_errors(wait=True)
         time.sleep(0.3)
         r.enable(wait=True)
         r.enter_idle_mode(wait=True)
-        r.home(wait=True)
+        # 2026-11-20 (review batch 9): this re-homing failed J5 (240 deg without its endstop) in every run since 11-18;
+        # where J5 stands before it, and the failure as a note instead of a crash that hid it.
+        notes.append(f"before the re-homing: J5 {float(r.get_joints()[4]):.1f} deg, mode {r.status().get('mode')}")
+        try:
+            r.home(wait=True)
+        except Exception as e:                            # HomingFailed: kept as a note, the scenario fails below
+            notes.append(f"the re-homing failed: {e}")
         st = r.status()
         notes.append(f"obstacle gone + Clear Errors + Enable + Home: homed={st.get('homed')} err={st.get('err')}")
     finally:

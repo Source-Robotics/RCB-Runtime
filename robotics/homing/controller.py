@@ -182,6 +182,11 @@ class HomingController:
         # ~0.9 turn and wound its cables (the user E-stopped it).
         self._question: dict = {}
         self._accepted = False                            # taken at the next step()
+        # Review D7 (2026-11-20, user: a timeout): unanswered for question_timeout_s (system.xml
+        # <homing_question_timeout_s>, RTI sets it; 0 = for ever) the homing ends not homed, as a Stop does. Only the
+        # ticks of a pure wait count (waiting_for_answer).
+        self.question_timeout_s = 0.0
+        self._question_wait_ticks = 0
 
     # ------------------------------------------------------------------
     # Public time-based properties — backward compat
@@ -399,6 +404,7 @@ class HomingController:
         self._hold_pos = {}
         self._question = {}
         self._accepted = False
+        self._question_wait_ticks = 0
         self._publish_question(shared_data)
         self._approach_travel = {}
         self._approach_arrival = {}
@@ -678,6 +684,12 @@ class HomingController:
             return 'running'
         if not self.waiting_for_answer:                  # the history's duration leaves the wait out
             self._seq_ticks += 1
+            self._question_wait_ticks = 0
+        else:
+            self._question_wait_ticks += 1               # review D7: the question's own clock
+            if (self.question_timeout_s > 0
+                    and self._question_wait_ticks * self.dt >= self.question_timeout_s):
+                return self._question_timed_out(shared_data)
         if self._accepted and self._seq_phase == self._HOMING:
             self._take_accept(Motor, shared_data)
 
@@ -976,6 +988,22 @@ class HomingController:
         logger.info(f"{names}: accepted as the new reference ({line})")
         log_milestone("HOMING_QUESTION", f"{names}: accepted as the new reference")
         self._publish_question(shared_data)
+
+    def _question_timed_out(self, shared_data) -> str:
+        """Review D7: nobody answered within question_timeout_s — the homing ends NOT homed, as a Stop would end it (no
+        error latched: nothing failed, nobody decided). 'failed' with no failure reported = the dispatch's IDLE, not
+        homed (utility/mode_dispatch.py _HomingDispatch.step)."""
+        names = ", ".join(f"{self._jlabel(j, self._Motor)} {d:+.2f} deg" for j, d in sorted(self._question.items()))
+        why = (f"the homing question ({names}) was not answered within {self.question_timeout_s:g} s "
+               f"(system.xml <homing_question_timeout_s>): the homing ends, the arm NOT homed — check the joint, bring "
+               f"the arm to its park pose and home again")
+        logger.warning(why)
+        log_milestone("HOMING_QUESTION", why, level="warning")
+        self._question = {}
+        self._question_wait_ticks = 0
+        self._publish_question(shared_data)
+        self._seq_phase = self._FAILED
+        return 'failed'
 
     def _report_failure(self, j: int, reason: str):
         """One failure for the error pass: J{n}:HOMING_FAILED for an arm joint, GRIPPER_HOMING_FAILED for the gripper."""

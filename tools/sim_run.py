@@ -110,6 +110,34 @@ def _log_lines_since(path, offset):
 NICE = {"GUI": 10, "executor": 5, "worker": 5, "recorder": 5}
 
 
+def _layout_path(env):
+    """The "shm_layout" segment as a file (data/shared_data.py: a 4-byte length, then the text) — read, never
+    attached: importing data.shared_data here would attach every segment."""
+    return "/dev/shm/" + env.get("RCB_SHM_PREFIX", "") + "shm_layout"
+
+
+def _clear_layout(env):
+    try:
+        with open(_layout_path(env), "r+b") as fh:
+            fh.write(b"\0\0\0\0")                     # length 0: no layout published
+    except OSError:
+        pass                                           # none yet: nothing to clear
+
+
+def _wait_for_layout(env, rti_proc, timeout_s=60.0):
+    """Until RTI (the owner) has published its layout, or it exited, or timeout_s. True when published."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s and rti_proc.poll() is None:
+        try:
+            with open(_layout_path(env), "rb") as fh:
+                if int.from_bytes(fh.read(4), "little") > 0:
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def _start(name, argv, run_dir, env):
     out = open(os.path.join(run_dir, f"{name}.out.log"), "w")
     nice = NICE.get(name, 0)
@@ -179,7 +207,14 @@ def main():
     try:
         procs.append(("drives", *_start("drives", _argv("drives", args.coverage), run_dir, env)))
         time.sleep(1.0)
-        for name in ("RTI", "executor", "worker", "recorder") + (("GUI",) if args.gui else ()):
+        # Review I3 (2026-11-20): RTI owns the shared memory layout — the others start once it has published it, so
+        # after an update that resized a segment none of them meets the old one (they refuse it, and nothing restarts
+        # them here as the supervisor would). The old run's published layout is cleared first.
+        _clear_layout(env)
+        procs.append(("RTI", *_start("RTI", _argv("RTI", args.coverage), run_dir, env)))
+        if not _wait_for_layout(env, procs[-1][1]):
+            print("  RTI published no shared memory layout within 60 s — starting the others anyway")
+        for name in ("executor", "worker", "recorder") + (("GUI",) if args.gui else ()):
             procs.append((name, *_start(name, _argv(name, args.coverage), run_dir, env)))
 
         t0 = time.monotonic()

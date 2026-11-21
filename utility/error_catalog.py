@@ -77,6 +77,12 @@ CATALOG = {
     "SW_ESTOP": _e(1002, "Software emergency stop active",
                    "A software emergency stop was set by a command or the dashboard.", _HARD,
                    "Release the software E-stop. Clear errors, then enable the robot."),
+    "ESTOP_CHANNEL_FAULT": _e(1003, "E-stop channels disagree",
+                              "The control box reads the E-stop on two channels, and they disagreed for longer than "
+                              "contact bounce: one read pressed, the other released. A broken wire, a loose connector "
+                              "or a worn contact on one channel. The robot treats the E-stop as pressed.", _HARD,
+                              "Check the E-stop's wiring and contacts on both channels. Once both agree again, clear "
+                              "errors, then enable the robot."),
     "OUT_OF_RANGE": _e(1101, "Joint outside its software limit",
                        "The joint's measured position went past its software limit while the robot moved it. A "
                        "collision, a push or a move the limits should have stopped can cause this.",
@@ -248,8 +254,9 @@ CATALOG = {
                                 "check which drive is in that joint."),
     "GAINS_MISMATCH_WARNING": _e(2114, "Drive holds other gains than the robot sent",
                                  "After the start-up read of the drives' parameters, this drive held other gains or "
-                                 "limits than RTI sent it from the robot XML (a config frame lost on the bus, or the "
-                                 "drive changed by someone else since). The start-up log names each value, both ways.",
+                                 "limits than RTI sent it from the robot XML, or a joint coasted when idle instead of "
+                                 "braking (a lost config frame, or the drive changed since; RTI sends the brake again). "
+                                 "The start-up log names each value.",
                                  "Warning only: the robot keeps running, but that joint runs the drive's values. The "
                                  "warning stays until the robot service restarts.",
                                  "Restart the robot service (it sends the configuration again); if it comes back, check "
@@ -636,6 +643,12 @@ CATALOG = {
                         _WARN,
                         "Check the CPU load and temperature, and whether a drive went silent. Heavy jobs on the Pi "
                         "slow the loop."),
+    "DISK_LOW_WARNING": _e(8003, "Memory card nearly full",
+                           "The Pi's memory card has less than 500 megabytes free. A full card stops the logs, the "
+                           "incident recordings and every saved setting, and can leave a configuration file cut short.",
+                           _WARN,
+                           "Free space: run the disk cleanup tool (it removes old editor caches and installers), "
+                           "delete old recordings in the Recordings tab, or move large files off the Pi."),
     "LOOP_CRITICAL": _e(8002, "Control loop critically slow",
                         "RTI's control loop was critically slow: its period stayed over 1.5 times nominal for a "
                         "second, or one tick took over 3 times nominal.", _HARD,

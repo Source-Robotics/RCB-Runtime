@@ -185,12 +185,18 @@ _input_history = {
     GPIO_4: []
 }
 _DEBOUNCE_SAMPLES = 5  # Require 5 consecutive stable reads to change state
+# An E-stop channel reads PRESSED (0, active low) once this many of the last _DEBOUNCE_SAMPLES reads are pressed —
+# not after 5 identical reads like every other input (review D15, 2026-11-20; user: "2 reads"). A pressed contact that
+# chatters (0, 1, 0, 1, ...) never gave 5 identical reads, so the press was never seen; one glitch alone still is
+# not a press. The release keeps the 5 identical reads.
+_ESTOP_PRESS_SAMPLES = 2
 
 
 def _apply_debounce(input_index, raw_value):
     """
     Apply debounce filter to raw GPIO reading.
-    Requires multiple stable reads before accepting state change.
+    Requires multiple stable reads before accepting state change. An E-stop channel is the exception for a PRESS:
+    _ESTOP_PRESS_SAMPLES pressed reads among the last _DEBOUNCE_SAMPLES are enough (its release needs them all).
 
     Args:
         input_index (int): Input index
@@ -220,6 +226,10 @@ def _apply_debounce(input_index, raw_value):
     history.append(raw_value)
     if len(history) > _DEBOUNCE_SAMPLES:
         history.pop(0)
+
+    # An E-stop channel: pressed (0) once enough of the window reads pressed (review D15)
+    if input_index in (ESTOP_1, ESTOP_2) and history.count(0) >= _ESTOP_PRESS_SAMPLES:
+        return 0
 
     # If all recent readings are the same, accept that value
     if len(history) == _DEBOUNCE_SAMPLES and all(h == history[0] for h in history):
@@ -391,6 +401,34 @@ def set_output(output_index, value):
     if output_index in pin_map and not _simulated:
         lgpio.gpio_write(_gpio_handle, pin_map[output_index], int(value))
         _last_written[output_index] = int(value)
+
+
+_outputs_off_done = False
+
+
+def outputs_off_at_exit():
+    """Every isolated output LOW as RTI stops — a service stop or restart, or RTI ending on an exception (review D15,
+    2026-11-20; user: "Yes, low on shutdown"). Before, an output stayed at its last level until the next RTI start
+    switched it off (initialize_gpio). RTI calls it from its SIGTERM handler BEFORE shared memory is released, and
+    atexit calls it too (registered after shared_data.cleanup, so it runs first); only the first call does anything.
+    Never raises: a shutdown must not stop here. A process killed outright (SIGKILL, a power cut) cannot do this."""
+    global _outputs_off_done
+    if _outputs_off_done:
+        return
+    _outputs_off_done = True
+    for idx, pin in _OUTPUTS:
+        try:
+            shared_data.gpio_states[idx] = LOW
+        except Exception:  # nosec B110 — shared memory already released at exit: the pin below still matters
+            pass
+        if _simulated or _gpio_handle is None:
+            continue
+        try:
+            lgpio.gpio_write(_gpio_handle, pin, LOW)
+            _last_written[idx] = LOW
+        except Exception as exc:
+            logger.warning(f"output on pin {pin} could not be switched off at exit: {exc}")
+    logger.info("isolated outputs switched off (RTI stopping)")
 
 
 def set_all_outputs_low():

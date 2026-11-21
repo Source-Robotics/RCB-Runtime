@@ -130,6 +130,10 @@ def _fill_motion_limit_defaults(cfg: dict) -> dict:
                    * _np.asarray(cfg['gear_efficiency'], dtype=float))
     trq_rate = _np.where(_np.isnan(trq_rate), peak_torque * _DERIVED_TRQ_RATE_PER_TAU, trq_rate)
 
+    # Review K6 (2026-11-20): the speed derived above is the ceiling too — it was computed for the acceleration default
+    # and then dropped, so INDIGO / SKAR kept a NaN joint_velocity_limit that every clamp passed (and EXEC's / RTI's
+    # per-mode speed limits, filled from it below, were NaN as well). validate_robot_config refuses any NaN left.
+    cfg['joint_velocity_limit'] = vel
     cfg['joint_acceleration_limit'] = accel
     cfg['joint_jerk_limit'] = jerk
     cfg['torque_rate_limit'] = trq_rate

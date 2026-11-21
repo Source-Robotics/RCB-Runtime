@@ -26,6 +26,12 @@ DRIVE_WATCHDOG_DEFAULT_MS = 100
 DRIVE_WATCHDOG_MIN_MS = 80
 DRIVE_WATCHDOG_MAX_MS = 1000
 
+# <homing_question_timeout_s> (review D7, 2026-11-20; user: "yea ... timeout"): how long homing waits for the answer to
+# its question (a joint homed off its usual spot) before it ends not homed, as a Stop does — a script that exits after
+# home() left the arm in HOMING, holding, until someone pressed Stop. 0 = wait for ever (as before).
+HOMING_QUESTION_TIMEOUT_DEFAULT_S = 600.0
+HOMING_QUESTION_TIMEOUT_MAX_S = 86400.0
+
 # <kt_tolerance> (2026-11-15, user: ±30 %): how far a drive's own Kt may be from the robot XML's before RTI keeps the
 # XML value. A fraction. The drives reported up to +20 % on 2026-11-07 (J5 0.219 against 0.183); the band is for a
 # value a reflash or recalibration made wild, not for those.
@@ -134,6 +140,16 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         logger.warning(f"system.xml <drive_watchdog_ms>{_wd_text!r} is not a whole number of ms in "
                         f"{DRIVE_WATCHDOG_MIN_MS}..{DRIVE_WATCHDOG_MAX_MS} — using {DRIVE_WATCHDOG_DEFAULT_MS} ms")
         drive_watchdog_ms = DRIVE_WATCHDOG_DEFAULT_MS
+    # <homing_question_timeout_s> (review D7): missing -> the default; not a number in [0, MAX] -> the default + warning
+    _hq_text = (root.findtext("homing_question_timeout_s") or str(HOMING_QUESTION_TIMEOUT_DEFAULT_S)).strip()
+    try:
+        homing_question_timeout_s = float(_hq_text)
+    except ValueError:
+        homing_question_timeout_s = float("nan")
+    if not 0.0 <= homing_question_timeout_s <= HOMING_QUESTION_TIMEOUT_MAX_S:     # NaN fails it too
+        logger.warning(f"system.xml <homing_question_timeout_s>{_hq_text!r} is not a number of seconds in "
+                       f"0..{HOMING_QUESTION_TIMEOUT_MAX_S:g} — using {HOMING_QUESTION_TIMEOUT_DEFAULT_S:g} s")
+        homing_question_timeout_s = HOMING_QUESTION_TIMEOUT_DEFAULT_S
     # <control_box><pcb_version>: which PCB is fitted (hardware/control_box.py has the capability table; the
     # first consumer is the E-stop channel policy). Missing or not a number -> 1 (the board the fleet has).
     _cb = root.find("control_box")
@@ -165,6 +181,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         "realtime_required": realtime_required,
         "can_read_first": can_read_first,
         "drive_watchdog_ms": drive_watchdog_ms,
+        "homing_question_timeout_s": homing_question_timeout_s,
         "pcb_version":    pcb_version,
         "jog_defaults":   jog_defaults,
         "rti_defaults":   rti_defaults,

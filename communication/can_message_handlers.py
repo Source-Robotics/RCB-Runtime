@@ -198,8 +198,14 @@ def send_brake_on_idle(Motor, nodes):
     and flash. RTI asserts brake at its start and after a joint reconnects (a rebooted drive restores what it saved).
     Not in load_motor_configs: the tick-50/150/300 re-send block shares it and must not change. Firmware before 107
     has no IN_SETTINGS frame and ignores it."""
-    for i in nodes:
-        Motor[i].Send_Brake_Coast(True)
+    # Sent BRAKE_SENDS times (review D12, 2026-11-20): one frame with no answer — a lost one left a saved coast in
+    # force unnoticed. The setting is idempotent, so a repeat costs only bus time (6 joints x 3 frames ~ 2 ms at start).
+    for _ in range(BRAKE_SENDS):
+        for i in nodes:
+            Motor[i].Send_Brake_Coast(True)
+
+
+BRAKE_SENDS = 3
 
 
 # The drives' identity for recognising the arm (2026-11-16, robotics/homing_arms.recognise_boards): parameter 86 = the

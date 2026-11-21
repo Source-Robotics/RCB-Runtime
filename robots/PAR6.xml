@@ -4,12 +4,12 @@
     <hardware_revision>v1.0</hardware_revision> <!-- This arm's hardware revision (2026-10-21, versioning V4): the Versions card and get_versions show it. vMAJOR.MINOR: MINOR = parts still interchangeable, MAJOR = not. -->
     <description_package min="2.0"/> <!-- The oldest PAR6 description package (URDF / meshes) this arm's models and self-collision geometry are made from: tools/self_collision_capsules.py refuses an older one, the Versions card marks it. -->
     <active_gripper>MSG_small_motor_150mm_rail</active_gripper> <!-- FALLBACK only: config/system.xml takes precedence and is what normally selects the gripper. Must match a filename in the grippers/ folder (e.g. MSG_small_motor_150mm_rail -> grippers/MSG_small_motor_150mm_rail.xml). Keep it in step with system.xml — the gripper drives kt, stroke, homing offsets AND the driver_type that firmware flashing checks against. -->
-    <server_port>8080</server_port>
-    <network_mode>ethernet</network_mode> <!-- Options: ethernet, wifi, offline -->
+    <server_port>8080</server_port> <!-- NOT USED: no code reads it (review K6, 2026-11-20) -->
+    <network_mode>ethernet</network_mode> <!-- NOT USED: no code reads it (review K6, 2026-11-20; it listed ethernet, wifi, offline) -->
     <RTI_loop_time>0.004</RTI_loop_time>
     <RTI_Joint_mode_loop_time>0.001</RTI_Joint_mode_loop_time> <!-- What rate to use for a Joint only mode, Ignore ALL Ik, FK, Jacobians; we need super fast loop -->
-    <base_transform>1</base_transform> <!-- Is the robot on horizontal table, ceiling, under specific angle  -->
-    <gravity_value>9.81</gravity_value> <!-- Gravity value to be used in dynamics calculations. Default is 9.81 m/s^2 -->
+    <base_transform>1</base_transform> <!-- NOT USED: no code reads it — a ceiling or angled mount changes nothing today (review K6, 2026-11-20) -->
+    <gravity_value>9.81</gravity_value> <!-- NOT USED: no code reads it — the dynamics use 9.81 m/s^2 (review K6, 2026-11-20) -->
     <homing_config>config/PAR6_homing.xml</homing_config> <!-- Separate homing sequence file defining parallel groups and pre-moves -->
 
     <!-- Pose the arm is moved to before maintenance where the motors LOSE TORQUE
@@ -73,7 +73,7 @@
                 <jerk>16000.0</jerk>
                 <torque_rate>364.0</torque_rate>
             </rti_limits>
-            <watchdog_rate>5000</watchdog_rate>  <!-- (Motor) Watchdog rate in ms -->
+            <watchdog_rate>5000</watchdog_rate> <!-- NOT USED since 2026-10-13: every drive's watchdog is config/system.xml <drive_watchdog_ms> (review K6, 2026-11-20) -->
             <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0015, KIIQ 0.9, KPIQ 7 -->
             <KPP>88</KPP> <!-- Kp value for Positon loop of cascade PID controller -->
             <KPV>0.078</KPV> <!-- Kp value for Velocity loop of cascade PID controller -->
@@ -103,7 +103,7 @@
             <homing_max_travel_deg>150</homing_max_travel_deg>   <!-- 2026-11-16: a homing search turning further than this from where it began stops and FAILS (J6 wound its cables); ~1.3-2x the largest travel of 98 homings; a gripper XML can replace one joint's
                  (<arm_joint_homing_max_travel_deg>: the bare Flange's J6 360) -->
             <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
-            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass>1</homing_two_pass> <!-- NOT USED for an arm joint: two-pass homing is always on (a Hall-sensor joint skips it); only the gripper XML's is read (review K6, 2026-11-20) -->
             <homing_two_pass_max_diff>3500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
             <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
             <homing_release_current_ma>300</homing_release_current_ma>   <!-- 2026-10-09 (homing plan H2.3b): was 0 (coast). The coast release gave J1 only sd 0.034 -> 0.025 deg; J5, which pushes INTO its stop (+1500 mA), repeats within +-0.005 deg. +300 mA = a defined push into J1's stop (homing direction positive; its homing current is 700 mA) — the latch is taken at that force. To be measured on the arm. -->
@@ -114,7 +114,7 @@
             <dir>0</dir> <!-- is positive rotation of the joint matched to the one in kinematic definiton of the robot 0 yes 1 no -->
             <positive_direction>the whole arm turns counter-clockwise, seen from above</positive_direction> <!-- what + looks like on the arm, in words: the + sign on each joint must point this way. The first-run check (tools/first_run.py, stage 3) asks by those signs (2026-11-20) and names these words in a FAIL's hint. From the kinematic model at the park pose (2026-10-18). If the arm counts the other way, <dir> above is wrong. -->
             <first_run_move amplitude_deg="5" speed_dps="5" current_ma="600"/> <!-- the first-run check's powered test move before homing (tools/first_run.py, stage 3; robotics/joint_test.py): this far from where the joint stands and back, peaking at this speed, the drive's current limited to this meanwhile (1.5 x the joint's worst gravity torque with the MSG gripper; user, 2026-10-18). from_rest (2026-11-19, the user): the way the joint is free to move from the REST pose (the arm folded, as it lies switched off; "+" when missing) — before the first homing nothing says where the arm stands, so stage 3 moves each joint only that way, never the other way automatically (J2 / J3 rest against an endstop) -->
-            <joint_type>revolute</joint_type> <!-- Type of the joint. Options: revolute, prismatic, continuous_revolute -->
+            <joint_type>revolute</joint_type> <!-- NOT USED: no code reads it; every joint is revolute (review K6, 2026-11-20) -->
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured yet; api_tests/54, 2026-10-02). 0 = not measured: no friction compensation -->
             <friction_coulomb_nm>0.190</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.177 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
             <friction_viscous_nm_s>0.051</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
@@ -147,7 +147,7 @@
                 <jerk>5000.0</jerk>
                 <torque_rate>2005.0</torque_rate>
             </rti_limits>
-            <watchdog_rate>5000</watchdog_rate>  <!-- (Motor) Velocity limit in ticks/s -->
+            <watchdog_rate>5000</watchdog_rate> <!-- NOT USED since 2026-10-13: every drive's watchdog is config/system.xml <drive_watchdog_ms> (review K6, 2026-11-20) -->
             <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 3, KPV 0.01, KIV 0.001, KIIQ 0.5, KPIQ 2 -->
             <KPP>100</KPP>
             <KPV>0.025</KPV>
@@ -176,7 +176,7 @@
             <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
             <homing_max_travel_deg>90</homing_max_travel_deg>
             <homing_backoff_s>1.5</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
-            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass>1</homing_two_pass> <!-- NOT USED for an arm joint: two-pass homing is always on (a Hall-sensor joint skips it); only the gripper XML's is read (review K6, 2026-11-20) -->
             <homing_two_pass_max_diff>2000</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
             <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
             <homing_release_current_ma>150</homing_release_current_ma>   <!-- Current [mA] during release phase (0 = coast/relax gearbox) -->
@@ -187,7 +187,7 @@
             <dir>0</dir>
             <positive_direction>the upper arm leans forward (toward where the arm reaches when parked) and the gripper goes down</positive_direction>
             <first_run_move amplitude_deg="5" speed_dps="5" current_ma="1500" from_rest="+"/> <!-- from_rest: the way off its endstop at the rest pose (folded) -->
-            <joint_type>revolute</joint_type>
+            <joint_type>revolute</joint_type> <!-- NOT USED: no code reads it; every joint is revolute (review K6, 2026-11-20) -->
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
             <friction_coulomb_nm>0.609</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 26 slides at 4 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive [/0.9491: the torque scale of 78 20261017_164505] -->
             <friction_viscous_nm_s>0.658</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) [/0.9491: the torque scale of 78 20261017_164505] -->
@@ -221,7 +221,7 @@
                 <jerk>5650.0</jerk>
                 <torque_rate>1483.0</torque_rate>
             </rti_limits>
-            <watchdog_rate>5000</watchdog_rate>
+            <watchdog_rate>5000</watchdog_rate> <!-- NOT USED since 2026-10-13: every drive's watchdog is config/system.xml <drive_watchdog_ms> (review K6, 2026-11-20) -->
             <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0015, KIIQ 0.9, KPIQ 7 -->
             <KPP>113</KPP>
             <KPV>0.025</KPV>
@@ -250,7 +250,7 @@
             <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
             <homing_max_travel_deg>100</homing_max_travel_deg>
             <homing_backoff_s>1.5</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
-            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass>1</homing_two_pass> <!-- NOT USED for an arm joint: two-pass homing is always on (a Hall-sensor joint skips it); only the gripper XML's is read (review K6, 2026-11-20) -->
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
             <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
             <homing_release_current_ma>-150</homing_release_current_ma>   <!-- Current [mA] during release phase (0 = coast/relax gearbox) -->
@@ -261,7 +261,7 @@
             <dir>1</dir>
             <positive_direction>the elbow opens: the forearm swings away from the upper arm (with the arm parked: the forearm lifts)</positive_direction>
             <first_run_move amplitude_deg="5" speed_dps="5" current_ma="1000" from_rest="+"/> <!-- from_rest: the way off its endstop at the rest pose (folded). current_ma 1000 (user, 2026-11-20; was 800 = 1.5 x the worst gravity torque alone): J3's friction (~0.5 Nm) comes on top — three healthy runs needed 723-751 of 800 mA, a WARN every time -->
-            <joint_type>revolute</joint_type>
+            <joint_type>revolute</joint_type> <!-- NOT USED: no code reads it; every joint is revolute (review K6, 2026-11-20) -->
             <friction_static_nm>0</friction_static_nm> <!-- Nm, breakaway friction (not measured; J2/J3 allowed for api_tests/54 by the user 2026-10-02). 0 = not measured -->
             <friction_coulomb_nm>0.541</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 18 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough; poses left out (over 1.5x the others): +354.0 deg). Was <friction_sliding_nm>0.369 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
             <friction_viscous_nm_s>0.227</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
@@ -295,7 +295,7 @@
                 <jerk>25650.0</jerk>
                 <torque_rate>173.0</torque_rate>
             </rti_limits>
-            <watchdog_rate>5000</watchdog_rate>
+            <watchdog_rate>5000</watchdog_rate> <!-- NOT USED since 2026-10-13: every drive's watchdog is config/system.xml <drive_watchdog_ms> (review K6, 2026-11-20) -->
             <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0005, KIIQ 1, KPIQ 7 -->
             <KPP>94</KPP>
             <KPV>0.04</KPV>
@@ -324,7 +324,7 @@
             <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
             <homing_max_travel_deg>220</homing_max_travel_deg>
             <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
-            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass>1</homing_two_pass> <!-- NOT USED for an arm joint: two-pass homing is always on (a Hall-sensor joint skips it); only the gripper XML's is read (review K6, 2026-11-20) -->
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
             <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
             <homing_release_current_ma>0</homing_release_current_ma>
@@ -335,7 +335,7 @@
             <dir>1</dir>
             <positive_direction>the forearm rolls counter-clockwise, seen from the elbow looking toward the gripper</positive_direction>
             <first_run_move amplitude_deg="10" speed_dps="5" current_ma="600"/>
-            <joint_type>revolute</joint_type>
+            <joint_type>revolute</joint_type> <!-- NOT USED: no code reads it; every joint is revolute (review K6, 2026-11-20) -->
             <friction_static_nm>0.13</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.26; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.190</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.163 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
             <friction_viscous_nm_s>0.086</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
@@ -369,7 +369,7 @@
                 <jerk>25650.0</jerk>
                 <torque_rate>173.0</torque_rate>
             </rti_limits>
-            <watchdog_rate>5000</watchdog_rate>
+            <watchdog_rate>5000</watchdog_rate> <!-- NOT USED since 2026-10-13: every drive's watchdog is config/system.xml <drive_watchdog_ms> (review K6, 2026-11-20) -->
             <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 5, KPV 0.015, KIV 0.0005, KIIQ 1, KPIQ 7 -->
             <KPP>94</KPP>
             <KPV>0.04</KPV>
@@ -398,7 +398,7 @@
             <homing_timeout_s>10</homing_timeout_s>   <!-- Homing timeout in seconds -->
             <homing_max_travel_deg>240</homing_max_travel_deg>
             <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
-            <homing_two_pass>1</homing_two_pass>   <!-- 1 = two-pass homing (fast approach + slow re-approach), 0 = single pass -->
+            <homing_two_pass>1</homing_two_pass> <!-- NOT USED for an arm joint: two-pass homing is always on (a Hall-sensor joint skips it); only the gripper XML's is read (review K6, 2026-11-20) -->
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
             <has_hall_sensor>0</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
             <homing_release_current_ma>1500</homing_release_current_ma>
@@ -409,7 +409,7 @@
             <dir>1</dir>
             <positive_direction>the wrist bends so the gripper tips up (with the arm parked)</positive_direction>
             <first_run_move amplitude_deg="5" speed_dps="5" current_ma="600"/>
-            <joint_type>revolute</joint_type>
+            <joint_type>revolute</joint_type> <!-- NOT USED: no code reads it; every joint is revolute (review K6, 2026-11-20) -->
             <friction_static_nm>0.06</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.05-0.12; the encoders are on the motors, so give in the gearing counts as motion — sliding needs more; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.093</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.080 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
             <friction_viscous_nm_s>0.064</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->
@@ -443,7 +443,7 @@
                 <jerk>10350.0</jerk>
                 <torque_rate>198.0</torque_rate>
             </rti_limits>
-            <watchdog_rate>5000</watchdog_rate>
+            <watchdog_rate>5000</watchdog_rate> <!-- NOT USED since 2026-10-13: every drive's watchdog is config/system.xml <drive_watchdog_ms> (review K6, 2026-11-20) -->
             <!-- 2026-10-09: the user's new tune (dashboard Tune Joint). Was: KPP 3, KPV 0.009, KIV 0.0006, KIIQ 0.5, KPIQ 2 -->
             <KPP>75</KPP>
             <KPV>0.016</KPV>
@@ -478,7 +478,7 @@
             <homing_timeout_s>15</homing_timeout_s>   <!-- Homing timeout in seconds -->
             <homing_max_travel_deg>150</homing_max_travel_deg>
             <homing_backoff_s>0.3</homing_backoff_s>   <!-- Time to reverse after hitting endstop (seconds) -->
-            <homing_two_pass>0</homing_two_pass>   <!-- 0 = single pass (Hall sensor joints skip two-pass regardless) -->
+            <homing_two_pass>0</homing_two_pass> <!-- NOT USED for an arm joint: two-pass homing is always on (a Hall-sensor joint skips it); only the gripper XML's is read (review K6, 2026-11-20) -->
             <homing_two_pass_max_diff>1500</homing_two_pass_max_diff>   <!-- Max allowed difference in encoder ticks between pass 1 and pass 2. Exceeding this fails homing. -->
             <has_hall_sensor>1</has_hall_sensor>   <!-- 1 if this joint uses Hall sensor for homing, 0 for endstop/stall -->
             <homing_release_current_ma>0</homing_release_current_ma>
@@ -489,7 +489,7 @@
             <dir>1</dir>
             <positive_direction>the gripper turns counter-clockwise, seen from the elbow looking toward it</positive_direction>
             <first_run_move amplitude_deg="10" speed_dps="5" current_ma="400"/>
-            <joint_type>revolute</joint_type>
+            <joint_type>revolute</joint_type> <!-- NOT USED: no code reads it; every joint is revolute (review K6, 2026-11-20) -->
             <friction_static_nm>0.111</friction_static_nm> <!-- Nm, 'breakaway' from 54's ramp (0.06-0.19; informational once friction_sliding_nm is set; 2026-10-02) -->
             <friction_coulomb_nm>0.109</friction_coulomb_nm> <!-- Nm, sliding (Coulomb) friction, the typical value: 9 slides at 3 poses (api_tests/77, applied 2026-10-17, runs 20261017_004031_quick + 20261017_010314_thorough). Was <friction_sliding_nm>0.070 (api_tests/54's lowest). The friction model of utility/friction_model.py: feedforward, external torque, freedrive -->
             <friction_viscous_nm_s>0.025</friction_viscous_nm_s> <!-- Nm.s/rad: the friction grows by this x speed (api_tests/77) -->

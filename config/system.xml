@@ -59,6 +59,12 @@
          was 5 s): support or park the arm first. -->
     <drive_watchdog_ms>100</drive_watchdog_ms>
 
+    <!-- How long homing waits for the answer to its question — a joint that homed off where this arm's joint always
+         homes (review D7, 2026-11-20): unanswered this long, the homing ends not homed, as a Stop does (the arm holds
+         meanwhile). Seconds; 0 = wait for ever. A script that exited after home() left the arm homing until someone
+         pressed Stop. -->
+    <homing_question_timeout_s>600</homing_question_timeout_s>
+
     <!-- The time zone the dashboard and the tools SHOW times in (2026-10-09, user: "it is annoying that this shows UTC
          while I am in Europe/Zagreb"). An IANA name (Europe/Zagreb, America/New_York, UTC) or "system" = the Pi's own
          zone. Display only: logs keep their UTC timestamps (unambiguous, safe across the summer-time change). Set it in

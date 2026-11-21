@@ -416,10 +416,17 @@ class RTIClient:
         self._tcp = None              # the one stream socket, when transport='tcp'
         self._rxbuf = bytearray()     # partial state frame carried between reads
         self._send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # The state socket (review P5, 2026-11-20): no SO_REUSEADDR — with it a second client (or a second robot's
+        # client) bound the same port SILENTLY and the states mixed; now the second gets "port taken". Bound here for
+        # UDP, or in connect() when a TCP-made client switches to UDP (it never was). Packets not from the robot are
+        # ignored and counted (foreign_packets).
         self._recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listen_port = int(listen_port)
+        self._bound = False
+        self.foreign_packets = 0
+        self._foreign_from = None
         if transport == 'udp':
-            self._recv_sock.bind(('0.0.0.0', listen_port))
+            self._bind_udp()
         self._running = False
 
         # --- loop-delay measurement (needs the `rti_seq` tag in the active recipe) ---
@@ -528,6 +535,8 @@ class RTIClient:
             if transport not in ('udp', 'tcp'):
                 raise ValueError("transport must be 'udp' or 'tcp'")
             self.transport = transport
+        if self.transport == 'udp':
+            self._bind_udp()                 # review P5: a client made with 'tcp' never bound its state socket
         self.robot.rti_connect(pc_ip, rate_hz=rate_hz, transport=self.transport)
         # The robot's tick length, for control()'s robot time (None: an executor that does not publish it).
         try:
@@ -726,6 +735,11 @@ class RTIClient:
         if self.clock != 'robot':
             raise RuntimeError("control() is robot-clocked; use send_*() with clock='pc'")
 
+        # Review P2 (2026-11-20): a second claim() + control() on one client ended at once or raised a false
+        # ControlLost — the first session's "had control" stayed set, and the loop began on the oldest packet still
+        # queued (the first session's end). A fresh start: the flag reset, the queue drained.
+        self._had_control = False
+        self._raw_drain()
         self._running = True
         _to = [first_packet_timeout]
         started = time.monotonic()
@@ -759,7 +773,7 @@ class RTIClient:
                             "rti_state, so check robot.latest_status() and the error list for the cause)."
                             + self._link_summary())
                     raise RuntimeError("RTI timeout: no state packet from robot "
-                                       "(never started streaming — is it paired?)")
+                                       "(never started streaming — is it paired?)" + self._foreign_summary())
 
                 state = self._decode(data)
                 received = True
@@ -779,7 +793,7 @@ class RTIClient:
                 result = callback(state)
 
                 if isinstance(result, MotionFinished):
-                    self._send(CMD_STOP, [0.0] * 6, [0.0] * 6, state.elapsed if state.robot_time else None)
+                    self._send_stops(state.elapsed if state.robot_time else None)
                     break
                 if result is not None:
                     # Stamped with the time the target was computed FOR (robot time when known): the
@@ -788,8 +802,50 @@ class RTIClient:
                                state.elapsed if state.robot_time else None)
 
                 _to[0] = timeout        # first packet may be slow; the rest must not be
+        except BaseException:
+            # Review P5 (2026-11-20): the callback raised, or Ctrl-C — the robot was left to its watchdog
+            # (RTI_LINK_LOST, the arm disabled). Ask for the controlled stop first; the error goes on unchanged.
+            if received:
+                try:
+                    self._send_stops(None)
+                except Exception:  # nosec B110 — the stop is best effort; the original error is what is raised
+                    pass
+            raise
         finally:
             self._running = False
+
+    STOP_SENDS = 3                   # the stop is a datagram with no answer: sent 3 times (review P5)
+
+    def _send_stops(self, timestamp):
+        """The stop, STOP_SENDS times (a lost UDP datagram must not leave the robot to its watchdog; the robot acts on
+        the first, the others reach it while it already brakes)."""
+        for _ in range(self.STOP_SENDS):
+            self._send(CMD_STOP, [0.0] * 6, [0.0] * 6, timestamp)
+
+    def _bind_udp(self):
+        """Bind the state socket once (review P5). A port another client holds is refused out loud."""
+        if self._bound:
+            return
+        try:
+            self._recv_sock.bind(('0.0.0.0', self._listen_port))
+        except OSError as e:
+            raise OSError(f"UDP port {self._listen_port} is taken — another RTIClient (or program) on this PC receives "
+                          f"robot state there: close it first, or give this one another listen_port") from e
+        self._bound = True
+
+    def _from_robot(self, addr) -> bool:
+        """A datagram from the paired robot? Others are counted and ignored (review P5: two robots, one PC)."""
+        if self.robot_ip is None or addr[0] == self.robot_ip:
+            return True
+        self.foreign_packets += 1
+        self._foreign_from = addr[0]
+        return False
+
+    def _foreign_summary(self) -> str:
+        if not self.foreign_packets:
+            return ""
+        return (f" ({self.foreign_packets} packet(s) from {self._foreign_from} were ignored: not the robot at "
+                f"{self.robot_ip} — another robot or client sending to this port?)")
 
     def _check_control_alive(self, state):
         """Raise ControlLost if the robot is no longer applying our commands.
@@ -1028,7 +1084,7 @@ class RTIClient:
             >>> robot.rti_disconnect(wait=True)
             >>> rti.close()
         """
-        self._send(CMD_STOP, [0.0] * 6, [0.0] * 6)
+        self._send_stops(None)               # STOP_SENDS times: a datagram with no answer (review P5)
         self._running = False
 
     # ------------------------------------------------------------------ #
@@ -1278,14 +1334,19 @@ class RTIClient:
                     newest = f
                 return newest
             return self._tcp_take_frame()
+        if not self._bound:
+            return None                      # nothing can arrive on an unbound socket
         self._recv_sock.setblocking(False)
         latest = None
         try:
             while True:
                 try:
-                    latest, _ = self._recv_sock.recvfrom(4096)
+                    data, addr = self._recv_sock.recvfrom(4096)
                 except (BlockingIOError, socket.timeout):
                     break
+                if not self._from_robot(addr):
+                    continue                 # review P5: not the robot's
+                latest = data
                 self._cap(latest)
         finally:
             self._recv_sock.setblocking(True)
@@ -1307,9 +1368,17 @@ class RTIClient:
                     raise ControlLost("robot closed the RTI TCP stream"
                                       + self._link_summary())
                 self._rxbuf.extend(chunk)
-        self._recv_sock.settimeout(timeout)
-        data, _ = self._recv_sock.recvfrom(4096)
-        return data
+        if not self._bound:
+            raise RuntimeError("the state socket is not bound: connect() with transport='udp' first")
+        end = time.monotonic() + timeout
+        while True:                          # review P5: only the robot's datagrams count
+            left = end - time.monotonic()
+            if left <= 0:
+                raise socket.timeout()
+            self._recv_sock.settimeout(left)
+            data, addr = self._recv_sock.recvfrom(4096)
+            if self._from_robot(addr):
+                return data
 
     def _send(self, cmd_type, payload, feedforward, timestamp=None):
         if self.robot_ip is None:

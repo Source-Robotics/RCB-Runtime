@@ -3204,15 +3204,16 @@ except Exception:
 # board in its bootloader, which is recoverable.
 _FLASHER_CLI = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "tools", "flash_motor_firmware.py")
-_fw_proc = None          # asyncio subprocess while a flash is running
-_fw_starting = False     # claimed synchronously — covers the gap before _fw_proc
-                         # is assigned. See _fw_run_cli for why that gap matters.
+# The flasher session (the running subprocess, and `starting` — claimed synchronously, covering the gap before the
+# subprocess exists; see _fw_run_cli) lives in a MODULE since review G5 (2026-11-20): this script runs again at every
+# page load, and its globals made each page think no flash was running (gui_firmware_session.py).
+from gui_firmware_session import SESSION as _fw_session   # noqa: E402
 
 
 def _fw_busy():
-    """Is a firmware operation running OR about to be? Both halves are needed:
-    `_fw_proc` misses the window between the guard and the subprocess spawn."""
-    return _fw_proc is not None or _fw_starting
+    """Is a firmware operation running OR about to be — on ANY page? Both halves are needed: the process alone misses
+    the window between the guard and the subprocess spawn."""
+    return _fw_session.busy()
 
 
 def _fw_log(line):
@@ -3263,18 +3264,23 @@ def _fw_sync_source():
     fw_validate_btn.set_enabled(source != "github")
 
 
-def handle_fw_upload(event):
-    """Persist an uploaded .bin and point the flasher at it."""
+async def handle_fw_upload(event):
+    """Persist an uploaded .bin and point the flasher at it. Review G5 (2026-11-20): NiceGUI 3 hands the upload as
+    `event.file` (its name, an async read()); every upload failed on `event.content` / `event.name` (NiceGUI 2)."""
     try:
-        data = event.content.read()
-        path = _fw_github_module().save_uploaded_firmware(event.name, data)
+        f = getattr(event, "file", None)
+        if f is not None:
+            name, data = f.name, await f.read()
+        else:                                            # an older NiceGUI
+            name, data = event.name, event.content.read()
+        path = _fw_github_module().save_uploaded_firmware(name, data)
     except Exception as exc:
         _fw_log(f"ERROR: could not save the upload: {exc}")
         ui.notify(f"Could not save the upload: {exc}", type="negative", timeout=10000)
         return
     fw_file.value = str(path)
     fw_upload_label.set_text(f"{path}  ({len(data)} bytes)")
-    _fw_log(f"Uploaded {event.name} -> {path} ({len(data)} bytes)")
+    _fw_log(f"Uploaded {name} -> {path} ({len(data)} bytes)")
     ui.notify("Uploaded. Validate it before flashing.", type="positive")
 
 
@@ -3458,26 +3464,25 @@ def handle_fw_exit():
 
 async def _fw_run_cli(args, label):
     """Spawn the flasher CLI and pump its JSON lines into the UI."""
-    global _fw_proc, _fw_starting
-    # `_fw_proc` alone is NOT a sufficient guard: it is only assigned after the
+    # the process alone is NOT a sufficient guard: it is only assigned after the
     # `await` below, so two click events queued close together both saw None and
     # both spawned a flasher. Disabling the buttons does not help — an event
     # already in flight is still delivered. This dashboard is a single shared UI
     # (no @ui.page), so the two clicks can even come from different browsers.
-    # `_fw_starting` is set SYNCHRONOUSLY, before any await, closing the window.
+    # `_fw_session.starting` is set SYNCHRONOUSLY, before any await, closing the window.
     if _fw_busy():
         ui.notify("A firmware operation is already running", type="warning")
         return
-    _fw_starting = True
+    _fw_session.starting = True
     _fw_set_busy(True)
     fw_progress.set_value(0.0)
     fw_stage_label.set_text(f"{label}: starting")
     _fw_log(f"$ {os.path.basename(_FLASHER_CLI)} {' '.join(args)}")
     try:
-        _fw_proc = await asyncio.create_subprocess_exec(
+        proc = _fw_session.proc = await asyncio.create_subprocess_exec(
             sys.executable, _FLASHER_CLI, *args, "--progress-json",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        async for raw in _fw_proc.stdout:
+        async for raw in proc.stdout:
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
@@ -3503,9 +3508,9 @@ async def _fw_run_cli(args, label):
                 fw_stage_label.set_text("done" if ok else "failed")
                 ui.notify(str(msg.get("message", "")),
                           type="positive" if ok else "negative", timeout=10000)
-        await _fw_proc.wait()
-        _stderr = (await _fw_proc.stderr.read()).decode(errors="replace").strip()
-        if _fw_proc.returncode not in (0, None) and _stderr:
+        await proc.wait()
+        _stderr = (await proc.stderr.read()).decode(errors="replace").strip()
+        if proc.returncode not in (0, None) and _stderr:
             # Plain-text output is redirected to stderr in JSON mode, so this is
             # where a crash (as opposed to a clean refusal) shows up.
             _fw_log(_stderr.splitlines()[-1])
@@ -3513,8 +3518,8 @@ async def _fw_run_cli(args, label):
         _fw_log(f"ERROR: could not run the flasher: {exc}")
         ui.notify(f"Could not run the flasher: {exc}", type="negative", timeout=10000)
     finally:
-        _fw_proc = None
-        _fw_starting = False
+        _fw_session.proc = None
+        _fw_session.starting = False
         _fw_set_busy(False)
 
 
@@ -3694,13 +3699,14 @@ async def handle_fwr_update():
 
 
 def handle_fw_cancel():
-    """SIGINT the child — the CLI handles it and explains the recoverable state."""
-    if _fw_proc is None:
+    """SIGINT the child — the CLI handles it and explains the recoverable state. Any page can cancel it (review G5)."""
+    proc = _fw_session.proc
+    if proc is None:
         ui.notify("Nothing is running", type="info")
         return
     _fw_log("Cancelling — sending SIGINT to the flasher")
     try:
-        _fw_proc.send_signal(signal.SIGINT)
+        proc.send_signal(signal.SIGINT)
     except Exception as exc:
         _fw_log(f"Could not signal the flasher: {exc}")
 
@@ -3807,7 +3813,9 @@ def refresh_firmware_tab():
 
 
 # Leaving the page must not leave a flasher transmitting on the bus.
-app.on_shutdown(lambda: _fw_proc.kill() if _fw_proc is not None else None)
+if not _fw_session.shutdown_hooked:                # once per dashboard process, not per page load (review G5)
+    app.on_shutdown(_fw_session.kill)
+    _fw_session.shutdown_hooked = True
 
 
 # ─────────────────────────────────────────────────────────────

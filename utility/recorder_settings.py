@@ -23,10 +23,10 @@ of recording, measured 2026-10-16: 65 s -> 6.8 MB).
 """
 from __future__ import annotations
 
-import os
 import re
 import xml.etree.ElementTree as ET  # nosec B405 — our own config/system.xml, read as config/xml_parser reads it
 
+from utility.config_write import edit_lock, write_atomic
 from utility.incident_dump import (CAPTURE_KEEP, CAPTURE_MAX_S, INCIDENT_AFTER_S, INCIDENT_BEFORE_S, INCIDENT_KEEP,
                                    INCIDENT_MIN_INTERVAL_S)
 
@@ -107,6 +107,12 @@ def write(path, values: dict) -> dict:
     clean, problems = validate(values)
     if problems:
         raise ValueError("; ".join(problems))
+    with edit_lock(path):                           # one edit of system.xml at a time across processes (review D10)
+        return _write_element(path, clean)
+
+
+def _write_element(path, clean: dict) -> dict:
+    """write()'s edit of the file, under its edit lock."""
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
     new_elem = element(clean)
@@ -124,10 +130,7 @@ def write(path, values: dict) -> dict:
     parsed, problems = parse_text(new)
     if problems or parsed != clean:
         raise ValueError(f"the edited file would not read back as written: {problems or parsed}")
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(new)
-    os.replace(tmp, path)
+    write_atomic(path, new)                         # its own temporary file (review D10)
     return clean
 
 

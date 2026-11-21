@@ -853,12 +853,13 @@ class RobotClient:
         `RTI_VELOCITY_LIMIT`, `RTI_ACCELERATION_LIMIT`, `RTI_JERK_LIMIT`,
         `RTI_NO_SEND_TIME` or `RTI_BAD_VALUE` (see `RTIClient`).
 
-        The robot answers at once and never reports whether the claim took. It
-        ignores a claim while an error is latched, while the session is not paired
-        and idle (already claimed, or still stopping after a release), or when the
-        rate limiter is on and its planner is missing. The state packet's
-        `rti_state` shows it: 2 means control is active. While a claim is active,
-        control of the robot (`take_control()`) does not expire.
+        RTI answers within one tick. It refuses a claim (`RTI_REFUSED`, raised as
+        `CommandRejected`) while an error is latched, while the session is not
+        paired and idle (already claimed, or still stopping after a release), or
+        when the rate limiter is on and its planner is missing. Once the claim
+        takes, the state packet's `rti_state` shows 2: control is active. While
+        a claim is active, control of the robot (`take_control()`) does not
+        expire.
 
         Raises:
             CommandRejected: The robot refused it: it is not in a real-time mode (for
@@ -909,12 +910,12 @@ class RobotClient:
         is latched. After 0.5 s of holding, the session is paired and idle again:
         the robot stays in its real-time mode, keeps sending state and holds the
         arm still, and a new `rti_claim()` starts another stream. A claim sent
-        while it brakes or during the 0.5 s is ignored.
+        while it brakes or during the 0.5 s is refused (`RTI_REFUSED`).
 
         It works in both real-time modes, also when the stream itself is down.
         Send it within the command timeout after your last command, or the robot
-        latches `RTI_LINK_LOST` first. Without an active claim the robot ignores
-        it.
+        latches `RTI_LINK_LOST` first. Without an active claim the robot refuses
+        it (`RTI_REFUSED`).
 
         Raises:
             CommandRejected: Another client holds control. Or RTI refused it or did not
@@ -1358,7 +1359,7 @@ class RobotClient:
                 test.
             amplitude_deg: How far to move, in degrees, up to 15; the sign gives
                 the direction.
-            speed_dps: The peak speed, in degrees per second, up to 10.
+            speed_dps: The peak speed, in degrees per second, 0.5 to 10.
             current_ma: The drive's current limit during the test, in milliamperes,
                 up to the joint's own current limit. PAR6's first-run check uses
                 400 to 1500 mA, 1.5 times the joint's largest gravity torque.
@@ -1379,7 +1380,7 @@ class RobotClient:
         Errors:
             BAD_ARGS: `joint` is not 0 to the number of joints; or, for a test,
                 `amplitude_deg` is 0, above 15 degrees or not finite, `speed_dps` is
-                not above 0 and up to 10 deg/s, or `current_ma` is not above 0 and
+                not 0.5 to 10 deg/s, or `current_ma` is not above 0 and
                 up to the joint's current limit in force (`set_pid_gains()` may
                 have changed it).
             JOINT_TEST_REFUSED: The test cannot start: the robot software started less
@@ -1893,8 +1894,8 @@ class RobotClient:
         it.
 
         Args:
-            source: `"stream"` or `"off"`, in any case. The robot ignores any other
-                value and keeps the current one.
+            source: `"stream"` or `"off"`, in any case. The robot refuses any other
+                value (`RTI_REFUSED`) and keeps the current one.
 
         Defaults:
             `"stream"`, set at every `rti_connect()`.
@@ -2441,8 +2442,8 @@ class RobotClient:
 
         There is no off: the state stream is how `RTIClient` notices that the
         robot left real-time control. In RTI mode, where you close the loop every
-        tick, the robot ignores this call; send it after a SOFT_RTI
-        `rti_connect()`.
+        tick, the robot refuses this call (`RTI_REFUSED`); send it after a
+        SOFT_RTI `rti_connect()`.
 
         Args:
             hz: Packets per second, from 10 to 250 (clamped); 0 sends every tick
@@ -2660,8 +2661,8 @@ class RobotClient:
             The real-time loop checks the name again, in lower case, against the
             recipes it has loaded. A file added but not reloaded, or a recipe whose
             name inside the file has capitals or differs from its file name, is
-            refused there, in its log only; the call still returns normally. Check
-            the status field `recipe`.
+            refused there: the call raises `CommandRejected` (`RTI_REFUSED`, its
+            message lists the recipes RTI knows).
 
         See also:
             `reload_recipes()`, `rti_set_state_rate()`, `rti_connect()`
@@ -2753,6 +2754,8 @@ class RobotClient:
         `{"J6": 2.42}`. Answer with `accept_homing_reference()`, or end the
         homing with `stop()` (the arm is then not homed), or in the dashboard. It
         asks only once the arm is recognised from the joints homed before it.
+        Unanswered for 10 minutes (`config/system.xml`
+        `<homing_question_timeout_s>`), the homing ends as a stop ends it.
 
         Args:
             wait: Wait until homing has ended, up to 3 minutes.
@@ -2763,7 +2766,8 @@ class RobotClient:
                 enabled, or another client holds control. Or RTI refused it or did not
                 answer within 1 s (`Errors:`).
             HomingFailed: With `wait`, homing failed. It names the robot's error
-                keys.
+                keys. Or the homing was stopped before it finished (`stop()`, the
+                dashboard or the control box).
             HomingQuestion: With `wait`, homing asks about a joint. Its `joints`
                 names each one and how far off it homed, in degrees.
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
@@ -2807,7 +2811,9 @@ class RobotClient:
         deliberate change, such as the gripper re-fitted or a belt or a drive
         replaced: the robot stores the new spot for that joint and homing goes
         on. Otherwise end the homing with `stop()`: the arm is then not homed;
-        bring it to its park pose and home it again.
+        bring it to its park pose and home it again. Unanswered for 10 minutes
+        (`config/system.xml` `<homing_question_timeout_s>`), the homing ends the
+        same way.
 
         Args:
             wait: Wait until homing has ended, up to 3 minutes.
@@ -2817,7 +2823,7 @@ class RobotClient:
             CommandRejected: The robot refused it: it is not homing or not
                 enabled, or another client holds control. Or RTI refused it or did not
                 answer within 1 s (`Errors:`).
-            HomingFailed: With `wait`, homing failed later on.
+            HomingFailed: With `wait`, homing failed later on, or was stopped.
             HomingQuestion: With `wait`, homing asks about another joint.
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`,
                 homing had not ended after 3 minutes.
@@ -2859,15 +2865,29 @@ class RobotClient:
     def _wait_homed(self, timeout, what):
         """Until homed and out of HOMING — or out of HOMING with an error (a failed homing latches one, 2026-10-14):
         then HomingFailed at once, naming the robot's error keys — or homing asks about a joint (2026-11-16): then
-        HomingQuestion at once, with the joints asked about."""
-        self.wait(lambda s: s.get("homing_question") or (s.get("mode") != "HOMING"
-                                                         and (s.get("homed") is True or s.get("err") == 1)),
-                  timeout, what)
+        HomingQuestion at once, with the joints asked about. Review P6 (2026-11-20): a homing STOPPED (stop(), the
+        dashboard, the control box) ends in IDLE, not homed and with no error — the wait ran into its 3 minutes; once
+        the robot was seen homing, leaving HOMING not homed ends it too: HomingFailed saying so."""
+        seen = [False]
+
+        def ended(s):
+            if s.get("homing_question"):
+                return True
+            if s.get("mode") == "HOMING":
+                seen[0] = True
+                return False
+            return s.get("homed") is True or s.get("err") == 1 or seen[0]
+
+        self.wait(ended, timeout, what)
         st = self.latest_status()
         if st.get("homing_question"):
             raise HomingQuestion(st["homing_question"])
         if st.get("homed") is not True and st.get("err") == 1:
             raise HomingFailed(st.get("errors") or [])
+        if st.get("homed") is not True and seen[0]:
+            raise HomingFailed([], why="the homing was stopped before it finished (stop(), the dashboard or the "
+                                       "control box); the arm is not homed — bring it to its park pose and home it "
+                                       "again")
 
     def pause(self, wait: bool | None = None) -> None:
         """Pause the running program: brake along its path and hold.
@@ -3274,7 +3294,7 @@ class RobotClient:
         Examples:
             >>> import time
             >>> robot.enter_jog_mode(wait=True)
-            >>> robot.jog(5, 1, 0.05)
+            >>> robot.jog(5, 1, 5)
             >>> time.sleep(0.5)
             >>> robot.jog_stop()
         """
@@ -3625,7 +3645,7 @@ class RobotClient:
 
         Examples:
             >>> import time
-            >>> robot.jog(0, 1, 0.05)
+            >>> robot.jog(0, 1, 5)
             >>> time.sleep(0.5)
             >>> robot.jog_stop()
         """
@@ -3910,6 +3930,8 @@ class RobotClient:
             REJECTED: The robot is homing, or the Hall sensor check, a freed joint
                 or a joint test runs: each relies on the joint's current limit,
                 which this command sets.
+            RTI_REFUSED: The robot is in FLASHING mode: nothing is sent to a drive
+                while one is flashed.
             RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
                 responding. The command may still have taken effect.
 
@@ -4172,7 +4194,7 @@ class RobotClient:
 
         Examples:
             >>> robot.move_joints(90, -105, 165, 0, -30, 180)
-            >>> robot.move_joints([90, -105, 165, 0, -30, 180], speed=0.2)
+            >>> robot.move_joints([90, -105, 165, 0, -30, 180], speed=20)
             >>> robot.wait_idle()
         """
         if len(angles_deg) == 1 and isinstance(angles_deg[0], (list, tuple)):
@@ -5529,12 +5551,12 @@ class RobotClient:
                 `None` means 200 mA. At most the current limit in the gripper's
                 configuration.
             timeout: Seconds to wait for the jaws to settle, in sync mode only.
-            **options: Accepted as on a move: `speed`, `accel`, `duration`,
-                `profile`, `jerk`, `ramp_fraction`, `blend`, `blend_mode`,
+            **options: Accepted as on a move: `accel`, `duration`, `profile`,
+                `jerk`, `ramp_fraction`, `blend`, `blend_mode`,
                 `blend_continuity`, `ik_solver`, `singularity_strategy`, `samples`
-                and `dry_run`. Only `dry_run` changes a gripper command: the robot
-                checks it and moves nothing. An unknown setting or a bad value is
-                refused.
+                and `dry_run` (`speed` is this command's own argument above). Only
+                `dry_run` changes a gripper command: the robot checks it and moves
+                nothing. An unknown setting or a bad value is refused.
 
         Returns:
             The command id. The call returns once the robot has accepted the
@@ -5717,8 +5739,8 @@ class RobotClient:
             CommandRejected: The gripper command failed: its code says why, for
                 example `GRIPPER_SETTLE_TIMEOUT`, `SUPERSEDED`, `STOPPED` or
                 `ABORTED`, or the connection closed before it settled. Each call
-                raises it again until the next gripper command, and `wait_idle()`
-                reports the same failure once more, as `MotionFailed`.
+                raises it again until the next gripper command; `wait_idle()`
+                does not report it again.
             RobotTimeout: The command had not settled within `timeout`.
 
         See also:
@@ -5774,7 +5796,7 @@ class RobotClient:
             ...     print(missed.result)
         """
         self.wait_gripper_move_complete(timeout)
-        result = self.gripper_result()
+        result = self._awaited_gripper_result()
         if result is None or not result.object_detected:
             raise GripFailed("holding a part", result)
         return result
@@ -5816,10 +5838,20 @@ class RobotClient:
             GripperResult(code=3, 'reached target, no object')
         """
         self.wait_gripper_move_complete(timeout)
-        result = self.gripper_result()
+        result = self._awaited_gripper_result()
         if result is None or not result.reached_target:
             raise GripFailed("released and at target", result)
         return result
+
+    def _awaited_gripper_result(self) -> GripperResult | None:
+        """The result of the gripper command wait_gripper_move_complete() waited for — not the connection's last one
+        (review P6, 2026-11-20: after a stop or a refused close, a stale "holding" of an earlier command passed
+        wait_holding_part()). None when this client sent none, or it settled without reporting why."""
+        p = self._last_gripper_queued
+        code = (getattr(p, "data", None) or {}).get("gripper_object") if p is not None else None
+        if code is None:
+            return None
+        return GripperResult(int(code), command_id=p.cid)
 
     def wait(self, predicate: Callable[[dict], bool], timeout: float | None = WAIT_STATE_TIMEOUT, what: str = 'wait') -> None:
         """Wait until the robot's status meets a condition of your own.
@@ -5935,7 +5967,8 @@ class RobotClient:
 
         When homing ends in an error, it raises `HomingFailed` at once instead of
         waiting out the timeout. It also raises it when the arm is not homed and
-        an error is latched, such as a pressed E-stop, even if no homing ran.
+        an error is latched, such as a pressed E-stop, even if no homing ran, and
+        when a homing it saw running was stopped before it finished.
         Warnings do not count.
 
         Args:
@@ -5944,7 +5977,8 @@ class RobotClient:
         Raises:
             HomingFailed: Homing ended with an error, or an error is latched while
                 the arm is not homed. Its `errors` lists the robot's error and
-                warning keys, for example `J3:HOMING_FAILED`.
+                warning keys, for example `J3:HOMING_FAILED`. Or a homing it saw
+                running was stopped before it finished (`errors` empty).
             HomingQuestion: Homing asks about a joint that homed off its usual
                 spot. Answer with `accept_homing_reference()`, or end the
                 homing with `stop()`.
@@ -7034,6 +7068,9 @@ class RobotClient:
             `rti_alive`: false once the robot's real-time loop has stopped
                 (no tick for 0.5 s): every other value is then the last one it
                 wrote, and moves are refused with `RTI_NOT_RUNNING`.
+            `homing_question`: while homing asks about joints that homed off
+                their usual spot, each one and how far, in degrees, such as
+                `{"J2": 5.63}`; otherwise `None` (as in `latest_status()`).
             `pose_angles`: `"xyz-mobile"`, the pose angles R = Rx Ry Rz that this
                 robot reads and returns.
             `runtime_version`: the robot software's version, such as `"0.10.0"`.

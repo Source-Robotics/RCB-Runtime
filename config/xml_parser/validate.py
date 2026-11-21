@@ -80,6 +80,28 @@ def _check_positive(cfg: dict, issues: list[str]) -> None:
                 issues.append(f"[ERROR] {label} <= 0 on joint(s) {bad}{suffix}")
 
 
+# Review K6 (2026-11-20): the motion limits every consumer clamps with — each must be a finite number above 0. A robot
+# XML without <joint_velocity_limit> kept a NaN ceiling (only the acceleration / jerk / torque-rate defaults are
+# derived), and every clamp against NaN passes: the arm would run unlimited. Zero / negative were never checked either.
+_MOTION_LIMIT_FIELDS = ("joint_velocity_limit", "joint_acceleration_limit", "joint_jerk_limit", "torque_rate_limit",
+                        "exec_velocity_limit", "exec_acceleration_limit", "exec_jerk_limit",
+                        "rti_velocity_limit", "rti_acceleration_limit", "rti_jerk_limit", "rti_torque_rate_limit",
+                        "motor_velocity_limit")
+
+
+def _check_motion_limits(cfg: dict, issues: list[str]) -> None:
+    """Every motion limit finite and > 0 on every joint (a field the config lacks is not judged here)."""
+    for name in _MOTION_LIMIT_FIELDS:
+        arr = _cfg_array(cfg, name)
+        if arr is None:
+            continue
+        bad = np.where(~np.isfinite(arr) | (arr <= 0))[0].tolist() if arr.ndim else ([0] if not (
+            np.isfinite(arr) and arr > 0) else [])
+        if bad:
+            issues.append(f"[ERROR] {name} is missing, not a number or not above 0 on joint(s) {bad} — every clamp "
+                          f"against it would pass: give each joint a finite positive limit in the robot XML")
+
+
 def _check_encoder_bits(cfg: dict, issues: list[str]) -> None:
     """An encoder resolution outside 8-20 bits is unusual (a warning)."""
     enc = _cfg_array(cfg, "motor_encoder")
@@ -255,6 +277,7 @@ def validate_robot_config(cfg: dict) -> tuple[bool, list[str]]:
         return False, issues
     _check_required_arrays(cfg, jn, issues)
     _check_positive(cfg, issues)
+    _check_motion_limits(cfg, issues)
     _check_encoder_bits(cfg, issues)
     _check_drive_speed_cap(cfg, issues)
     lim_neg, lim_pos = _check_hard_limits(cfg, jn, issues)

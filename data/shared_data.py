@@ -36,6 +36,48 @@ _SHM_PREFIX = os.environ.get("RCB_SHM_PREFIX", "")
 logger = logging.getLogger("shm")  # docs/logging.md "Logger names"
 _blocks_attached = 0   # counted per setup(); the summary line reports them
 _blocks_created = 0
+# Review I3 (2026-11-20): the shared memory has a LAYOUT — every segment's name and size. RTI owns it (RTI.py sets
+# RCB_SHM_OWNER before this import; read once and removed, so nothing RTI starts inherits it): the owner may recreate
+# a segment of another size and publishes the layout's hash in "shm_layout"; every other process refuses a segment of
+# another size or a different hash, and tells the operator to restart the robot service. Before, any process
+# recreated a mismatched segment — after an update that changed a count, restarting only the executor + dashboard
+# left the executor reading an orphan of zeros for ever (one warning), with RTI writing the old one. Only the owner
+# resets the one-shot signals too (every importer zeroed them: a pending Clear Errors could be wiped).
+_OWNER = os.environ.pop("RCB_SHM_OWNER", "") == "1"
+_layout_entries: list = []      # (name, kind, size) of every segment setup() made, for the layout hash
+_in_setup = False
+_reconfiguring = False          # setup(joints=N) of THIS process changing its own joint count: it may recreate
+
+
+def _may_recreate() -> bool:
+    return _OWNER or _reconfiguring
+
+
+def _reset_one_shot_signals(*signals) -> None:
+    """The one-shot signals to "0" — by the owner (RTI), or for a segment just created (review I3): every importer reset
+    them, so a pending Clear Errors could be wiped by another program starting."""
+    for sig in signals:
+        if _OWNER or sig.created:
+            sig.set("0")
+
+
+def _unlink_quiet(shm) -> None:
+    """Remove a segment this process already un-registered from the resource tracker: SharedMemory.unlink() would
+    un-register it a second time, which the tracker reports as a KeyError traceback on stderr."""
+    try:
+        os.unlink("/dev/shm/" + shm._name.lstrip("/"))  # type: ignore[attr-defined]  # nosec B108 — POSIX shm's own folder
+    except FileNotFoundError:
+        pass
+
+
+class LayoutMismatch(RuntimeError):
+    """This process's shared memory layout is not the running RTI's (an update changed it): restart the service."""
+
+
+def _mismatch(name, what):
+    raise LayoutMismatch(f"shared memory '{name}' {what} — this program's layout is not the running RTI's (an update "
+                         f"changed it): restart the robot service (sudo systemctl restart autorun.service), not this "
+                         f"program alone")
 
 # ======================= SharedString Class ==========================
 class SharedString:
@@ -53,8 +95,20 @@ class SharedString:
         except FileExistsError:
             self.shm = shared_memory.SharedMemory(name=name)
             self.created = False
+            if self.shm.size != size:                        # review I3: a string that grew raised on every write
+                if not _may_recreate():
+                    self.shm.close()
+                    _mismatch(name, f"holds {self.shm.size} bytes, this program expects {size}")
+                logger.warning(f"string '{name}' has {self.shm.size} bytes, expected {size} — recreating it")
+                self.shm.close()
+                self.shm.unlink()
+                self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+                self.shm.buf[:size] = b'\x00' * size  # type: ignore[index]  # a created segment always has a buffer
+                self.created = True
             _blocks_attached += 1
             logger.debug(f"string '{name}' attached")
+        if _in_setup:
+            _layout_entries.append((name[len(_SHM_PREFIX):], "str", int(size)))
         # Prevent resource_tracker from unlinking this segment on process exit;
         # lifetime is managed explicitly (shared across processes).
         resource_tracker.unregister(self.shm._name, "shared_memory")  # type: ignore[attr-defined]  # the private name the resource tracker registered
@@ -153,11 +207,15 @@ def _attach_or_create(name: str, dtype, count: int):
 
         expected_size = np.dtype(dtype).itemsize * count
         if shm.size != expected_size:
-            # Stale segment with wrong size (e.g. dtype changed) — recreate it.
+            # Stale segment with wrong size (e.g. dtype changed). Only the owner (RTI) recreates it (review I3): another
+            # process unlinking it orphaned RTI's — the two then wrote and read different memory for ever.
+            if not _may_recreate():
+                shm.close()
+                _mismatch(name, f"holds {shm.size} bytes, this program expects {expected_size}")
             logger.warning(f"'{name}' has the wrong size ({shm.size} bytes, expected {expected_size}) — "
                            f"unlinking and recreating")
             shm.close()
-            shm.unlink()
+            _unlink_quiet(shm)   # already un-registered above: unlink() would do it twice (a KeyError traceback)
             raise FileNotFoundError  # fall through to create branch
 
         arr = np.ndarray((count,), dtype=dtype, buffer=shm.buf)
@@ -174,8 +232,12 @@ def _attach_or_create(name: str, dtype, count: int):
         arr[:] = 0
         _blocks_created += 1
         logger.debug(f"created {name} ({size} bytes)")
+    except LayoutMismatch:
+        raise
     except Exception as e:
         raise RuntimeError(f"Failed to attach/create {name}: {e}")
+    if _in_setup:
+        _layout_entries.append((name[len(_SHM_PREFIX):], np.dtype(dtype).str, int(count)))
     return shm, arr
 
 
@@ -209,7 +271,10 @@ def setup(joints: int = 6, force_reinit: bool = False):
         return
 
     # Clean up old per-joint blocks if changing joint count
+    global _reconfiguring
+    _reconfiguring = False
     if _initialized and joints != joint_num:
+        _reconfiguring = True            # review I3: its own blocks — it may recreate them
         logger.info(f"reconfiguring from {joint_num} to {joints} joints — closing the old blocks")
         for shm in motor_shms.values():  # type: ignore[attr-defined]  # only reached after setup() filled it (re-setup with another joint count)
             shm.close()
@@ -219,6 +284,9 @@ def setup(joints: int = 6, force_reinit: bool = False):
 
     joint_num = max(1, joints)
     _blocks_attached = _blocks_created = 0
+    global _in_setup
+    _layout_entries.clear()
+    _in_setup = True                     # review I3: the layout is what setup() makes
     logger.debug(f"setting up the shared memory of a {joint_num}-DOF robot")
 
     # ========================= String-based states =========================
@@ -517,21 +585,17 @@ def setup(joints: int = 6, force_reinit: bool = False):
 
     # Signal flag: GUI sets to "1" after uploading a new recipe XML file;
     # RTI calls recipe_mgr.reload() and clears it back to "0".
+    # The four one-shot signals: set to "1" by a client, reset to "0" by RTI after handling. Zeroed here only by RTI
+    # (the owner) or when just created (review I3: every importer zeroed them — a pending Clear Errors could be wiped).
     recipe_reload_signal = SharedString("recipe_reload_signal", 8)
-    recipe_reload_signal.set("0")
-
     filter_reload_signal = SharedString("filter_reload_signal", 8)
-    filter_reload_signal.set("0")
-
     # GUI sets to "1" to request an error latch clear; RTI resets it to "0" after handling.
     clear_error_signal = SharedString("clear_error_signal", 8)
-    clear_error_signal.set("0")
-
     # GUI/client sets to "1" to zero the "since start" loop-timing peaks
     # (max_jitter/max_loop_period/max_loop_execution_time/overrun_count) and the
     # rolling p95/p99 window; RTI resets it to "0" after handling.
     loop_stats_reset_signal = SharedString("loop_stats_reset_signal", 8)
-    loop_stats_reset_signal.set("0")
+    _reset_one_shot_signals(recipe_reload_signal, filter_reload_signal, clear_error_signal, loop_stats_reset_signal)
 
     # ========================= RTI Process Data =========================
 
@@ -772,7 +836,11 @@ def setup(joints: int = 6, force_reinit: bool = False):
                         # the Change-gripper mode: 1 while the gripper is being swapped (TODO/live_gripper_swap_plan.md)
                         ("gripper_change", 1),
                         ("hall_check_joint", 1), ("hall_check_pin", 1), ("hall_check_changes", 1),
-                        ("hall_check_edge_deg", 2), ("free_joint", 1), ("joint_test", 8)]:
+                        ("hall_check_edge_deg", 2), ("free_joint", 1), ("joint_test", 8),
+                        # the SD card nearly full (review I6, 2026-11-20): [1 = low, the free MB] — the supervisor
+                        # writes it every DISK_CHECK_S, RTI's error pass shows DISK_LOW_WARNING (never a file system
+                        # call in RTI's loop)
+                        ("disk_low", 2)]:
         shm, arr = _attach_or_create(name, np.float64, count)
         rti_shms[name] = shm
         rti[name] = arr
@@ -853,9 +921,35 @@ def setup(joints: int = 6, force_reinit: bool = False):
         gripper_shms[name] = shm
         gripper[name] = arr
 
+    _in_setup = False
+    _reconfiguring = False
+    _check_layout()
     _initialized = True
     logger.info(f"{_blocks_attached + _blocks_created} blocks ready for a {joint_num}-DOF robot: "
                 f"{_blocks_attached} attached, {_blocks_created} created")
+
+
+LAYOUT_DIGEST = None                     # this process's layout hash (setup())
+
+
+def layout_digest(entries) -> str:
+    """The hash of a layout: every segment's (name, kind, size), order-free."""
+    import hashlib
+    return hashlib.sha1(json.dumps(sorted(entries)).encode()).hexdigest()[:16]  # nosec B324 — a name, not security
+
+
+def _check_layout():
+    """Review I3: the owner (RTI) publishes its layout's hash; any other process compares — a different one refuses to
+    start (LayoutMismatch). An empty one (RTI not started yet, or an RTI from before this check) is accepted."""
+    global LAYOUT_DIGEST
+    LAYOUT_DIGEST = layout_digest(_layout_entries)
+    published = SharedString("shm_layout", 64)
+    if _OWNER:
+        published.set(LAYOUT_DIGEST)
+        return
+    theirs = published.get()
+    if theirs and theirs != LAYOUT_DIGEST:
+        _mismatch("shm_layout", f"says RTI runs layout {theirs}, this program has {LAYOUT_DIGEST}")
 
 
 def cleanup():

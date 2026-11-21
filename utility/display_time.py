@@ -126,13 +126,13 @@ def clock_status() -> dict:
 
 def save_to_system_xml(path, name: str) -> None:
     """Write `<display_timezone>` into config/system.xml, changing that one element only (its comments stay)."""
+    from utility.config_write import edit_lock, write_atomic
     name = set_zone(name)                               # validates (raises ValueError) and applies
-    with open(path) as fh:
-        text = fh.read()
-    new, n = re.subn(r"<display_timezone>[^<]*</display_timezone>", f"<display_timezone>{name}</display_timezone>", text)
-    if n != 1:
-        raise ValueError(f"{path} has {n} <display_timezone> elements (expected 1)")
-    tmp = f"{path}.tmp"
-    with open(tmp, "w") as fh:
-        fh.write(new)
-    os.replace(tmp, path)
+    with edit_lock(path):                               # one edit of system.xml at a time (review D10)
+        with open(path) as fh:
+            text = fh.read()
+        new, n = re.subn(r"<display_timezone>[^<]*</display_timezone>", f"<display_timezone>{name}</display_timezone>",
+                         text)
+        if n != 1:
+            raise ValueError(f"{path} has {n} <display_timezone> elements (expected 1)")
+        write_atomic(path, new)                         # its own temporary file

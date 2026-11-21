@@ -26,8 +26,9 @@ class FreeJoint:
     `current_limit` the live per-joint limits (what stop() restores; PID apply edits these arrays in place), `rti` the
     rti shared-memory dict (`free_joint`: the freed joint's number, 0 = none)."""
 
-    def __init__(self, motors, joint_num, velocity_limit, current_limit, rti, log=None):
+    def __init__(self, motors, joint_num, velocity_limit, current_limit, rti, log=None, restore=None):
         self.motors = motors
+        self.restore = restore                  # robotics/limit_restore.RestoreResend, shared by the three (review D14)
         self.joint_num = int(joint_num)
         self.velocity_limit = velocity_limit
         self.current_limit = current_limit
@@ -63,6 +64,8 @@ class FreeJoint:
             return None
         if self.active:
             self.stop(f"J{joint + 1} freed instead")
+        if self.restore is not None and self.restore.joint == joint:
+            self.restore.cancel()               # a pending restore of this joint must not undo the 0 mA (review D14)
         self._send_limits(joint, 0)
         self.joint = joint
         self._ticks = 0
@@ -76,6 +79,8 @@ class FreeJoint:
             return
         j = self.joint
         self._send_limits(j, self.current_limit[j])
+        if self.restore is not None:
+            self.restore.arm(j)                 # sent again over the next second (review D14)
         self.joint = None
         self.rti["free_joint"][0] = 0
         if self.log:

@@ -161,8 +161,11 @@ def main():
     robot = RobotClient(); robot.connect(a.host)
     out = {}
     try:
+        rti = None    # one client at a time: the next pass closes the last one's port first
         for label, rate, cfg, freq in cases:
             period = 1.0 / rate
+            if rti is not None:
+                rti.close()    # a second RTIClient on the same UDP port is refused (2026-11-20)
             rti = RTIClient(robot, clock="pc")
             rti.connect(rate_hz=rate); time.sleep(0.4)
             rti.read_once(timeout=2.0)

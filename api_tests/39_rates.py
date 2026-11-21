@@ -341,10 +341,13 @@ def main():
             print(f"ABORT: {why}")
             return 1
 
+        rti = None    # one client at a time: the next pass closes the last one's port first
         for hz in rates:
             tag = "expect clean" if predicted_clean(hz) else "expect ROUGH"
             print(f"  {hz:8.4g} Hz  ({sc.LOOP_HZ/hz:6.3f} ticks/cmd, {tag}) ... ",
                   end="", flush=True)
+            if rti is not None:
+                rti.close()    # a second RTIClient on the same UDP port is refused (2026-11-20)
             rti = RTIClient(robot, clock="pc")
             try:
                 # One session PER RATE. The rate is fixed by the contract at connect time,

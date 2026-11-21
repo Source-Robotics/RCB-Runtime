@@ -20,13 +20,16 @@ Description: Script lifecycle management for supervisor.
 """
 
 import os
+import shlex
 import signal
 import subprocess
 import psutil
 import logging
 import time
 from project_paths import PROJECT_ROOT, TEMP_DATA_DIR
-from utility.housekeeping import RECORDINGS_BUDGET_BYTES, copy_truncate, enforce_budget, rotate_by_size
+import shutil
+from utility.housekeeping import (DISK_LOW_BYTES, DISK_OK_BYTES, RECORDINGS_BUDGET_BYTES, copy_truncate, enforce_budget,
+                                  rotate_by_size)
 from utility.system_temperature import get_raspberry_pi_temperature
 
 logger = logging.getLogger("sup.process")  # docs/logging.md "Logger names"
@@ -59,6 +62,39 @@ def _cap_running_out_logs(processes, max_bytes=OUT_LOG_MAX_BYTES, keep=OUT_LOG_K
             logger.info(f"Rotated {path.name} while {name} runs (was over {max_bytes // (1024 * 1024)} MB)")
 
 
+DISK_CHECK_S = 30.0                     # the free space is checked every 30 s (review I6)
+_last_disk_check = [float("-inf")]
+_disk_low = [False]
+
+
+def _check_disk(now=None, root=PROJECT_ROOT, flag=None, free_bytes=None):
+    """Every DISK_CHECK_S: the SD card's free space -> rti['disk_low'] [1 = low, free MB], which RTI's error pass shows
+    as DISK_LOW_WARNING (review I6, 2026-11-20) — under DISK_LOW_BYTES, cleared above DISK_OK_BYTES; logged when it
+    changes. Returns low / not, or None when not checked. Never raises."""
+    now = time.monotonic() if now is None else now
+    if now - _last_disk_check[0] < DISK_CHECK_S:
+        return None
+    _last_disk_check[0] = now
+    try:
+        free = shutil.disk_usage(str(root)).free if free_bytes is None else int(free_bytes)
+        if flag is None:
+            from data import shared_data
+            flag = shared_data.rti["disk_low"]
+    except (OSError, KeyError, AttributeError) as exc:
+        logger.warning(f"free disk space not checked: {exc}")
+        return None
+    low = free < DISK_LOW_BYTES or (_disk_low[0] and free < DISK_OK_BYTES)
+    if low != _disk_low[0]:
+        _disk_low[0] = low
+        if low:
+            logger.warning(f"the SD card has {free / 1e6:.0f} MB free (under {DISK_LOW_BYTES // 1_000_000} MB): "
+                           f"DISK_LOW_WARNING — free space (tools/disk_cleanup.py) before logs and saves fail")
+        else:
+            logger.info(f"the SD card has {free / 1e6:.0f} MB free again: DISK_LOW_WARNING cleared")
+    flag[0], flag[1] = (1.0 if low else 0.0), free / 1e6
+    return low
+
+
 def _check_recordings_budget(now=None, root=TEMP_DATA_DIR, budget=RECORDINGS_BUDGET_BYTES):
     """Once an hour (the first monitor pass too): the test recordings in temp_data together at most `budget`
     (500 MB, utility/housekeeping.RECORDINGS_BUDGET_BYTES), the oldest runs deleted first
@@ -84,14 +120,17 @@ def _spawn(name, cmd):
     """Launch one script in its own process group, output -> logs/<name>.out.log (rotated first if large)."""
     _rotate_out_log(LOG_DIR / f"{name}.out.log")
     logf = open(LOG_DIR / f"{name}.out.log", "ab", buffering=0)
-    proc = subprocess.Popen(
-        cmd,
-        shell=True,
+    # Review I4 (2026-11-20): the script itself, not `sh -c` — with the shell the child was the shell and Python its
+    # child: a stop saw the shell exit at once and logged "stopped" while Python still shut down (two RTIs for up to
+    # 10 s, the dashboard's "Address already in use"), and the SIGKILL step could never fire.
+    proc = subprocess.Popen(  # nosec B603 — supervisor.py's own SCRIPTS (this Python + a repo script), no outside input
+        shlex.split(str(cmd)),
         stdout=logf,
         stderr=subprocess.STDOUT,
         start_new_session=True,  # new pgid so we can kill the whole tree later
     )
     proc._logf = logf  # keep a reference so the file handle isn't GC'd
+    proc._started = time.monotonic()   # review I4: a death soon after the start counts towards a crash loop
     logger.info(f"Started {name} (PID {proc.pid})")
     return proc
 
@@ -214,6 +253,44 @@ def _planned_restart(cmd, now=None, path=None):
     return bool(script) and script in words[1:]
 
 
+# Review I4 (2026-11-20): a crash loop (a bad XML: RTI dies at start) restarted the script every 2 s for ever, with one
+# line each. A death within QUICK_DEATH_S of the start is a QUICK death: the first is restarted at once (as before),
+# the next ones after CRASH_BACKOFF_S, and the CRASH_LOOP_DEATHS-th logs one ERROR naming the loop.
+QUICK_DEATH_S = 30.0
+CRASH_BACKOFF_S = (2.0, 4.0, 8.0, 16.0, 30.0, 60.0)
+CRASH_LOOP_DEATHS = 5
+_quick_deaths: dict = {}                  # name -> quick deaths in a row
+_restart_at: dict = {}                    # name -> monotonic time of its delayed restart
+
+
+def _restart_crashed(name, process, processes, SCRIPTS, now=None) -> str:
+    """A script that stopped unexpectedly: restarted at once, or after its back-off. Returns its status text."""
+    now = time.monotonic() if now is None else now
+    if name in _restart_at:                                       # waiting out its back-off
+        if now < _restart_at[name]:
+            return "waiting to restart (crash loop back-off)"
+        del _restart_at[name]
+        restart_script(name, processes, SCRIPTS)
+        return "restarted (after a back-off)"
+    lived = now - getattr(process, "_started", now)
+    n = _quick_deaths.get(name, 0) + 1 if lived < QUICK_DEATH_S else 0
+    _quick_deaths[name] = n
+    if n <= 1:
+        logger.error(f"{name} stopped unexpectedly (exit {process.returncode}) — restarting it. "
+                     f"See logs/{name}.out.log")
+        restart_script(name, processes, SCRIPTS)
+        return "restarted (crashed)"
+    wait = CRASH_BACKOFF_S[min(n - 2, len(CRASH_BACKOFF_S) - 1)]
+    _restart_at[name] = now + wait
+    logger.error(f"{name} stopped again {lived:.1f} s after its start (exit {process.returncode}; quick death {n} in a "
+                 f"row) — restarting it in {wait:g} s. See logs/{name}.out.log")
+    if n == CRASH_LOOP_DEATHS:
+        logger.error(f"{name} is in a CRASH LOOP: {n} deaths within {QUICK_DEATH_S:g} s of their start — it will keep "
+                     f"being restarted every {CRASH_BACKOFF_S[-1]:g} s at most; logs/{name}.out.log says why (a broken "
+                     f"configuration file, most often)")
+    return f"crashed — restart in {wait:g} s"
+
+
 def monitor_scripts(emergency_stop, processes, SCRIPTS):
     """
     Monitor running scripts, check responsiveness, and restart if necessary.
@@ -257,15 +334,15 @@ def monitor_scripts(emergency_stop, processes, SCRIPTS):
                 restart_script(name, processes, SCRIPTS)
                 status_dict[name] = {"status": "restarted (planned)"}
                 continue
-            logger.error(f"{name} stopped unexpectedly (exit {process.returncode}) — restarting it. "
-                        f"See logs/{name}.out.log")
-            restart_script(name, processes, SCRIPTS)
-            status_dict[name] = {"status": "restarted (crashed)"}
+            status_dict[name] = {"status": _restart_crashed(name, process, processes, SCRIPTS)}
         else:
+            if time.monotonic() - getattr(process, "_started", float("-inf")) > QUICK_DEATH_S:
+                _quick_deaths[name] = 0                   # it has run a while: a later death starts afresh
             status_dict[name] = {"status": "running"}
 
     _cap_running_out_logs(processes)
     _check_recordings_budget()
+    _check_disk()                                          # review I6: DISK_LOW_WARNING
 
     # Raspberry Pi temperature.
     temp = get_raspberry_pi_temperature()

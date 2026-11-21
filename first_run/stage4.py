@@ -40,6 +40,10 @@ REASON_HINTS = [
     (("controlled approach stopped",),
      ["something in the way before the endstop: the arm against itself or its base, a cable",
       "the joint could not carry the arm there: move the arm to its park pose and home again"]),
+    (("was not answered within",),                  # 2026-11-20 (review D7): the homing question's timeout
+     ["homing asked about a joint that homed off its usual spot, and nobody answered: home again and answer it in "
+      "the dashboard's question (accept after a deliberate change, else stop and check the joint)",
+      "something in the joint's way, a skipped belt or a slipping coupling moves its spot — check the joint first"]),
     (("always homes",),
      ["after a deliberate mechanical change (a new belt, the joint taken apart): accept the new reference in the "
       "dashboard's System Info, Arms (homing)",

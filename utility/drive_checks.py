@@ -1,9 +1,10 @@
 """Two checks of the drives at RTI's start (2026-11-17, user; TODO/driver_110_rtb15_plan.md "The 110 re-check").
 
 - Gains: after the start-up parameter read (utility/drive_params.py) every drive should hold the gains and limits RTI
-  sent it (parameters 8-17: Kpp, Kpv, Kiv, Kpiq, Kiiq, KP, KD, the velocity, current and voltage limits). One that
-  holds another value lost a config frame (or was changed by someone else since): J<n>:GAINS_MISMATCH_WARNING, with
-  both values in the log. A check only — the tick-50 / 150 / 300 re-send block stays exactly as it is.
+  sent it (parameters 8-17: Kpp, Kpv, Kiv, Kpiq, Kiiq, KP, KD, the velocity, current and voltage limits; and on the
+  joints 18, brake on idle — review D12, 2026-11-20). One that holds another value lost a config frame (or was changed
+  by someone else since): J<n>:GAINS_MISMATCH_WARNING, with both values in the log. A check only — the tick-50 / 150 /
+  300 re-send block stays exactly as it is; a joint found coasting is sent brake again (RTI).
 - Product: the identity reply's product (1 STEPFOC, 2 Spectral Micro) against the robot / gripper XML's <driver_type>.
   A drive that is not the product the XML describes runs other gains in other units: J<n>:DRIVE_PRODUCT_MISMATCH, a
   hard error re-raised every tick — the arm cannot be enabled until the drive or the XML is fixed and RTI restarts.
@@ -20,9 +21,15 @@ import math
 
 PRODUCT_IDS = {"stepfoc": 1, "spectral-bldc": 2}
 PRODUCT_NAMES = {1: "STEPFOC", 2: "Spectral Micro"}
-GAIN_NUMBERS = (8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
+GAIN_NUMBERS = (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
 GAIN_NAMES = {8: "Kpp", 9: "Kpv", 10: "Kiv", 11: "Kpiq", 12: "Kiiq", 13: "KP", 14: "KD", 15: "velocity limit",
-              16: "current limit", 17: "voltage limit"}
+              16: "current limit", 17: "voltage limit", 18: "brake on idle"}
+# Parameter 18, brake on idle: 1 = brake (phases shorted), 0 = coast. RTI asserts brake on every JOINT at its start
+# and after a reconnect (communication/can_message_handlers.send_brake_on_idle); firmware 110 restores a SAVED coast
+# at power-up, so a lost frame would leave J2 / J3 dropping at every idle. Checked with the gains since review D12
+# (2026-11-20); the gripper is not sent it, so not judged.
+BRAKE_ON_IDLE = 18
+BRAKE = 1.0
 
 
 def held_voltage_limit(sent_mv: float) -> float:
@@ -32,10 +39,14 @@ def held_voltage_limit(sent_mv: float) -> float:
     return 0.0 if v == 0 else max(v, 6000.0)
 
 
-def sent_values(KPP, KPV, KIV, KPIQ, KIIQ, KP, KD, velocity_limit, Ilim, voltage_limit) -> dict:
-    """{parameter number: the value the drive should hold} from what RTI sends one drive."""
-    return {8: float(KPP), 9: float(KPV), 10: float(KIV), 11: float(KPIQ), 12: float(KIIQ), 13: float(KP),
-            14: float(KD), 15: float(velocity_limit), 16: float(Ilim), 17: held_voltage_limit(voltage_limit)}
+def sent_values(KPP, KPV, KIV, KPIQ, KIIQ, KP, KD, velocity_limit, Ilim, voltage_limit, brake=None) -> dict:
+    """{parameter number: the value the drive should hold} from what RTI sends one drive. `brake`: BRAKE for a joint
+    (RTI sends it brake on idle), None for a drive it is not sent to (the gripper) — then parameter 18 is not judged."""
+    out = {8: float(KPP), 9: float(KPV), 10: float(KIV), 11: float(KPIQ), 12: float(KIIQ), 13: float(KP),
+           14: float(KD), 15: float(velocity_limit), 16: float(Ilim), 17: held_voltage_limit(voltage_limit)}
+    if brake is not None:
+        out[BRAKE_ON_IDLE] = float(brake)
+    return out
 
 
 def gains_mismatches(sent: dict, held: dict) -> list:

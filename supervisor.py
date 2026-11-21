@@ -36,6 +36,12 @@ Contact: petar@source-robotics.com
 """
 
 import os
+# BEFORE anything imports data.shared_data (review I3, 2026-11-20): the supervisor is the service's FIRST process — when
+# it starts, nothing of the service runs (systemd stopped the whole unit), so it may recreate a segment an update
+# resized and publish the layout. Without this it attached the old run's segments as a non-owner, refused the new
+# layout, and never started RTI (the service would restart for ever). Read and removed at the import: the scripts it
+# starts do not inherit it (RTI marks itself again).
+os.environ["RCB_SHM_OWNER"] = "1"
 import sys
 import time
 import queue
@@ -86,7 +92,8 @@ settings_store.load()
 # DEBUG=False -> log to file only. Under systemd the terminal IS the journal, which rsyslog copies into
 #                /var/log/syslog: with True every line was written three times (2026-10-01: ~150 MB/day).
 DEBUG = False
-setup_logging(str(SUPERVISOR_LOG), log_to_console=DEBUG, critical_log_file=str(CRITICAL_LOG))
+setup_logging(str(SUPERVISOR_LOG), log_to_console=DEBUG, critical_log_file=str(CRITICAL_LOG),
+              critical_rotates=False)   # RTI rotates critical_errors.log; the supervisor only appends (review I6)
 
 
 def handle_exception(exc_type, exc_value, exc_traceback):

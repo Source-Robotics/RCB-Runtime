@@ -149,6 +149,10 @@ class PAR6(DHRobot):
 
         # Initialize grippers
         self._grippers = self._define_grippers(symbolic=symbolic)
+        # Review K5 (2026-11-20): a malformed gripper file is skipped (it stopped every start, also when nobody selected
+        # it) — but the ACTIVE gripper's still stops the start, with its own reason: never a silent Flange instead.
+        if gripper_name in self._broken_grippers:
+            raise ValueError(self._broken_grippers[gripper_name])
 
         # Add initial gripper / flange. Gripper XML supplies the tool-link geometry.
         initial_gripper = self._grippers.get(gripper_name, self._grippers["Flange"])
@@ -186,6 +190,7 @@ class PAR6(DHRobot):
         from utility.tool_link import tool_link_params
 
         grippers = {}
+        self._broken_grippers = {}              # name -> why (review K5): skipped here, refused if it is the active one
         gripper_dir = os.path.join(os.path.dirname(__file__), "..", "grippers")
 
         for xml_path in sorted(glob.glob(os.path.join(gripper_dir, "*.xml"))):
@@ -193,11 +198,18 @@ class PAR6(DHRobot):
                 root = ET.parse(xml_path).getroot()
             except ET.ParseError:
                 continue
+            name = root.get("name")
             # one reader of a gripper's tool link for the model and for RTI's live gripper swap (utility/tool_link.py)
-            p = tool_link_params(root)          # a malformed block raises, as the parse always did
+            try:
+                p = tool_link_params(root)
+            except ValueError as e:             # a malformed <kinematics> block: this gripper only (review K5)
+                if name:
+                    self._broken_grippers[name] = f"{os.path.basename(xml_path)}: {e}"
+                import logging
+                logging.getLogger("config").warning("%s skipped: %s", os.path.basename(xml_path), e)
+                continue
             if p is None:
                 continue
-            name = root.get("name")
             if not name:
                 continue
             grippers[name] = [

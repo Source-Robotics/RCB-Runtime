@@ -104,8 +104,11 @@ class HomingFailed(RobotError):
     `errors` is the list of error keys the robot reported when the homing ended.
     """
 
-    def __init__(self, errors):
+    def __init__(self, errors, why=None):
         self.errors = list(errors)
+        if why:                                     # an ending that latched no error: a stopped homing (review P6)
+            super().__init__(f"homing failed — {why}")
+            return
         listed = ", ".join(self.errors) or "none reported"
         super().__init__(f"homing failed — errors: {listed} (the reason: the dashboard's error list or "
                          f"logs/activity_rti.log)")

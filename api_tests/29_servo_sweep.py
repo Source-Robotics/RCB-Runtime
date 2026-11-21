@@ -198,8 +198,11 @@ def main():
                   f"homed={st.get('homed')}")
             return 1
 
+        rti = None    # one client at a time: the next pass closes the last one's port first
         for rate in rates:
             period = 1.0 / rate
+            if rti is not None:
+                rti.close()    # a second RTIClient on the same UDP port is refused (2026-11-20)
             rti = RTIClient(robot, clock="pc")
             rti.connect(rate_hz=rate)
             time.sleep(0.4)

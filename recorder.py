@@ -93,7 +93,10 @@ def main() -> int:
         t0 = time.monotonic()
         try:
             if reader is None or reader.stale():
-                reader = TraceReader.attach()
+                new_reader = TraceReader.attach()
+                if new_reader is not None and rec is not None:
+                    rec.flush("RTI restarted")             # review I5: its pending incident / capture were dropped
+                reader = new_reader
                 if reader is not None:
                     rec = Recorder(reader.layout, TEMP_DATA_DIR / "incidents", TEMP_DATA_DIR / "captures", activity)
                     rec.apply_settings(settings)
@@ -121,6 +124,7 @@ def main() -> int:
                 rec.on_errors(error_state.get_json(), t0)
                 rec.on_request(capture_request.get_json() or None)
                 rec.capture_overdue()
+                rec.check_stall(reader.writer_pid(), t0)   # review I5: a stall / a dead RTI that latched no error
                 reader.heartbeat()
                 if rec.capture is not None or t0 - last_status > STATUS_IDLE_S:
                     last_status = t0
@@ -134,6 +138,8 @@ def main() -> int:
         except Exception:                                # the recorder must keep running; the supervisor sees a crash
             logger.exception("recorder pass failed")
         time.sleep(max(0.0, POLL_S - (time.monotonic() - t0)))
+    if rec is not None:
+        rec.flush("the recorder is stopping")              # review I5
     logger.info("recorder stopped")
     return 0
 

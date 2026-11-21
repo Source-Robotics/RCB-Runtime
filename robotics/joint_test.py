@@ -29,6 +29,9 @@ ABORT_DEG = 2.0              # behind the commanded motion by more than this: st
 _FELL_BEHIND_TEXT = f"more than {ABORT_DEG:g} deg behind the commanded motion"   # built once: tick builds no string
 MAX_AMPLITUDE_DEG = 15.0     # the executor refuses more
 MAX_SPEED_DPS = 10.0
+# The slowest test (review D14, 2026-11-20): without a floor a tiny speed was a test of hours with the joint on its
+# test current. At 0.5 deg/s the largest one (15 deg) takes ~96 s — bounded, so no timeout of its own.
+MIN_SPEED_DPS = 0.5
 
 IDLE, RUNNING, DONE, FELL_BEHIND, STOPPED = 0, 1, 2, 3, 4
 STATE_NAMES = {IDLE: "idle", RUNNING: "running", DONE: "done", FELL_BEHIND: "fell_behind", STOPPED: "stopped"}
@@ -70,8 +73,9 @@ class JointTest:
     dispatch context (joint_test_joint / _pos / _speed), `rti` the rti shared-memory dict, `dt` the tick (s)."""
 
     def __init__(self, motors, joints, joint_num, velocity_limit, current_limit, ctx, rti, dt, log=None, done=None,
-                 q_meas=None, soft_lo=None, soft_hi=None, motor_data=None):
+                 q_meas=None, soft_lo=None, soft_hi=None, motor_data=None, restore=None):
         self.motors, self.joints, self.joint_num = motors, joints, int(joint_num)
+        self.restore = restore                  # robotics/limit_restore.RestoreResend, shared by the three (review D14)
         # RTI's store of each drive's data replies (utility/data_init: {node: deque of {"position", ...}}): the start
         # position when the drive object's own field is momentarily empty (2026-11-19 — the CAN library clears every
         # field at each message from the drive, so after a non-data reply .position is None until the next data
@@ -130,9 +134,10 @@ class JointTest:
         if other_active:
             return "the Hall sensor check or a freed joint is active — stop it first"
         a, v, c = float(amplitude_deg), float(speed_dps), float(current_ma)
-        if not (0.0 < abs(a) <= MAX_AMPLITUDE_DEG and 0.0 < v <= MAX_SPEED_DPS and 0.0 < c <= self.current_limit[j]):
-            return (f"amplitude 0-{MAX_AMPLITUDE_DEG:g} deg, speed 0-{MAX_SPEED_DPS:g} deg/s, current up to the "
-                    f"joint's limit ({int(self.current_limit[j])} mA)")
+        if not (0.0 < abs(a) <= MAX_AMPLITUDE_DEG and MIN_SPEED_DPS <= v <= MAX_SPEED_DPS
+                and 0.0 < c <= self.current_limit[j]):
+            return (f"amplitude 0-{MAX_AMPLITUDE_DEG:g} deg, speed {MIN_SPEED_DPS:g}-{MAX_SPEED_DPS:g} deg/s, current "
+                    f"up to the joint's limit ({int(self.current_limit[j])} mA)")
         if homed and self.q_meas is not None and self.soft_lo is not None and self.soft_hi is not None:
             q = float(self.q_meas[j])
             end = q + math.radians(a)
@@ -153,6 +158,8 @@ class JointTest:
         self._ticks = 0
         self._moved = self._max_err = self._peak_i = self._end = 0.0
         self._test_ma = c
+        if self.restore is not None and self.restore.joint == j:
+            self.restore.cancel()               # a pending restore of this joint must not undo the test current (D14)
         self._send_limits(j, c)
         self.joint = j
         self.ctx.joint_test_joint = j
@@ -171,6 +178,8 @@ class JointTest:
         j = self.joint
         self._reset_ctx()                       # this tick's dispatch sends the joint its normal command again
         self._send_limits(j, self.current_limit[j])
+        if self.restore is not None:
+            self.restore.arm(j)                 # sent again over the next second (review D14)
         self.joint = None
         r = self.rti["joint_test"]
         r[_I["state"]], r[_I["moved_deg"]] = state, math.degrees(self._moved)

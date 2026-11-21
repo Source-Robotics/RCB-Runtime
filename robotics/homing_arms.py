@@ -389,20 +389,87 @@ def _drive_changes(arm: dict, boards: dict, calibrations: dict) -> list:
     return changed
 
 
+# Review D9 (2026-11-20): an arm entry without one of these keys raised inside RTI's tick at a homing's end; a file that
+# could not be read became an empty table SILENTLY (the arm check off for KNOWN_AFTER homings, and the next save
+# overwrote the file's history). Now each entry is checked on load: one without an id or joints is dropped, a missing
+# optional key gets its default, and a file that is not a readable table is kept as <file>.corrupt-<UTC> first.
+_ARM_DEFAULTS = {"known": False, "homings": 0}      # the keys read with arm[...]; every other one with .get()
+
+
+def _clean_arm(arm):
+    """The entry made safe to judge (a copy), or None when it cannot be (no id, no joints, a latch not a number)."""
+    if not isinstance(arm, dict) or not isinstance(arm.get("id"), str) or not isinstance(arm.get("joints"), dict):
+        return None
+    out = dict(arm)
+    joints = {}
+    for key, lat in arm["joints"].items():
+        if not isinstance(lat, list) or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in lat):
+            return None
+        joints[str(key)] = [int(x) for x in lat]
+    out["joints"] = joints
+    for key, default in _ARM_DEFAULTS.items():
+        if not isinstance(out.get(key), type(default)):
+            out[key] = copy.deepcopy(default)
+    return out
+
+
+def _keep_corrupt(path, why: str) -> None:
+    """A copy of a file that is not a usable table, before anything overwrites it (never raises)."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    dest = f"{path}.corrupt-{stamp}"
+    try:
+        import shutil
+        shutil.copy2(path, dest)
+        logger.warning("arm table %s: %s — kept as %s", path, why, dest)
+    except OSError as exc:
+        logger.warning("arm table %s: %s — and no copy could be kept (%s)", path, why, exc)
+
+
 def load_table(path) -> dict:
+    """The table in `path`, checked (review D9); an empty one when there is no file yet or it is not a table (then a
+    .corrupt copy is kept). Never raises."""
     try:
         with open(path) as fh:
             t = json.load(fh)
-        return t if isinstance(t, dict) and isinstance(t.get("arms"), list) else empty_table()
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return empty_table()                           # a first start: nothing to keep
+    except (OSError, ValueError) as exc:
+        _keep_corrupt(path, f"unreadable ({exc}); starting from an empty table")
         return empty_table()
+    if not isinstance(t, dict) or not isinstance(t.get("arms"), list):
+        _keep_corrupt(path, "not an arm table; starting from an empty table")
+        return empty_table()
+    arms = [_clean_arm(a) for a in t["arms"]]
+    if any(a is None for a in arms):
+        _keep_corrupt(path, f"{sum(a is None for a in arms)} arm entr(y/ies) without an id, joints or number "
+                            f"latches dropped")
+    t["arms"] = [a for a in arms if a is not None]
+    if not isinstance(t.get("last_failed"), (dict, type(None))):
+        t["last_failed"] = None
+    for key in ("relearn", "learn_next"):
+        if key in t and not isinstance(t[key], (dict, bool, type(None))):
+            del t[key]
+    return t
+
+
+def table_text(table: dict) -> str:
+    """The table as the file holds it: compact JSON (review D8, 2026-11-20 — the C encoder, ~1 ms for one arm; the
+    indented file took the pure-Python encoder ~6 ms, holding the GIL RTI's thread shares). Read it with
+    tools/homing_arms.py, or python -m json.tool."""
+    return json.dumps(table, separators=(",", ":"))
+
+
+def save_text(path, text: str) -> None:
+    """Write the table's text atomically. The temporary name is this process's and thread's own (review D9: RTI, the
+    dashboard and the tool shared one)."""
+    tmp = f"{path}.{os.getpid()}-{threading.get_ident()}.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
 
 
 def save_table(path, table: dict) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, "w") as fh:
-        json.dump(table, fh, indent=1)
-    os.replace(tmp, path)
+    save_text(path, table_text(table))
 
 
 class HomingArms:
@@ -479,7 +546,7 @@ class HomingArms:
         recognised the arm used it."""
         self.table["relearn"] = {"gripper": self.gripper, "joints": sorted(int(j) for j in joints)}
         if self._thread is not None:
-            self._q.put(("save", copy.deepcopy(self.table)))
+            self._q.put(("save", table_text(self.table)))     # review D8: text, not a deep copy
 
     def relearn_joints(self) -> set:
         """The joints this homing re-learns (mark_relearn), for the active gripper only."""
@@ -558,7 +625,7 @@ class HomingArms:
         apply(self.table, verdict, latches, self.gripper, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()), {},
               self.prefix)
         if self._thread is not None:
-            self._q.put(("save", copy.deepcopy(self.table)))
+            self._q.put(("save", table_text(self.table)))     # review D8: text, not a deep copy
         d = off[0][1]
         # 2026-11-16 (user: "pause and ask"): the controller asks instead of failing — this text is the question's why
         why = (f"it homed {d:+.2f} deg from where arm {arm_label(arm)} always homes — checked as soon as it homed: a "
@@ -573,7 +640,7 @@ class HomingArms:
         homing's spot as their reference (accept_last); the save is queued. In memory on the RT thread."""
         line = accept_last(self.table, self.gears, self.gripper_dependent, self.counts)
         if self._thread is not None:
-            self._q.put(("save", copy.deepcopy(self.table)))
+            self._q.put(("save", table_text(self.table)))     # review D8: text, not a deep copy
         return line
 
     def judge_and_learn(self, latches: dict, stats: dict | None = None, utc: str | None = None) -> dict:
@@ -594,7 +661,7 @@ class HomingArms:
         if unknown is not None:
             # 2026-10-14 (user): a new arm only on request — here no known arm matches and none was requested
             if self._thread is not None:
-                self._q.put(("save", copy.deepcopy(self.table)))
+                self._q.put(("save", table_text(self.table)))     # review D8: text, not a deep copy
             return unknown
         apply(self.table, verdict, latches, self.gripper, utc, stats, self.prefix)
         verdict["text"] = describe(self.table, verdict)
@@ -609,7 +676,7 @@ class HomingArms:
         if stored:
             verdict["text"] += f" — {stored}"
         if self._thread is not None:
-            self._q.put(("save", copy.deepcopy(self.table)))
+            self._q.put(("save", table_text(self.table)))     # review D8: text, not a deep copy
         return verdict
 
     # ---- the drives' board ids (2026-11-16) ------------------------------------------------------------------------
@@ -734,6 +801,6 @@ class HomingArms:
                 if what == "load":
                     self._fresh = load_table(self.path)
                 elif what == "save":
-                    save_table(self.path, table)
+                    save_text(self.path, table)            # the text table_text made on the RT thread (review D8)
             except Exception as exc:                       # never take homing down over a file
                 logger.warning("arm table %s failed: %s", what, exc)

@@ -51,6 +51,7 @@ import zmq
 
 from project_paths import HIGH_LEVEL_LOG, SYSTEM_XML, ROBOTS_DIR, GRIPPERS_DIR, CELLS_DIR, DATA_RECIPE_DIR, FILTER_CONFIG_PATH, PROJECT_ROOT, TEMP_DATA_DIR
 from utility.code_version import describe as describe_code
+from utility.config_write import edit_lock, write_atomic           # review D10: one edit at a time, its own temp file
 from data.shared_memory_index import (
     ISOLATED_INPUT_1, ISOLATED_INPUT_2, ISOLATED_INPUT_3,
     ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_2, ISOLATED_OUTPUT_3,
@@ -740,6 +741,7 @@ RTI_ANSWER_CODES = {
     "set_joint_wall": ("RTI_REFUSED",),
     "set_log_level": ("RTI_REFUSED",),
     "set_payload": ("RTI_REFUSED",),
+    "set_pid_gains": ("RTI_REFUSED",),          # in FLASHING (review C4, 2026-11-20)
     "set_recipe": ("RTI_REFUSED",),
     "set_sound": ("RTI_REFUSED",),
     "stop": ("RTI_REFUSED",),
@@ -1478,24 +1480,28 @@ def _handle_save_drive_parameter_to_xml(args, cid, conn):
     path = _GRIPPER_XML if gripper else Path(str(_sys['robot_xml_path']))
     key = f"{'gripper' if gripper else 'motor'}_{XML_KEYS[number]}"
     try:
-        before_text = path.read_text()
-        after_text = xml_set_value(before_text, XML_TAGS[number], xml_text(number, value),
-                                   joint_id=None if gripper else node)
-        backups = TEMP_DATA_DIR / "xml_backups"
-        backups.mkdir(parents=True, exist_ok=True)
-        backup = backups / f"{path.stem}.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.xml"
-        backup.write_text(before_text)
-        tmp = path.with_suffix(".xml.tmp")
-        tmp.write_text(after_text)
-        _os.replace(tmp, path)
-        new_cfg = read_XML2.load_full_robot_config(str(_sys['robot_xml_path']), grippers_dir=GRIPPERS_DIR,
-                                                   active_gripper=_sys['active_gripper'])
-        problem = _xml_change_problem(cfg, new_cfg, key, None if gripper else node, float(xml_text(number, value)))
-        if problem:
-            path.write_text(before_text)
-            return reply(conn, {"id": cid, "status": "error", "code": "INTERNAL",
-                                "message": f"save_drive_parameter_to_xml: not saved, {problem} (the file is back as "
-                                           f"it was)"})
+        with edit_lock(path):                          # one edit at a time across processes (review D10)
+            # Review C8 (2026-11-20): compared with the file as it is NOW, not with the configuration this executor
+            # started with — a second save was refused "<the first key> changed too" until the executor restarted.
+            before_cfg = read_XML2.load_full_robot_config(str(_sys['robot_xml_path']), grippers_dir=GRIPPERS_DIR,
+                                                          active_gripper=_sys['active_gripper'])
+            before_text = path.read_text()
+            after_text = xml_set_value(before_text, XML_TAGS[number], xml_text(number, value),
+                                       joint_id=None if gripper else node)
+            backups = TEMP_DATA_DIR / "xml_backups"
+            backups.mkdir(parents=True, exist_ok=True)
+            backup = backups / f"{path.stem}.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.xml"
+            backup.write_text(before_text)
+            write_atomic(path, after_text)
+            new_cfg = read_XML2.load_full_robot_config(str(_sys['robot_xml_path']), grippers_dir=GRIPPERS_DIR,
+                                                       active_gripper=_sys['active_gripper'])
+            problem = _xml_change_problem(before_cfg, new_cfg, key, None if gripper else node,
+                                          float(xml_text(number, value)))
+            if problem:
+                write_atomic(path, before_text)
+                return reply(conn, {"id": cid, "status": "error", "code": "INTERNAL",
+                                    "message": f"save_drive_parameter_to_xml: not saved, {problem} (the file is back "
+                                               f"as it was)"})
     except (OSError, ValueError) as e:
         return reply(conn, {"id": cid, "status": "error", "code": "INTERNAL",
                             "message": f"save_drive_parameter_to_xml: not saved: {e}"})
@@ -1563,10 +1569,11 @@ def _save_active_gripper(name):
     import re as _re
     path = Path(SYSTEM_XML)
     try:
-        before = path.read_text()
+        with edit_lock(path):                          # the read, the edit and the check as one (review D10)
+            before = path.read_text()
+            why = _write_active_gripper(path, name, before, _re)
     except OSError as e:
         return f"system.xml not changed: {e}", None
-    why = _write_active_gripper(path, name, before, _re)
     return why, (None if why else before)
 
 
@@ -1579,13 +1586,11 @@ def _write_active_gripper(path, name, before, _re):
         backups = TEMP_DATA_DIR / "xml_backups"
         backups.mkdir(parents=True, exist_ok=True)
         (backups / f"system.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.xml").write_text(before)
-        tmp = path.with_suffix(".xml.tmp")
-        tmp.write_text(after)
-        _os.replace(tmp, path)
+        write_atomic(path, after)                      # under _save_active_gripper's edit lock (review D10)
         read_XML2.load_system_config(SYSTEM_XML, ROBOTS_DIR)            # the file still parses as a whole
         # its own <active_gripper> (2026-11-18: not the parser's answer, which a test's RCB_ACTIVE_GRIPPER replaces)
         if (read_XML2.ET.parse(str(path)).getroot().findtext("active_gripper") or "").strip() != name:  # nosec B314
-            _put_back_system_xml(before)
+            write_atomic(path, before)                 # put back (the lock is held: never _put_back_system_xml here)
             return "system.xml did not read back the new gripper (it is back as it was)"
     except (OSError, ValueError, KeyError, read_XML2.ET.ParseError) as e:
         return f"system.xml not changed: {e}"
@@ -1593,12 +1598,12 @@ def _write_active_gripper(path, name, before, _re):
 
 
 def _put_back_system_xml(before):
-    """system.xml back to `before` (a temporary file, then a rename). -> None or why not."""
+    """system.xml back to `before` (a temporary file, then a rename), under its edit lock (review D10 — never call it
+    while holding that lock). -> None or why not."""
     path = Path(SYSTEM_XML)
     try:
-        tmp = path.with_suffix(".xml.tmp")
-        tmp.write_text(before)
-        _os.replace(tmp, path)
+        with edit_lock(path):
+            write_atomic(path, before)
     except OSError as e:
         return str(e)
     return None
@@ -1790,17 +1795,16 @@ def _handle_set_sound(args, cid, conn):
     texts = {k: sound_text(k, v) for k, v in args.items()}
     path = Path(SYSTEM_XML)
     try:
-        before = path.read_text()
-        after = set_values_in_block(before, "sound", texts)
-        got = _parse_sound(read_XML2.ET.fromstring(after).find("sound"))     # nosec B314 — our own file
-        if any(sound_text(k, got[k]) != v for k, v in texts.items()):
-            raise ValueError("the edited <sound> block does not read back the values")
-        backups = TEMP_DATA_DIR / "xml_backups"
-        backups.mkdir(parents=True, exist_ok=True)
-        (backups / f"system.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.xml").write_text(before)
-        tmp = path.with_suffix(".xml.tmp")
-        tmp.write_text(after)
-        _os.replace(tmp, path)
+        with edit_lock(path):                          # one edit at a time across processes (review D10)
+            before = path.read_text()
+            after = set_values_in_block(before, "sound", texts)
+            got = _parse_sound(read_XML2.ET.fromstring(after).find("sound"))     # nosec B314 — our own file
+            if any(sound_text(k, got[k]) != v for k, v in texts.items()):
+                raise ValueError("the edited <sound> block does not read back the values")
+            backups = TEMP_DATA_DIR / "xml_backups"
+            backups.mkdir(parents=True, exist_ok=True)
+            (backups / f"system.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.xml").write_text(before)
+            write_atomic(path, after)
     except (OSError, ValueError, read_XML2.ET.ParseError) as e:
         return reply(conn, {"id": cid, "status": "error", "code": "INTERNAL",
                             "message": f"set_sound: not saved (system.xml unchanged): {e}"})
@@ -1809,8 +1813,9 @@ def _handle_set_sound(args, cid, conn):
 
 
 def _xml_change_problem(old_cfg, new_cfg, key, joint, value):
-    """None when the re-parsed configuration differs from the one this executor started with only in `key` (its
-    `joint`'s entry, or the gripper's) and holds `value` there; else what differs."""
+    """None when the re-parsed configuration differs from `old_cfg` — the file as it was just before this edit (review
+    C8, 2026-11-20; it was the configuration this executor started with) — only in `key` (its `joint`'s entry, or the
+    gripper's) and holds `value` there; else what differs."""
     def same(a, b):
         try:
             return bool(np.array_equal(np.asarray(a, dtype=float), np.asarray(b, dtype=float), equal_nan=True))
@@ -2488,14 +2493,15 @@ def _arg_jog_percent(v):
 # Each joint's current limit as the drive has it now (2026-10-24): set_pid_gains changes it, and joint_test checked
 # against the start-up value while RTI checks the live one — an "ok" here, refused silently there.
 _live_ilim = [float(v) for v in cfg['motor_Ilim'][:JOINT_NUM]]
-_JOINT_TEST_MAX_DEG = 15.0          # robotics/joint_test.py MAX_AMPLITUDE_DEG / MAX_SPEED_DPS
+_JOINT_TEST_MAX_DEG = 15.0          # robotics/joint_test.py MAX_AMPLITUDE_DEG / MAX_SPEED_DPS / MIN_SPEED_DPS
 _JOINT_TEST_MAX_DPS = 10.0
+_JOINT_TEST_MIN_DPS = 0.5           # review D14 (2026-11-20): a tiny speed was a test of hours on the test current
 
 
 def _handle_joint_test(args, cid, conn):
     """joint_test [joint, amplitude_deg, speed_dps, current_ma] — a small powered test move of one joint and back
     (robotics/joint_test.py, 2026-10-18); [0, ...] stops it. Each value checked here (BAD_ARGS, nothing sent): the
-    joint 1..N, 0 < |amplitude| <= 15 deg, 0 < speed <= 10 deg/s, 0 < current <= that joint's current limit."""
+    joint 1..N, 0 < |amplitude| <= 15 deg, 0.5 <= speed <= 10 deg/s, 0 < current <= that joint's current limit."""
     def bad(msg):
         _log_exec_reject(cid, "BAD_ARGS", msg, command=_fmt_command("joint_test", args))
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
@@ -2508,9 +2514,9 @@ def _handle_joint_test(args, cid, conn):
     if not 0 <= j <= JOINT_NUM:
         return bad(f"joint_test: joint {j} — expected 1-{JOINT_NUM}, or 0 to stop")
     if j and not (all(math.isfinite(x) for x in (a, v, c)) and 0 < abs(a) <= _JOINT_TEST_MAX_DEG
-                  and 0 < v <= _JOINT_TEST_MAX_DPS and 0 < c <= _live_ilim[j - 1]):
-        return bad(f"joint_test: amplitude 0-{_JOINT_TEST_MAX_DEG:g} deg, speed 0-{_JOINT_TEST_MAX_DPS:g} deg/s, "
-                   f"current up to J{j}'s limit ({_live_ilim[j - 1]:.0f} mA)")
+                  and _JOINT_TEST_MIN_DPS <= v <= _JOINT_TEST_MAX_DPS and 0 < c <= _live_ilim[j - 1]):
+        return bad(f"joint_test: amplitude 0-{_JOINT_TEST_MAX_DEG:g} deg, speed {_JOINT_TEST_MIN_DPS:g}-"
+                   f"{_JOINT_TEST_MAX_DPS:g} deg/s, current up to J{j}'s limit ({_live_ilim[j - 1]:.0f} mA)")
     _answered(conn, cid, _fmt_command("joint_test", [j, a, v, c]), f"joint_test:{j}:{a!r}:{v!r}:{c!r}")
 
 

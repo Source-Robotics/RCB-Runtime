@@ -32,7 +32,7 @@ import queue
 import re
 import sys
 import time
-from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler, WatchedFileHandler
 
 
 _FMT = "%(levelname)-8s | %(asctime)s | %(tick)9s | %(name)-13s | %(message)s"
@@ -144,7 +144,7 @@ def _is_terminal(stream) -> bool:
 
 
 def setup_logging(log_file: str = "logs/system.log", log_to_console: bool = True, critical_log_file: str | None = None,
-                  queued: bool = False) -> QueueListener | None:
+                  queued: bool = False, critical_rotates: bool = True) -> QueueListener | None:
     """
     Configure the root logger for the process. Returns the QueueListener when `queued`, else None.
 
@@ -185,7 +185,7 @@ def setup_logging(log_file: str = "logs/system.log", log_to_console: bool = True
     os.makedirs(os.path.dirname(log_file) or "logs", exist_ok=True)
     formatter = make_formatter()
 
-    handlers = []
+    handlers: list[logging.Handler] = []
     # Main rotating file handler (10 MB x 5 backups = up to 50 MB history)
     file_handler = RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=5)
     file_handler.setFormatter(formatter)
@@ -200,7 +200,12 @@ def setup_logging(log_file: str = "logs/system.log", log_to_console: bool = True
     # Optional persistent CRITICAL-only log (larger backups, survives restarts)
     if critical_log_file:
         os.makedirs(os.path.dirname(critical_log_file) or "logs", exist_ok=True)
-        critical_handler = RotatingFileHandler(critical_log_file, maxBytes=5_000_000, backupCount=10)
+        # ONE process rotates it (review I6, 2026-11-20): RTI and the supervisor both did, each renaming the file under
+        # the other (lines lost into a renamed copy, backups shifted twice). critical_rotates=False (the supervisor):
+        # a WatchedFileHandler, which re-opens the file when RTI's rotation replaced it.
+        critical_handler: logging.FileHandler = (
+            RotatingFileHandler(critical_log_file, maxBytes=5_000_000, backupCount=10)
+            if critical_rotates else WatchedFileHandler(critical_log_file))
         critical_handler.setLevel(logging.CRITICAL)
         critical_handler.setFormatter(formatter)
         handlers.append(critical_handler)

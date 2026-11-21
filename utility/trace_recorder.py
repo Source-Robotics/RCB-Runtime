@@ -37,6 +37,20 @@ from utility.recorder_settings import HISTORY_EXTRA_S
 
 logger = logging.getLogger("rec")  # docs/logging.md "Logger names"
 STALL_EXTRA_S = 3.0          # an incident's after-window waits this much longer for rows before it is written anyway
+# Review I5 (2026-11-20): rows that stop this long while the trace's writer (RTI) has not stopped cleanly = an
+# incident of its own — TRACE_STOPPED (RTI alive: a stall, as the 194 s one of 2026-10-16 that latched nothing) or
+# RTI_DIED (its process gone). A clean stop (RTI's SIGTERM) clears the writer pid: nothing then. The longest normal
+# pause, the start-up self-check, is 0.4 s.
+TRACE_STALL_S = 2.0
+
+
+def pid_alive(pid: int) -> bool:
+    """Is process `pid` alive (a zombie counts as gone)?"""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            return fh.read().split(") ")[-1][:1] not in ("Z", "X")
+    except OSError:
+        return False
 
 
 class Recorder:
@@ -68,6 +82,51 @@ class Recorder:
         self._last_seq = None
         self.capture = None                  # the running capture, or None
         self.captured: list = []
+        self._last_rows_mono = None          # when rows last came (review I5)
+        self._stall_noted = False            # this stop of the rows judged already (once per stop)
+        self.stalls = 0
+
+    def flush(self, why: str) -> None:
+        """Write every pending incident with the rows it has, and finish a running capture — before this recorder is
+        replaced (RTI restarted: a new generation) or stops (review I5: both were dropped). Never raises."""
+        for p in list(self.pending):
+            self.pending.remove(p)
+            try:
+                self._write_incident(p)
+                logger.info(f"incident {', '.join(p['keys'])} written early: {why}")
+            except Exception:                                         # one failed write must not lose the others
+                logger.exception(f"incident {', '.join(p['keys'])} could not be written ({why})")
+        if self.capture is not None:
+            self.capture["gaps"] += 1
+            self.capture["stopped"] = True
+            try:
+                self._finish_capture()
+            except Exception:
+                logger.exception(f"the running capture could not be written ({why})")
+
+    def check_stall(self, writer_pid: int, now=None):
+        """The trace's rows stopped TRACE_STALL_S ago and the writer did not stop cleanly: an incident TRACE_STOPPED
+        (the writer alive) or RTI_DIED (gone), with the history it has — once per stop. Returns the key, or None."""
+        now = time.monotonic() if now is None else now
+        if self._last_rows_mono is None or self._stall_noted or now - self._last_rows_mono < TRACE_STALL_S:
+            return None
+        self._stall_noted = True
+        if not writer_pid:                                            # stopped on purpose (or an older RTI)
+            return None
+        key = "TRACE_STOPPED" if pid_alive(writer_pid) else "RTI_DIED"
+        self.flush(f"the trace stopped ({key})")
+        tick = self.newest_tick()
+        if tick is None:
+            return key
+        self.stalls += 1
+        self._last_incident = now
+        logger.warning(f"{key}: no trace row for {now - self._last_rows_mono:.1f} s (RTI's process {writer_pid} "
+                       f"{'alive: a stall' if key == 'TRACE_STOPPED' else 'gone'}) — the last rows saved as an incident")
+        try:
+            self._write_incident({"keys": [key], "tick": tick, "wall": time.time(), "mono": now})
+        except Exception:
+            logger.exception(f"{key}: the incident could not be written")
+        return key
 
     def apply_settings(self, values) -> None:
         """The windows, the files kept and the rate limit (utility/recorder_settings keys). The history grows or
@@ -130,6 +189,8 @@ class Recorder:
         for row in block:
             self._buf[self._n % self._cap_rows] = row
             self._n += 1
+        if len(block):
+            self._last_rows_mono, self._stall_noted = now, False      # rows again: the next stop is judged anew
         if self.capture is not None and len(block):
             self._capture_take(block)
         newest = self.newest_tick()

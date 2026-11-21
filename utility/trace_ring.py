@@ -26,6 +26,7 @@ weakly-ordered CPU) and drops a row whose sequence number changed while it copie
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import numpy as np
@@ -35,8 +36,13 @@ READ_LAG = 2                 # rows a reader leaves behind COUNT
 SCALARS = ("timestamp", "exec_t", "tick", "rti_seq", "rti_ok", "rti_miss", "rti_state", "mode", "period_ms",
            "can_read_t")
 H_COUNT, H_GENERATION, H_WIDTH, H_ROWS, H_TICK_S, H_REC_HEARTBEAT, H_REC_TIME = range(7)
+# The writer's process id while it runs; 0 once it stopped cleanly (RTI's SIGTERM: mark_clean_stop) — the recorder
+# tells a stall (alive, no rows) from a death (gone, still set) and from a stop (0) (review I5, 2026-11-20). The head's
+# spare slot: its size is unchanged, and an RTI from before leaves it 0 = "stopped cleanly" (no false incidents).
+H_WRITER_PID = 7
 REC_ALIVE_S = 1.0            # the recorder passes 20 times a second; older than this = not running
 HEAD_SIZE = 8
+_active_head = None          # the head of the writer in THIS process (mark_clean_stop)
 LAYOUT_BYTES = 16384
 
 
@@ -91,6 +97,9 @@ class TraceWriter:
         self._head[H_ROWS] = self.rows
         self._head[H_TICK_S] = float(tick_s)
         _layout_string().set(json.dumps(self.layout))
+        self._head[H_WRITER_PID] = float(os.getpid())         # review I5: a stall vs a death vs a clean stop
+        global _active_head
+        _active_head = self._head
         self._head[H_GENERATION] = generation                 # last: a reader re-attaches when it changes
 
     def write(self, timestamp, exec_t, tick, rti_seq, rti_ok, rti_miss, rti_state, mode, period_ms, can_read_t):
@@ -114,6 +123,16 @@ class TraceWriter:
         row[0] = n
         self._head[H_COUNT] = n
         self._n = n
+
+
+def mark_clean_stop() -> None:
+    """RTI is stopping on purpose (its SIGTERM handler, before shared memory goes): the trace's writer pid -> 0, so the
+    recorder does not take the rows that stop now for a stall or a crash (review I5). Never raises."""
+    try:
+        if _active_head is not None:
+            _active_head[H_WRITER_PID] = 0.0
+    except (ValueError, TypeError, IndexError):  # nosec B110 — the mapping already gone: nothing to mark
+        pass
 
 
 class TraceReader:
@@ -141,6 +160,10 @@ class TraceReader:
     def stale(self) -> bool:
         """RTI restarted (a new generation): attach() again."""
         return float(self._head[H_GENERATION]) != self.generation
+
+    def writer_pid(self) -> int:
+        """The writer's process id; 0 once it stopped cleanly (or an RTI from before this field)."""
+        return int(self._head[H_WRITER_PID])
 
     def poll(self, lag: int = READ_LAG):
         """The rows written since the last poll (oldest first, a copy) and how many were lost (overwritten before they

@@ -80,19 +80,47 @@ def save(directory, wall_time, tick, keys, channels, ticks, kind="incident", kee
     stamp = time.strftime('%Y%m%d_%H%M%S', time.gmtime(wall_time))
     path = directory / (f"{stamp}_{safe}.npz" if kind == "capture" else f"{stamp}_{int(tick)}_{safe}.npz")
     tmp = path.with_suffix(".tmp.npz")
-    np.savez_compressed(tmp, **{_META_KEY: np.array(json.dumps(meta))}, **channels)
-    os.replace(tmp, path)
+    try:
+        np.savez_compressed(tmp, **{_META_KEY: np.array(json.dumps(meta))}, **channels)
+        os.replace(tmp, path)
+    except BaseException:
+        # review I5 (2026-11-20): a failed write (a full SD card) left the .tmp.npz, which prune counted as a file —
+        # leftovers pushed real incidents out of the newest `keep`
+        try:
+            tmp.unlink()
+        except OSError:  # nosec B110 — never made: the write's own error is raised
+            pass
+        raise
     prune(directory, keep)
     return path
 
 
+TMP_STALE_S = 600.0              # a .tmp.npz older than this is a leftover of a write that never finished
+
+
 def prune(directory, keep) -> None:
-    """Keep the newest `keep` .npz files in `directory` (by modification time)."""
-    files = sorted(Path(directory).glob("*.npz"), key=lambda p: p.stat().st_mtime)
-    for old in files[:-keep] if keep > 0 else []:
+    """Keep the newest `keep` .npz files in `directory` (by modification time). Temporary files (.tmp.npz) never count
+    (review I5); one older than TMP_STALE_S is a leftover and is removed."""
+    now = time.time()
+    files = []
+    for p in Path(directory).glob("*.npz"):
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue                                     # gone meanwhile
+        if p.name.endswith(".tmp.npz"):
+            if now - mtime > TMP_STALE_S:
+                try:
+                    p.unlink()
+                except OSError:  # nosec B110 — removed by another pass
+                    pass
+            continue
+        files.append((mtime, p))
+    files.sort(key=lambda mp: mp[0])
+    for _mtime, old in files[:-keep] if keep > 0 else []:
         try:
             old.unlink()
-        except OSError:
+        except OSError:  # nosec B110 — removed by another pass
             pass
 
 

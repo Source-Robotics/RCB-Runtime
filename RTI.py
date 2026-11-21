@@ -20,6 +20,10 @@ import os
 # at NORMAL priority on core 0 that the RT loop would have to wait on for any BLAS call large enough to be
 # split (2026-10-01). RTI's linear algebra is 6x6 — one thread is always right. setdefault: overridable.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+# BEFORE anything imports data.shared_data (review I3, 2026-11-20): RTI owns the shared memory layout — it alone may
+# recreate a segment of another size and resets the one-shot signals; every other process refuses a layout it does
+# not share. shared_data reads (and removes) this at its import, so no process RTI starts inherits it.
+os.environ["RCB_SHM_OWNER"] = "1"
 import time
 import signal
 import atexit
@@ -70,10 +74,11 @@ from utility.error_checks import (
     CLEAR_ERROR_SETTLE_TICKS, CLEAR_ERROR_SEND_REPEATS, BOOT_CLEAR_TICK, _WARNING_SUFFIXES,
 )
 from utility.activity_log import get_rti_activity_logger, log_activity, note_origin
-from utility.trace_ring import TraceWriter
+from utility.trace_ring import TraceWriter, mark_clean_stop
 from robotics.hall_check import HallCheck, hall_joint_index
 from robotics.free_joint import FreeJoint
 from robotics.joint_test import JointTest
+from robotics.limit_restore import RestoreResend
 from robotics.homing import HomingController
 from robotics.homing_arms import HomingArms
 from motion.rti_handler import RTIModeHandler
@@ -93,7 +98,7 @@ from utility.can_reply_monitor import CanReplyMonitor
 # ==========================================================================
 from hardware.gpio_handler import (
     initialize_gpio, update_gpio, check_estop_active, write_all_outputs, read_inputs_into_shared, configure_estop,
-    set_output, set_output_high, set_output_low, toggle_output, HIGH, LOW,
+    estop_channel_fault, outputs_off_at_exit, set_output, set_output_high, set_output_low, toggle_output, HIGH, LOW,
     ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_2, ISOLATED_OUTPUT_3
 )
 from hardware.motor_setup import setup_motor_system
@@ -468,6 +473,7 @@ def main():
 
     # Build homing controller from XML config
     homing_ctrl = HomingController.from_config(cfg, joint_num)
+    homing_ctrl.question_timeout_s = _sys['homing_question_timeout_s']       # review D7: system.xml policy
     # 2026-10-09 (TODO/homing_plan.md H1): which arm is connected, and did every joint home where THIS arm's joint always
     # homes (a false stall / skipped belt fails homing). The table is read here; a worker thread off this core re-reads it
     # when a homing starts and writes it when one ends — the loop itself touches no file.
@@ -559,6 +565,13 @@ def main():
             _gripper_fw_state['position'] = pos
 
     _gripper_err_prev = [False]          # the error pass's last error_active: an error latching holds the jaws
+    # Review C17 (2026-11-20): a drive that does not answer makes the start-up self-check (tick 8) wait its whole 0.4 s
+    # — no command goes out meanwhile, so every HEALTHY drive's 100 ms watchdog trips after the start-up clear, and the
+    # error list blamed all of them in exactly the case a builder is troubleshooting. A self-check that held the loop
+    # past half the drive watchdog sends the start-up clear again two ticks later (after a tick of commands restarted
+    # every timer); the drives' own faults are read from the settle after the LAST start-up clear.
+    _late_boot_clear_tick = [-1]
+    _driver_faults_after = [BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS]
     # Calibrate state machine. After Send_gripper_calibrate fires, the bus must be
     # held with *empty* Send_gripper_data_pack() polls — resuming the full data
     # pack mid-calibration cancels it. Its end (2026-10-24, as homing's robotics/homing/gripper.py): the gripper's
@@ -869,12 +882,13 @@ def main():
         RTI sent (from the start-up read; skipped when a homing ran meanwhile — its current limit is the homing's), and
         each is the product its XML's <driver_type> declares. Once, at DRIVE_CHECKS_TICK. A gains mismatch is a
         warning; a product mismatch a hard error re-raised every tick (the arm cannot be enabled)."""
-        from utility.drive_checks import GAIN_NAMES, gains_mismatches, product_mismatch, sent_values
+        from utility.drive_checks import (BRAKE, BRAKE_ON_IDLE, GAIN_NAMES, gains_mismatches, product_mismatch,
+                                          sent_values)
         from utility.drive_params import READ, SLOTS
         vals, states = shared_data.rti["drive_params"], shared_data.rti["drive_params_state"]
         nodes = [(f"J{j + 1}", j, sent_values(motor_KPP[j], motor_KPV[j], motor_KIV[j], motor_KPIQ[j], motor_KIIQ[j],
                                               motor_KP[j], motor_KD[j], motor_velocity_limit[j], motor_Ilim[j],
-                                              motor_voltage_limit[j]), cfg['motor_driver_type'][j])
+                                              motor_voltage_limit[j], brake=BRAKE), cfg['motor_driver_type'][j])
                  for j in range(joint_num)]
         if active_CAN_gripper:
             nodes.append(("GRIPPER", joint_num, sent_values(st.gripper_KPP, st.gripper_KPV, st.gripper_KIV,
@@ -892,6 +906,9 @@ def main():
                     found.append(f"{label}:GAINS_MISMATCH_WARNING")
                     log_startup.warning("%s: the drive holds %s — not what RTI sent (a config frame lost?)", label,
                                         "; ".join(f"{GAIN_NAMES[n]} {h:g} (sent {v:g})" for n, v, h in bad))
+                    if any(n == BRAKE_ON_IDLE for n, _v, _h in bad):     # coasting when idle: J2 / J3 would drop
+                        send_brake_on_idle(Motor, (node,))                 # (review D12) — sent again at once
+                        log_startup.warning("%s: brake on idle sent again", label)
             why = product_mismatch(driver_type, getattr(Motor[node], "product_id", None))
             if why:
                 found.append(f"{label}:DRIVE_PRODUCT_MISMATCH")
@@ -1091,6 +1108,9 @@ def main():
     # Graceful shutdown — cleanup shared memory on exit / SIGTERM
     # ==========================================================================
     atexit.register(shared_data.cleanup)
+    # Every isolated output LOW as RTI ends (review D15, 2026-11-20): registered AFTER shared_data.cleanup, so it runs
+    # BEFORE it (atexit is last-in, first-out); the SIGTERM handler below calls it first itself.
+    atexit.register(outputs_off_at_exit)
 
     # 2026-10-06: a stop still hangs now and then until systemd's 90 s SIGKILL (10-03 09:43, 10-06 16:12 — the latter
     # with the two SIGTERMs' handlers NESTED and no "atexit reached"; nothing names where it waits). So the handler
@@ -1102,6 +1122,8 @@ def main():
     def _handle_sigterm(_signum, _frame):
         faulthandler.dump_traceback_later(SHUTDOWN_WATCHDOG_S, exit=True)
         logger.info("SIGTERM received — shutting down gracefully.")
+        outputs_off_at_exit()                      # the outputs LOW while shared memory is still there (review D15)
+        mark_clean_stop()                          # the recorder: a stop, not a stall or a crash (review I5)
         shared_data.cleanup()
         logger.info("shared memory released — raising SystemExit.")   # breadcrumb (2026-10-03 hang)
         sys.exit(0)
@@ -1222,19 +1244,24 @@ def main():
         motor_buffers=motor_buffers,
     )
 
+    # The restore of a joint's live limits when one of the three below ends, sent again over a second while IDLE
+    # (robotics/limit_restore.py, review D14, 2026-11-20) — one for all three: they never run together.
+    limit_restore = RestoreResend(Motor, motor_velocity_limit, motor_Ilim)
     # The Hall sensor check (robotics/hall_check.py, 2026-10-13): the robot XML's <has_hall_sensor> joint, its live
     # limits (stop() restores them; PID apply edits these arrays in place).
     hall_check = HallCheck(Motor, hall_joint_index(cfg['has_hall_sensor'], joint_num), motor_velocity_limit, motor_Ilim,
-                           ctx, shared_data.rti, shared_data.joint['joint_position'], log=log_homing.info)
+                           ctx, shared_data.rti, shared_data.joint['joint_position'], log=log_homing.info,
+                           restore=limit_restore)
     # One joint freed for hand turning (robotics/free_joint.py, 2026-10-18; the first-run check's S3) — the same live
     # limits as the Hall check; never both at once.
-    free_joint = FreeJoint(Motor, joint_num, motor_velocity_limit, motor_Ilim, shared_data.rti, log=log_homing.info)
+    free_joint = FreeJoint(Motor, joint_num, motor_velocity_limit, motor_Ilim, shared_data.rti, log=log_homing.info,
+                           restore=limit_restore)
     # A small powered test move of one joint, homed or not (robotics/joint_test.py, 2026-10-18; the first-run check's
     # stage 3) — the same live limits; never beside the Hall check or a freed joint.
     joint_test = JointTest(Motor, Joint, joint_num, motor_velocity_limit, motor_Ilim, ctx, shared_data.rti, delta_t,
                            q_meas=shared_data.joint['joint_position'],
                            soft_lo=cfg['software_joint_limit_negative'], soft_hi=cfg['software_joint_limit_positive'],
-                           log=log_homing.info, motor_data=Motor_data,
+                           log=log_homing.info, motor_data=Motor_data, restore=limit_restore,
                            done=lambda text: log_activity(_rti_activity_logger, "RTI", "info", "JOINT_TEST", message=text))
 
     MODE_HANDLERS = build_mode_dispatch(
@@ -1621,12 +1648,19 @@ def main():
 
 
     def _handle_clear_errors(cmd_msg, cmd_dict):
-        send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
-                          Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper)
+        # Review C4 (2026-11-20): in FLASHING (a maintenance mode) the latch is cleared WITHOUT the drives' CAN clear —
+        # the bus stays quiet while a drive is flashed; the documented thing to press there must not break the flash.
+        quiet = st.current_mode in MAINTENANCE_MODES
+        if not quiet:
+            send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
+                              Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper)
+        else:
+            log_handler.info("clear_errors in %s: the latch only — no CAN clear to the drives (a quiet bus)",
+                             st.current_mode)
         note_clear(st.latched_errors)              # only these are wiped after the settle (review C3, 2026-11-20)
         st.clear_error_countdown = CLEAR_ERROR_SETTLE_TICKS
-        if shared_data.rti["loop_tick"][0] > CAPTURE_ARM_TICK:   # the fault captures again (a drive that rebooted lost it)
-            drive_capture.rearm(range(joint_num + (1 if active_CAN_gripper else 0)))
+        if not quiet and shared_data.rti["loop_tick"][0] > CAPTURE_ARM_TICK:   # the fault captures again (a drive
+            drive_capture.rearm(range(joint_num + (1 if active_CAN_gripper else 0)))   # that rebooted lost it)
 
 
     def _handle_gravity_comp(cmd_msg, cmd_dict):
@@ -1787,8 +1821,14 @@ def main():
         log_handler.info("reading the parameters of %s (%d requests, paced in the poll slot)",
                      "every drive" if node == -1 else f"node {node}", int(shared_data.rti["drive_params_read"][2]))
 
+    _MAINTENANCE_NO_CAN = ("FLASHING keeps the bus quiet while a drive is flashed: nothing is sent to a drive now — "
+                           "leave FLASHING first")
+
     def _drive_write_refusal(node):
-        """Why a drive's parameter may not be written / saved now, or None (2026-11-16: the arm disabled, a drive here)."""
+        """Why a drive's parameter may not be written / saved now, or None (2026-11-16: the arm disabled, a drive here;
+        review C4, 2026-11-20: never in a maintenance mode — FLASHING's quiet bus)."""
+        if st.current_mode in MAINTENANCE_MODES:
+            return _MAINTENANCE_NO_CAN
         if shared_data.robot_state.get() == "ENABLED":
             return "disable the arm first: a drive's parameters are written only while the arm is disabled"
         if node not in range(joint_num + (1 if active_CAN_gripper else 0)):
@@ -2002,6 +2042,7 @@ def main():
             name_of_the_gripper = new['gripper_name']
             _GRIPPER_CALIBRATE_MIN_TICKS = _calibration_wait_ticks(new)
             fresh = HomingController.from_config(new, joint_num)
+            fresh.question_timeout_s = homing_ctrl.question_timeout_s           # review D7: the same policy
             fresh.arm_check = homing_ctrl.arm_check
             fresh.arm_check.gripper = new['gripper_name']
             homing_ctrl = fresh
@@ -2049,6 +2090,9 @@ def main():
         a drive whose flash keeps a second settings block (its identity flag; else the id is lost at power-off). The
         tool check (_gripper_tool_check) reads it back from the drive's next identity reply."""
         from utility.drive_checks import tool_name
+        if st.current_mode in MAINTENANCE_MODES:        # review C4: a parameter write + a flash save — FLASHING's quiet bus
+            _refused(log_handler, "tool_id refused: %s", _MAINTENANCE_NO_CAN)
+            return
         try:
             tool = int(cmd_msg.split(":", 1)[1])
         except (IndexError, ValueError):
@@ -2382,6 +2426,9 @@ def main():
 
 
     def _handle_set_pid_gains(cmd_msg, cmd_dict):
+        if st.current_mode in MAINTENANCE_MODES:        # review C4: its config reload is CAN frames — FLASHING's quiet bus
+            _refused(log_handler, "set_pid_gains refused: %s", _MAINTENANCE_NO_CAN)
+            return
         _joint = int(cmd_dict.get("joint", -1))
         if 0 <= _joint < joint_num:
             if "KPP"     in cmd_dict: motor_KPP[_joint]            = float(cmd_dict["KPP"])
@@ -3180,6 +3227,8 @@ def main():
             st.clear_error_countdown, st.latched_errors, st.error_metadata,
             _gripper_errors_active(), st.current_mode, homing_ctrl,     # 0 while the gripper is being changed
             check_estop_active(),
+            estop_channel_fault=estop_channel_fault(),   # after check_estop_active, which updates it (review D15)
+            disk_low=shared_data.rti['disk_low'][0] >= 0.5,  # the supervisor's flag, every 30 s (review I6)
             Gripper_data=Gripper_data,
             exec_link_lost=_exec_link_lost,
             # RTI command watchdog. A KEY, not a direct error_active write — this
@@ -3202,12 +3251,20 @@ def main():
             monitor_warnings=safety_monitor.warnings,
             # The settle after the start-up clear (sent at tick BOOT_CLEAR_TICK): a driver reports the watchdog trip the
             # last run's end and the set-up left it until the clear lands.
-            driver_faults=_tick_now > BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS,
+            driver_faults=_tick_now > _driver_faults_after[0],    # a late start-up clear moves it (review C17)
             homing_errors=st.homing_failures,
             detail_of=_fault_detail,
         )
         if st.homing_failures:
             st.homing_failures.clear()             # latched by the call above (the latch keeps them until Clear Errors)
+        # Review C5 (2026-11-20): the error pass changed the mode (EXEC / JOG / RTI / SOFT_RTI -> ACTIVE_ERROR) without
+        # the old handler's exit(), as a normal mode change calls it: EXEC's exec_paused / exec_stopping stayed 1 through
+        # ACTIVE_ERROR and IDLE (a wait on them hung) and its batches stayed queued; a jog session or an RTI claim stayed
+        # open. HOMING is left out: the error pass ends it itself (homing_ctrl.exit). The plain-function modes have none.
+        if st.current_mode != _mode_before_errors and _mode_before_errors != RobotMode.HOMING:
+            _err_old_handler = MODE_HANDLERS.get(_mode_before_errors)
+            if _err_old_handler is not None and hasattr(_err_old_handler, 'exit'):
+                _err_old_handler.exit(ctx)
         _err_now = bool(shared_data.rti['error_active'][0])
         if _err_now and not _gripper_err_prev[0]:  # an error latched: the jaws stop where they are (2026-10-24)
             _freeze_gripper("an error latched")
@@ -3367,16 +3424,19 @@ def main():
             _arm_captures_at_start()
         if _tick_now == SOUND_BOOT_TICK:
             _sound_boot()
-        if _tick_now == BOOT_CLEAR_TICK:
+        if _tick_now == BOOT_CLEAR_TICK or _tick_now == _late_boot_clear_tick[0]:
             send_clear_errors(shared_data, Motor, Motor_errors_data, joint_num, CLEAR_ERROR_SEND_REPEATS,
                               Gripper_data=Gripper_data, active_CAN_gripper=active_CAN_gripper, all_motors=True)
+            if _tick_now != BOOT_CLEAR_TICK:                  # the late one (review C17)
+                _driver_faults_after[0] = _tick_now + CLEAR_ERROR_SETTLE_TICKS
             log_errors.info("start-up clear sent to every driver at tick %d; their own faults are read from "
-                         "tick %d.", BOOT_CLEAR_TICK, BOOT_CLEAR_TICK + CLEAR_ERROR_SETTLE_TICKS + 1)
+                         "tick %d.", _tick_now, _driver_faults_after[0] + 1)
 
         # ==========================================================================
         # Run selfcheck (only once at startup)
         # ==========================================================================
         if st.startup_selfcheck == 0 and _tick_now == 8:
+            _selfcheck_t0 = time.monotonic()
             scan_ids = scan_can_bus(communication=communication1)
             shared_data.rti["scan_received_ids"][:] = scan_ids
             run_selfcheck(
@@ -3387,6 +3447,13 @@ def main():
                 shared_data=shared_data,
                 scan_received_ids=scan_ids,
             )
+            _selfcheck_ms = 1e3 * (time.monotonic() - _selfcheck_t0)
+            if _selfcheck_ms >= 0.5 * float(_sys['drive_watchdog_ms']):          # review C17
+                _late_boot_clear_tick[0] = _tick_now + 2
+                log_errors.warning("the start-up self-check held the loop %.0f ms (a drive did not answer; the drive "
+                                   "watchdog is %d ms): the start-up clear goes out again at tick %d, so the healthy "
+                                   "drives' watchdog trips are not blamed on them", _selfcheck_ms,
+                                   int(_sys['drive_watchdog_ms']), _late_boot_clear_tick[0])
 
             st.startup_selfcheck = 1
             st.pending_mode_request = RobotMode.IDLE  # selfcheck done → transition out of BOOTING
@@ -3560,6 +3627,9 @@ def main():
         if joint_test.active:
             joint_test.tick(st.current_mode == RobotMode.IDLE and st.pending_mode_request is None
                             and shared_data.robot_state.get() == "ENABLED")
+        # The restore of the three's last joint, sent again over a second — only while IDLE (review D14).
+        if limit_restore.pending:
+            limit_restore.tick(st.current_mode == RobotMode.IDLE and st.pending_mode_request is None)
 
         # ==========================================================================
         # Perform robot state and mode management

@@ -226,10 +226,13 @@ def main():
         if why:
             print(f"ABORT: {why}")
             return 1
+        rti = None    # one client at a time: the next pass closes the last one's port first
         for name in names:
             for plabel, plo, phi in profiles:
                 rng = random.Random(a.seed)
                 print(f"  {name:>18}  {plabel:>14} ... ", end="", flush=True)
+                if rti is not None:
+                    rti.close()    # a second RTIClient on the same UDP port is refused (2026-11-20)
                 rti = RTIClient(robot, clock="pc", transport=a.transport)
                 try:
                     # A session per block: the rate contract is fixed at connect, and the

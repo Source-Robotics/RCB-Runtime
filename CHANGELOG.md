@@ -19,8 +19,43 @@ What changed in each version of the RCB runtime. The newest version is at the to
   0.5 s. Every other value is then the last one it wrote, not live.
 - A new error, `COMMAND_NOT_A_NUMBER` (1209): what the robot commanded a joint, its position or its speed, was not a
   number. The robot stops; meanwhile the joint holds where it is measured.
+- A new error, `ESTOP_CHANNEL_FAULT` (1003): the E-stop's two channels disagreed past contact bounce (a broken wire or
+  contact on one channel). It latches next to `ESTOP`; before, only a log line said why the E-stop read pressed.
+- A new warning, `DISK_LOW_WARNING` (8003): the SD card has less than 500 MB free (checked every 30 s; it clears above
+  550 MB). A full card stops the logs, the recordings and every saved setting; nothing said so unless the dashboard's
+  health card was open.
+- The recorder saves an incident when the robot's real-time loop stops without latching an error: `TRACE_STOPPED`
+  (the loop stalled) or `RTI_DIED` (its process is gone) — a service stop or restart saves none.
 
 ### Changed
+
+- The E-stop input registers a press once 2 of its last 5 reads (8-20 ms) are pressed; it needed 5 identical reads, so
+  a pressed contact that chatters never registered. One glitch alone still does not. The release still needs 5.
+- Every isolated output switches off when RTI stops (a service stop or restart, or RTI ending on an error); they kept
+  their level until the next start. A crash that kills the process outright still cannot do this.
+- `joint_test()` refuses a speed under 0.5 deg/s (`BAD_ARGS`; RTI refuses it too): a tiny speed was a test of hours
+  with the joint on its test current.
+- `home(wait=True)` and `wait_homed()` raise `HomingFailed` at once when a homing they saw running is stopped before it
+  finished (they waited out 3 minutes).
+- `RTIClient`: a second client on the same UDP port is refused ("port taken") instead of sharing it silently — a
+  program that makes a new client for each session must `close()` the previous one first; packets
+  that do not come from the robot are ignored and counted (`foreign_packets`). The stop is sent three times, and
+  `control()` sends it when the callback raises or the program is interrupted (Ctrl-C) — the robot braked only after
+  its command timeout, with `RTI_LINK_LOST`, before.
+- The per-arm homing table (`temp_data/homing_arms.json`) is written as compact JSON; `tools/homing_arms.py` lists it.
+- An unanswered homing question ends the homing after 10 minutes (`config/system.xml` `<homing_question_timeout_s>`,
+  0 = wait for ever), as a stop ends it: the arm is not homed. A script that exited after `home()` left the arm homing,
+  holding, until someone pressed Stop.
+- The robot refuses to start when a motion limit in the robot XML (a speed, acceleration, jerk or torque-rate limit,
+  the ceiling or a mode's) is missing, not a number, or not above 0: a missing speed limit let every clamp pass.
+- In FLASHING, Clear Errors clears the error list without sending anything to the drives, and drive parameter writes,
+  saves, `set_pid_gains` and storing the tool id are refused (`RTI_REFUSED`): the bus stays quiet while a drive is
+  flashed.
+- A program started on its own after a software update that changed the shared memory refuses to start and says
+  "restart the robot service" (it read stale or empty values for ever before). Restart the whole service after an
+  update, not the executor and dashboard alone.
+- `robots/PAR6.xml` marks the settings no code reads as "NOT USED" (the network settings, the mount and gravity,
+  each drive's watchdog rate, the arm joints' two-pass switch, the joint type).
 
 - `release_control()` is refused (`REJECTED`) while the client holds control and its own moves are still queued or
   running: wait for them (`wait_idle()`) or stop them (`stop()`) first. Released, they played on with nobody
@@ -72,6 +107,45 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - Control's 30 s idle expiry used the wall clock: a clock step (time sync) could expire the holder at once.
 - `RobotClient.wait_idle()` could return no failure for a move that had just failed (the failure was recorded after the
   waiter woke).
+- Brake on idle was one unanswered frame per joint at RTI's start: one lost frame left a coast saved in the drive in
+  force (J2 / J3 drop when idle). It is sent three times, and the start-up drive check now reads it: a joint found
+  coasting gets `GAINS_MISMATCH_WARNING` and is sent brake again.
+- An error that ended EXEC, JOG or RTI mode skipped that mode's exit: `exec_paused` / `exec_stopping` stayed 1 through
+  the error and after it (a wait on them hung), and the mode's queued trajectory, jog session or RTI claim stayed.
+- One drive missing at start: the start-up self-check waited 0.4 s for it, every healthy drive's watchdog tripped,
+  and the error list blamed all of them. The start-up clear goes out again after a slow self-check.
+- The Hall check, a freed joint and a joint test restore the joint's current limit with frames that could all be
+  lost (a joint left limp at 0 mA); the restore is sent again five times over the next second while in IDLE.
+- A self-collision worker that stopped while the robot was in IDLE was noticed 0.5 s into the next move, whose escape
+  baseline came from the stopped worker's last data. It is watched in every mode now.
+- Log rotation on a full SD card shifted the older copies before copying: every failed copy pushed one more out (all
+  three gone within 6 s), retried every 2 s. The copy is made first now, and a failed one is retried after 10 minutes.
+  `critical_errors.log` is rotated by one process (two did, each renaming it under the other).
+- The per-arm homing table: a corrupt or unreadable file became an empty table silently (the arm check off for three
+  homings, the file's history overwritten) — it is kept as a dated `.corrupt` copy; an entry missing a key ended the
+  real-time loop at a homing's end — it is dropped or completed on load. Copying it at a homing's end cost the
+  real-time loop 2.5 ms per arm learned, and writing it held the loop up to 6 ms more.
+- Two edits of `config/system.xml` or the robot XML at the same time (the sound settings, the active gripper, the
+  recorder settings, the time zone, a saved drive parameter, the freedrive walls) could lose one, or rename in the
+  other's half-written file: one edit at a time now, each with its own temporary file.
+- The recorder dropped a pending incident or a running capture when the real-time loop restarted, and a failed write
+  left a temporary file that pushed real incidents out of the newest 20.
+- Saving a drive parameter to the XML worked once per executor start; the second save was refused.
+- `RTIClient`: a client created with `transport="tcp"` that connected over UDP never received the robot's state; a
+  second `claim()` and `control()` on one client ended at once or raised a false `ControlLost`.
+- `wait_holding_part()` and `wait_released_part()` judged the last gripper result the client had received, not the
+  command they waited for (a stale "holding" passed after a stop or a refused close).
+- Command ids came from Python's global random generator: a script that re-seeded it could give two commands one id.
+- The dashboard's Firmware tab: every `.bin` upload failed on the installed NiceGUI; and a page loaded while a flash
+  ran showed none running, offering to put the robot software back on the bus mid-flash. One flasher session now
+  serves every page.
+- The supervisor stopped the shell around each program, not the program: a restart could run two copies for seconds
+  (two real-time loops, or "address already in use"). It also restarted a program that crashed at its start every
+  2 s for ever; it now backs off (up to a minute) and names the crash loop in its log.
+- A malformed gripper file stopped the robot from starting even when another gripper was selected; it is skipped
+  with a warning (a malformed selected one still stops the start, with its reason).
+- Every program reset the shared Clear Errors / reload requests when it started, so a pending Clear Errors could be
+  lost; only the real-time loop resets them now.
 
 ## [2.0.0] - 2026-11-20
 

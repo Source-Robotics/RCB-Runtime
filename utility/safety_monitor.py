@@ -413,6 +413,7 @@ class SafetyMonitor:
         self._sc_stale_n = sustain_ticks(SC_STALE_S, dt)
         self._sc_c, self._sc_armed, self._sc_live = 0, True, False
         self._sc_last_hb, self._sc_hb_ticks, self._sc_stale = -1.0, 0, False
+        self._sc_hb_moved = False       # the heartbeat changed since RTI started (review D13: passive-mode STALE)
         # the escape rule: per pair, the gap below which it trips — +inf (any gap = within the margin = trip) for a pair
         # that was clear when the active period began, (its gap then - SC_ESCAPE_TOL_M) for one already within it
         self._sc_gaps = sc.get("pair_gaps") if sc is not None else None
@@ -700,6 +701,7 @@ class SafetyMonitor:
         if self.check_hold_osc:
             self._hold_osc_step()
         if self.check_self_collision:
+            self._sc_heartbeat(passive)                      # every mode (review D13, 2026-11-20)
             if passive:
                 self._sc_rebase = True                       # the next active period takes its escape baseline
             else:
@@ -930,17 +932,24 @@ class SafetyMonitor:
                             f"margin already (escape rule): moving apart is allowed; SELF_COLLISION if a pair gets "
                             f"{1e3 * SC_ESCAPE_TOL_M:g} mm closer or another pair comes within the margin")
 
-    def _self_collision_step(self, fired):
-        """SELF_COLLISION / its warning / STALE from the worker's fields, one tick. Allocation-free unless something
-        starts or ends (then a log line and a key)."""
-        sc = self._sc
-        hb = sc["heartbeat"][0]
+    def _sc_heartbeat(self, passive):
+        """The worker's heartbeat -> SELF_COLLISION_STALE, counted in EVERY mode (review D13, 2026-11-20). Before, only
+        an active mode counted it: a worker that died in IDLE was noticed 0.5 s into the next active period, and that
+        period's escape baseline came from its last (stale) data. In a passive mode it is called stale only once the
+        heartbeat has moved since RTI started (the worker starts after RTI: no warning at every start); in an active
+        mode after SC_STALE_S, as before. An active period that STARTS stale takes its escape baseline on its first
+        fresh tick (_sc_rebase stays set while stale). One that started fresh keeps its baseline when the worker comes
+        back: a contact that grew while nothing watched must trip, not become the new start.
+        Allocation-free unless the state changes."""
+        hb = self._sc["heartbeat"][0]
         if hb != self._sc_last_hb:
+            if self._sc_last_hb != -1.0:                         # a change, not the first read since RTI started
+                self._sc_hb_moved = True
             self._sc_last_hb = hb
             self._sc_hb_ticks = 0
         else:
             self._sc_hb_ticks += 1
-        stale = self._sc_hb_ticks >= self._sc_stale_n
+        stale = self._sc_hb_ticks >= self._sc_stale_n and (self._sc_hb_moved or not passive)
         if stale != self._sc_stale:                              # cold: the worker stopped, or came back
             self._sc_stale = stale
             if stale:
@@ -950,7 +959,12 @@ class SafetyMonitor:
             else:
                 self.warnings.discard(SELF_COLLISION_STALE)
                 logger.info("the self-collision worker is back")
-        if stale:
+
+    def _self_collision_step(self, fired):
+        """SELF_COLLISION / its warning from the worker's fields, one tick (active modes; the heartbeat and STALE in
+        _sc_heartbeat, every mode). Allocation-free unless something starts or ends (then a log line and a key)."""
+        sc = self._sc
+        if self._sc_stale:
             self._sc_c = 0
             return fired
         if self._sc_rebase:                                       # cold: the first fresh tick of an active period

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import logging
-import os
 logger = logging.getLogger("config")  # docs/logging.md "Logger names"
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -107,8 +106,16 @@ def _wall_attr(v: float | None) -> str:
 def write_freedrive_walls(xml_path: str | Path, specs: Sequence[dict | None]) -> int:
     """Write the per-joint wall specs into the robot XML, replacing each joint's <freedrive_wall .../> or adding one
     before </joint>. Text-level, so comments and formatting elsewhere are untouched. Returns the joints written."""
-    import re
+    from utility.config_write import edit_lock
     path = Path(xml_path)
+    with edit_lock(path):                  # one edit of the robot XML at a time across processes (review D10)
+        return _write_walls(path, specs)
+
+
+def _write_walls(path: Path, specs: Sequence[dict | None]) -> int:
+    """write_freedrive_walls' edit, under the robot XML's edit lock."""
+    import re
+    from utility.config_write import write_atomic
     text = path.read_text()
     for i, spec in enumerate(specs):
         spec = wall_spec(spec)
@@ -131,11 +138,7 @@ def write_freedrive_walls(xml_path: str | Path, specs: Sequence[dict | None]) ->
         text = text[:m.start(1)] + body + text[m.end(1):]
     ET.fromstring(text)                    # never write a file that no longer parses
     # Written next to it, synced, then swapped in (2026-10-24): a write that fails half-way (a full SD card) used to
-    # leave the robot XML cut short, and the robot software would not start until it was fixed by hand.
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    # leave the robot XML cut short, and the robot software would not start until it was fixed by hand. Its own
+    # temporary file since review D10 (2026-11-20; another writer shared the name).
+    write_atomic(path, text)
     return len(specs)
