@@ -473,6 +473,12 @@ CATALOG = {
     "BAD_ARGUMENTS": _e(5110, "Invalid curve arguments",
                         "A curve command has the wrong number of values or an unknown frame.", _MOVE,
                         "Check the command's arguments against the command reference."),
+    "BLEND_DEGRADED": _e(5111, "Blend not possible: moves run one by one",
+                         "A chain of blended moves could not be planned as one path (a corner past a limit, a zone or "
+                         "the arm itself, or a planning failure), so each move runs on its own and stops at its "
+                         "target.", "Warning only: the moves run, without the blended corners.",
+                         "Make the blend smaller, or move the corner away from the limit, zone or obstacle the "
+                         "message names."),
     "TOPPRA_UNAVAILABLE": _e(5201, "TOPPRA profile unavailable",
                              "The TOPPRA profile was requested, but its package cannot be imported.", _MOVE,
                              "Install the toppra package, or choose another profile."),

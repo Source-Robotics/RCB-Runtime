@@ -15,6 +15,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Added
 
+- A new warning, `BLEND_DEGRADED` (5111): a chain of blended moves that could not be planned as one path runs its moves
+  one by one, each stopping at its target — the activity log now says so and why.
 - `get_status()` and the status stream carry `rti_alive`: false once the robot's real-time loop has not ticked for
   0.5 s. Every other value is then the last one it wrote, not live.
 - A new error, `COMMAND_NOT_A_NUMBER` (1209): what the robot commanded a joint, its position or its speed, was not a
@@ -88,6 +90,19 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- Blending: a move blending at speed into a move that joins a blend chain (`ruckig_corner`) stopped dead at the
+  corner; it now ends at rest there.
+- Blending: a move committed a corner speed into the next one after checking only the next move's two ends. A next
+  move that failed later — its path through a stop zone or the arm itself, an impossible duration, a slow move
+  on the trapezoid profile that could not start at that speed — left the arm to stop dead from that speed. The
+  next move is now planned in full first; when it fails, the move before ends at rest. A next move that still
+  fails on its turn brakes to rest along its own line from the corner speed, then reports its error.
+- Blending: a Stop at the wrong moment could let the stopped program's blended move run after the next program
+  started; it is dropped.
+- Blending: a chain ending in repeated identical targets could end the program (an empty batch); each repeated
+  target now completes in turn.
+- Blending: after a failed send in the middle of a chain, the later moves were never reported (their programs
+  waited out their own timeouts); they are reported ABORTED, and a failed send no longer logs the move completed.
 - A second supervisor (a second service unit, or one started by hand next to the service) started a second RTI on the
   same CAN bus; it now refuses to start, naming the one that runs (a lock released when that one ends).
 - `setup_system.sh` and `check_system.py` checked different module lists (`pinokin`, which nothing imports; no

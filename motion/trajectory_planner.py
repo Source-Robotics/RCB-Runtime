@@ -666,7 +666,8 @@ class TrajectoryPlanner(Thread):
                     # short to hold -> sent whole -> ARM STOPS). Splicing N commands adds N
                     # legs for the same split, so the chain reaches a steady state and
                     # streams indefinitely.
-                    self._blend_buffer.append(cmd)
+                    if not self._buffer_append(cmd):
+                        continue
                     if len(self._blend_buffer) >= self.MAX_BLEND_LOOKAHEAD:
                         self._splice_pending("lookahead cap reached")
                     else:
@@ -695,7 +696,8 @@ class TrajectoryPlanner(Thread):
                 # TOPPRA/Bezier chain (or vice versa).
                 if self._blend_buffer and self._blend_lane(self._blend_buffer[0]) != self._blend_lane(cmd):
                     self._flush_blend_buffer()
-                self._blend_buffer.append(cmd)
+                if not self._buffer_append(cmd):
+                    continue
                 if len(self._blend_buffer) >= self.MAX_BLEND_LOOKAHEAD:
                     self._flush_blend_buffer()
             else:
@@ -724,8 +726,10 @@ class TrajectoryPlanner(Thread):
         try:
             self._mark_started(cmd)
             self._plan_and_send(cmd)
-            self._mark_completed(cmd)
+            if self._went_out(cmd):              # review, blend finding 11: no CMD_COMPLETED after a failed send
+                self._mark_completed(cmd)
         except PlannerError as e:
+            self._brake_committed_corner(cmd)
             cid = self._cmd_id(cmd)
             logger.error(f"command {cid} failed: {e.code}: {e.message}")
             self._mark_error(cmd, e.code, e.message)
@@ -733,6 +737,7 @@ class TrajectoryPlanner(Thread):
             log_activity(_activity_logger, "EXEC", "error", e.code, id=cid, message=e.message,
                          command=self._fmt_command(cmd))
         except Exception as e:
+            self._brake_committed_corner(cmd)
             cid = self._cmd_id(cmd)
             logger.error(f"command {cid} failed: {e}")
             self._mark_error(cmd, "PLAN_FAIL", str(e))
@@ -758,6 +763,39 @@ class TrajectoryPlanner(Thread):
         if ctype in self._CARTESIAN_LINEAR_TYPES:
             return "cartesian"
         return None
+
+    def _went_out(self, cmd):
+        """The command's plan was sent: no failed send reported for it (that latches the abort with its id) and no
+        Stop since (a new epoch). Review, blend finding 11 (2026-11-21): CMD_COMPLETED was logged after a failed
+        send too."""
+        with self.abort_gate:
+            if self._cmd_epoch != self._epoch:
+                return False
+            a = self._abort
+            return not (a and a.get("cid") == self._cmd_id(cmd))
+
+    def _blend_degraded(self, chain, why):
+        """A chain that could not be planned as one blended path runs as single moves, each stopping at its target —
+        and says so where a program and the operator see it (review, blend finding 10, 2026-11-21; the user: keep the
+        fallback, report it, like a "corner path failure"): a BLEND_DEGRADED warning in the activity log naming the
+        moves and why. It was a logger line only, and the client was told success."""
+        ids = [str(self._cmd_id(c)) for c in chain]
+        logger.warning(f"blend not possible for a {len(chain)}-command chain ({why}) — each move runs on its own")
+        log_activity(_activity_logger, "EXEC", "warning", "BLEND_DEGRADED", id=ids[0] if ids else None,
+                     message=f"{len(chain)} moves ({', '.join(ids)}) run one by one, stopping at each target: {why}")
+
+    def _buffer_append(self, cmd):
+        """Put a fetched command into the blend buffer — only when it belongs to the current program: the epoch check
+        and the append under the abort gate flush() holds (review, blend finding 3, 2026-11-21: the append was outside
+        it; a Stop landing between the queue's get and the append left the stopped program's command in the cleared
+        buffer, and the next program's first command within 0.2 s flushed and SENT it under the new epoch). A stale
+        command is dropped: the Stop already failed it. True when appended."""
+        with self.abort_gate:
+            if self._cmd_epoch != self._epoch:
+                logger.info(f"id={self._cmd_id(cmd)} belongs to a stopped program: not buffered")
+                return False
+            self._blend_buffer.append(cmd)
+            return True
 
     def _is_blend_eligible(self, cmd):
         """True if cmd should be buffered for a zone-blend chain rather than
@@ -857,9 +895,7 @@ class TrajectoryPlanner(Thread):
             self._check_self_collision(sample.positions, f"blended chain of {len(chain)}")
             self._check_zones(sample.positions, sample.positions[0], f"blended chain of {len(chain)}")
         except Exception as e:
-            logger.warning(
-                f"zone blend failed for a {len(chain)}-command chain: "
-                f"{e} — planning individually instead.")
+            self._blend_degraded(chain, f"zone blend: {e}")
             for cmd in chain:
                 self._run_single(cmd)
             return
@@ -2012,9 +2048,7 @@ class TrajectoryPlanner(Thread):
             self._check_self_collision(sample.positions, f"ruckig_corner chain of {len(chain)}")
             self._check_zones(sample.positions, sample.positions[0], f"ruckig_corner chain of {len(chain)}")
         except Exception as e:
-            logger.warning(
-                f"ruckig corner blend failed for a {len(chain)}-command chain: "
-                f"{e} — planning individually instead.")
+            self._blend_degraded(chain, f"ruckig corner blend: {e}")
             for cmd in chain:
                 self._run_single(cmd)
             return
@@ -2271,6 +2305,7 @@ class TrajectoryPlanner(Thread):
         """
         start_idx = 0
         n = sample.positions.shape[0]
+        timed_boundaries = self._member_boundaries(timed_boundaries, n)
         for i, cmd in enumerate(chain):
             end_idx = timed_boundaries[i]
             # Defense in depth: an empty range would send no batch, so this
@@ -2288,6 +2323,12 @@ class TrajectoryPlanner(Thread):
             sent = self._send_range(sample.positions, sample.velocities, sample.torque_ff,
                                      start_idx, end_idx, cid, flags=flags)
             if not sent:
+                # Review, blend finding 11 (2026-11-21): the members after the failed one had left the queue, so
+                # the abort's drain never reached them — their clients waited out their own timeouts. Reported
+                # ABORTED now; not after a Stop (it failed them already).
+                if self._cmd_epoch == self._epoch:
+                    for rest in chain[i + 1:]:
+                        self._report_aborted(rest)
                 return False
             start_idx = end_idx
         return True
@@ -2534,7 +2575,11 @@ class TrajectoryPlanner(Thread):
             # A dry-run successor is never sent, so there is nothing to carry a corner speed into: this move must
             # end at rest (2026-10-23 review: it was sent with BLEND_CONTINUES and a nonzero exit speed, RTI then
             # stopped it dead at the corner, and the move after the dry run started from that speed).
-            if nxt is not None and self._cmd_name(nxt) == "move_joints" and not bool(self._cmd_options(nxt).dry_run):
+            # A successor that joins a blend chain (zone / tolerance / ruckig_corner) is planned from REST in the
+            # blend buffer, so nothing carries a corner speed into it either (review, blend finding 1, 2026-11-21:
+            # this move ended at speed and the arm stopped dead at the corner).
+            if (nxt is not None and self._cmd_name(nxt) == "move_joints" and not bool(self._cmd_options(nxt).dry_run)
+                    and not self._is_blend_eligible(nxt)):
                 nxt_args = self._cmd_args(nxt)
                 nxt_profile = normalize_profile_name(self._cmd_options(nxt).profile or DEFAULT_PROFILE)
                 if nxt_profile == profile and len(nxt_args) >= self.joint_num:
@@ -2546,48 +2591,136 @@ class TrajectoryPlanner(Thread):
                             blend_pct / 100.0, speed_scale=speed_scale,
                             profile=time_parameterizer.profile)
                         if v_corner > 1e-9:
-                            end_vel = v_corner * dist / np.linalg.norm(dist)
+                            problem = self._successor_plan_problem(nxt, target, v_corner)
+                            if problem is not None:
+                                logger.info(f"the next move (id={self._cmd_id(nxt)}) cannot be planned from the "
+                                            f"corner speed ({problem}): this move ends at rest")
+                                v_corner = 0.0
+                            else:
+                                end_vel = v_corner * dist / np.linalg.norm(dist)
 
-        # `accel` scales the acceleration limit; `duration` then rescales the whole move to
-        # land on exactly `t`. Both were accepted and SILENTLY IGNORED before today.
+        sample, end_kept = self._time_joint_path(path, time_parameterizer, options, speed_scale, start_vel, end_vel,
+                                                 cid)
+        if not end_kept:
+            v_corner = 0.0
+        return sample, v_corner
+
+    def _time_joint_path(self, path, time_parameterizer, options, speed_scale, start_vel, end_vel, cid):
+        """A move_joints path timed and sampled, with the acceleration backstop: (sample, end_kept).
+
+        `accel` scales the acceleration limit; `duration` then rescales the whole move to land on exactly `t`. When the
+        closed-form solve refuses the boundary speeds (compute_corner_speed said "safe", the trapezoid disagreed —
+        rare), the move is planned to END AT REST (end_kept False) — never without its START speed (review, blend
+        finding 2, 2026-11-21: the old fallback dropped both, and a move the one before had already committed a corner
+        speed into started from rest: a velocity step to 0 in one tick). A start speed that cannot be met raises
+        PLAN_FAIL (the trial plan of the move before keeps that from happening; _brake_committed_corner handles what is
+        left). The duration's probe is inside the same handling (it was outside, and its ValueError escaped)."""
         max_accel = self._max_accel * self._accel_scale_for(options)
-        if options.duration is not None:
-            probe = time_parameterizer.parameterize(
-                path, self._max_vel, max_accel, self._dt, speed_scale=speed_scale,
-                start_vel=start_vel, end_vel=end_vel)
-            speed_scale = self._scale_for_duration(
-                options, probe.num_points * self._dt, speed_scale)
 
+        def solve(sv, ev):
+            scale = speed_scale
+            if options.duration is not None:
+                probe = time_parameterizer.parameterize(path, self._max_vel, max_accel, self._dt, speed_scale=scale,
+                                                        start_vel=sv, end_vel=ev)
+                scale = self._scale_for_duration(options, probe.num_points * self._dt, scale)
+            return time_parameterizer.parameterize(path, self._max_vel, max_accel, self._dt, speed_scale=scale,
+                                                   start_vel=sv, end_vel=ev)
+
+        end_kept = end_vel is not None
         try:
-            timed = time_parameterizer.parameterize(
-                path, self._max_vel, max_accel, self._dt,
-                speed_scale=speed_scale, start_vel=start_vel, end_vel=end_vel)
+            try:
+                timed = solve(start_vel, end_vel)
+            except (TOPPRAUnavailable, TOPPRAInfeasible):
+                raise
+            except ValueError as e:
+                if end_vel is None:
+                    raise
+                logger.warning(f"blend into the next move infeasible for id={cid} ({e}): this move ends at rest")
+                timed, end_kept = solve(start_vel, None), False
         except TOPPRAUnavailable as e:
             raise PlannerError("TOPPRA_UNAVAILABLE", str(e)) from e
         except TOPPRAInfeasible as e:
-            # Real TOPPRA failure, not a blend-boundary-velocity issue — must be
-            # caught before the generic `except ValueError` below (TOPPRAInfeasible
-            # is a ValueError subclass), otherwise it would be misread as "blend
-            # infeasible" and silently retried without blend instead of surfacing
-            # the actual TOPPRA error.
+            # Real TOPPRA failure, not a blend-boundary-velocity issue — caught before the generic ValueError
+            # (TOPPRAInfeasible is a ValueError subclass), so it surfaces as itself.
             raise PlannerError("TOPPRA_INFEASIBLE", str(e)) from e
         except ValueError as e:
-            # compute_corner_speed said "safe" but the closed-form trapezoid solve
-            # disagreed (should be rare — see trajectory_profiles.py's derivation
-            # notes) — fall back to planning this move with no boundary velocity at
-            # all rather than propagate a broken profile. Safe but suboptimal, same
-            # philosophy as SEND_TIMEOUT/GRIPPER_SETTLE_TIMEOUT elsewhere in this file.
-            logger.warning(f"blend infeasible for id={cid}, "
-                           f"planning normally instead: {e}")
-            timed = time_parameterizer.parameterize(
-                path, self._max_vel, max_accel, self._dt,
-                speed_scale=speed_scale)
-            v_corner = 0.0
+            if start_vel is not None:
+                raise PlannerError("PLAN_FAIL", f"move_joints id={cid} cannot start at the corner speed the move "
+                                                f"before ends at ({e})") from e
+            raise
 
         sample = self._assert_commanded_accel(
             self._sampler.sample(timed), self._joint_accel_limit(options),
             "move_joints")
-        return sample, v_corner
+        return sample, end_kept
+
+    def _successor_plan_problem(self, nxt, start, v_corner):
+        """The next move_joints planned in FULL before this move commits a corner speed into it (review, blend finding
+        2, 2026-11-21, the user: "trial-plan next move"): its path from this move's target, its own options, starting
+        at that corner speed along its line, ending at rest — and checked the way its own turn will check it (joint
+        limits, zones, self-collision along its samples, the acceleration backstop, its duration / jerk / profile).
+        The target-only check before (M3) let a successor fail on its path after the corner speed was committed: a dead
+        stop from speed. Returns why not (a code), or None. Nothing is sent, nothing of the planner's state changes;
+        zone warnings are not logged (its own turn logs them)."""
+        cid = self._cmd_id(nxt)
+        options = self._cmd_options(nxt)
+        try:
+            profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
+            tp = make_time_parameterizer(profile, options.ramp_fraction, self._jerk_scale_for(options),
+                                         max_jerk=self._max_jerk)
+            path = self._path_builder.joint_line_from_degrees(start, self._cmd_args(nxt))
+            norm = float(np.linalg.norm(path.delta))
+            start_vel = v_corner * path.delta / norm if norm > 1e-9 else None
+            sample, _ = self._time_joint_path(path, tp, options, self._speed_scale_for(options), start_vel, None, cid)
+            where = f"move_joints id={cid} (the next move, planned ahead)"
+            self._check_joint_limits(sample.positions, start, where)
+            self._check_zones(sample.positions, start, where, warn=False)
+            self._check_self_collision(sample.positions, where)
+        except PlannerError as e:
+            return e.code
+        except (ValueError, RuntimeError) as e:          # a profile's own refusal; ruckig raises RuntimeError
+            return type(e).__name__
+        return None
+
+    def _brake_committed_corner(self, cmd):
+        """A move_joints failed after the move before committed a corner speed into it (review, blend finding 2's
+        leftover, 2026-11-21: the trial plan passed, something changed since — new zones, a setting). RTI plays the move
+        before to its end at that speed and then has nothing: a dead stop in one tick. Instead it brakes to rest along
+        THIS move's own line, at the line's acceleration limit (constant deceleration, never past its target), sent
+        with a checkpoint nobody waits for; the move then reports its failure as usual. Nothing when no corner speed is
+        committed (the usual case) or the arm left EXEC since (the start point resyncs). Never raises."""
+        if self._cmd_name(cmd) != "move_joints" or self._last_exit_speed is None:
+            return
+        cid = self._cmd_id(cmd)
+        try:
+            start = np.asarray(self._start_point(), dtype=np.float64)
+            v = self._last_exit_speed                    # None again when the arm left EXEC (_start_point resynced)
+            if v is None:
+                return
+            delta = np.asarray(self._path_builder.joint_line_from_degrees(start, self._cmd_args(cmd)).delta,
+                               dtype=np.float64)
+            length = float(np.linalg.norm(delta))
+            if length <= 1e-9:
+                logger.error(f"move_joints id={cid} failed after a corner speed into it and has no line to brake along")
+                return
+            u = delta / length
+            moving = np.abs(u) > 1e-12
+            decel = float(np.min(np.asarray(self._max_accel, dtype=np.float64)[moving] / np.abs(u[moving])))
+            t_stop = v / decel
+            t = np.minimum(np.arange(int(np.ceil(t_stop / self._dt)) + 2) * self._dt, t_stop)
+            s = np.minimum(v * t - 0.5 * decel * t ** 2, length)
+            pos = start[None, :] + s[:, None] * u[None, :]
+            vel = np.maximum(v - decel * t, 0.0)[:, None] * u[None, :]
+            vel[-1] = 0.0
+            sent = self._send_chunks(pos, vel, f"{cid}:brake")
+            with self.abort_gate:
+                if sent and self._cmd_epoch == self._epoch:
+                    self._last_endpoint = pos[-1].copy()
+                self._last_exit_speed = None
+            logger.warning(f"move_joints id={cid} failed after the move before committed a corner speed into it: "
+                           f"braked to rest along its line ({float(s[-1]):.4f} rad in {t_stop:.3f} s)")
+        except Exception as e:                           # noqa: BLE001 — the failure is reported by the caller
+            logger.error(f"move_joints id={cid}: could not brake from the corner speed: {e}")
 
     def _pose_from_args(self, args):
         return pose_from_xyz_rpy(args, label="Cartesian pose")
@@ -3680,11 +3813,30 @@ class TrajectoryPlanner(Thread):
                 time.sleep(0.002)
         return True
 
+    @staticmethod
+    def _member_boundaries(boundaries, n):
+        """Each chain member's end index, every member with at least one sample and the last ending at n (review, blend
+        finding 8 / M4, 2026-11-21: three identical targets at a chain's end collapsed the boundaries to n, n+1 — an
+        empty slice past the end that passed every check and went out as a 0-point batch; RTI refused it and the
+        program ended). Repeated targets at the end take the trajectory's LAST samples — the arm at their (same)
+        target — so each completes when the arm is there, never before. Unchanged when already well formed."""
+        b = [int(x) for x in boundaries]
+        if not b or n < len(b):
+            return b                                     # cannot give each a sample: _range_problem refuses it
+        b[-1] = n
+        for i in range(len(b) - 2, -1, -1):
+            b[i] = min(b[i], b[i + 1] - 1)
+        b[0] = max(b[0], 1)
+        for i in range(1, len(b)):
+            b[i] = max(b[i], b[i - 1] + 1)
+        return b
+
     def _range_problem(self, pos, vel, torque_ff, range_start, range_end):
-        """Why samples [range_start:range_end) cannot go to RTI, or None: no sample in the range, or a value that is
-        not finite (the first one named)."""
-        if range_end <= range_start:
-            return f"no sample in it (samples {range_start} to {range_end}: a repeated target?)"
+        """Why samples [range_start:range_end) cannot go to RTI, or None: no sample in the range (also a range at or
+        past the trajectory's end — 2026-11-21, blend finding 8: its empty slice passed every check), or a value that
+        is not finite (the first one named)."""
+        if range_end <= range_start or range_start < 0 or range_end > len(pos):
+            return (f"no sample in it (samples {range_start} to {range_end} of {len(pos)}: a repeated target?)")
         for name, arr in (("position", pos), ("speed", vel), ("torque", torque_ff)):
             part = np.asarray(arr[range_start:range_end])
             if part.ndim != 2 or part.shape[1] != self.joint_num:
