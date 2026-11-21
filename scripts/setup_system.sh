@@ -12,11 +12,11 @@
 #     groups     the user in dialout, i2c and gpio (the UART, the OLED's I2C, the GPIO header)
 #     sudo       the commands the runtime runs with sudo, password-free: /etc/sudoers.d/10-rcb-runtime — only when the
 #                user cannot already run them (the reference robot has NOPASSWD: ALL)
-#     priority   cap_sys_nice on the binary the .venv's python3 links to: RTI's SCHED_FIFO 99 on its core (without it
-#                RTI refuses to start); an apt upgrade of Python replaces that binary and removes it — run this again
+#     priority   checked only: RTI's SCHED_FIFO 99 comes from the service's rtprio.conf (below) since 2026-11-21 — no
+#                capability on the interpreter (an apt upgrade of Python removed it silently); a leftover one is named
 #     service    autorun.service + autorun.sh next to the repo folder (systemd/*.in), enabled (not started); the
 #                drop-ins memlock.conf (LimitMEMLOCK=infinity: RTI locks its memory), rtprio.conf (LimitRTPRIO=99: RTI's
-#                priority under the service even when an upgrade removed the capability; 2026-11-18) and, with
+#                real-time priority; 2026-11-18) and, with
 #                --allowed-ips, allowed-ips.conf (RCB_ALLOWED_IPS); an existing unit or autorun.sh is checked, never
 #                overwritten
 #     logs       tools/system_log_limits.sh: the journal 200 MB, syslog 50 MB, logrotate hourly
@@ -180,7 +180,8 @@ if real; then
         miss "it is Python ${PY_VER:-?}, not 3.11 (every pin was verified on 3.11)"
         fix "README 'Python 3.11, not 3.12' (the deadsnakes PPA), then ./scripts/install.sh"
     fi
-    MODULES="numpy scipy can zmq nicegui psutil roboticstoolbox roboticstoolbox._frne_c roboticstoolbox._fknm_c spatialmath pinocchio coal ruckig toppra Spectral_BLDC SourceRoboticsToolbox lgpio gpiozero distro serial PIL adafruit_ssd1306 board busio"
+    # one list with scripts/check_system.py (review I8, 2026-11-21): scripts/required_modules.txt, every line
+    MODULES="$(sed -e 's/#.*//' "$REPO/scripts/required_modules.txt" | awk 'NF{print $1}' | tr '\n' ' ')"
     AS_USER=()
     [ "$(id -u)" = "0" ] && AS_USER=(sudo -u "$RUN_USER" -H)
     BAD="$("${AS_USER[@]}" "$ROBOT_PY" - "$MODULES" 2>/dev/null <<'PY'
@@ -295,13 +296,13 @@ if real; then
     # the binary the robot's interpreter links to — the python section resolved it from .venv/bin/python3 (the
     # system python3 only without a .venv); never a second lookup of `python3`, which may be another version
     PY_BIN="${PY_BIN:-$(readlink -f "$(command -v python3)")}"
+    # Review I8 (2026-11-21): RTI's priority comes from the service (autorun.service.d/rtprio.conf, LimitRTPRIO=99,
+    # below) — no capability on the interpreter any more: an apt upgrade of Python removed it silently, and nothing
+    # else needs it (a simulated RTI sets no priority; a by-hand RTI outside the service refuses to start anyway).
     if getcap "$PY_BIN" 2>/dev/null | grep -q cap_sys_nice; then
-        ok "$PY_BIN has cap_sys_nice (RTI's real-time priority)"
-    elif apply; then
-        setcap cap_sys_nice=eip "$PY_BIN" && did "cap_sys_nice on $PY_BIN"
+        note "$PY_BIN still has cap_sys_nice — no longer needed (the service's rtprio.conf grants RTI's priority); to remove it: sudo setcap -r $PY_BIN"
     else
-        miss "$PY_BIN has no cap_sys_nice: RTI cannot get SCHED_FIFO 99 and refuses to start (an apt upgrade of Python removes it)"
-        fix "sudo bash $0   (or: sudo setcap cap_sys_nice=eip $PY_BIN)"
+        ok "no capability on $PY_BIN: RTI's real-time priority comes from the service (rtprio.conf)"
     fi
 else
     skip "cap_sys_nice"
@@ -419,9 +420,13 @@ if real; then
         miss "autorun.service is not enabled"
         fix "sudo systemctl enable autorun.service"
     fi
+    # Review I8 (2026-11-21): the second unit's template is gone; one installed (enabled or not) is a leftover
     if [ "$(systemctl is-enabled rcb-runtime.service 2>/dev/null)" = "enabled" ]; then
         miss "rcb-runtime.service is ALSO enabled: two supervisors would start"
-        fix "sudo systemctl disable rcb-runtime.service"
+        fix "sudo systemctl disable --now rcb-runtime.service && sudo rm /etc/systemd/system/rcb-runtime.service && sudo systemctl daemon-reload"
+    elif [ -e "$ROOT/etc/systemd/system/rcb-runtime.service" ]; then
+        miss "an old second unit is installed (rcb-runtime.service, disabled): the robot runs autorun.service only"
+        fix "sudo rm /etc/systemd/system/rcb-runtime.service && sudo systemctl daemon-reload"
     fi
     if [ "$RELOAD" = "1" ] && [ "$(systemctl is-active autorun.service 2>/dev/null)" = "active" ]; then
         note "autorun.service is running: the changes apply at its next restart (sudo systemctl restart autorun.service, then home the arm)"

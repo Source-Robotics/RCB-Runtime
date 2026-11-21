@@ -1,0 +1,31 @@
+# The Python modules the robot's interpreter must import: ONE list for scripts/setup_system.sh and
+# scripts/check_system.py (review I8, 2026-11-21: the two lists disagreed — check_system wanted pinokin, which nothing
+# imports any more, and did not check coal, which the self-collision check needs).
+# One module per line. "optional" after the name: check_system.py warns instead of failing (setup_system.sh checks
+# every line). A comment after "#".
+numpy
+scipy
+can
+zmq
+nicegui
+psutil
+serial
+PIL
+distro
+Spectral_BLDC
+SourceRoboticsToolbox
+roboticstoolbox
+# roboticstoolbox 1.5 falls back to slow pure Python, without a warning, when its compiled parts do not load
+# (2026-11-15): import them by name so a bad wheel fails here
+roboticstoolbox._frne_c
+roboticstoolbox._fknm_c
+spatialmath
+pinocchio optional        # the fast kinematics backend; the toolbox is the fallback
+coal                      # the self-collision check's distance queries
+ruckig                    # RTI's position rate limiter (a safety dependency) and the default EXEC profile
+toppra                    # the only blend-capable time parameterizer (zone / tolerance blending)
+lgpio
+gpiozero
+adafruit_ssd1306 optional # the control box's OLED
+board optional            # the OLED's I2C (Blinka)
+busio optional            # the OLED's I2C (Blinka)

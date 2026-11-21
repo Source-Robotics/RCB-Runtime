@@ -101,7 +101,7 @@ printf '  1. Review config/system.xml and robots/<name>.xml
 '
 printf '  2. Run: ./scripts/check_system.py
 '
-printf '  3. Install service: ./scripts/install_service.sh
+printf '  3. Install the service (autorun.service, the only one): sudo bash scripts/setup_system.sh
 '
 printf '  4. Start manually first: .venv/bin/python supervisor.py
 '

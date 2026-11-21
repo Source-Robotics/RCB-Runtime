@@ -160,15 +160,12 @@ The arguments of the last three are regular expressions (sudo 1.9.10+): a plain 
 
 **Real-time priority.** RTI asks for `SCHED_FIFO` 99 on core 3 and refuses to start without it
 (`<realtime_required>` in `config/system.xml`): a control loop that other programs can delay is not the robot anyone
-tested. The setup script grants it twice:
-
-- a file capability on the binary the robot's interpreter links to (from the repo folder:
-  `sudo setcap cap_sys_nice=eip "$(readlink -f .venv/bin/python3)"`, normally `/usr/bin/python3.11`). Every process
-  of that Python may then raise its own priority; a side effect: the C library drops `TMPDIR` / `LD_*` from such a
-  process's environment (the test runner passes `RCB_TMPDIR` instead). **An `apt upgrade` that updates Python
-  replaces the binary and the capability is gone** — run `bash scripts/setup_system.sh --check` after one;
-- `LimitRTPRIO=99` for the robot service (`/etc/systemd/system/autorun.service.d/rtprio.conf`, since 2026-11-18):
-  under the service RTI gets its priority even when an upgrade removed the capability.
+tested. The setup script grants it through the robot service: `LimitRTPRIO=99`
+(`/etc/systemd/system/autorun.service.d/rtprio.conf`, since 2026-11-18). Since 2026-11-21 it no longer puts a file
+capability (`cap_sys_nice`) on the interpreter's binary: an `apt upgrade` that updated Python removed it silently, and
+nothing else needs it — a simulated RTI sets no priority, and an RTI started by hand outside the service refuses to
+start anyway (its core). A capability left from earlier is harmless; `bash scripts/setup_system.sh --check` names it,
+and `sudo setcap -r "$(readlink -f .venv/bin/python3)"` removes it.
 
 **If RTI keeps restarting**: `logs/supervisor.log` repeats `RTI stopped unexpectedly (exit 1) — restarting it` and
 `logs/RTI.out.log` ends in `real-time scheduling is required and not available` — the line says what RTI got and what
@@ -282,29 +279,9 @@ sudo systemctl stop autorun.service         # the arm goes limp ~0.1 s later (dr
 journalctl -u autorun.service -f
 ```
 
-The older template below (`rcb-runtime.service`: `.venv` + `LimitRTPRIO` instead of the capability) has never been
-validated on a clean machine. **Never enable both** — two supervisors would start; the setup script's check says so.
-
-> ⚠️ **NOT PROPERLY TESTED YET** (the `rcb-runtime.service` template).
-
-To install that template instead:
-
-```bash
-./scripts/install_service.sh
-```
-
-The service is rendered with your current repo path and user, so it does not
-hardcode `/home/robot/Desktop`.
-
-Useful commands:
-
-```bash
-sudo systemctl start rcb-runtime.service
-sudo systemctl stop rcb-runtime.service
-sudo systemctl restart rcb-runtime.service
-sudo systemctl status rcb-runtime.service
-journalctl -u rcb-runtime.service -f
-```
+`autorun.service` is the only service (2026-11-21: the older `rcb-runtime.service` template and its installer are
+gone; the setup script's check names a leftover one). One supervisor per robot: it takes a lock at its start
+(`/dev/shm/rcb-supervisor.lock`), and a second one — started by hand next to the service — refuses to start.
 
 ## Manual Run
 
@@ -337,7 +314,7 @@ Why by hand rather than through the supervisor or the service:
 If the systemd service is enabled it will also be starting these, so stop it first:
 
 ```bash
-sudo systemctl stop autorun.service    # or rcb-runtime.service, whichever is installed
+sudo systemctl stop autorun.service
 ```
 
 ## Run Under the Supervisor

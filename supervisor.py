@@ -36,6 +36,16 @@ Contact: petar@source-robotics.com
 """
 
 import os
+# One supervisor per robot (review I8, 2026-11-21), before ANYTHING else: a second one — a second service unit, or one
+# started by hand next to the service — would start a second RTI on the same CAN bus and, as a shared-memory owner,
+# could recreate the running one's segments. The lock ends with this process (supervisor/instance_lock.py).
+from supervisor.instance_lock import acquire as _acquire_instance_lock
+_INSTANCE_LOCK, _lock_holder = _acquire_instance_lock()
+if _INSTANCE_LOCK is None:
+    import sys
+    print(f"another supervisor already runs (pid {_lock_holder or 'unknown'}): this one does not start — one robot, "
+          f"one supervisor (sudo systemctl status autorun.service)", file=sys.stderr, flush=True)
+    sys.exit(1)
 # BEFORE anything imports data.shared_data (review I3, 2026-11-20): the supervisor is the service's FIRST process — when
 # it starts, nothing of the service runs (systemd stopped the whole unit), so it may recreate a segment an update
 # resized and publish the layout. Without this it attached the old run's segments as a non-owner, refused the new

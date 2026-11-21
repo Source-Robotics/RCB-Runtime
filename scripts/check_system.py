@@ -246,8 +246,8 @@ def check_rt_permissions(robot_pi: bool) -> None:
     if probe.returncode == 0:
         add("RT priority permission", True, f"{said}; {facts}")
         return
-    fix = (f"Fix: sudo bash scripts/setup_system.sh (or: sudo setcap cap_sys_nice=eip {binary}); an apt upgrade of "
-           f"Python removes the capability again")
+    fix = ("Fix: sudo bash scripts/setup_system.sh — it installs autorun.service with rtprio.conf (LimitRTPRIO=99), "
+           "where RTI gets its priority (review I8, 2026-11-21: no capability on the interpreter any more)")
     service_ok = "LimitRTPRIO=99" in (file_text(RTPRIO_DROPIN) or "")
     if service_ok:
         add("RT priority permission", False,
@@ -259,41 +259,22 @@ def check_rt_permissions(robot_pi: bool) -> None:
         required=robot_pi)
 
 
+MODULES_FILE = ROOT / "scripts" / "required_modules.txt"
+
+
+def required_modules() -> dict:
+    """{module: required} from scripts/required_modules.txt — the one list setup_system.sh checks too (review I8,
+    2026-11-21: this file had its own, with pinokin, which nothing imports any more, and without coal)."""
+    modules = {}
+    for line in MODULES_FILE.read_text(encoding="utf-8").splitlines():
+        words = line.split("#", 1)[0].split()
+        if words:
+            modules[words[0]] = "optional" not in words[1:]
+    return modules
+
+
 def check_imports() -> None:
-    modules = {
-        "can": True,
-        "zmq": True,
-        "psutil": True,
-        "numpy": True,
-        "scipy": True,
-        "nicegui": True,
-        "serial": True,
-        "PIL": True,
-        "Spectral_BLDC": True,
-        "roboticstoolbox": True,
-        # roboticstoolbox 1.5 falls back to slow pure Python, without a warning, when its compiled parts do not
-        # load (2026-11-15): import them by name so a bad wheel fails here.
-        "roboticstoolbox._frne_c": True,
-        "roboticstoolbox._fknm_c": True,
-        "spatialmath": True,
-        "pinocchio": False,
-        # Added 2026-08-08. All three were missing here, so this check passed installs that
-        # could not actually run the robot — including the one that shipped without `pinokin`
-        # pinned at all.
-        #   ruckig  — RTI mode's POSITION RATE LIMITER since 2026-08-02. Without it RTI
-        #             silently falls back to a legacy cascade that does not converge, so this
-        #             is a safety dependency, not an optional profile.
-        #   pinokin — SE(3) helpers used by motion/cartesian_paths.py; absent means no
-        #             Cartesian motion planning.
-        #   toppra  — the only blend-capable time parameterizer (zone / tolerance blending).
-        "ruckig": True,
-        "pinokin": True,
-        "toppra": True,
-        "lgpio": True,
-        "gpiozero": True,
-        "adafruit_ssd1306": False,
-        "board": False,
-    }
+    modules = required_modules()
     for module, required in modules.items():
         code = f"import importlib; importlib.import_module({module!r})"
         result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
@@ -319,7 +300,24 @@ def summary_line(required_failures: int, warnings: int) -> str:
     return "System check finished with no required failures."
 
 
+def arm_enabled() -> bool:
+    """The running robot's state reads ENABLED (shared memory read as a file: no import, no attach). Review I8,
+    2026-11-21: the import checks start ~25 heavy interpreters, and heavy jobs on this Pi slowed RTI's ticks while the
+    arm held itself."""
+    path = Path("/dev/shm") / (os.environ.get("RCB_SHM_PREFIX", "") + "robot_state")
+    try:
+        raw = path.read_bytes()
+        n = int.from_bytes(raw[:4], "little")
+        return raw[4:4 + n].decode("utf-8", "replace").strip() == "ENABLED"
+    except (OSError, ValueError):
+        return False
+
+
 def main() -> int:
+    if arm_enabled() and "--force" not in sys.argv[1:]:
+        print("The arm is ENABLED: this check starts ~25 heavy imports, which can slow the real-time loop while the arm "
+              "holds itself. Disable the arm first (or run with --force).")
+        return 2
     print(f"RCB Control Runtime system check\nrepo: {ROOT}\n")
     check_python()
     check_repo_layout()

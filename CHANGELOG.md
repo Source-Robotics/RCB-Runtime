@@ -29,6 +29,12 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Changed
 
+- `autorun.service` is the only service: the `rcb-runtime.service` template and `scripts/install_service.sh` are
+  removed, `install.sh` points to `sudo bash scripts/setup_system.sh`, and its check names a leftover second unit.
+- RTI's real-time priority comes from the service (`rtprio.conf`, `LimitRTPRIO=99`) only: `setup_system.sh` no longer
+  puts `cap_sys_nice` on the interpreter (a Python upgrade removed it silently); a leftover one is named.
+- `scripts/check_system.py` refuses while the arm is enabled (its ~25 heavy imports can slow the real-time loop);
+  `--force` runs it anyway.
 - The dashboard's Plan Preview tab loads the active preview when the tab is first shown, not during every page load.
 - The E-stop input registers a press once 2 of its last 5 reads (8-20 ms) are pressed; it needed 5 identical reads, so
   a pressed contact that chatters never registered. One glitch alone still does not. The release still needs 5.
@@ -82,6 +88,10 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- A second supervisor (a second service unit, or one started by hand next to the service) started a second RTI on the
+  same CAN bus; it now refuses to start, naming the one that runs (a lock released when that one ends).
+- `setup_system.sh` and `check_system.py` checked different module lists (`pinokin`, which nothing imports; no
+  `coal`, which the self-collision check needs): one list, `scripts/required_modules.txt`.
 - The dashboard: every page load left its command thread and its connection to the executor behind and added the
   block editor's routes again, until the dashboard restarted. A closed or reloaded page now lets go of its connection
   once nothing it queued still runs; the routes are added once per dashboard process. (A closed page's memory is still
