@@ -26,29 +26,39 @@ def load_capture(path):
         return info, {s: [float(v) for v in z[s]] for s in info["signals"]}
 
 
-def times_ms(info) -> list:
-    """Each sample's time from the fault (the trigger sample = 0), ms."""
-    dt = info.get("sample_s") or 0.0
+def trigger_known(info) -> bool:
+    """The drive answered where its trigger sample is (a lost reply is stored as -1)."""
     trig = info.get("trigger_index", -1)
-    trig = trig if trig is not None and trig >= 0 else 0
+    return trig is not None and trig >= 0
+
+
+def times_ms(info) -> list:
+    """Each sample's time from the fault (the trigger sample = 0), ms; from the first sample when the trigger is
+    unknown."""
+    dt = info.get("sample_s") or 0.0
+    trig = info["trigger_index"] if trigger_known(info) else 0
     return [round((i - trig) * dt * 1000.0, 2) for i in range(info["count"])]
 
 
 def label(path, info) -> str:
     name = Path(path).name.replace("_drive_capture.npz", "")
     lost = f", {info['lost']} lost" if info.get("lost") else ""
-    return f"{name} — {info['count']} samples{lost}"
+    unknown = "" if trigger_known(info) else ", the fault's moment unknown"
+    return f"{name} — {info['count']} samples{lost}{unknown}"
 
 
-def chart(signal, unit, x, values) -> dict:
-    """ECharts options: the signal over the time from the fault, the fault marked."""
+def chart(signal, unit, x, values, fault_known=True) -> dict:
+    """ECharts options: the signal over the time from the fault, the fault marked. With the trigger unknown (review
+    C10, 2026-11-21: it was drawn as "fault" at the first sample) the time runs from the first sample, nothing marked."""
+    series = {"type": "line", "showSymbol": False, "data": [[t, v] for t, v in zip(x, values)]}
+    if fault_known:
+        series["markLine"] = {"symbol": "none", "lineStyle": {"color": "#c10015", "width": 2},
+                              "label": {"formatter": "fault"}, "data": [{"xAxis": 0}]}
+    axis = "ms from the fault" if fault_known else "ms from the first sample (the fault's moment unknown)"
     return {"title": {"text": f"{TITLES.get(signal, signal)} ({unit})", "left": "center", "textStyle": {"fontSize": 13}},
             "tooltip": {"trigger": "axis"}, "grid": {"left": 60, "right": 20, "top": 36, "bottom": 30},
-            "xAxis": {"type": "value", "name": "ms from the fault", "nameLocation": "middle", "nameGap": 22},
-            "yAxis": {"type": "value", "scale": True},
-            "series": [{"type": "line", "showSymbol": False, "data": [[t, v] for t, v in zip(x, values)],
-                        "markLine": {"symbol": "none", "lineStyle": {"color": "#c10015", "width": 2},
-                                     "label": {"formatter": "fault"}, "data": [{"xAxis": 0}]}}]}
+            "xAxis": {"type": "value", "name": axis, "nameLocation": "middle", "nameGap": 22},
+            "yAxis": {"type": "value", "scale": True}, "series": [series]}
 
 
 def add_drive_captures_card(folder=None):
@@ -79,7 +89,7 @@ def add_drive_captures_card(folder=None):
         x = times_ms(info)
         with charts:
             for signal, unit in zip(info["signals"], info["units"]):
-                ui.echart(chart(signal, unit, x, data[signal])).classes("w-full").style("height:220px;")
+                ui.echart(chart(signal, unit, x, data[signal], trigger_known(info))).classes("w-full").style("height:220px;")
 
     def refresh():
         files = list_captures(folder)

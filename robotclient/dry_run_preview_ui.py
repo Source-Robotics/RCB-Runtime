@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import json
+import threading
 import time
 
 import numpy as np
@@ -31,6 +32,7 @@ METRICS = {
 
 RAW_WINDOW_DURATION_S = 20.0
 RAW_WINDOW_SHIFT_S = 4.0
+ACTIVE_CHECK_S = 1.0       # how often a shown tab looks whether the active preview changed (review G8, 2026-11-21)
 
 
 def raw_window_indices(time_s, start_s, duration_s=RAW_WINDOW_DURATION_S):
@@ -60,6 +62,7 @@ def add_dry_run_preview(is_visible=None, angle_unit=None):
         'last_wall_s': None, 'metric': 'joint_position_rad', 'axes': {0},
         'path_mode': 'xy', 'window_start_s': 0.0, 'window_first_index': 0,
         'window_dirty': False, 'active_mtime_ns': None,
+        'loading': False, 'last_check': float('-inf'),   # the background load of the active preview (review G8)
     }
     axis_checkboxes = []
 
@@ -535,23 +538,46 @@ def add_dry_run_preview(is_visible=None, angle_unit=None):
         else:
             update_sample()
 
+    def show_load_error(error):
+        state.update(data=None, playing=False, last_wall_s=None)
+        status.text = f"Preview load failed: {error}"
+        status.classes(replace="text-sm text-negative")
+
     def load_preview():
+        """The Load button: the file in the path box, loaded now."""
         path = path_input.value.strip()
         try:
             data = load_dry_run_preview(path)
-        except (OSError, ValueError) as error:
-            state.update(data=None, playing=False, last_wall_s=None)
-            status.text = f"Preview load failed: {error}"
-            status.classes(replace="text-sm text-negative")
+        except Exception as error:        # any broken file (a bad zip, a missing array), not only OSError / ValueError:
+            show_load_error(error)        # one escaped and took every page load down (review G8, 2026-11-21)
             return
-        state.update(data=data, index=0, playing=False, last_wall_s=None,
-                     window_start_s=float(data.time_s[0]), window_first_index=0, window_dirty=False)
         try:
-            state["active_mtime_ns"] = (ACTIVE_PREVIEW_PATH.stat().st_mtime_ns
-                                        if Path(path) == ACTIVE_PREVIEW_PATH else None)
+            mtime_ns = (ACTIVE_PREVIEW_PATH.stat().st_mtime_ns if Path(path) == ACTIVE_PREVIEW_PATH else None)
         except OSError:
-            state["active_mtime_ns"] = None
-        status.text = (f"Loaded {os.path.basename(path)}: {len(data.segments)} segments, "
+            mtime_ns = None
+        show_loaded(path, data, mtime_ns)
+
+    def start_auto_load(path, mtime_ns):
+        """Load the managed active preview on a thread — a large one takes a while, and the dashboard's one event
+        loop serves every page (review G8); playback_tick shows it when it is back."""
+        state['loading'] = True
+        status.text = f"Loading {os.path.basename(str(path))} ..."
+        status.classes(replace="text-sm text-gray-500")
+
+        def work():
+            try:
+                result = (load_dry_run_preview(path), None)
+            except Exception as error:      # shown by playback_tick, like the Load button's
+                result = (None, error)
+            state['loaded'] = (path, mtime_ns) + result
+
+        threading.Thread(target=work, name="plan-preview-load", daemon=True).start()
+
+    def show_loaded(path, data, mtime_ns):
+        state.update(data=data, index=0, playing=False, last_wall_s=None,
+                     window_start_s=float(data.time_s[0]), window_first_index=0, window_dirty=False,
+                     active_mtime_ns=mtime_ns)
+        status.text = (f"Loaded {os.path.basename(str(path))}: {len(data.segments)} segments, "
                        f"{len(data.events)} events, {len(data.time_s):,} samples, "
                        f"{data.duration_s:.3f} s")
         status.classes(replace="text-sm text-positive")
@@ -628,23 +654,36 @@ def add_dry_run_preview(is_visible=None, angle_unit=None):
             targets = [index for index in indices if index > state['index']]
             set_index(targets[0] if targets else len(data.time_s) - 1)
     def playback_tick():
-        active_path = ACTIVE_PREVIEW_PATH
-        try:
-            active_mtime_ns = active_path.stat().st_mtime_ns
-        except OSError:
-            active_mtime_ns = None
-        if (Path(path_input.value.strip()) == active_path
-                and active_mtime_ns is not None
-                and active_mtime_ns != state['active_mtime_ns']):
-            load_preview()
-        data = state['data']
-        if data is None:
-            return
+        done = state.pop('loaded', None)                  # a background load is back
+        if done is not None:
+            state['loading'] = False
+            path, mtime_ns, data, error = done
+            if error is not None:
+                show_load_error(error)
+                state['active_mtime_ns'] = mtime_ns        # tried: again only once the file changes
+            elif Path(path_input.value.strip()) == Path(path):   # still the file asked for
+                show_loaded(path, data, mtime_ns)
         if not visible():
             if state['playing']:
                 state['playing'] = False
                 play_button.props('icon=play_arrow')
             state['window_dirty'] = False
+            return
+        # The managed active preview, loaded while this tab is SHOWN and checked once a second — it was loaded at
+        # every page build and stat()ed 30 times a second by every open page (review G8, 2026-11-21).
+        now = time.monotonic()
+        if not state['loading'] and now - state['last_check'] >= ACTIVE_CHECK_S:
+            state['last_check'] = now
+            active_path = ACTIVE_PREVIEW_PATH
+            if Path(path_input.value.strip()) == active_path:
+                try:
+                    active_mtime_ns = active_path.stat().st_mtime_ns
+                except OSError:
+                    active_mtime_ns = None
+                if active_mtime_ns is not None and active_mtime_ns != state['active_mtime_ns']:
+                    start_auto_load(active_path, active_mtime_ns)
+        data = state['data']
+        if data is None:
             return
         if state['window_dirty']:
             state['window_dirty'] = False
@@ -772,10 +811,8 @@ def add_dry_run_preview(is_visible=None, angle_unit=None):
         ]
         diagnostic_table = ui.table(columns=[{**c, 'label': unit_text(c['label'])} for c in diagnostic_columns],
                                     rows=[]).classes('w-full').props('dense flat wrap-cells')
-    # Load the one managed active preview when the page is opened. A later run of
-    # the offline planner is picked up by playback_tick via its changed mtime.
-    if ACTIVE_PREVIEW_PATH.exists():
-        load_preview()
+    # The one managed active preview is loaded by playback_tick the first time this tab is shown (on a thread), and
+    # again whenever a later run of the offline planner changes its mtime — not at every page build (review G8).
     ui.timer(1.0 / 30.0, playback_tick)
 
     def set_units():

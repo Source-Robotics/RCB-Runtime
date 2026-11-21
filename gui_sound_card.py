@@ -40,6 +40,39 @@ def changed(before: dict, after: dict) -> dict:
     return out
 
 
+def send_setting(state: dict, key: str, value, exec_fn) -> bool:
+    """Send one setting when it differs from what the robot holds; True when it was sent.
+
+    `state` takes the value only once the robot has taken it — inside the call exec_fn runs, after set_sound returned
+    without raising (review C18, 2026-11-21): it was recorded at the click, so a refused change (control held by
+    someone else, the executor down) read as saved and the same click again sent nothing.
+    """
+    if state.get(key) == value:
+        return False
+
+    def send(r, k=key, v=value):
+        r.set_sound(**{k: v})
+        state[k] = v
+
+    exec_fn(send, "set_sound")
+    return True
+
+
+def send_changes(state: dict, new: dict, exec_fn) -> dict:
+    """The tone settings that differ from what the robot holds, sent in one set_sound; `state` takes them only once the
+    robot has (send_setting). Returns what was sent."""
+    diff = changed(state, new)
+    if diff:
+        sent = dict(diff)
+
+        def send(r):
+            r.set_sound(**sent)
+            state.update(sent)
+
+        exec_fn(send, "set_sound")
+    return diff
+
+
 def add_sound_card(settings: dict, joint_num: int, has_gripper: bool, exec_fn, poll_fn):
     """The card. settings = system.xml's <sound> as parsed at page load; exec_fn(fn, label) changes the robot (it takes
     control); poll_fn(fn, label) sends identify_arm, which needs no control."""
@@ -49,17 +82,12 @@ def add_sound_card(settings: dict, joint_num: int, has_gripper: bool, exec_fn, p
     state = dict(settings)
 
     def set_value(key, value):
-        if state.get(key) != value:
-            exec_fn(lambda r, k=key, v=value: r.set_sound(**{k: v}), "set_sound")
-            state[key] = value
+        send_setting(state, key, value, exec_fn)
 
     def save_tone():
         new = {"axis": axis.value, "current_ma": float(current.value or 0), "node": int(node.value),
                "limit_mv": float(limit.value or 0)}
-        diff = changed(state, new)
-        if diff:
-            exec_fn(lambda r, d=dict(diff): r.set_sound(**d), "set_sound")
-            state.update(diff)
+        send_changes(state, new, exec_fn)
 
     def hear(name):
         exec_fn(lambda r, n=name: r.play_sound(n), "play_sound")

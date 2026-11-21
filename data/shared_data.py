@@ -80,12 +80,16 @@ def _mismatch(name, what):
                          f"program alone")
 
 # ======================= SharedString Class ==========================
+GET_JSON_TRIES = 5                       # get_json: reads before it falls back to the last value read whole
+
+
 class SharedString:
     """A wrapper for string shared memory with 4-byte length prefix."""
     def __init__(self, name: str, size: int = 256):
         global _blocks_attached, _blocks_created
         name = _SHM_PREFIX + name
         self.size = size
+        self._last_raw = b""                                 # the last JSON read whole (get_json)
         try:
             self.shm = shared_memory.SharedMemory(name=name, create=True, size=size)
             self.shm.buf[:size] = b'\x00' * size  # type: ignore[index]  # SharedMemory.buf is typed Optional; a created segment always has one
@@ -120,14 +124,28 @@ class SharedString:
         self.set(json_str)
 
     def get_json(self):
-        """Reads from memory and converts JSON back to Python objects."""
-        raw = self.get()
-        if not raw or raw == "":
-            return []  # Return empty list if memory is empty
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return []
+        """Reads from memory and converts JSON back to Python objects; [] when the block is empty.
+
+        A read that meets a write half-done (the new length with the old bytes) is read again: the bytes must read the
+        same twice in a row and decode (review I7, 2026-11-21 — a torn error list decoded as [], "no errors", and a cut
+        UTF-8 character raised). After GET_JSON_TRIES reads that never settle, the last value this process read whole."""
+        for _ in range(GET_JSON_TRIES):
+            raw = self._raw()
+            if raw != self._raw():
+                continue
+            if not raw:
+                return []
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except ValueError:                               # JSONDecodeError and UnicodeDecodeError are ValueErrors
+                continue
+            self._last_raw = raw
+            return value
+        return json.loads(self._last_raw.decode("utf-8")) if self._last_raw else []
+
+    def _raw(self) -> bytes:
+        length = min(int.from_bytes(self.shm.buf[:4], "little"), self.size - 4)  # type: ignore[index]  # a created or attached segment always has a buffer
+        return bytes(self.shm.buf[4:4 + length])  # type: ignore[index]  # a created or attached segment always has a buffer
 
 
     def set(self, value: str):
@@ -177,7 +195,7 @@ homed_state = sim_mode = robot_command = None  # SharedString globals
 force_confirm_who = None                   # SharedString: who is asking to force a control
                                             # takeover ("ip:port"), for the OLED prompt
 motor_shms = motor_arrays = joint_shms = joint_arrays = None
-tcp_shms = tcp_arrays = ext_shms = ext_arrays = None
+tcp_shms = tcp_arrays = None
 shm_GPIO = gpio_states = None
 control_board_shms = None
 control_board = {}
@@ -280,7 +298,9 @@ def setup(joints: int = 6, force_reinit: bool = False):
             shm.close()
         for shm in joint_shms.values():  # type: ignore[attr-defined]  # only reached after setup() filled it (re-setup with another joint count)
             shm.close()
-        ext_shms["torque_external"].close()  # type: ignore[index]  # only reached after setup() filled it (re-setup with another joint count)
+        # torque_external is the one per-joint array in the TCP block (2026-11-21: this closed ext_shms, a name never
+        # assigned — every change of the joint count crashed here)
+        tcp_shms["torque_external"].close()  # type: ignore[index]  # only reached after setup() filled it (re-setup with another joint count)
 
     joint_num = max(1, joints)
     _blocks_attached = _blocks_created = 0
@@ -950,6 +970,22 @@ def _check_layout():
     theirs = published.get()
     if theirs and theirs != LAYOUT_DIGEST:
         _mismatch("shm_layout", f"says RTI runs layout {theirs}, this program has {LAYOUT_DIGEST}")
+
+
+DRIVE_IDENTITY_KEYS = ("HARDWARE_VERSION", "BATCH_DATE", "SOFTWARE_VERSION", "SERIAL_NUMBER", "motor_idle_brake")
+GRIPPER_IDENTITY_KEYS = ("gripper_motor_hw_version", "gripper_motor_sw_version", "gripper_motor_serial",
+                         "gripper_motor_idle_brake")
+
+
+def forget_drive_identity():
+    """RTI at its start, before it hears a drive: every drive's versions, serial and idle-brake code read 0, "not
+    reported" (2026-11-21). The last run's numbers stay in shared memory and passed for this run's until the drives
+    answered: after every simulator run (its drives report firmware 103) the executor warned that all seven drives
+    were too old."""
+    for key in DRIVE_IDENTITY_KEYS:
+        motor[key][:] = 0
+    for key in GRIPPER_IDENTITY_KEYS:
+        gripper[key][0] = 0
 
 
 def cleanup():

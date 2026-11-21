@@ -1007,12 +1007,16 @@ def read_live_state():
 # RTI's loop tick as the status watcher last saw it change (2026-10-24): with RTI stopped, get_joints / get_pose /
 # get_digital_input answered the last values in shared memory, with no sign they were old.
 RTI_STALE_S = 0.5
-_rti_tick = {"value": None, "at": 0.0}
+# "moved": the tick changed since this process first looked — what shared memory holds is this RTI run's, not a
+# value left by the last one (2026-11-21)
+_rti_tick = {"value": None, "at": 0.0, "moved": False}
 
 
 def _note_rti_tick():
     tick = int(shared_data.rti["loop_tick"][0])
     if tick != _rti_tick["value"]:
+        if _rti_tick["value"] is not None:
+            _rti_tick["moved"] = True
         _rti_tick["value"], _rti_tick["at"] = tick, time.monotonic()
 
 
@@ -3357,7 +3361,11 @@ _fw_seen = None
 
 def _check_drive_firmware():
     global _fw_seen
-    reported = [int(shared_data.motor["SOFTWARE_VERSION"][i]) for i in range(JOINT_NUM)]
+    # Only what THIS RTI run reported (2026-11-21): the executor starts with RTI, and until RTI ticks shared memory
+    # holds the last run's versions — after a simulator run its drives' 103, warned as "too old" for every drive.
+    if not (_rti_tick["moved"] and _rti_alive()):
+        return
+    reported =[int(shared_data.motor["SOFTWARE_VERSION"][i]) for i in range(JOINT_NUM)]
     names = [f"J{i + 1}" for i in range(JOINT_NUM)]
     types = list(cfg.get("motor_driver_type") or [])[:JOINT_NUM]
     types += [None] * (JOINT_NUM - len(types))

@@ -41,7 +41,7 @@ from utility.signal_filters import FILTER_KINDS
 # that can drift (TODO/RTI_mode_plan.md §9.1 is what happens when numbers get retyped).
 from motion.rti_handler import COMMAND_TIMEOUT_S, SUCCESS_WINDOW_TICKS, SUCCESS_WARN, SUCCESS_BAD
 from utility.filter_config import ALL_SIGNALS, default_filter_config
-from gui_processes import PROCESS_COLUMNS, add_processes_card, process_rows   # System Info: processes / threads / cores
+from gui_processes import add_processes_card   # System Info: processes / threads / cores
 from data.shared_memory_index import ESTOP_1 as _ESTOP_1   # for plot event markers
 
 shared_data.setup(joints=6)
@@ -459,9 +459,6 @@ rti_columns = [
     {'name': 'old_data', 'label': 'Old Data', 'field': 'old_data'},
     {'name': 'conn_err', 'label': 'Conn Err', 'field': 'conn_err'},
 ]
-
-# Processes panel (System Info tab): gui_processes.py (processes, threads, the core plan; 2026-10-13).
-process_columns = PROCESS_COLUMNS
 
 pid_columns = [
     {'name': 'joint',    'label': 'Joint',          'field': 'joint'},
@@ -1574,7 +1571,15 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
 
         # ─── Processes, threads and the core plan (gui_processes.py, 2026-10-13) ──────
         # Reads LIVE kernel state; refreshed at 1 Hz only while this tab is active (refresh_processes()).
-        refresh_process_card = add_processes_card()
+        # Built in a try like its neighbours (review G8): a failure must not break the page.
+        try:
+            refresh_process_card = add_processes_card()
+        except Exception:
+            logger.exception("processes card unavailable")
+            ui.label("Processes card unavailable — see logs/gui.log").classes("text-negative")
+
+            def refresh_process_card():
+                return None
 
         # Which arm homing recognised, the learned arms, rename / forget / accept (gui_homing_arms.py, 2026-10-09)
         try:
@@ -1987,23 +1992,33 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
 
     # ─── Offline Plan Preview ─────────────────────────────────
     with ui.tab_panel(tab_preview):
-        from robotclient.dry_run_preview_ui import add_dry_run_preview
+        # Built in a try like its neighbours (review G8): a corrupt preview file took every page load down.
+        _preview_set_units = lambda: None                      # noqa: E731 — replaced by the tab's redraw below
+        try:
+            from robotclient.dry_run_preview_ui import add_dry_run_preview
 
-        # Follows the Angles toggle and returns its redraw (_set_angle_unit). NiceGUI 3's script mode runs this FILE
-        # again at every page load but keeps the modules it imported as they were first imported, so until the GUI
-        # process restarts a page load can meet the Plan Preview from before angle_unit existed: then it is built as
-        # before (radians, returns None) instead of the whole page failing on an unexpected keyword.
-        import inspect as _inspect
-        _preview_kw = ({'angle_unit': lambda: _ANGLE_UNIT[0]}
-                       if 'angle_unit' in _inspect.signature(add_dry_run_preview).parameters else {})
-        _preview_set_units = add_dry_run_preview(
-            is_visible=lambda: _active_tab_name(tabs.value) == 'Plan Preview', **_preview_kw) or (lambda: None)
+            # Follows the Angles toggle and returns its redraw (_set_angle_unit). NiceGUI 3's script mode runs this
+            # FILE again at every page load but keeps the modules it imported as they were first imported, so until
+            # the GUI process restarts a page load can meet the Plan Preview from before angle_unit existed: then it
+            # is built as before (radians, returns None) instead of the whole page failing on an unexpected keyword.
+            import inspect as _inspect
+            _preview_kw = ({'angle_unit': lambda: _ANGLE_UNIT[0]}
+                           if 'angle_unit' in _inspect.signature(add_dry_run_preview).parameters else {})
+            _preview_set_units = add_dry_run_preview(
+                is_visible=lambda: _active_tab_name(tabs.value) == 'Plan Preview', **_preview_kw) or (lambda: None)
+        except Exception:
+            logger.exception("Plan Preview tab unavailable")
+            ui.label("Plan Preview tab unavailable — see logs/gui.log").classes("text-negative")
 
     # ─── Walls (TEMPORARY freedrive joint-wall tuner, gui_walls_tab.py) ───
     with ui.tab_panel(tab_walls):
-        from gui_walls_tab import add_walls_tab
-        add_walls_tab(_exec, shared_data, JOINTS, is_visible=lambda: _active_tab_name(tabs.value) == 'Walls',
-                      poll_fn=lambda fn, label: _page_sender().submit(fn, label=label))   # not "activity"
+        try:                                              # like its neighbours (review G8)
+            from gui_walls_tab import add_walls_tab
+            add_walls_tab(_exec, shared_data, JOINTS, is_visible=lambda: _active_tab_name(tabs.value) == 'Walls',
+                          poll_fn=lambda fn, label: _page_sender().submit(fn, label=label))   # not "activity"
+        except Exception:
+            logger.exception("Walls tab unavailable")
+            ui.label("Walls tab unavailable — see logs/gui.log").classes("text-negative")
 
     # ─── Drive parameters (every drive's parameters, read on demand; gui_drive_params_tab.py, 2026-11-16) ───
     with ui.tab_panel(tab_drive_params):
@@ -2832,15 +2847,6 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         # The motor view starts with 3 visible charts at 256px; acceleration is
         # shown for Joint/TCP modes, while torque/current is hidden for TCP.
         # _relayout_charts only runs on a user collapse/expand, when mounted.
-
-        # ── TEMP diagnostics: live Processes table under the plots, so the GUI
-        # core's CPU% is visible while toggling joints. Remove when done tuning.
-        with ui.card().classes('w-full mt-3'):
-            with ui.row().classes('items-center gap-2'):
-                ui.label('Processes (diagnostic)').classes('text-sm font-semibold text-gray-600 uppercase tracking-wide')
-                ui.label('TEMP — watch GUI CPU% vs selected joints').classes('text-xs text-gray-400')
-            process_table_diag = ui.table(columns=process_columns, rows=[], row_key='name') \
-                .classes('w-full').props('dense flat')
 
         async def _take_snapshot():
             # Export with the current theme's background so dark charts don't
@@ -4776,14 +4782,11 @@ def refresh_plots():
 # AUTO REFRESH
 # ─────────────────────────────────────────────────────────────
 def refresh_processes():
-    """1 Hz refresh of the processes / threads / core-plan card (gui_processes.py). Reads only while a tab that shows
-    it is active (System Info, or the Plots tab's TEMP diagnostic copy) — cpu_percent() wants ~1 s between samples."""
-    _tab = _active_tab_name(tabs.value)
-    if _tab == 'System Info':
+    """1 Hz refresh of the processes / threads / core-plan card (gui_processes.py). Reads only while the System Info
+    tab is active — cpu_percent() wants ~1 s between samples. (The Plots tab's "TEMP" copy of the table, a leftover of a
+    tuning session that read hundreds of /proc files a second there, is gone — review G8, 2026-11-21.)"""
+    if _active_tab_name(tabs.value) == 'System Info':
         refresh_process_card()
-    elif _tab == 'Plots':  # TEMP diagnostic copy
-        process_table_diag.rows = process_rows()
-        process_table_diag.update()
 
 
 _plot_connected = [False]   # one-shot guard: connect the charts only once
@@ -4836,6 +4839,17 @@ def _on_disconnect():
         _jog_btn_pressed['active'] = False
         _joystick_active[0] = False
         _exec_sender.abort()
+
+
+def _on_delete():
+    """The page is gone for good — NiceGUI deletes a client 3 s after its browser left without coming back (a closed
+    tab, a reload): retire its executor channel. Its thread and connection used to stay for the rest of the dashboard,
+    one more per page load (review G6, 2026-11-21). retire() lets a move this page queued run to its end first."""
+    retire = getattr(_exec_sender, "retire", None)     # a dashboard not restarted since may hold the older sender
+    if retire is not None:
+        retire()
+    import gui_page_lifecycle as _lifecycle            # its objects go at the next full collection (G6, 2026-11-21)
+    getattr(_lifecycle, "page_gone", lambda: None)()
 
 async def _on_tab_change():
     # The Plots charts only mount when their tab is shown, so link the synced
@@ -4911,15 +4925,32 @@ def _drain_exec_toasts():
 tabs.on_value_change(_on_tab_change)
 ui.context.client.on_connect(_on_connect)
 ui.context.client.on_disconnect(_on_disconnect)
-ui.timer(TABLE_REFRESH_S, update_tables)   # tables/status — calm, readable
+ui.context.client.on_delete(_on_delete)
+# The 10 Hz refresh through a guard (gui_page_lifecycle.Guarded, review G8): one failure — a missing shared-memory key —
+# was a traceback ten times a second; now its first one, then a line a minute with a count.
+from gui_page_lifecycle import Guarded, freeze_once  # noqa: E402
+import gui_page_lifecycle as _page_lifecycle  # noqa: E402
+# A full collection after pages went, on the APP's timer, registered once per process (G6, 2026-11-21: without it a
+# closed page's memory was never freed); getattr: a dashboard not restarted since holds the older module. Not in script
+# mode's PREFLIGHT run (the script once before the server starts, same process): a timer made then never runs, and the
+# once-per-process flag set then kept every page from starting it (found on the live dashboard, 2026-11-21).
+from nicegui import core as _nicegui_core  # noqa: E402
+if not _nicegui_core.is_script_mode_preflight():
+    getattr(_page_lifecycle, "start_collector", lambda timer: False)(app.timer)
+_update_tables_guarded = Guarded(update_tables, "the tables refresh", logger)
+ui.timer(TABLE_REFRESH_S, _update_tables_guarded)   # tables/status — calm, readable
 ui.timer(PLOT_REFRESH_S, refresh_plots)    # plots — smooth, independent rate
 ui.timer(1.0, refresh_processes)           # slow panel (System Info tab)
 ui.timer(0.5, refresh_firmware_tab)        # park verdict + mode badge (Firmware tab)
 ui.timer(0.3, _drain_exec_toasts)          # command failures from the sender thread
 ui.timer(0.5, _refresh_control_state)       # who holds control (status bar, greyed controls)
-# Homing's question (2026-11-16, user: "pause and ask"): a joint homed off its usual spot -> a dialog on every page
-from gui_homing_question import add_homing_question  # noqa: E402
-ui.timer(0.5, add_homing_question(shared_data, JOINTS, _exec))
+# Homing's question (2026-11-16, user: "pause and ask"): a joint homed off its usual spot -> a dialog on every page.
+# Built in a try like the tab builders (review G8): a failure must not take the whole page down.
+try:
+    from gui_homing_question import add_homing_question  # noqa: E402
+    ui.timer(0.5, add_homing_question(shared_data, JOINTS, _exec))
+except Exception:
+    logger.exception("homing question dialog unavailable")
 # Memory and disk move, but slowly — 5 s is plenty, and it keeps the shared strings fresh for any
 # other consumer too. Platform/CPU/disk-device are published once at startup (they cannot change
 # without a reboot). Both calls are cheap: one virtual_memory() and one statvfs.
@@ -4932,13 +4963,12 @@ ui.timer(5.0, _publish_slow_system_info)
 
 # Populate rows/labels synchronously so the very first page render already
 # contains data — otherwise the default Joints & TCP tab shows as empty until
-# the first websocket tick or a tab switch.
-update_tables()
+# the first websocket tick or a tab switch. Guarded: a failure here must not fail the page load.
+_update_tables_guarded()
 
-# Move everything allocated so far (UI tree, charts, config, shared-memory
-# wrappers) into the GC's permanent generation so it never re-scans them. The
-# per-frame plot garbage is then the only thing the collector has to consider.
-gc.collect()
-gc.freeze()
+# Move everything allocated so far (libraries, UI tree, charts, config, shared-memory wrappers) into the GC's
+# permanent generation so it never re-scans them — ONCE per dashboard process (gui_page_lifecycle.freeze_once,
+# review G6, 2026-11-21): at every page load it pinned every page for good (frozen objects are never collected).
+freeze_once()
 
 ui.run(reload=False, port=8081)

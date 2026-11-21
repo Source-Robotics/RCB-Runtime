@@ -7,9 +7,43 @@ says whether the robot's CLOCK is right: synchronised from the internet (NTP), o
 """
 from __future__ import annotations
 
+import threading
 import time
+from typing import Any
 
 import utility.display_time as dt
+
+# The clock's state (`timedatectl`: a subprocess, up to 2 s) is read OFF the dashboard's event loop and once per
+# PROCESS every CLOCK_REFRESH_S — not on the loop by every open page every 10 s (review G8, 2026-11-21). This module
+# is imported once, so the cache is shared by every page load.
+CLOCK_REFRESH_S = 10.0
+_clock: dict[str, Any] = {"status": {}, "at": None, "running": False}
+_clock_lock = threading.Lock()
+
+
+def _refresh_clock():
+    try:
+        status = dt.clock_status()
+    except Exception:                    # never let the reader thread die with the flag set
+        status = {}
+    with _clock_lock:
+        _clock["status"] = status
+        _clock["running"] = False
+
+
+def cached_clock_status(now: float | None = None) -> dict:
+    """The last clock status read ({} until the first read is back); starts a background read when the last one is
+    CLOCK_REFRESH_S old and none is running. Never blocks on the subprocess."""
+    now = time.monotonic() if now is None else now
+    with _clock_lock:
+        due = not _clock["running"] and (_clock["at"] is None or now - _clock["at"] >= CLOCK_REFRESH_S)
+        if due:
+            _clock["running"] = True
+            _clock["at"] = now
+        status = dict(_clock["status"])
+    if due:
+        threading.Thread(target=_refresh_clock, name="gui-clock-status", daemon=True).start()
+    return status
 
 
 def clock_text(status: dict) -> str:
@@ -27,7 +61,6 @@ def add_time_card(system_xml_path: str):
     """The card. Returns its handles (for the net)."""
     from nicegui import ui
     zones = ["system"] + dt.all_zones()
-    state = {"last_status": 0.0}
     with ui.card().classes("flex-1 min-w-64"):
         ui.label("Time").classes("text-sm font-semibold mb-2 text-gray-600 uppercase tracking-wide")
         now_lbl = ui.label("").classes("font-mono text-sm")
@@ -50,9 +83,9 @@ def add_time_card(system_xml_path: str):
     def tick():
         now_lbl.set_text("Robot time: " + dt.fmt(time.time(), "%Y-%m-%d %H:%M:%S %Z")
                          + (f"  ({dt.zone_name()})" if dt.zone_name() != "system" else f"  ({dt.system_zone_name()})"))
-        if time.monotonic() - state["last_status"] > 10.0:
-            state["last_status"] = time.monotonic()
-            clock_lbl.set_text(clock_text(dt.clock_status()))
+        text = clock_text(cached_clock_status())          # the process's cache: no subprocess here (review G8)
+        if clock_lbl.text != text:
+            clock_lbl.set_text(text)
 
     apply_btn.on_click(apply)
     ui.timer(1.0, tick)

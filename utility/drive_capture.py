@@ -17,6 +17,8 @@ samples lost on the way.
 """
 from __future__ import annotations
 
+import contextlib
+import logging
 import time
 from collections import deque
 
@@ -107,6 +109,7 @@ class DriveCapture:
             if e and not self.prev[n] and n in self.armed:
                 self.armed.discard(n)
                 self.pending.append((n, self.tick, self.clock()))
+                self._drop_arming(n)
             self.prev[n] = e
         if self.queue or self.tick - self.last_send < WAIT_TICKS:
             return
@@ -117,6 +120,14 @@ class DriveCapture:
             self._after_meta(motors)
         else:
             self._after_data(motors)
+
+    def _drop_arming(self, node) -> None:
+        """On `node`'s fault edge: its arming frames not sent yet are dropped (review C10, 2026-11-21). A fault right
+        after Clear Errors, while they waited, was followed by them — they restarted the drive's recording over it. Off
+        the per-tick path (a fault edge only)."""
+        keep = [q for q in self.queue if not (q[0] == "set" and q[1] == node)]
+        self.queue.clear()
+        self.queue.extend(keep)
 
     def _start(self, motors) -> None:
         n, t, wall = self.pending.popleft()
@@ -200,19 +211,36 @@ class CaptureSaver:
         self.activity = activity
         self.seen = int(meta[0])              # what was there before the recorder started is not saved again
 
-    def poll(self):
-        """Save a new capture; returns its path or None."""
+    RETRY_S = 30.0                        # a failed save (a full card) is tried again this long after
+
+    def poll(self, now=None):
+        """Save a new capture; returns its path or None. A save that fails is tried again RETRY_S later, until it
+        succeeds or a newer capture replaces it (review C10, 2026-11-21: it was marked saved first, so a failure lost it
+        for good); one warning per capture."""
         import json
         import numpy as np
-        if int(self.meta[0]) == self.seen:
+        seq = int(self.meta[0])
+        if seq == self.seen:
             return None
-        self.seen = int(self.meta[0])
+        now = time.monotonic() if now is None else now
+        if getattr(self, "_failed", None) == seq and now < self._retry_at:
+            return None
         info, channels = capture_arrays(self.samples, self.meta)
         label = node_label(info["node"], self.joint_num)
         stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime(info["fault_time"] or time.time()))
-        self.folder.mkdir(parents=True, exist_ok=True)
         path = self.folder / f"{stamp}_{label}_drive_capture.npz"
-        np.savez_compressed(path, meta=json.dumps(info), **{s: np.asarray(c) for s, c in zip(SIGNALS, channels)})
+        try:
+            self.folder.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(path, meta=json.dumps(info), **{s: np.asarray(c) for s, c in zip(SIGNALS, channels)})
+        except OSError as e:
+            if getattr(self, "_failed", None) != seq:
+                logging.getLogger("rec").warning("drive capture %s could not be saved (%s) — tried again every %g s",
+                                                 path.name, e, self.RETRY_S)
+            self._failed, self._retry_at = seq, now + self.RETRY_S
+            with contextlib.suppress(OSError):
+                path.unlink()                 # a half-written file is not a capture
+            return None
+        self.seen = seq
         for old in sorted(self.folder.glob("*_drive_capture.npz"))[:-self.KEEP]:
             old.unlink()
         if self.activity is not None:

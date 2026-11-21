@@ -49,8 +49,14 @@ def mount(app, prefix="/blockly", robot_host=None, robot_port=None):
 
     The API goes in FIRST: the static mount matches every path under the prefix, so a route added after it would
     never be reached.
+
+    Once per app: the dashboard calls this at every page load (NiceGUI's script mode), and each call added the eleven
+    routes and the static mount again, for the life of the dashboard (review G6, 2026-11-21). A later call only
+    configures the runner. Returns True when it mounted now.
     """
     runs.configure(host=robot_host, port=robot_port)
+    if is_mounted(app, prefix):
+        return False
     router = APIRouter(prefix=prefix + "/api")
     router.add_api_route("/codegen", codegen, methods=["POST"])
     router.add_api_route("/check", check, methods=["POST"])
@@ -65,6 +71,12 @@ def mount(app, prefix="/blockly", robot_host=None, robot_port=None):
     router.add_api_route("/run/{action}", run_control, methods=["POST"])
     app.include_router(router)
     app.mount(prefix, FreshStaticFiles(directory=WEB_DIR, html=True), name="blockly")
+    return True
+
+
+def is_mounted(app, prefix="/blockly"):
+    """The editor's static mount is on `app` already (its route's path is the prefix)."""
+    return any(getattr(r, "path", None) == prefix for r in getattr(app, "routes", ()))
 
 
 class FreshStaticFiles(StaticFiles):

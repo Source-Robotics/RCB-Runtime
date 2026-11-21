@@ -130,6 +130,7 @@ from utility.pinocchio_attach import attach_pinocchio
 _sys = read_XML2.load_system_config(SYSTEM_XML, ROBOTS_DIR)
 from data import shared_data
 shared_data.setup(joints=_sys['joint_num'])
+shared_data.forget_drive_identity()          # the last run's drive versions are not this run's (2026-11-21)
 from data.update_shared_data import (update_motor_and_gripper_data, update_joint_and_tcp_data, update_joint_state,
                                      update_tcp_pose, update_joint_rest)
 from utility.filter_config import build_filter_banks, load_filter_banks
@@ -898,9 +899,14 @@ def main():
         read_done = float(shared_data.rti["drive_params_read"][0]) == 2.0
         homing_ran = bool(np.any(shared_data.rti["homing_status"]))
         found = []
+        # Review C9 (2026-11-21): a drive that answered no read and no identity passed both checks unjudged, and the
+        # summary said it "holds what RTI sent" — now named as not checked
+        unread, unnamed = [], []
         for label, node, sent, driver_type in nodes:
             if read_done and not homing_ran:
                 held = {n: float(vals[node * SLOTS + n]) for n in sent if int(states[node * SLOTS + n]) == READ}
+                if len(held) < len(sent):
+                    unread.append(f"{label} ({len(sent) - len(held)} of {len(sent)} values)")
                 bad = gains_mismatches(sent, held)
                 if bad:
                     found.append(f"{label}:GAINS_MISMATCH_WARNING")
@@ -909,16 +915,28 @@ def main():
                     if any(n == BRAKE_ON_IDLE for n, _v, _h in bad):     # coasting when idle: J2 / J3 would drop
                         send_brake_on_idle(Motor, (node,))                 # (review D12) — sent again at once
                         log_startup.warning("%s: brake on idle sent again", label)
-            why = product_mismatch(driver_type, getattr(Motor[node], "product_id", None))
+            product_id = getattr(Motor[node], "product_id", None)
+            if product_id is None:
+                unnamed.append(label)
+            why = product_mismatch(driver_type, product_id)
             if why:
                 found.append(f"{label}:DRIVE_PRODUCT_MISMATCH")
                 log_startup.error("%s: %s — not the drive the robot XML describes: the arm cannot be enabled", label, why)
         if not read_done or homing_ran:
             log_startup.warning("the drives' gains were not checked: %s", "a homing ran during the start-up read"
                                 if homing_ran else "the start-up parameter read had not finished")
-        log_startup.info("drive checks at start: %s", ", ".join(found) if found else
-                         "every drive is the product its XML declares" + ("" if not read_done or homing_ran else
-                                                                          " and holds what RTI sent"))
+        if unread:
+            log_startup.warning("not checked, the drive did not answer the start-up read of what RTI sent it: %s",
+                                ", ".join(unread))
+        if unnamed:
+            log_startup.warning("product not checked, the drive sent no identity reply: %s", ", ".join(unnamed))
+        products = ("every drive is the product its XML declares" if not unnamed else
+                    f"every drive that identified itself is the product its XML declares ({', '.join(unnamed)} did "
+                    f"not)")
+        holds = ("" if not read_done or homing_ran else
+                 " and holds what RTI sent" if not unread else
+                 f" and holds what RTI sent, of what it answered ({', '.join(unread)} not read)")
+        log_startup.info("drive checks at start: %s", ", ".join(found) if found else products + holds)
         _drive_check_found[:] = found
         if found:
             _apply_base_warnings()

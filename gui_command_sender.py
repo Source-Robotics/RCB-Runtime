@@ -75,6 +75,7 @@ class ExecCommandSender:
         self._pending_cv = threading.Condition()
         self._queue_max = _QUEUE_MAX
         self._stop = threading.Event()
+        self._retiring = False        # retire(): the page is gone — run what is queued, then close
         self._worker = threading.Thread(target=self._run, name="gui-exec-sender", daemon=True)
         self._worker.start()
 
@@ -88,7 +89,7 @@ class ExecCommandSender:
         closed = False
         superseded = 0
         with self._pending_cv:
-            if self._stop.is_set():
+            if self._stop.is_set() or self._retiring:
                 closed = True
             elif label in _STOP_LABELS:
                 kept = deque()
@@ -176,6 +177,30 @@ class ExecCommandSender:
     def closed(self):
         return self._stop.is_set()
 
+    def retire(self):
+        """The page is gone for good (NiceGUI deleted its client): take no new command, run the ones queued, then
+        close the connection once nothing it started still runs — and end the worker thread with it.
+
+        Every page load used to leave its sender thread and its executor connection behind for the life of the
+        dashboard (review G6, 2026-11-21). Not closed at once: the executor stops the moves of a control holder that
+        disconnects, so a move this page queued (a reload in the middle of one) runs to its end first, and the control
+        it holds goes back when that is done.
+        """
+        with self._pending_cv:
+            self._retiring = True
+            self._pending_cv.notify_all()
+
+    @property
+    def retiring(self):
+        return self._retiring
+
+    def _runs_anything(self):
+        """This connection holds control while the robot's queue has work: only the holder queues moves, so they are
+        this page's (the moves the executor would stop if it went now). Read from the status the executor pushes; not
+        connected = nothing."""
+        st = self.control_state()
+        return bool(st["mine"] and st["busy"])
+
     def abort(self):
         """End this page's channel at once, cancelling pending sends.
 
@@ -209,9 +234,21 @@ class ExecCommandSender:
                     self._pending_cv.wait(timeout=_POLL_TIMEOUT)
                 if self._stop.is_set():
                     break
-                if not self._pending:
+                retire_now = self._retiring and not self._pending
+                if not self._pending and not retire_now:
                     continue
-                fn, label = self._pending.popleft()
+                if not retire_now:
+                    fn, label = self._pending.popleft()
+            if retire_now:
+                if self._runs_anything():
+                    continue                    # its moves still run: look again in _POLL_TIMEOUT
+                self._stop.set()
+                if self._robot.connected:
+                    try:
+                        self._robot.disconnect()
+                    except Exception as exc:    # the thread ends either way
+                        logger.warning("closing a gone page's executor connection: %s", exc)
+                break
             if not self._ensure_connected():
                 self._on_error(label, RuntimeError("command_executor unreachable"))
                 continue

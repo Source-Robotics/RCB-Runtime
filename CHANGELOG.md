@@ -29,6 +29,7 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Changed
 
+- The dashboard's Plan Preview tab loads the active preview when the tab is first shown, not during every page load.
 - The E-stop input registers a press once 2 of its last 5 reads (8-20 ms) are pressed; it needed 5 identical reads, so
   a pressed contact that chatters never registered. One glitch alone still does not. The release still needs 5.
 - Every isolated output switches off when RTI stops (a service stop or restart, or RTI ending on an error); they kept
@@ -81,6 +82,29 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- The dashboard: every page load left its command thread and its connection to the executor behind and added the
+  block editor's routes again, until the dashboard restarted. A closed or reloaded page now lets go of its connection
+  once nothing it queued still runs; the routes are added once per dashboard process. (A closed page's memory is still
+  kept: about 8 MB per page load until the dashboard restarts — not fixed yet.)
+- The dashboard's pages stalled on slow work: the Time card ran `timedatectl` every 10 s for every open page, the Plan
+  Preview loaded its file at every page build and checked it 30 times a second, and a leftover diagnostic table on
+  the Plots tab read hundreds of system files a second (removed). The first two now run on a thread.
+- A corrupt plan-preview file took every dashboard page load down. A tab that fails to build now shows "unavailable",
+  and a failing table refresh logs once, then a line a minute, instead of ten tracebacks a second.
+- The Sound card showed a refused change as saved, and clicking again sent nothing; it now records a setting only
+  once the robot has taken it.
+- A read of the error list that met a write half-done reported "no errors" (and a cut character raised); it now
+  reads again and otherwise keeps the last list it read whole. The test recordings' reader drops a row the robot
+  began rewriting while it was copied (it passed with mixed data).
+- The start's drive check said every drive "holds what RTI sent" when a drive had answered nothing; it now names a
+  drive it could not read or identify.
+- A drive's own fault recording: a fault right after Clear Errors was overwritten by the drive's re-arming, a failed
+  save (a full card) lost the recording for good (it is tried again every 30 s), and a recording without its fault's
+  moment was drawn with "fault" at its first sample.
+- After a simulator run, the executor warned at the next start that every drive's firmware was too old: it read the
+  simulator's numbers before RTI had read the real drives. RTI now clears them at its start, and the executor judges
+  only what this RTI run reported.
+- A program that changed its shared memory's joint count (`setup(joints=N)`) always crashed.
 - RTI: a position packet after a torque stream was planned from where the arm was before the torque stream: a step
   as large as the torque had moved the arm, which no check judged.
 - RTI: the PC's speed feedforward reached the drives unclamped in SOFT_RTI and with the rate limiter off (a client

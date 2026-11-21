@@ -178,8 +178,12 @@ class TraceReader:
             lost += new_first - first
             first = new_first
         seqs = np.arange(first, upto + 1)
-        block = self._ring[(seqs - 1) % self.rows].copy()
-        ok = block[:, 0] == seqs                              # a row the writer reached while we copied it: dropped
+        idx = (seqs - 1) % self.rows
+        block = self._ring[idx].copy()
+        # A row the writer reached while we copied it: dropped. Its sequence number is checked AFTER the copy too
+        # (review I7, 2026-11-21): the copy reads column 0 first, so a row the writer began overwriting during the copy
+        # still showed its old number there and passed with torn data.
+        ok = (block[:, 0] == seqs) & (self._ring[idx, 0] == seqs)
         lost += int((~ok).sum())
         self.last = upto
         return block[ok], lost
