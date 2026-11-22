@@ -109,7 +109,7 @@ from motion.planner_pipeline import (
     path_velocity_from_joint_velocity, build_geometric_path,
     blend_distance_for_tolerance,
 )
-from motion.ruckig_corner import plan_ruckig_corner_chain
+from motion.ruckig_corner import leg_duration, plan_ruckig_corner_chain
 from motion.trajectory_profiles import compute_corner_speed
 from scipy.interpolate import CubicSpline
 from robotics.robot_kinematics import (
@@ -695,6 +695,17 @@ class TrajectoryPlanner(Thread):
                         self._service_held()
                     self._poll_gripper_completions()
                     continue
+                if self._ends_chain(cmd):
+                    # Decision 4a: the blend=0 move is the chain's last member — spliced in, its corner rounded; a
+                    # chain ending in blend 0 holds no tail. A rejected splice leaves them as a fresh chain: flushed
+                    # NOW, nothing may follow the blend=0 move into it.
+                    if not self._buffer_append(cmd):
+                        continue
+                    self._splice_pending("a blend=0 move ends the chain")
+                    if self._blend_buffer:
+                        self._flush_blend_buffer()
+                    self._poll_gripper_completions()
+                    continue
                 self._commit_held_tail("a non-spliceable command arrived")
 
             if self._is_blend_eligible(cmd):
@@ -707,6 +718,12 @@ class TrajectoryPlanner(Thread):
                     continue
                 if len(self._blend_buffer) >= self.MAX_BLEND_LOOKAHEAD:
                     self._flush_blend_buffer()
+            elif self._ends_chain(cmd):
+                # Decision 4a: the chain's last member, then the chain is flushed at once (a later blended move must
+                # never be buffered behind a blend=0 one: its corner would have no radius).
+                if not self._buffer_append(cmd):
+                    continue
+                self._flush_blend_buffer()
             else:
                 # A non-eligible command (different type, blend=0, gripper/delay,
                 # exact_velocity mode, ...) ends any in-flight zone-blend chain —
@@ -819,6 +836,29 @@ class TrajectoryPlanner(Thread):
         return (options.blend_mode in ("zone", "tolerance", "ruckig_corner")
                 and float(options.blend or 0.0) > 0.0)
 
+    def _ends_chain(self, cmd):
+        """True when `cmd` joins the buffered (or held) chain as its LAST member — decision 4a (the user, 2026-11-21):
+        the corner before a blend=0 move is rounded, by the blend of the move before it. A move with blend 0 (in any
+        blend mode: it owns no corner), of the chain's family and profile (the chain's lane times it; another profile
+        would silently change its timing), no dry run, behind a chain that exists. It ran on its own before, and the
+        move before it stopped at its target."""
+        ref = (self._held["chain"][0] if self._held is not None
+               else (self._blend_buffer[0] if self._blend_buffer else None))
+        if ref is None:
+            return False
+        family = self._chain_family(cmd)
+        if family is None or family != self._chain_family(ref):
+            return False
+        options = self._cmd_options(cmd)
+        if bool(options.dry_run) or float(options.blend or 0.0) > 0.0:
+            return False
+        return options.profile == self._cmd_options(ref).profile
+
+    def _corner_continuities(self, chain):
+        """One continuity per corner of `chain` — the move BEFORE the corner owns it, as it owns the radius
+        (_blend_radius_mm). Finding 5a, 2026-11-22: every corner took chain[0]'s."""
+        return [self._cmd_options(c).blend_continuity for c in chain[:-1]]
+
     def _blend_lane(self, cmd):
         """Return the planner lane that may safely share one blended chain."""
         options = self._cmd_options(cmd)
@@ -893,7 +933,7 @@ class TrajectoryPlanner(Thread):
 
         plan_fn = self._plan_blended_chain if family == "joint" else self._plan_blended_cartesian_chain
         try:
-            sample, timed_boundaries, waypoints, geometry, geom_boundaries = plan_fn(chain)
+            sample, timed_boundaries, waypoints, geometry, geom_boundaries, timing = plan_fn(chain)
             # A blended corner can bulge past a limit that no individual endpoint touches.
             # Failing here falls back to planning each command alone, where the offending
             # one is rejected by name.
@@ -914,7 +954,7 @@ class TrajectoryPlanner(Thread):
             self._mark_started(cmd)
         self._last_diagnostic = chain_diag
         self._dispatch_chain(chain, sample, timed_boundaries,
-                             self._splice_context(chain, waypoints, family, sample),
+                             self._splice_context(chain, waypoints, family, sample, timing),
                              geometry=geometry, geom_boundaries=geom_boundaries)
 
     # ------------------------------------------------------------------ #
@@ -997,7 +1037,7 @@ class TrajectoryPlanner(Thread):
         return max(self.SPLICE_SEAM_VEL_FLOOR,
                    self.SPLICE_SEAM_VEL_FRAC[family] * float(split_speed))
 
-    def _splice_context(self, chain, waypoints, family, sample):
+    def _splice_context(self, chain, waypoints, family, sample, timing):
         """What a future splice needs to rebuild the remaining geometry, or None if this
         chain can't be spliced into at all.
 
@@ -1017,21 +1057,31 @@ class TrajectoryPlanner(Thread):
           different shape than the batch would have.
         * `d_cut_joint` — the same cut, expressed as joint arc length. The braking bound
           in _choose_split compares SPEEDS, which are joint speeds, so it needs this one.
+
+        Blends done right (finding 7, 2026-11-22) — what a continuation needs to time and shape like the batch:
+        `timing` (the chain's _chain_timing: its members' speeds, accel, time scale and one speed scale per row of
+        `geometry`), the chain's IK solver (the batch takes chain[0]'s), and its last command, whose corner radius
+        and continuity the continuation uses once the next target is known (_blend_radius_mm). A `tolerance`
+        corner's radius depends on that target, so the split assumes the LARGEST cut it can have (half the segment
+        before — both builders' cap); the real corner is never larger. Before, a tolerance was read as a raw radius
+        (G64 P0.05: 0.05 mm corners after the first chain) and every splice ran at the last command's speed and the
+        unscaled acceleration.
         """
         if self._read_exec_runway is None or self._robot is None:
             return None
-        radius_mm = float(chain[-1].options.blend or 0.0)
+        last_opts = self._cmd_options(chain[-1])
+        radius_mm = float(last_opts.blend or 0.0)
         if radius_mm <= 0.0 or len(waypoints) < 2:
             return None
+        tolerance = last_opts.blend_mode == "tolerance"
         pos = sample.positions
         n = pos.shape[0]
         if n < 2:
             return None
 
-        ctx = {"family": family, "blend_mm": radius_mm,
-               "last_target_q": np.asarray(pos[-1], dtype=np.float64),
-               "speed_scale": (self._speed_scale_for(chain[-1].options) if family == "joint"
-                               else self._cartesian_speed_scale_for(chain[-1].options))}
+        first_opts = self._cmd_options(chain[0])
+        ctx = {"family": family, "last_cmd": chain[-1], "timing": timing, "ik_solver": first_opts.ik_solver,
+               "last_target_q": np.asarray(pos[-1], dtype=np.float64)}
 
         if family == "joint":
             prev_q = np.asarray(waypoints[-2], dtype=np.float64)
@@ -1042,14 +1092,15 @@ class TrajectoryPlanner(Thread):
             if seg_before_mm <= 1e-6:
                 return None
             # Exactly the conversion _plan_blended_chain uses, so the corner we place
-            # later is the one the batch blend would have placed.
-            frac_before = min(radius_mm / seg_before_mm, 0.5)
+            # later is the one the batch blend would have placed (a tolerance: its largest).
+            frac_before = 0.5 if tolerance else min(radius_mm / seg_before_mm, 0.5)
             d_cut = frac_before * float(np.linalg.norm(last_q - prev_q))
             if d_cut <= 1e-9:
                 return None
             ctx["dist_to_corner"] = np.linalg.norm(pos - last_q[None, :], axis=1)
             ctx["cut"] = d_cut              # the metric the joint builder clamps on
             ctx["d_cut_joint"] = d_cut
+            ctx["prev_q"] = prev_q
             return ctx
 
         # --- Cartesian ---------------------------------------------------------
@@ -1058,8 +1109,8 @@ class TrajectoryPlanner(Thread):
         if seg_before_mm <= 1e-6:
             return None
         # build_composite_cartesian_path clamps the radius to half the segment, so the
-        # cut actually applied is this, not the raw request.
-        cut_mm = min(radius_mm, seg_before_mm / 2.0)
+        # cut actually applied is this, not the raw request (a tolerance: its largest).
+        cut_mm = seg_before_mm / 2.0 if tolerance else min(radius_mm, seg_before_mm / 2.0)
 
         # Per-sample TCP distance to the corner. One FK per sample (~30us on pinocchio);
         # this runs once at plan time, never on the commit deadline.
@@ -1080,6 +1131,8 @@ class TrajectoryPlanner(Thread):
         ctx["cut"] = cut_mm                 # the metric the Cartesian builder clamps on
         ctx["d_cut_joint"] = d_cut_joint
         ctx["last_target_pose"] = last_pose
+        ctx["prev_pose"] = prev_pose
+        ctx["arc_from_end"] = arc_from_end  # with dist_to_corner: the real corner's joint cut, at the splice
         return ctx
 
     # ------------------------------------------------------------------ #
@@ -1115,6 +1168,17 @@ class TrajectoryPlanner(Thread):
     #   * The Cartesian continuation only IK-solves the NEW corner and leg, not the whole
     #     remainder. That is what the 0.25s margin was paying for.
     # ------------------------------------------------------------------ #
+
+    def _vel_scale_along(self, geometry, vel_scale, start_arc, rows):
+        """One speed scale per row of `rows`, a path along `geometry` from its arc length `start_arc` (a reused prefix):
+        the slower of the two geometry rows around the same arc length — the constraint the batch had there (the
+        arc length is the one coordinate both samplings share, as in _geom_index_for_split)."""
+        ga = self._cumulative_arclength(geometry)
+        ra = float(start_arc) + self._cumulative_arclength(np.asarray(rows, dtype=np.float64))
+        i = np.clip(np.searchsorted(ga, ra, side="right") - 1, 0, len(ga) - 1)
+        j = np.minimum(i + 1, len(ga) - 1)
+        vs = np.asarray(vel_scale, dtype=np.float64)
+        return np.minimum(vs[i], vs[j])
 
     def _geom_index_for_split(self, geometry, timed_positions, split):
         """Which geometry sample the timed split sits at (matched by arc length — the one
@@ -1285,7 +1349,10 @@ class TrajectoryPlanner(Thread):
         ))[::-1]
         dist_to_entry = np.maximum(arc_to_end - splice_ctx["d_cut_joint"], 0.0)
         tangent = np.abs(sample.velocities[lo:n]) / np.maximum(speed[:, None], 1e-9)
-        a_along = np.min(self._max_accel[None, :] / np.maximum(tangent, 1e-6), axis=1)
+        # The chain's own acceleration limit (_chain_timing; it was the unscaled one).
+        timing = splice_ctx["timing"]
+        a_eff = self._max_accel * timing["accel_scale"] * timing["time_scale"] ** 2
+        a_along = np.min(a_eff[None, :] / np.maximum(tangent, 1e-6), axis=1)
         brake_dist = speed ** 2 / (2.0 * np.maximum(a_along, 1e-9))
         bound = self._last_ok(
             brake_dist * self.SPLICE_BRAKE_MARGIN <= dist_to_entry + 1e-9, lo)
@@ -1417,6 +1484,8 @@ class TrajectoryPlanner(Thread):
         cornering spends acceleration budget. Both were wrong in the same direction —
         confidently, and by a lot. TOPPRA already models all of this correctly.
         """
+        timing = splice_ctx["timing"]
+        timed_arc = self._cumulative_arclength(sample.positions)
         for candidate in self._split_candidates(split):
             split_q = sample.positions[candidate]
             split_qd = sample.velocities[candidate]
@@ -1427,9 +1496,10 @@ class TrajectoryPlanner(Thread):
                 continue
             try:
                 sd0 = path_velocity_from_joint_velocity(prefix, split_qd, s=0.0)
-                self._toppra_path_parameterizer.parameterize_path(
-                    prefix, self._max_vel, self._max_accel, self._dt,
-                    speed_scale=splice_ctx["speed_scale"], sd_start=sd0, sd_end=0.0)
+                # The chain's own timing along the prefix (blends done right: it was the last command's speed and
+                # the unscaled acceleration).
+                self._parameterize_chain(prefix, dict(timing, vel_scale=self._vel_scale_along(
+                    geometry, timing["vel_scale"], float(timed_arc[candidate]), prefix)), sd_start=sd0)
                 return candidate
             except TOPPRAInfeasible:
                 continue
@@ -1465,7 +1535,13 @@ class TrajectoryPlanner(Thread):
         batch path does; the one straddling the split gets a partial, non-terminal send
         (no checkpoint — RTI must play straight on); everything after it is held, and gets
         checkpointed by whatever we send next (a continuation, or the committed tail).
+
+        The boundaries are made well formed first (_member_boundaries; blends done right, finding 8, 2026-11-22: only
+        the whole-chain send had it — a repeated target in a held tail or a continuation could still give an empty
+        range past the end). After a failed send the members not sent are reported ABORTED, as the whole-chain send
+        does (finding 11's splice half).
         """
+        boundaries = self._member_boundaries(boundaries, sample.positions.shape[0])
         split = self._choose_split(sample, boundaries, splice_ctx)
         if split is not None and geometry is not None:
             spacing = (self._path_spacing if splice_ctx["family"] == "joint" else
@@ -1490,6 +1566,7 @@ class TrajectoryPlanner(Thread):
             if not self._send_range(sample.positions, sample.velocities, sample.torque_ff,
                                     start_idx, end_idx, self._cmd_id(chain[i]),
                                     flags=BATCH_FLAG_BLEND_CONTINUES):
+                self._abort_unsent(chain[i + 1:])
                 return
             self._mark_completed(chain[i])
             start_idx = end_idx
@@ -1500,6 +1577,7 @@ class TrajectoryPlanner(Thread):
             if not self._send_range(sample.positions, sample.velocities, sample.torque_ff,
                                     start_idx, split, self._cmd_id(chain[sent_cmds]),
                                     terminal=False):
+                self._abort_unsent(chain[sent_cmds + 1:])
                 return
 
         with self.abort_gate:                    # flush() resets these under the same lock (2026-11-18 review M1)
@@ -1669,11 +1747,13 @@ class TrajectoryPlanner(Thread):
         for i, cmd in enumerate(remaining):
             k = held["sent_cmds"] + i
             end_idx = int(boundaries[k]) if k < len(boundaries) - 1 else n
-            end_idx = max(end_idx, start_idx + 1)
+            # never past the end (finding 8): boundaries are well formed (_dispatch_chain), this only guards
+            end_idx = min(max(end_idx, start_idx + 1), n)
             is_last = (k == len(chain) - 1)
             if not self._send_range(sample.positions, sample.velocities, sample.torque_ff,
                                     start_idx, end_idx, self._cmd_id(cmd),
                                     flags=0 if is_last else BATCH_FLAG_BLEND_CONTINUES):
+                self._abort_unsent(remaining[i + 1:])
                 return
             self._mark_completed(cmd)
             start_idx = end_idx
@@ -1698,22 +1778,22 @@ class TrajectoryPlanner(Thread):
         builder = (self._build_joint_continuation if ctx["family"] == "joint"
                    else self._build_cartesian_continuation)
         try:
-            geom, handoff, waypoints, reject = builder(held, cmds, split_q)
+            geom, handoff, waypoints, reject, layout = builder(held, cmds, split_q)
         except TOPPRAInfeasible:
-            geom = handoff = waypoints = None
+            geom = handoff = waypoints = layout = None
             reject = "too fast to make the corner from the speed already committed"
         except Exception as e:
-            geom = handoff = waypoints = None
+            geom = handoff = waypoints = layout = None
             reject = f"continuation solve failed: {e}"
 
-        timed = sd_start = None
+        timed = sd_start = cont_timing = cont = None
         if reject is None:
             try:
                 sd_start = path_velocity_from_joint_velocity(geom, split_qd, s=0.0)
-                timed = self._toppra_path_parameterizer.parameterize_path(
-                    geom, self._max_vel, self._max_accel, self._dt,
-                    speed_scale=self._continuation_speed_scale(held),
-                    sd_start=sd_start, sd_end=0.0)
+                # The chain's own timing, as the batch of these commands would have it (blends done right, finding 7:
+                # it was the last held command's speed and the unscaled acceleration).
+                cont_timing = self._continuation_timing(held, cmds, geom, layout)
+                timed = self._parameterize_chain(geom, cont_timing, sd_start=sd_start)
             except TOPPRAInfeasible:
                 # TOPPRA's own feasibility check IS the reject rule, and this is the
                 # expected way to fail: the speed we already committed to the arm is
@@ -1732,6 +1812,14 @@ class TrajectoryPlanner(Thread):
                 reject = (f"seam not exact (dpos={seam_p:.2e} rad, dvel={seam_v:.2e} "
                           f"rad/s, tol {self.SPLICE_SEAM_POS_TOL:.0e}/{vel_tol:.1e}) "
                           f"— refusing to inject a discontinuity")
+
+        if reject is None:
+            # The acceleration (and speed) backstop every batch chain has — the continuation had none (finding 7).
+            try:
+                cont = self._assert_commanded_accel(self._sampler.sample(timed), self._accel_backstop_limit(),
+                                                    "splice continuation")
+            except PlannerError as e:
+                reject = e.message
 
         if reject is None:
             # A rejected splice just lets the in-flight move finish; the commands then run as a
@@ -1756,8 +1844,7 @@ class TrajectoryPlanner(Thread):
                     self._blend_buffer = list(cmds) + self._blend_buffer   # start a fresh chain
             return
 
-        # Accepted. The continuation IS the batch blend's remainder.
-        cont = self._sampler.sample(timed)
+        # Accepted. The continuation IS the batch blend's remainder (cont, sampled and checked above).
 
         # The continuation carries every command that was still held, plus the new one.
         # EVERY un-sent command carries over, not just the last one.
@@ -1803,7 +1890,7 @@ class TrajectoryPlanner(Thread):
                              f"sd_start={sd_start:.4f}")
         self._dispatch_chain(
             new_chain, cont, cont_boundaries,
-            self._splice_context(new_chain, waypoints, ctx["family"], cont),
+            self._splice_context(new_chain, waypoints, ctx["family"], cont, cont_timing),
             geometry=geom, geom_boundaries=geom_bounds)
 
     def _splice_pending(self, why):
@@ -1815,10 +1902,30 @@ class TrajectoryPlanner(Thread):
         logger.info(f"splicing {len(batch)} buffered command(s) ({why})")
         self._try_splice(batch)
 
-    def _continuation_speed_scale(self, held):
-        options = held["chain"][-1].options
-        return (self._speed_scale_for(options) if held["splice"]["family"] == "joint"
-                else self._cartesian_speed_scale_for(options))
+    def _continuation_timing(self, held, cmds, geom, layout):
+        """A splice continuation's _chain_timing (blends done right, finding 7, 2026-11-22): the held members keep their
+        speeds, the new ones get theirs (_member_speeds on the rest of the path), the reused prefix keeps the batch's
+        per-row speeds (arc length mapped), the new corner takes the slower of the held chain's last move and the first
+        new one (1a); the acceleration is the smallest `accel` and the time scale the fastest speed of the whole stream
+        so far — what one batch of all of it would use. Raises ValueError on a bad duration (the splice is rejected;
+        the fresh chain then falls back and the move reports it by name)."""
+        old = held["splice"]["timing"]
+        off = layout["handoff"] - 1
+        rest = geom[off:]
+        new_speeds = self._member_speeds(cmds, rest, layout["rest_bounds"],
+                                         cartesian=held["splice"]["family"] != "joint")
+        held_speeds = list(old["speeds"][held["sent_cmds"]:])
+        prefix_rows = layout["prefix_rows"]
+        vs = np.empty(geom.shape[0], dtype=np.float64)
+        split_arc = float(self._cumulative_arclength(held["sample"].positions)[held["split"]])
+        vs[:prefix_rows] = self._vel_scale_along(held["geometry"], old["vel_scale"], split_arc, geom[:prefix_rows])
+        vs[off:] = self._chain_vel_scale(rest.shape[0], layout["rest_bounds"], layout["rest_zones"], new_speeds)
+        vs[prefix_rows - 1:layout["handoff"]] = min(held_speeds[-1], new_speeds[0])
+        return {"speeds": held_speeds + new_speeds,
+                "accel_scale": min([old["accel_scale"]]
+                                   + [self._accel_scale_for(self._cmd_options(c)) for c in cmds]),
+                "time_scale": max([old["time_scale"]] + new_speeds),
+                "vel_scale": vs}
 
     def _build_joint_continuation(self, held, cmds, split_q):
         """Reuse the planned geometry from the split; build the new corner + the WHOLE
@@ -1834,8 +1941,13 @@ class TrajectoryPlanner(Thread):
         Splicing N commands adds N chords for the same split, so the chain reaches a
         steady state (braking distance + batch arc) and never dies.
 
-        Returns (geom, handoff_rows, waypoints, reject_reason) where handoff_rows is where
-        the OLD chain's last command hands off — its checkpoint index.
+        Returns (geom, handoff_rows, waypoints, reject_reason, layout) where handoff_rows is
+        where the OLD chain's last command hands off — its checkpoint index — and layout
+        what _continuation_timing needs (_continuation_layout).
+
+        Blends done right (findings 7 and 5a, 2026-11-22): every corner's radius through
+        _blend_radius_mm (a tolerance was read as a raw radius), each corner its own move's
+        continuity (it fell back to c1).
         """
         ctx = held["splice"]
         last_q = ctx["last_target_q"]
@@ -1844,14 +1956,8 @@ class TrajectoryPlanner(Thread):
         for c in cmds:
             args = self._cmd_args(c)
             if len(args) < self.joint_num:
-                return None, None, None, "a queued command is malformed"
+                return None, None, None, "a queued command is malformed", None
             targets.append(np.deg2rad(np.asarray(args[:self.joint_num], dtype=np.float64)))
-
-        prefix, entry_q = self._reused_prefix(
-            held["geometry"], held["geom_split"], split_q, ctx["d_cut_joint"],
-            self._path_spacing)
-        if prefix is None:
-            return None, None, None, "split is already inside the new corner's blend zone"
 
         # Corner sizing, verbatim from _plan_blended_chain, so every corner we build lands
         # exactly where a batch of these same commands would have put it.
@@ -1862,28 +1968,48 @@ class TrajectoryPlanner(Thread):
             w = i + 1
             sb = float(np.linalg.norm(tcp[w] - tcp[w - 1]))
             sa = float(np.linalg.norm(tcp[w + 1] - tcp[w]))
-            r = float(cmds[i].options.blend or 0.0)
+            r = self._blend_radius_mm(cmds[i], tcp[w - 1], tcp[w], tcp[w + 1])
             fracs.append((min(r / sb, 0.5) if sb > 1e-6 else 0.0,
                           min(r / sa, 0.5) if sa > 1e-6 else 0.0))
 
+        # The corner at the held chain's last target, now that the next target is known.
+        prev_q = ctx["prev_q"]
+        tcp_prev = calculate_forward_kinematics(self._robot, prev_q).t * 1000.0
+        r_corner = self._blend_radius_mm(ctx["last_cmd"], tcp_prev, tcp[0], tcp[1])
+        seg_before_mm = float(np.linalg.norm(tcp[0] - tcp_prev))
+        d_cut = min(r_corner / seg_before_mm, 0.5) * float(np.linalg.norm(last_q - prev_q))
+        if d_cut <= 1e-9:
+            return None, None, None, "the corner has no blend (a tolerance with no room)", None
+        if d_cut > ctx["d_cut_joint"] + 1e-9:          # never: the split assumed the largest
+            return None, None, None, "the corner is larger than the split left room for", None
+
+        prefix, entry_q = self._reused_prefix(
+            held["geometry"], held["geom_split"], split_q, d_cut,
+            self._path_spacing)
+        if prefix is None:
+            return None, None, None, "split is already inside the new corner's blend zone", None
+
         seg_after_mm = float(np.linalg.norm(tcp[1] - tcp[0]))
-        frac_after = (min(ctx["blend_mm"] / seg_after_mm, 0.5)
+        frac_after = (min(r_corner / seg_after_mm, 0.5)
                       if seg_after_mm > 1e-6 else 0.0)
         exit_q = last_q + frac_after * (targets[0] - last_q)
 
         spacing = self._path_spacing
-        zone, _ = blend_joint_zone(entry_q, last_q, exit_q, spacing)
+        zone, _ = blend_joint_zone(entry_q, last_q, exit_q, spacing,
+                                   self._cmd_options(ctx["last_cmd"]).blend_continuity)
         # start_trim: the rest of the path starts at the Bezier's EXIT, part-way along the
         # first segment — not at last_q. Without it the builder would treat that exit as a
         # fresh waypoint and recompute every fraction against a shortened segment.
-        rest, rest_bounds = build_composite_joint_path(
-            waypoints, fracs, arclen_spacing=spacing, start_trim=frac_after)
+        rest, rest_bounds, rest_zones = build_composite_joint_path(
+            waypoints, fracs, arclen_spacing=spacing, start_trim=frac_after,
+            continuity=self._corner_continuities(cmds), return_blend_zones=True)
 
         geom = np.vstack([prefix, zone[1:], rest[1:]])
         handoff = prefix.shape[0] + zone[1:].shape[0]      # end of the new Bezier
         # rest row j lands at geom row (handoff + j - 1), so a boundary COUNT b becomes:
         bounds = [handoff] + [handoff + int(b) - 1 for b in rest_bounds]
-        return geom, bounds, [split_q] + waypoints, None
+        return (geom, bounds, [split_q] + waypoints, None,
+                self._continuation_layout(prefix.shape[0], handoff, rest_bounds, rest_zones))
 
     def _build_cartesian_continuation(self, held, cmds, split_q):
         """Same as the joint continuation, in pose space — and the reuse is what makes it
@@ -1895,24 +2021,21 @@ class TrajectoryPlanner(Thread):
         IK can fail for a purely kinematic reason (near-singular, branch jump). That is
         simply one more way to say no: reject, the move finishes, the commands run next.
 
-        Returns (geom, boundary_rows, waypoints, reject_reason).
+        Returns (geom, boundary_rows, waypoints, reject_reason, layout).
+
+        Blends done right (finding 7, 2026-11-22): every corner's radius through _blend_radius_mm
+        (a tolerance was read as a raw radius), the new corner cut as the batch cuts it (min of the
+        radius and half of EITHER segment; it was half the segment before only), each corner its
+        own move's continuity (finding 5a; it was c1) and the chain's IK solver (it was the first
+        new command's).
         """
         if not isinstance(cmds, (list, tuple)):
             cmds = [cmds]
         ctx = held["splice"]
         last_pose = ctx["last_target_pose"]
 
-        cart_spacing = float(np.median(
-            np.linalg.norm(np.diff(held["geometry"], axis=0), axis=1)))
-        prefix, entry_q = self._reused_prefix(
-            held["geometry"], held["geom_split"], split_q, ctx["d_cut_joint"],
-            cart_spacing if cart_spacing > 1e-9 else self._path_spacing)
-        if prefix is None:
-            return None, None, None, "split is already inside the new corner's blend zone"
-
         backend = self._fk_jacobian_backend()
         set_kinematics_backend(backend)
-        entry_pose = calculate_forward_kinematics(self._robot, entry_q)
 
         # Each command resolves against the PREVIOUS one's pose, so relative moves chain
         # exactly as _plan_blended_cartesian_chain does.
@@ -1923,19 +2046,41 @@ class TrajectoryPlanner(Thread):
             cur = tp
 
         waypoints = [last_pose] + targets
-        radii = [float(cmds[i].options.blend or 0.0) for i in range(len(cmds) - 1)]
+        pts_mm = [np.asarray(w.t, dtype=np.float64) * 1000.0 for w in waypoints]
+        radii = [self._blend_radius_mm(cmds[i], pts_mm[i], pts_mm[i + 1], pts_mm[i + 2])
+                 for i in range(len(cmds) - 1)]
 
         seg_after_mm = float(np.linalg.norm(targets[0].t - last_pose.t)) * 1000.0
         if seg_after_mm <= 1e-6:
-            return None, None, None, "next command is a zero-length move"
-        cut_after = min(ctx["blend_mm"], seg_after_mm / 2.0)
-        frac_after = cut_after / seg_after_mm
+            return None, None, None, "next command is a zero-length move", None
+        prev_mm = np.asarray(ctx["prev_pose"].t, dtype=np.float64) * 1000.0
+        seg_before_mm = float(np.linalg.norm(pts_mm[0] - prev_mm))
+        r_corner = self._blend_radius_mm(ctx["last_cmd"], prev_mm, pts_mm[0], pts_mm[1])
+        cut = min(r_corner, seg_before_mm / 2.0, seg_after_mm / 2.0)
+        if cut <= 1e-9:
+            return None, None, None, "the corner has no blend (a tolerance with no room)", None
+        if cut > ctx["cut"] + 1e-9:                    # never: the split assumed the largest
+            return None, None, None, "the corner is larger than the split left room for", None
+        d_cut_joint = float(np.interp(cut, ctx["dist_to_corner"][::-1], ctx["arc_from_end"][::-1]))
+
+        cart_spacing = float(np.median(
+            np.linalg.norm(np.diff(held["geometry"], axis=0), axis=1)))
+        prefix, entry_q = self._reused_prefix(
+            held["geometry"], held["geom_split"], split_q, d_cut_joint,
+            cart_spacing if cart_spacing > 1e-9 else self._path_spacing)
+        if prefix is None:
+            return None, None, None, "split is already inside the new corner's blend zone", None
+        entry_pose = calculate_forward_kinematics(self._robot, entry_q)
+
+        frac_after = cut / seg_after_mm
         exit_pose = interp_pose(last_pose, targets[0], frac_after)
 
         spacing = CART_ARCLEN_SPACING_M
-        zone_poses, _ = blend_zone_poses(entry_pose, last_pose, exit_pose, spacing)
-        rest, rest_bounds = build_composite_cartesian_path(
-            waypoints, radii, arclen_spacing=spacing, start_trim=frac_after)
+        zone_poses, _ = blend_zone_poses(entry_pose, last_pose, exit_pose, spacing,
+                                         self._cmd_options(ctx["last_cmd"]).blend_continuity)
+        rest, rest_bounds, rest_zones = build_composite_cartesian_path(
+            waypoints, radii, arclen_spacing=spacing, start_trim=frac_after,
+            continuity=self._corner_continuities(cmds), return_blend_zones=True)
 
         new_poses = list(zone_poses) + list(rest.poses)[1:]
         cart_path = CartesianPath(
@@ -1944,13 +2089,13 @@ class TrajectoryPlanner(Thread):
 
         solver = SeededIKPathSolver(
             self._robot, self.joint_num,
-            solver=normalize_ik_solver_name(cmds[0].options.ik_solver or "pinocchio"),
+            solver=normalize_ik_solver_name(ctx["ik_solver"] or "pinocchio"),
             config=DEFAULT_IK_CONFIG, kinematics_backend=backend)
         result = solver.solve(cart_path, entry_q)   # seeded from the reused path's end
         if not result.success:
             return None, None, None, (
                 f"continuation IK failed ({result.failure_code}): "
-                f"{result.failure_message}")
+                f"{result.failure_message}"), None
 
         new_joints = result.positions
         geom = np.vstack([prefix, new_joints[1:]])
@@ -1958,7 +2103,100 @@ class TrajectoryPlanner(Thread):
         handoff = prefix.shape[0] + nz - 1                       # end of the new Bezier
         bounds = [handoff] + [prefix.shape[0] + nz + int(b) - 2 for b in rest_bounds]
         bounds[-1] = geom.shape[0]
-        return geom, bounds, [split_q] + waypoints, None
+        return (geom, bounds, [split_q] + waypoints, None,
+                self._continuation_layout(prefix.shape[0], handoff, rest_bounds, rest_zones))
+
+    @staticmethod
+    def _continuation_layout(prefix_rows, handoff, rest_bounds, rest_zones):
+        """Where a continuation's parts sit in its geometry (both builders: the reused prefix's rows, then the new
+        corner up to row `handoff`, then the rest of the path, whose row j is geometry row handoff + j - 1)."""
+        return {"prefix_rows": int(prefix_rows), "handoff": int(handoff),
+                "rest_bounds": [int(b) for b in rest_bounds], "rest_zones": list(rest_zones or ())}
+
+    # ---- blends done right (2026-11-22, TODO/blends_2026-11-21.md; the user's decisions 1a-4a) -------------------
+    # Each move of a blended chain keeps its OWN speed on its part of the path, as industrial arms do (a fixed-shape
+    # corner, the speed planned along the whole path): a corner takes the slower of its two moves (1a); a move's
+    # `duration` becomes its equivalent speed, the chain's total time approximate (2a); the acceleration is the chain's
+    # smallest `accel` (the user, 2026-11-22: TOPPRA has no varying acceleration constraint), its time scaling the
+    # fastest move's. Before, every move ran at the FIRST move's speed / accel and `duration` was never read (M5).
+
+    def _member_speeds(self, chain, geometry, boundaries, cartesian=False, alone_time=None):
+        """One speed scale per chain member, on its own part of `geometry` (rows up to boundaries[i], an exclusive row
+        count): its `speed`, or its `duration` as the equivalent speed — the scale a SINGLE move uses for it
+        (_scale_for_duration): the part's time at 100 % with the member's own `accel` (and `jerk`), divided by the
+        duration. Velocity x s, acceleration x s^2 and jerk x s^3 scale a move's time by exactly 1/s, so that member
+        alone would take the duration; in the chain its corners and the chain's acceleration make the total
+        approximate (decision 2a). alone_time(i, opts, part) -> seconds replaces the TOPPRA probe (the ruckig_corner
+        lane times its straight legs with Ruckig). A duration that is no finite time above 0, or shorter than the
+        part's 100 % time, raises ValueError: the chain falls back to single moves, which report INVALID_DURATION /
+        DURATION_INFEASIBLE by name. Not capped at CARTESIAN_MOVE_MAX_SPEED_SCALE: a single Cartesian move's duration
+        is not either."""
+        speeds, lo = [], 0
+        for i, cmd in enumerate(chain):
+            opts = self._cmd_options(cmd)
+            s = self._cartesian_speed_scale_for(opts) if cartesian else self._speed_scale_for(opts)
+            hi = int(boundaries[i]) if i < len(boundaries) else int(geometry.shape[0])
+            if opts.duration is not None:
+                d = float(opts.duration)
+                if not (np.isfinite(d) and d > 0.0):
+                    raise ValueError(f"chain member {self._cmd_id(cmd)}: duration {d!r} is no time above 0")
+                part = geometry[max(lo - 1, 0):max(hi, lo + 1)]
+                t_full = float(alone_time(i, opts, part) if alone_time is not None
+                               else self._toppra_full_speed_time(part, opts))
+                if t_full > 0.0:
+                    s_eq = t_full / d
+                    if s_eq > 1.0 + 1e-9:
+                        raise ValueError(f"chain member {self._cmd_id(cmd)}: duration {d:g} s is shorter than its path "
+                                         f"allows ({t_full:.3f} s)")
+                    s = float(np.clip(s_eq, 1e-3, 1.0))
+            speeds.append(float(s))
+            lo = hi
+        return speeds
+
+    def _toppra_full_speed_time(self, part, opts):
+        """The time of `part` (joint rows) at 100 % with the member's own `accel`, rest to rest — what a single move's
+        duration probe measures. 0.0 for a part that does not move."""
+        part = np.asarray(part, dtype=np.float64)
+        if part.shape[0] < 2 or not np.any(np.abs(np.diff(part, axis=0)) > 1e-12):
+            return 0.0
+        probe = self._toppra_path_parameterizer.parameterize_path(
+            part, self._max_vel, self._max_accel * self._accel_scale_for(opts), self._dt, speed_scale=1.0)
+        return probe.num_points * self._dt
+
+    @staticmethod
+    def _chain_vel_scale(n_rows, boundaries, zones, speeds):
+        """The speed scale of every geometry row: its member's, and in a corner zone the slower of the two members it
+        joins (decision 1a). zones: build_composite_*_path's blend zones (corner_index k joins members k-1 and k)."""
+        vs = np.empty(int(n_rows), dtype=np.float64)
+        lo = 0
+        for i, b in enumerate(boundaries):
+            vs[lo:int(b)] = speeds[min(i, len(speeds) - 1)]
+            lo = int(b)
+        if lo < n_rows:
+            vs[lo:] = speeds[-1]
+        for z in zones or ():
+            k = int(z["corner_index"]) - 1
+            if 0 <= k < len(speeds) - 1:
+                vs[int(z["start_index"]):int(z["end_index"]) + 1] = min(speeds[k], speeds[k + 1])
+        return vs
+
+    def _chain_timing(self, chain, geometry, boundaries, zones, cartesian=False):
+        """How a zone / tolerance chain is timed, one dict for the batch and its splices: `speeds` (one per member,
+        _member_speeds), `accel_scale` (the chain's smallest `accel`), `time_scale` (the FASTEST member's speed: the
+        acceleration limit is max_accel x accel_scale x time_scale^2, as a single move's x speed^2 — with the
+        slowest's, one slow move made a fast one take tens of seconds to reach its speed) and `vel_scale` (one per
+        geometry row, _chain_vel_scale)."""
+        speeds = self._member_speeds(chain, geometry, boundaries, cartesian=cartesian)
+        return {"speeds": speeds,
+                "accel_scale": min(self._accel_scale_for(self._cmd_options(c)) for c in chain),
+                "time_scale": max(speeds),
+                "vel_scale": self._chain_vel_scale(geometry.shape[0], boundaries, zones, speeds)}
+
+    def _parameterize_chain(self, geometry, timing, sd_start=0.0):
+        """TOPPRA over a chain's (or a splice continuation's) joint geometry with its timing (_chain_timing), to rest."""
+        return self._toppra_path_parameterizer.parameterize_path(
+            geometry, self._max_vel, self._max_accel * timing["accel_scale"], self._dt,
+            speed_scale=timing["time_scale"], sd_start=sd_start, sd_end=0.0, vel_scale=timing["vel_scale"])
 
     def _plan_blended_chain(self, chain):
         """Build + time-parameterize a joint-space zone-blended composite path
@@ -1997,14 +2235,11 @@ class TrajectoryPlanner(Thread):
 
         geometry_positions, boundaries, geometry_blend_zones = build_composite_joint_path(
             waypoints_rad, blend_fracs, arclen_spacing=self._path_spacing,
-            continuity=self._cmd_options(chain[0]).blend_continuity,
+            continuity=self._corner_continuities(chain),
             return_blend_zones=True)
 
-        speed_scale = self._speed_scale_for(chain[0].options)
-        timed = self._toppra_path_parameterizer.parameterize_path(
-            geometry_positions, self._max_vel,
-            self._max_accel * self._accel_scale_for(chain[0].options),
-            self._dt, speed_scale=speed_scale)
+        timing = self._chain_timing(chain, geometry_positions, boundaries, geometry_blend_zones)
+        timed = self._parameterize_chain(geometry_positions, timing)
 
         timed_boundaries = self._map_boundaries_to_timed(geometry_positions, boundaries, timed.positions)
         sample = self._assert_commanded_accel(
@@ -2013,7 +2248,7 @@ class TrajectoryPlanner(Thread):
             "zone/tolerance joint chain")
         self._last_diagnostic = {"blend_zones": self._map_blend_zones_to_timed(
             geometry_positions, geometry_blend_zones, timed.positions)}
-        return sample, timed_boundaries, waypoints_rad, geometry_positions, boundaries
+        return sample, timed_boundaries, waypoints_rad, geometry_positions, boundaries, timing
 
     def _flush_ruckig_corner_chain(self, chain, family):
         """EXPERIMENTAL jerk-limited blending (TODO/blending_design.md §10.1).
@@ -2113,6 +2348,22 @@ class TrajectoryPlanner(Thread):
 
         opts = self._cmd_options(chain[0])
         jerk_factor = RUCKIG_JERK_FACTOR * (self._jerk_scale_for(opts) or 1.0)
+        # Each leg its own move's speed (or its duration's equivalent), acceleration and jerk (blends done right,
+        # 2026-11-22: every leg ran at the FIRST move's; each leg is a Ruckig solve of its own, so here each move's
+        # own acceleration holds too).
+        full = []                                        # each leg's 100 % limits: its own accel and jerk
+        for cmd in chain:
+            o = self._cmd_options(cmd)
+            js = self._jerk_scale_for(o) or 1.0
+            a = np.asarray(self._max_accel, dtype=np.float64) * self._accel_scale_for(o)
+            j = (np.asarray(self._max_jerk, dtype=np.float64) * js if self._max_jerk is not None
+                 else a * RUCKIG_JERK_FACTOR * js)
+            full.append((np.asarray(self._max_vel, dtype=np.float64), a, j))
+        # boundaries are exclusive row counts (build_composite_joint_path's contract): leg i = waypoint rows i..i+1.
+        speeds = self._member_speeds(
+            chain, np.asarray(waypoints_rad), list(range(2, len(chain) + 2)),
+            alone_time=lambda i, _o, _p: leg_duration(waypoints_rad[i], waypoints_rad[i + 1], *full[i]))
+        leg_limits = [(v * s, a * s * s, j * s ** 3) for (v, a, j), s in zip(full, speeds)]
         result = plan_ruckig_corner_chain(
             waypoints_rad, self._max_vel,
             self._max_accel * self._accel_scale_for(opts), self._dt, blend_dists,
@@ -2120,7 +2371,8 @@ class TrajectoryPlanner(Thread):
             # Same percentage semantics as jerk_factor above: `jerk` scales the budget,
             # whichever source states it. None here keeps the old derivation.
             max_jerk=(None if self._max_jerk is None
-                      else self._max_jerk * (self._jerk_scale_for(opts) or 1.0)))
+                      else self._max_jerk * (self._jerk_scale_for(opts) or 1.0)),
+            leg_limits=leg_limits)
 
         timed = TimedJointPath(positions=result.positions,
                                velocities=result.velocities,
@@ -2195,7 +2447,7 @@ class TrajectoryPlanner(Thread):
             for i in range(len(chain) - 1)]
         cart_path, boundaries, geometry_blend_zones = build_composite_cartesian_path(
             waypoints_se3, blend_radii_mm,
-            continuity=self._cmd_options(chain[0]).blend_continuity,
+            continuity=self._corner_continuities(chain),
             return_blend_zones=True)
 
         solver = SeededIKPathSolver(
@@ -2218,11 +2470,15 @@ class TrajectoryPlanner(Thread):
                 message=(f"condition={diagnostic.get('max_jacobian_condition')}, "
                          f"sigma_min={diagnostic.get('min_jacobian_sigma')}"))
 
-        speed_scale = self._cartesian_speed_scale_for(chain[0].options)
-        timed = self._toppra_path_parameterizer.parameterize_path(
-            result.positions, self._max_vel,
-            self._max_accel * self._accel_scale_for(chain[0].options),
-            self._dt, speed_scale=speed_scale)
+        timing = self._chain_timing(chain, result.positions, boundaries, geometry_blend_zones, cartesian=True)
+        timed = self._parameterize_chain(result.positions, timing)
+        # The path check of a single toppra move_linear, REPORTED (blends done right, finding 4, 2026-11-22: a chain
+        # splines between its IK'd geometry rows and measured nothing). Measured 2026-11-22: ~0.085 mm on 10 mm zones,
+        # 0.226 mm on 0.5 mm tolerance corners (the spline through a tight corner's few rows). Not refused and no
+        # per-sample IK here (the user's call, pending): refusing turns such a G-code stream into stop-and-go at every
+        # corner, and per-sample IK cost 3-6x the planning time and tripped the acceleration backstop at those corners.
+        self._last_diagnostic = diagnostic
+        self._assert_cartesian_path_fidelity(timed.positions, cart_path, refuse=False)
 
         timed_boundaries = self._map_boundaries_to_timed(result.positions, boundaries, timed.positions)
         sample = self._assert_commanded_accel(
@@ -2234,7 +2490,7 @@ class TrajectoryPlanner(Thread):
         self._last_diagnostic = diagnostic
         # The IK-solved joint path IS the geometry for this lane — a splice reuses it
         # verbatim from the split, so the continuation only IK-solves the new corner.
-        return sample, timed_boundaries, waypoints_se3, result.positions, boundaries
+        return sample, timed_boundaries, waypoints_se3, result.positions, boundaries, timing
 
     def _map_boundaries_to_timed(self, geometry_positions, geometry_boundaries, timed_positions):
         """Map each geometry-sample boundary (the end of a command's portion) to
@@ -2333,12 +2589,17 @@ class TrajectoryPlanner(Thread):
                 # Review, blend finding 11 (2026-11-21): the members after the failed one had left the queue, so
                 # the abort's drain never reached them — their clients waited out their own timeouts. Reported
                 # ABORTED now; not after a Stop (it failed them already).
-                if self._cmd_epoch == self._epoch:
-                    for rest in chain[i + 1:]:
-                        self._report_aborted(rest)
+                self._abort_unsent(chain[i + 1:])
                 return False
             start_idx = end_idx
         return True
+
+    def _abort_unsent(self, cmds):
+        """After a failed send, the chain members not sent are reported ABORTED — they left the queue, so the abort's
+        drain never reaches them (review, blend finding 11). Not after a Stop: it failed them already."""
+        if self._cmd_epoch == self._epoch:
+            for rest in cmds:
+                self._report_aborted(rest)
 
     def _start_point(self):
         if self._resync:
@@ -3195,7 +3456,7 @@ class TrajectoryPlanner(Thread):
         self._last_diagnostic["ik_per_sample"] = int(n)
         return pos, vel
 
-    def _assert_cartesian_path_fidelity(self, sampled, cart_path):
+    def _assert_cartesian_path_fidelity(self, sampled, cart_path, refuse=True):
         """Every commanded sample must lie ON the programmed Cartesian path.
 
         WHY. We do not interpolate blindly: with `cart_path` in hand, _ik_every_sample solves
@@ -3215,6 +3476,9 @@ class TrajectoryPlanner(Thread):
             interpolation legitimately bows off the CHORDS between sparse waypoints (1.3mm).
         There is no ground truth to check against unless the caller hands us the actual
         Cartesian path. So when `cart_path` is None we do not guess — we skip.
+
+        refuse=False (a blended Cartesian chain, finding 4): the deviation is recorded and a stray past the
+        tolerance is logged as a warning, not raised.
         """
         if cart_path is None or sampled.shape[0] < 3:
             return
@@ -3241,7 +3505,10 @@ class TrajectoryPlanner(Thread):
             worst = max(worst, float(dev.max()))
         tol = float(DEFAULT_IK_CONFIG.pose_translation_tolerance_m)
         self._last_diagnostic["cartesian_path_deviation_m"] = worst
-        if worst > tol:
+        if worst > tol and not refuse:
+            logger.warning(f"blended Cartesian chain: the commanded tool path strays {worst * 1000:.3f}mm from the "
+                           f"programmed one (tolerance {tol * 1000:.3f}mm) — the spline through a tight corner")
+        elif worst > tol:
             raise PlannerError(
                 "CARTESIAN_PATH_DEVIATION",
                 f"the commanded tool path strays {worst * 1000:.3f}mm from the programmed "

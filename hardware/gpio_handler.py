@@ -424,6 +424,25 @@ def set_output(output_index, value):
 _outputs_off_done = False
 
 
+def emergency_stop_all_outputs():
+    """
+    Emergency function to set all outputs LOW immediately.
+    Call this when E-stop is triggered or error occurs.
+    """
+    if not _simulated:
+        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_1_PIN, 0)
+        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_2_PIN, 0)
+        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_3_PIN, 0)
+    for idx in _last_written:
+        _last_written[idx] = 0
+
+    shared_data.gpio_states[ISOLATED_OUTPUT_1] = 0
+    shared_data.gpio_states[ISOLATED_OUTPUT_2] = 0
+    shared_data.gpio_states[ISOLATED_OUTPUT_3] = 0
+
+    logger.warning("Emergency stop - all outputs set LOW")
+
+
 def outputs_off_at_exit():
     """Every isolated output LOW as RTI stops — a service stop or restart, or RTI ending on an exception (review D15,
     2026-11-20; user: "Yes, low on shutdown"). Before, an output stayed at its last level until the next RTI start
@@ -471,79 +490,10 @@ def set_all_outputs_high():
 # Convenience Output Control Functions
 # ==========================================================================
 
-def set_output_high(output_index):
-    """
-    Set a specific output HIGH (1).
-
-    Args:
-        output_index (int): Output index (ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_2, or ISOLATED_OUTPUT_3)
-    """
-    set_output(output_index, 1)
-
-
-def set_output_low(output_index):
-    """
-    Set a specific output LOW (0).
-
-    Args:
-        output_index (int): Output index (ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_2, or ISOLATED_OUTPUT_3)
-    """
-    set_output(output_index, 0)
-
-
-def toggle_output(output_index):
-    """
-    Toggle a specific output between HIGH and LOW.
-
-    Args:
-        output_index (int): Output index (ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_2, or ISOLATED_OUTPUT_3)
-    """
-    current_state = shared_data.gpio_states[output_index]
-    set_output(output_index, 1 - current_state)
-
-
-# Named convenience functions for each isolated output
-def set_output_1_high():
-    """Set ISOLATED_OUTPUT_1 to HIGH."""
-    set_output_high(ISOLATED_OUTPUT_1)
-
-
-def set_output_1_low():
-    """Set ISOLATED_OUTPUT_1 to LOW."""
-    set_output_low(ISOLATED_OUTPUT_1)
-
-
-def set_output_2_high():
-    """Set ISOLATED_OUTPUT_2 to HIGH."""
-    set_output_high(ISOLATED_OUTPUT_2)
-
-
-def set_output_2_low():
-    """Set ISOLATED_OUTPUT_2 to LOW."""
-    set_output_low(ISOLATED_OUTPUT_2)
-
-
-def set_output_3_high():
-    """Set ISOLATED_OUTPUT_3 to HIGH."""
-    set_output_high(ISOLATED_OUTPUT_3)
-
-
-def set_output_3_low():
-    """Set ISOLATED_OUTPUT_3 to LOW."""
-    set_output_low(ISOLATED_OUTPUT_3)
-
 
 # ==========================================================================
 # Combined GPIO Update (for main loop)
 # ==========================================================================
-
-def update_gpio():
-    """
-    Update all GPIO - read inputs and write outputs.
-    Call this function in the main control loop.
-    """
-    read_all_inputs()
-    write_all_outputs()
 
 
 # ==========================================================================
@@ -599,24 +549,6 @@ def print_gpio_states():
 # ==========================================================================
 # Safety Functions
 # ==========================================================================
-
-def emergency_stop_all_outputs():
-    """
-    Emergency function to set all outputs LOW immediately.
-    Call this when E-stop is triggered or error occurs.
-    """
-    if not _simulated:
-        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_1_PIN, 0)
-        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_2_PIN, 0)
-        lgpio.gpio_write(_gpio_handle, ISOLATED_OUTPUT_3_PIN, 0)
-    for idx in _last_written:
-        _last_written[idx] = 0
-
-    shared_data.gpio_states[ISOLATED_OUTPUT_1] = 0
-    shared_data.gpio_states[ISOLATED_OUTPUT_2] = 0
-    shared_data.gpio_states[ISOLATED_OUTPUT_3] = 0
-
-    logger.warning("Emergency stop - all outputs set LOW")
 
 
 def gpio_cleanup():

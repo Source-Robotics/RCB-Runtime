@@ -41,6 +41,25 @@ def page_gone() -> None:
     _GONE[0] += 1
 
 
+def release_waiters(client) -> bool:
+    """A page deleted without ever having connected (curl, a link preview, a tab closed or reloaded while it loaded):
+    wake what waits for its connection; True when there was something to wake.
+
+    Every `ui.timer` waits for its page's browser before its first tick (NiceGUI 3.3: `await client.connected()`, no
+    timeout). NiceGUI deletes a never-connected client after a while but never wakes that wait, so each of the page's
+    timers stayed blocked for good and held, through its callback, the page's whole namespace — ~8 MB per such load,
+    measured 2026-11-22 (8 curl loads: 8 namespaces alive, 2 clients). Called from the page's delete hook, BEFORE the
+    client's elements go: the timers resume after the deletion, find themselves deleted and end (their callback
+    dropped), so the page is freed at the next collect_gone_pages()."""
+    if getattr(client, "has_socket_connection", True):
+        return False
+    event = getattr(client, "_connected", None)       # NiceGUI's own event (client.py); missing = nothing to do
+    if event is None or not hasattr(event, "set"):
+        return False
+    event.set()
+    return True
+
+
 def collect_gone_pages() -> bool:
     """A full collection when a page went since the last one; True when it ran.
 

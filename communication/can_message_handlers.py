@@ -569,10 +569,6 @@ def handle_polling_and_overrides(motors, state, overrides, override_queue, joint
             state["step"] = (state["step"] + 1) % 3
 
 
-def secondary_data_send():
-    None
-
-
 # ==========================================================================
 # Motor Configuration Pre-loading
 # ==========================================================================
@@ -1293,46 +1289,6 @@ def _kt_plausible(kt_can, kt_xml, tolerance, label):
 # ==========================================================================
 # Data Freshness Checking
 # ==========================================================================
-
-def check_data_freshness(Motor_data, joint_num, active_CAN_gripper, loop_tick_cnt,
-                         old_data_warning, CAN_node_connection_error,
-                         old_data_threshold=20, disconnect_threshold=50):
-    """
-    Check if motor data is fresh or stale.
-
-    Args:
-        Motor_data (dict): Motor data deques
-        joint_num (int): Number of joints
-        active_CAN_gripper (int): 1 if gripper active
-        loop_tick_cnt (int): Current loop tick
-        old_data_warning (np.array): Warning flags array
-        CAN_node_connection_error (np.array): Connection error array
-        old_data_threshold (int): Ticks before data considered old (default: 20)
-        disconnect_threshold (int): Ticks before considering disconnected (default: 50)
-
-    Returns:
-        tuple: (old_data_warning, CAN_node_connection_error)
-    """
-    # Get latest tick for each motor
-    loop_tick_latest = [Motor_data[i][-1]["tick"] for i in range(len(Motor_data))]
-
-    # Check each motor
-    for i in range(joint_num + active_CAN_gripper):
-        tick_diff = loop_tick_cnt - loop_tick_latest[i]
-
-        # Old data warning
-        if tick_diff >= old_data_threshold:
-            old_data_warning[i] = 1
-        else:
-            old_data_warning[i] = 0
-
-        # Disconnection error
-        if tick_diff >= disconnect_threshold:
-            CAN_node_connection_error[i] = 1
-        else:
-            CAN_node_connection_error[i] = 0
-
-    return old_data_warning, CAN_node_connection_error
 
 
 # ==========================================================================

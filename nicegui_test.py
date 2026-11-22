@@ -4859,6 +4859,8 @@ def _on_delete():
     if retire is not None:
         retire()
     import gui_page_lifecycle as _lifecycle            # its objects go at the next full collection (G6, 2026-11-21)
+    # A page that never connected: its timers still wait for the browser and hold the page (G6, 2026-11-22)
+    getattr(_lifecycle, "release_waiters", lambda client: False)(_PAGE_CLIENT)
     getattr(_lifecycle, "page_gone", lambda: None)()
 
 async def _on_tab_change():
@@ -4947,6 +4949,7 @@ def _drain_exec_toasts():
 
 
 tabs.on_value_change(_on_tab_change)
+_PAGE_CLIENT = ui.context.client                    # this page's client (its delete hook wakes its waiters, G6)
 ui.context.client.on_connect(_on_connect)
 ui.context.client.on_disconnect(_on_disconnect)
 ui.context.client.on_delete(_on_delete)

@@ -7,7 +7,7 @@ processes on the same machine. ~2–10 µs latency vs ~20–60 µs for TCP loopb
 
 Socket topology:
   ZMQ_CMD_SOCKET             — RTI binds (PULL),  all senders connect (PUSH)
-  ZMQ_STATUS_SOCKET          — command_executor binds (PULL), RTI connects (PUSH)
+  ZMQ_STATUS_SOCKET          — unused since 2026-11-22 (RTI's per-command "done" went to no reader; legacy/ only)
   ZMQ_EXEC_TRAJECTORY_SOCKET — RTI binds (PULL), command_executor planner connects (PUSH)
   ZMQ_EXEC_STATUS_SOCKET     — command_executor binds (PULL), RTI connects (PUSH)
 
@@ -95,7 +95,7 @@ SIMULATOR_PORT       = 27890  # Reserved for simulator connection (not yet imple
 # jog_stop to the live RTI, which ignored them in IDLE). Unset — the robot, the simulator — the paths are as before.
 _IPC_PREFIX = "".join(c for c in os.environ.get("RCB_SHM_PREFIX", "") if c.isalnum() or c in "_-")
 ZMQ_CMD_SOCKET    = f"ipc:///tmp/{_IPC_PREFIX}robot_cmd"     # RTI receives commands on this (PULL/bind)
-ZMQ_STATUS_SOCKET = f"ipc:///tmp/{_IPC_PREFIX}robot_status"  # RTI sends status on this (PUSH/connect)
+ZMQ_STATUS_SOCKET = f"ipc:///tmp/{_IPC_PREFIX}robot_status"  # unused since 2026-11-22 (legacy/ only)
 
 # --- EXEC mode trajectory transport (Phase 3) ---
 # Planner thread (in command_executor) PUSHes trajectory batches; RTI PULLs them
@@ -174,24 +174,6 @@ def zmq_listener(command_queue: Queue):
         except Exception as e:
             logger.error(f"Error in listener: {e}")
             time.sleep(0.1)
-
-
-def zmq_sender_setup():
-
-    ctx = background_zmq_context()
-    status_socket = ctx.socket(zmq.PUSH)
-    # LINGER 0: nothing binds ZMQ_STATUS_SOCKET since the executor rewrite, so every "done" RTI pushes stays queued,
-    # and with the default LINGER (-1, forever) the context's term() waited for them when SystemExit left main():
-    # 15 of 20 service stops hung until the 10 s shutdown watchdog (the dumps in RTI.out.log, 2026-10-06..10).
-    # Pending status messages are worthless once RTI stops; the other PUSH sockets set 0 too (2026-10-10).
-    status_socket.setsockopt(zmq.LINGER, 0)
-    #status_socket.setsockopt(zmq.SNDHWM, 10) #Default is 1000! The sender can queue 10 messages for that connection, the 11th blocks or fails
-    #tatus_socket.setsockopt(zmq.IMMEDIATE, 1) # detect disconnected receiver
-    #status_socket.setsockopt(zmq.SNDTIMEO, 0) # add timeout instead of pure non-block
-    # Connect to the IPC status socket; command_executor binds (PULL) on the other end
-    status_socket.connect(ZMQ_STATUS_SOCKET)
-
-    return status_socket
 
 
 def zmq_answer_sender_setup():

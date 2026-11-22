@@ -240,6 +240,10 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
                 self._blend_buffer.append(command)
                 if len(self._blend_buffer) >= self.MAX_BLEND_LOOKAHEAD:
                     self._flush_blend_buffer()
+            elif self._ends_chain(command):
+                # the live planner's rule (decision 4a): a blend=0 move is the chain's last member
+                self._blend_buffer.append(command)
+                self._flush_blend_buffer()
             else:
                 self._flush_blend_buffer()
                 self._run_single(command)
@@ -661,31 +665,48 @@ class DryRunRobotClient(RobotClient):
 
     def set_joint_speed(self, percent: float) -> Any:
         value = float(percent)
-        self._defaults = MotionOptions.from_dict({"speed": value}, self._defaults)
+        try:
+            self._defaults = MotionOptions.from_dict({"speed": value}, self._defaults)
+        except ValueError as e:   # as the robot refuses it (2026-11-22: a bare ValueError here)
+            raise _rejected("BAD_ARGS", f"set_joint_speed: {e}") from None
         self._record_immediate_event("set_joint_speed", {"percent": value, "kind": "setup"})
 
     def set_blending(self, percent: float) -> Any:
         value = float(percent)
-        self._defaults = MotionOptions.from_dict({"blend": value}, self._defaults)
+        try:
+            self._defaults = MotionOptions.from_dict({"blend": value}, self._defaults)
+        except ValueError as e:   # as the robot refuses it (2026-11-22: a bare ValueError here)
+            raise _rejected("BAD_ARGS", f"set_blending: {e}") from None
         self._record_immediate_event("set_blending", {"percent": value, "kind": "setup"})
 
     def set_profile(self, profile: str) -> Any:
         value = str(profile).strip().lower()
-        self._defaults = MotionOptions.from_dict({"profile": value}, self._defaults)
+        try:
+            self._defaults = MotionOptions.from_dict({"profile": value}, self._defaults)
+        except ValueError as e:   # as the robot refuses it (2026-11-22: a bare ValueError here)
+            raise _rejected("BAD_ARGS", f"set_profile: {e}") from None
         self._record_immediate_event("set_profile", {"profile": value, "kind": "setup"})
 
     set_default_profile = set_profile
 
     def set_ik_solver(self, solver: str) -> Any:
         value = str(solver).strip().lower()
-        self._defaults = MotionOptions.from_dict({"ik_solver": value}, self._defaults)
+        try:
+            self._defaults = MotionOptions.from_dict({"ik_solver": value}, self._defaults)
+        except ValueError as e:   # as the robot refuses it (2026-11-22: a bare ValueError here)
+            raise _rejected("BAD_ARGS", f"set_ik_solver: {e}") from None
         self._record_immediate_event("set_ik_solver", {"solver": value, "kind": "setup"})
 
     set_default_ik_solver = set_ik_solver
 
     def set_completion_policy(self, policy: str) -> Any:
         value = str(policy).strip().lower()
-        self._defaults = MotionOptions.from_dict({"completion_policy": value}, self._defaults)
+        if value not in ("commanded", "settled", "strict"):     # = command_executor._COMPLETION_POLICY_NAMES
+            raise _rejected("BAD_ARGS", f"set_completion_policy: {policy!r} is not one of commanded, settled, strict")
+        try:
+            self._defaults = MotionOptions.from_dict({"completion_policy": value}, self._defaults)
+        except ValueError as e:   # as the robot refuses it (2026-11-22: a bare ValueError here)
+            raise _rejected("BAD_ARGS", f"set_completion_policy: {e}") from None
         self._record_immediate_event("set_completion_policy", {"policy": value, "kind": "setup"})
 
     def plan_summary(self) -> DryRunPlan:
@@ -879,7 +900,7 @@ class DryRunRobotClient(RobotClient):
         return zones_summary(self._zone_setup)
 
     def get_status(self) -> dict:
-        summary = self.plan_summary()
+        self.plan_summary()                # plans what is queued: motion_aborted is then current
         return {
             "mode": self._mode,
             "state": self._state,
@@ -890,7 +911,13 @@ class DryRunRobotClient(RobotClient):
             "simulated": False,
             "virtual": True,
             "planner": self._planner.status_snapshot(),
-            "errors": [error.failure() for error in summary.errors],     # the live client's failure dicts (P4)
+            # As the live status (2026-11-22): `errors` are the robot's LATCHED error keys and a planning failure
+            # latches none (it was the failures' dicts, so wait_error_reset() never passed after one); the failure
+            # that aborted the program is `motion_aborted`, and every failure is in plan_summary() / wait_idle().
+            "err": 0,
+            "errors": [],
+            "error_details": [],
+            "motion_aborted": self._planner.abort_info(),
         }
 
     status = get_status

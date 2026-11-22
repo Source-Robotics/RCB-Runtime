@@ -16,6 +16,8 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation, Slerp
 from spatialmath import SE3
 
+from motion.joint_paths import corner_continuity  # one rule for both builders
+
 
 @dataclass(frozen=True)
 class CartesianPath:
@@ -492,6 +494,8 @@ def build_composite_cartesian_path(waypoints: Sequence[SE3], blend_radii_mm: Seq
             DEFAULT_ARCLEN_SPACING_M.
         samples_per_segment: Deprecated and ignored — sample density is now set
             by arclen_spacing. Accepted so existing callers keep working.
+        continuity: "c1" / "c2" for every corner, or a sequence with one per intermediate
+            waypoint (joint_paths.corner_continuity).
         start_trim: Fraction of the FIRST segment to skip. The rolling buffer needs this:
             a batch spliced into a move already running starts at the EXIT of the Bezier
             rounding the corner into it — part-way along the first segment, not at the
@@ -583,7 +587,7 @@ def build_composite_cartesian_path(waypoints: Sequence[SE3], blend_radii_mm: Seq
             exit_pose = interp_pose(end, next_end, seg_entry_frac[seg_idx + 1])
             zone_start = len(poses) - 1 if poses else 0
             zone_poses, _ = blend_zone_poses(entry_pose, corner_pose, exit_pose, spacing,
-                                             continuity)
+                                             corner_continuity(continuity, seg_idx))
             poses.extend(zone_poses[1:] if poses else zone_poses)
             blend_zones.append({"corner_index": int(seg_idx + 1), "start_index": int(zone_start),
                                 "end_index": int(len(poses) - 1)})

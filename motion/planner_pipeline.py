@@ -479,7 +479,7 @@ class TOPPRATimeParameterizer(TimeParameterizer):
         return self._solve(waypoints, max_vel, max_accel, dt, speed_scale)
 
     def parameterize_path(self, waypoints, max_vel, max_accel, dt, speed_scale=1.0,
-                          sd_start=0.0, sd_end=0.0):
+                          sd_start=0.0, sd_end=0.0, vel_scale=None):
         """Time-parameterize an arbitrary N-waypoint joint-space path.
 
         Intended for composite zone-blended chains (motion/joint_paths.py,
@@ -495,15 +495,49 @@ class TOPPRATimeParameterizer(TimeParameterizer):
         Raises TOPPRAInfeasible if the requested boundary velocity is too fast for
         the path's own constraints — TOPPRA returns None, which is exactly the
         "can't splice this fast, commit the stopping tail instead" signal.
+
+        vel_scale (blends done right, 2026-11-22): None, or one speed scale per WAYPOINT (0 < v <= 1): the joint speed
+        limit along the path is max_vel x that waypoint's scale (TOPPRA's varying velocity constraint), so each move of
+        a blended chain keeps its own speed — the caller gives a corner the slower of its two moves. `speed_scale` then
+        only scales the acceleration (x speed_scale^2, as for a single move).
         """
         waypoints = np.asarray(waypoints, dtype=np.float64)
         if waypoints.shape[0] < 2:
             raise ValueError("TOPPRA path needs at least 2 waypoints")
+        if vel_scale is not None:
+            vel_scale = np.asarray(vel_scale, dtype=np.float64)
+            if vel_scale.shape != (waypoints.shape[0],) or not np.all(np.isfinite(vel_scale)) \
+                    or np.any(vel_scale <= 0.0):
+                raise ValueError(f"vel_scale needs one positive scale per waypoint ({waypoints.shape[0]}), "
+                                 f"got shape {vel_scale.shape}")
         return self._solve(waypoints, max_vel, max_accel, dt, speed_scale,
-                           sd_start=sd_start, sd_end=sd_end)
+                           sd_start=sd_start, sd_end=sd_end, vel_scale=vel_scale)
+
+    @staticmethod
+    def _velocity_constraint(waypoints, max_vel, scale, vel_scale, constraint):
+        """The joint velocity constraint: max_vel x scale (one speed), or max_vel x the per-waypoint scale at the path
+        parameter s (each blended move its own speed; the knots are the geometric path's own, path_parameter)."""
+        vmax = np.asarray(max_vel, dtype=np.float64)
+        if vel_scale is None:
+            return constraint.JointVelocityConstraint(vmax * scale)
+        vs = np.clip(np.asarray(vel_scale, dtype=np.float64), 1e-3, 1.0)
+        if np.all(vs == vs[0]):
+            # One speed along the whole path: the constant constraint, exactly as before per-move speeds — a chain of
+            # equal speeds plans bit for bit as it did.
+            return constraint.JointVelocityConstraint(vmax * vs[0])
+        knots = path_parameter(waypoints)
+
+        def vlim(s):
+            # The slower of the two waypoints around s: a speed change never starts before the waypoint where the
+            # slower move's part begins (the corner itself carries min(v_N, v_N+1) from the caller).
+            i = int(np.clip(np.searchsorted(knots, float(s), side="right") - 1, 0, len(vs) - 1))
+            j = min(i + 1, len(vs) - 1)
+            v = vmax * min(vs[i], vs[j])
+            return np.stack((-v, v), axis=1)
+        return constraint.JointVelocityConstraintVarying(vlim)
 
     def _solve(self, waypoints, max_vel, max_accel, dt, speed_scale,
-               sd_start=0.0, sd_end=0.0):
+               sd_start=0.0, sd_end=0.0, vel_scale=None):
         try:
             import toppra as ta
             from toppra import algorithm, constraint
@@ -529,7 +563,7 @@ class TOPPRATimeParameterizer(TimeParameterizer):
             geom_path = build_geometric_path(waypoints)
             scale = float(np.clip(speed_scale, 1e-3, 1.0))
             constraints = [
-                constraint.JointVelocityConstraint(np.asarray(max_vel, dtype=np.float64) * scale),
+                self._velocity_constraint(waypoints, max_vel, scale, vel_scale, constraint),
                 constraint.JointAccelerationConstraint(np.asarray(max_accel, dtype=np.float64) * scale * scale),
             ]
             # Evenly-spaced explicit gridpoints, not TOPPRA's auto-selection —

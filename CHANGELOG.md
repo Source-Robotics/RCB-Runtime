@@ -18,6 +18,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - `get_motion_settings()`: the session's speed, blend, profile, IK solver and completion policy, which every queued
   move starts from; the status carries them as `motion_settings`, and the dashboard shows them next to the control
   badge.
+- A blended Cartesian chain measures how far its commanded tool path strays from the programmed one
+  (`last_diagnostic.cartesian_path_deviation_m`; a log warning above 0.2 mm). It is not refused for it.
 - A new warning, `BLEND_DEGRADED` (5111): a chain of blended moves that could not be planned as one path runs its moves
   one by one, each stopping at its target — the activity log now says so and why.
 - `get_status()` and the status stream carry `rti_alive`: false once the robot's real-time loop has not ticked for
@@ -48,6 +50,16 @@ What changed in each version of the RCB runtime. The newest version is at the to
   (`node=1`, J2, becomes `drive=2`). A client that speaks an older protocol is refused at `connect()`; a raw JSON
   client must send `"protocol": 4` for these commands (`CLIENT_TOO_OLD` otherwise).
 - `rti_set_vel_scale()` takes a percent like every other share: `10` is 10 % (it was `0.1`).
+- **Blended moves keep their own settings.** In a chain of blended moves (`zone`, `tolerance`, `ruckig_corner`) every
+  move ran at the FIRST move's `speed` / `accel` / `jerk`, and `duration` was never read. Now each move runs at its
+  own speed on its part of the path and a corner at the slower of its two moves; a `duration` becomes the speed at
+  which that move alone would take it (inside a chain the time is approximate — usually shorter); the acceleration
+  of a `zone` / `tolerance` chain is its smallest `accel` (`ruckig_corner`: each move its own `accel` and `jerk`).
+  A chain with different speeds takes longer than before.
+- **The corner before a move with `blend=0` is rounded**: a move with no blend right after a blended chain (the same
+  kind of move and profile) joins the chain as its last member. The arm stopped at that corner before.
+- Each corner of a chain uses its own move's `blend_continuity` (every corner took the first move's; mixing c1 and
+  c2 with `tolerance` overshot the tolerance).
 - The motion waits wait as long as the move takes by default: `wait_idle()`, `wait_motion_complete()`,
   `wait_gripper_move_complete()`, `wait_holding_part()`, `wait_released_part()` and every move's wait in sync mode
   (they gave up after 120 s, and a timeout of `0` also meant 120 s). `None` waits as long as it takes, a number that
@@ -141,9 +153,19 @@ What changed in each version of the RCB runtime. The newest version is at the to
   outside JOG mode too. They were answered "ok" and ignored, or a bad number raised in RTI's command guard.
 - The I/O uses only the 40-pin header's GPIO controller (the Pi 5's `pinctrl-rp1`): any GPIO chip that opened was
   taken. `RCB_GPIO_CHIP` still picks one explicitly.
+- RTI no longer sends a "done" message after every command to a socket nothing reads (left from before the executor
+  rewrite), nor calls an empty function every tick; unused helpers are removed.
 
 ### Fixed
 
+- The dashboard kept every page that never connected (one loaded by a script or a link preview, a tab closed or
+  reloaded while it loaded): its timers waited for the browser for good and held the whole page, ~8 MB each, until
+  the dashboard restarted. They are released when NiceGUI deletes the page.
+- `RobotClient`: after a fast `disconnect()` + `connect()` the old connection's receiver could end late and mark the
+  new connection lost, failing its commands.
+- The dry-run client's status matches the robot's: a planning failure is no latched error (it sat in `errors` for
+  good, so `wait_error_reset()` never passed), `motion_aborted` names it; its session settings refuse a bad value with
+  `CommandRejected` (`BAD_ARGS`) as the robot does (a bare `ValueError`; any completion policy was taken).
 - Cartesian moves on the default profile were jerk-limited by J1's limit alone (the solver took the first of the six
   joint limits it was handed; J2 allows less than a third of it), and with `duration` by none; the path's limit is
   now the joints' mapped onto the path.
@@ -188,6 +210,12 @@ What changed in each version of the RCB runtime. The newest version is at the to
   target now completes in turn.
 - Blending: after a failed send in the middle of a chain, the later moves were never reported (their programs
   waited out their own timeouts); they are reported ABORTED, and a failed send no longer logs the move completed.
+  The same now for a chain that holds its tail for more moves and for the tail sent later.
+- Blending while moves keep arriving (a G-code stream): a `tolerance` (G64) was read as a radius after the first
+  part of the stream (P0.05 rounded corners by 0.05 mm, the arm nearly stopping at each); the later parts ran at the
+  last move's speed with the full acceleration (not `accel`), with c1 corners and the first new move's IK solver,
+  and without the acceleration check every other plan has. They are planned as one chain of the same moves would
+  be. A repeated target at the end of such a part could still give an empty batch; it completes in turn.
 - A second supervisor (a second service unit, or one started by hand next to the service) started a second RTI on the
   same CAN bus; it now refuses to start, naming the one that runs (a lock released when that one ends).
 - `setup_system.sh` and `check_system.py` checked different module lists (`pinokin`, which nothing imports; no

@@ -245,6 +245,11 @@ class Connection:
         except OSError:
             pass
         finally:
+            if self._sock is not None and self._sock is not sock:
+                # A newer connect() owns this Connection now (a fast disconnect() + connect()): this receiver's end is
+                # the OLD socket's, and its clean-up would mark the new connection lost and fail its commands (2026-11-22,
+                # found by the dry-run review). Nothing of the old connection is left to clean (disconnect() did).
+                return
             self._connected = False
             if self._closing:                   # our own disconnect(): it reports DISCONNECTED (2026-10-24)
                 self._fail_all("DISCONNECTED", "connection closed")

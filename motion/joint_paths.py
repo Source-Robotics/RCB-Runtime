@@ -93,6 +93,15 @@ def arclen_spacing_for(max_vel: np.ndarray | float, dt: float) -> float:
 CORNER_DEVIATION_COEFF = {"c1": 0.5, "c2": 7.0 / 32.0}
 
 
+def corner_continuity(continuity, corner: int) -> str:
+    """The continuity of one corner: `continuity` is one value for every corner, or one per intermediate waypoint
+    (blends done right, finding 5a, 2026-11-22: a chain shaped every corner with its first move's continuity while
+    a tolerance radius used each corner's own — mixing c1 and c2 overshot the tolerance up to ~2.3x). None = "c1", the
+    default (the curve code read None as c1 already)."""
+    c = continuity if isinstance(continuity, str) or continuity is None else continuity[corner]
+    return c or "c1"
+
+
 def _bezier(entry_q, corner_q, exit_q, t, continuity="c1"):
     """The corner curve, evaluated analytically at arbitrary t (never interpolated).
 
@@ -204,6 +213,8 @@ def build_composite_joint_path(waypoints: np.ndarray, blend_fracs: Sequence[floa
             arclen_spacing_for(max_vel, dt).
         samples_per_segment: Deprecated and ignored — sample density is now set
             by arclen_spacing. Accepted so existing callers keep working.
+        continuity: "c1" / "c2" for every corner, or a sequence with one per intermediate
+            waypoint (corner_continuity).
         start_trim: Fraction of the FIRST segment to skip. The rolling buffer needs this:
             when a batch of commands is spliced into a move already running, the new path
             starts at the EXIT of the Bezier that rounds the corner into it — part-way
@@ -309,7 +320,8 @@ def build_composite_joint_path(waypoints: np.ndarray, blend_fracs: Sequence[floa
         if piece[0] == "line":
             seg_rows, _ = linear_joint_segment(piece[1], piece[2], spacing)
         else:
-            seg_rows, _ = blend_joint_zone(piece[2], piece[3], piece[4], spacing, continuity)
+            seg_rows, _ = blend_joint_zone(piece[2], piece[3], piece[4], spacing,
+                                           corner_continuity(continuity, piece[1] - 1))
         zone_start = row_count - 1 if is_blend and rows else row_count
         if rows:
             seg_rows = seg_rows[1:]   # drop the duplicate point at the junction

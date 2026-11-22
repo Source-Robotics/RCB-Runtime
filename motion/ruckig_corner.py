@@ -242,6 +242,15 @@ def _leg_trajectory(start: np.ndarray, end: np.ndarray, vmax: np.ndarray, amax: 
     return traj
 
 
+def leg_duration(start: np.ndarray, end: np.ndarray, vmax: np.ndarray, amax: np.ndarray, jmax: np.ndarray) -> float:
+    """Seconds of the rest-to-rest leg start -> end at these limits (the planner's `duration` -> speed for a leg)."""
+    start, end = np.asarray(start, dtype=np.float64), np.asarray(end, dtype=np.float64)
+    if not np.any(np.abs(end - start) > 1e-12):
+        return 0.0
+    return float(_leg_trajectory(start, end, np.asarray(vmax, dtype=np.float64), np.asarray(amax, dtype=np.float64),
+                                 np.asarray(jmax, dtype=np.float64)).duration)
+
+
 def _polyline_distance(points, waypoints):
     """Max distance from the joint-space waypoint polyline (rad).
 
@@ -344,7 +353,7 @@ def _state_at(traj: Any, t: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def plan_ruckig_corner_chain(waypoints: np.ndarray, max_vel: np.ndarray, max_accel: np.ndarray, dt: float,
                              blend_dists: Sequence[float], jerk_factor: float = RUCKIG_JERK_FACTOR, speed_scale: float = 1.0,
-                             max_jerk: np.ndarray | None = None) -> RuckigCornerChain:
+                             max_jerk: np.ndarray | None = None, leg_limits=None) -> RuckigCornerChain:
     """Plan a jerk-limited joint-space chain with Ruckig corner transitions.
 
     Args:
@@ -361,6 +370,10 @@ def plan_ruckig_corner_chain(waypoints: np.ndarray, max_vel: np.ndarray, max_acc
             comes from config rather than being computed from the acceleration limit.
         speed_scale: same convention as every other lane — velocity x scale,
             acceleration x scale^2, jerk x scale^3, so `speed` keeps one meaning.
+        leg_limits: None, or one (vmax, amax, jmax) per leg — each move of the chain its own
+            speed / acceleration / jerk (2026-11-22); a corner then takes the slower leg's
+            velocity limit (raised only to meet a faster exit state) and the faster leg's
+            acceleration and jerk. Overrides speed_scale / max_* when given.
 
     Returns:
         RuckigCornerChain sampled uniformly at dt (final row exactly at the last
@@ -380,9 +393,15 @@ def plan_ruckig_corner_chain(waypoints: np.ndarray, max_vel: np.ndarray, max_acc
     jmax = ((np.asarray(max_jerk, dtype=np.float64) if max_jerk is not None
              else np.asarray(max_accel, dtype=np.float64) * float(jerk_factor))
             * scale ** 3)
+    # Each leg its own limits (blends done right, 2026-11-22): leg_limits[i] = (vmax, amax, jmax) of the move that
+    # leg belongs to; None = the one set above for every leg, as before.
+    per_leg = [(vmax, amax, jmax)] * (n_wp - 1) if leg_limits is None else [
+        tuple(np.asarray(x, dtype=np.float64) for x in lim) for lim in leg_limits]
+    if len(per_leg) != n_wp - 1:
+        raise ValueError(f"leg_limits needs one (vmax, amax, jmax) per leg ({n_wp - 1}), got {len(per_leg)}")
 
     dt = float(dt)
-    legs = [_leg_trajectory(waypoints[i], waypoints[i + 1], vmax, amax, jmax)
+    legs = [_leg_trajectory(waypoints[i], waypoints[i + 1], *per_leg[i])
             for i in range(n_wp - 1)]
     leg_lengths = [float(np.linalg.norm(waypoints[i + 1] - waypoints[i]))
                    for i in range(n_wp - 1)]
@@ -414,9 +433,19 @@ def plan_ruckig_corner_chain(waypoints: np.ndarray, max_vel: np.ndarray, max_acc
                 # Clamp before handing the cut states to Ruckig — see _clamp_state. Without
                 # this, a state read back off a limit-saturated leg can sit a hair OUTSIDE
                 # the limit and Ruckig raises instead of solving.
-                state_a = _clamp_state(_state_at(legs[c], t_a), vmax, amax)
-                state_b = _clamp_state(_state_at(legs[c + 1], t_b), vmax, amax)
-                transition = _transition(state_a, state_b, vmax, amax, jmax)
+                # The corner between two legs (blends done right, 2026-11-22): the SLOWER leg's velocity limit
+                # (decision 1a), raised only where the exit state on the next leg is faster (Ruckig refuses a target
+                # above its limits; an entry state above them it brakes); the FASTER leg's acceleration and jerk, so
+                # a fast leg brakes into a slow corner as hard as it may (the slower leg's could overshoot the corner
+                # by many times the blend radius) — as the zone lane takes the chain's acceleration from its fastest
+                # move. Each cut state is clamped to its OWN leg's limits. Equal legs: the limits as before.
+                (va, aa, _), (vb, ab, _) = per_leg[c], per_leg[c + 1]
+                state_a = _clamp_state(_state_at(legs[c], t_a), va, aa)
+                state_b = _clamp_state(_state_at(legs[c + 1], t_b), vb, ab)
+                cv = np.maximum(np.minimum(va, vb), np.abs(state_b[1]) / _LIMIT_EPS)
+                ca = np.maximum(aa, ab)
+                cj = np.maximum(per_leg[c][2], per_leg[c + 1][2])
+                transition = _transition(state_a, state_b, cv, ca, cj)
                 if transition is not None:
                     leg_to[c] = t_a
                     leg_from[c + 1] = t_b

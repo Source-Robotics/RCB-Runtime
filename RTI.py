@@ -106,9 +106,9 @@ from hardware.can_hardware import scan_can_bus, initialize_can_communication
 # ==========================================================================
 # Networking
 # ==========================================================================
-from config.networking import RT_CPU_CORE, zmq_listener, zmq_sender_setup, zmq_answer_sender_setup, udp_socket_receive_setup, udp_socket_send_setup, broadcast_udp_telemetry, drain_rti_udp, RTI_PORT_SENDER, init_rti_tcp_listener, accept_rti_tcp, drain_rti_tcp, send_rti_tcp, drain_rti_tcp_backlog
+from config.networking import RT_CPU_CORE, zmq_listener, zmq_answer_sender_setup, udp_socket_receive_setup, udp_socket_send_setup, broadcast_udp_telemetry, drain_rti_udp, RTI_PORT_SENDER, init_rti_tcp_listener, accept_rti_tcp, drain_rti_tcp, send_rti_tcp, drain_rti_tcp_backlog
 from communication.can_message_handlers import receive_and_process_can_messages, handle_polling_and_overrides, update_can_connection_status, drain_can_discard
-from communication.can_message_handlers import send_gripper_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
+from communication.can_message_handlers import send_gripper_commands, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
 from communication.can_message_handlers import send_brake_on_idle, fetch_board_ids, board_ids_of
 from utility.drive_params import ParamRead, catalogue as drive_param_catalogue
 from utility.drive_capture import DriveCapture
@@ -406,7 +406,6 @@ def main():
     threading.Thread(target=zmq_listener, args=(command_queue,), daemon=True).start()
 
     # --- Setup ZMQ response sender
-    status_socket = zmq_sender_setup()
     # RTI's answers to the executor's commands (2026-10-25: ok, or why it refused) — to the executor's checkpoint
     # listener, the way the EXEC handler's checkpoints go (config/networking.zmq_answer_sender_setup).
     answer_socket = zmq_answer_sender_setup()
@@ -3607,10 +3606,6 @@ def main():
                     st.pending_mode_request_id = st.command_id      # this command asked for the mode change
                 st.command_id = None
 
-            try:
-                status_socket.send_string("done", zmq.NOBLOCK)
-            except zmq.Again:
-                pass  # drop — don't block the RT loop
 
 
         except Empty:
@@ -3926,7 +3921,6 @@ def main():
         # ==========================================================================
         # Secondary data send; NOTE when sending these commands drivers do not respond anything!
         # ==========================================================================
-        secondary_data_send()
         _profile_last = _profile_mark(_profile_last, "secondary_send")
 
 
