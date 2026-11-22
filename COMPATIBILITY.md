@@ -5,6 +5,7 @@ first. What changed in each release is in `CHANGELOG.md`.
 
 | Runtime | Client | Command protocol | RTI protocol | Telemetry format | Config formats | Drive firmware | Control box PCB | Arm and grippers | Description package | OS image | Docs |
 |---|---|---|---|---|---|---|---|---|---|---|---|
+| 3.0.0 | 3.0.x | 4 | 1 | 1 | 1 | 110 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 3.0 |
 | 2.0.0 | 2.0.x | 3 | 1 | 1 | 1 | 110 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 2.0 |
 | 1.1.1 | 1.1.x | 2 | 1 | 1 | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 1.1 |
 | 1.1.0 | 1.1.x | 2 | 1 | 1 | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 1.1 |

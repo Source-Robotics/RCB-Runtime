@@ -13,6 +13,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-22
+
 ### Added
 
 - `get_motion_settings()`: the session's speed, blend, profile, IK solver and completion policy, which every queued
