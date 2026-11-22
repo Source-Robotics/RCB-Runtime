@@ -1,5 +1,6 @@
 """Offline EXEC planner client for previewing programs without RTI, ZMQ, or CAN."""
 from __future__ import annotations
+import math
 from typing import Any, Callable, Sequence
 
 from dataclasses import dataclass, replace
@@ -8,9 +9,12 @@ from queue import Empty, Queue
 import numpy as np
 
 import config.xml_parser as xml_parser
+from communication.protocol import canonical_command
 from motion.cartesian_paths import pose_from_xyz_rpy
-from motion.exec_commands import DEFAULT_PROFILE, MotionOptions, QueuedCommand
+from motion.exec_commands import (DEFAULT_PROFILE, MotionOptions, QueuedCommand, blend_problem,
+                                  profile_option_problem)
 from motion.reachability import find_reachable_clear, make_starts
+from utility.error_catalog import entry as catalog_entry
 from utility.zones import reach_reply, zones_summary
 from motion.trajectory_planner import PlannerError, TrajectoryPlanner
 from project_paths import CELLS_DIR, GRIPPERS_DIR, ROBOTS_DIR, SYSTEM_XML
@@ -25,7 +29,89 @@ from utility.robot_factory import create_robot
 
 from .client import RobotClient, _pose_in, _pose_out
 from .commands import generate_id
-from .exceptions import CommandRejected, MotionFailed, RobotTimeout
+from .connection import Connection
+from .exceptions import CommandRejected, MotionFailed, RobotConnectionError, RobotTimeout
+
+
+# ── The executor's queue-time refusals (review P4, 2026-11-22) ─────────────────────────────────────────────────────
+# command_executor.py cannot be imported offline (it starts its servers on import), so these are COPIES of its
+# originals, each named where it stands. dummy_test_scripts/test_review_batch17_client.py lifts the originals from
+# the executor's source and keeps the two equal on a table of cases: change both together.
+
+# = command_executor._UNSUPPORTED_PER_COMMAND_OPTIONS: a session setting, refused per move (BAD_OPTIONS)
+_UNSUPPORTED_PER_COMMAND_OPTIONS = {
+    "completion_policy": "use set_completion_policy() instead of a per-command option",
+}
+
+
+def _reject_unsupported_per_command_options(option_overrides):
+    """= command_executor._reject_unsupported_per_command_options: a ValueError (BAD_OPTIONS) naming each session
+    setting given per move."""
+    bad = sorted(set(option_overrides or {}) & set(_UNSUPPORTED_PER_COMMAND_OPTIONS))
+    if not bad:
+        return
+    details = "; ".join(f"{key}: {_UNSUPPORTED_PER_COMMAND_OPTIONS[key]}" for key in bad)
+    raise ValueError(details)
+
+
+# = command_executor._POSE_ARG_COMMANDS
+_POSE_ARG_COMMANDS = ("move_pose", "move_linear", "move_linear_rel_world", "move_linear_rel_tool")
+
+
+def _queued_args_problem(cmd, args, joint_num):
+    """= command_executor._queued_args_problem, the robot's joint count an argument here (the executor's JOINT_NUM):
+    why a queued move's values cannot be planned (BAD_ARGS: too few, or one that is no finite number), or None."""
+    if cmd == "move_joints":
+        need, what = joint_num, f"{joint_num} joint angles in degrees"
+    elif cmd in _POSE_ARG_COMMANDS:
+        need, what = 6, "a pose: x, y, z in metres and rx, ry, rz"
+    else:
+        return None
+    if not isinstance(args, (list, tuple)) or len(args) < need:
+        got = f"{len(args)} value(s)" if isinstance(args, (list, tuple)) else repr(args)
+        return f"{cmd} needs {what}; got {got}"
+    for v in args[:need]:
+        try:
+            ok = not isinstance(v, bool) and math.isfinite(float(v))
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            return f"{cmd}: {v!r} is not a finite number ({what})"
+    return None
+
+
+_QUEUED_GRIPPER_COMMANDS = ("open_gripper", "close_gripper", "move_gripper")   # = command_executor's
+# = command_executor._queued_gripper_problem's NO_GRIPPER text (the gripper XML's <CAN_gripper>, read as the executor)
+_NO_GRIPPER = "this robot has no CAN gripper (the active gripper XML's <CAN_gripper> is not 1)"
+# = the keys of command_executor._DIGITAL_OUTPUT_PINS / _DIGITAL_INPUT_PINS: the control box's isolated I/O (BAD_PIN)
+_IO_PINS = (1, 2, 3)
+
+
+def _motion_aborted_text(aborted):
+    """= command_executor._submit_queued's MOTION_ABORTED message, from the planner's abort_info()."""
+    why = (f"motion is aborted: command {aborted['cid']} failed ({aborted['code']})"
+           if aborted.get("cid") else f"motion is aborted: {aborted['message']}")
+    return why + " — clear errors (clear_errors / the Clear Errors button) to run motion again"
+
+
+def _catalog_fields(code):
+    """The error catalog's number, title and fix of a code, as the executor's reply() adds them to an error."""
+    cat = catalog_entry(code) or {}
+    return {k: cat[k] for k in ("number", "title", "fix") if cat.get(k) is not None}
+
+
+def _rejected(code, message):
+    """A refusal as the live client raises it: CommandRejected with the catalog's number, title and fix."""
+    return CommandRejected(code, message, **_catalog_fields(code))
+
+
+class _NoRobot(Connection):
+    """The dry run's connection: no robot behind it (review P4, 2026-11-22). The client state the inherited methods
+    read works — no address, no gripper result —; a command that needs the robot raises RobotConnectionError naming
+    it (before, the dry-run client had no connection at all: an AttributeError)."""
+
+    def send_command(self, cid, cmd, args=None, options=None):
+        raise RobotConnectionError(f"{cmd}: a dry run has no robot to send it to (it plans moves offline)")
 
 
 @dataclass(frozen=True)
@@ -50,10 +136,12 @@ class DryRunError:
     message: str
 
     def failure(self):
-        """This error as a MotionFailed failure: the live client's {"id", "code", "message"} — MotionFailed formats
-        f["id"], so a bare __dict__ (command_id, no id) raised a KeyError instead of MotionFailed; found 2026-10-05 by
-        the block editor's Check — plus the preview's own fields."""
-        return {"id": self.command_id, **self.__dict__}
+        """This error as the live client reports a failure (wait_idle(), MotionFailed, on_motion_error()): "id",
+        "code", "message" and the error catalog's "number", "title" and "fix", as the robot sends them (the catalog's
+        since review P4, 2026-11-22) — plus the preview's own fields. MotionFailed formats f["id"]: a bare __dict__
+        (command_id, no id) raised a KeyError instead of MotionFailed (found 2026-10-05 by the block editor's Check);
+        every failure record of the dry-run client is built here."""
+        return {"id": self.command_id, **self.__dict__, **_catalog_fields(self.code)}
 
 
 @dataclass(frozen=True)
@@ -109,7 +197,7 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
     """TrajectoryPlanner with its live output boundary replaced by memory."""
 
     def __init__(self, initial_joints_rad, joint_num, max_vel, max_accel, dt, robot,
-                 max_jerk=None, joint_limits=None):
+                 max_jerk=None, joint_limits=None, gripper_current_limit_ma=None):
         self._initial_joints = np.asarray(initial_joints_rad, dtype=np.float64).copy()
         self._commands = {}
         self._segments = []
@@ -124,6 +212,7 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
             offline_output=True,
             max_jerk=max_jerk,
             joint_limits=joint_limits,
+            gripper_current_limit_ma=gripper_current_limit_ma,
         )
 
     @property
@@ -168,6 +257,25 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
         self._timeline_s = 0.0
         self._last_diagnostic = None
         self._last_error = None
+
+    def stop_pending(self, message):
+        """The live executor's stop for the commands not planned yet (review P4, 2026-11-22: they vanished, never
+        completed nor failed): each fails STOPPED, and nothing aborts — the robot takes new moves at once. The next
+        move starts where the planned program ends, as a live Stop holds the arm where it stopped (set_hold_start);
+        flush() alone re-read the START joints. Returns the STOPPED errors, in queue order."""
+        end = self.current_joints_rad
+        pending = list(self._blend_buffer)
+        try:
+            while True:
+                pending.append(self._queue.get_nowait())
+        except Empty:
+            pass
+        self.flush()
+        self.set_hold_start(end)
+        stopped = [DryRunError(command_id=str(self._cmd_id(c)), sequence=self._cmd_seq(c), command=self._cmd_name(c),
+                               code="STOPPED", message=str(message)) for c in pending]
+        self._errors.extend(stopped)
+        return stopped
 
     def summary(self):
         self.plan_pending()
@@ -268,15 +376,10 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
         self._timeline_s += duration_s
         return True
 
-    def _send_gripper(self, command_type, args, command_id):
-        if command_type == "open_gripper":
-            position = self.GRIPPER_OPEN_POS
-        elif command_type == "close_gripper":
-            position = self.GRIPPER_CLOSE_POS
-        else:
-            if not args:
-                raise ValueError("move_gripper needs [position]")
-            position = int(args[0])
+    def _send_gripper(self, command_type, values, command_id):
+        # (position, speed, current), checked by the planner's _gripper_values first (the 0-255 scales, the gripper
+        # XML's current limit) — not the command's arguments, as this override's signature once said.
+        position = values[0]
         self._events.append(DryRunEvent(
             command_id=command_id,
             sequence=self._commands[command_id].seq,
@@ -298,18 +401,47 @@ class _OfflineTrajectoryPlanner(TrajectoryPlanner):
 
 
 class DryRunRobotClient(RobotClient):
-    """RobotClient-compatible offline EXEC program planner.
+    """A robot client that plans a program offline, with no robot.
 
-    `start_joints` is required and uses the normal public API unit: degrees. The
-    object never creates a TCP connection or a live ZMQ output socket. Motion calls
-    queue a virtual program; call `plan_summary()` to finalize buffered blends and
-    receive timestamped samples suitable for NiceGUI plots or path previews.
+    It plans every move with the robot's own planner, limits, safety zones and
+    self-collision check, in memory, and never opens a connection.
+    `start_joints`, in degrees, J1 first, is where the virtual arm starts. Motion
+    calls queue a virtual program; `plan_summary()` plans it and returns
+    timestamped samples for plots and path previews. The waits plan what is queued
+    too.
+
+    It answers as the live client does: a command the robot refuses when it is
+    sent raises `CommandRejected` with the robot's code (`BAD_ARGS`,
+    `BAD_OPTIONS`, `MOTION_ABORTED`, `NO_GRIPPER`, `BAD_PIN`); a move that fails
+    when it is planned is reported by `wait_idle()` (`MotionFailed`),
+    `wait_motion_complete()` and `wait_gripper_move_complete()` (`CommandRejected`)
+    and `on_motion_error()`, and the moves queued after it fail `ABORTED` until
+    `clear_errors()`; `stop()` fails the moves not planned yet with `STOPPED`.
+
+    It does not simulate the robot's modes and states: a move is planned whether
+    or not `enable()`, `home()` and `enter_exec_mode()` were called, and nothing is
+    refused for a mode. Commands that need the robot itself (jogging, real-time
+    streaming, the other mode changes, control, drive parameters, diagnostics)
+    raise `RobotConnectionError`.
+
+    Examples:
+        >>> from robotclient import DryRunRobotClient
+        >>> robot = DryRunRobotClient([90, -105, 165, 0, -30, 180])
+        >>> robot.move_joints(90, -100, 160, 0, -30, 180)
+        >>> robot.wait_idle()
+        []
+        >>> robot.plan_summary().duration_s
     """
 
     def __init__(self, start_joints):
         initial_deg = np.asarray(start_joints, dtype=np.float64)
         if initial_deg.shape != (6,):
             raise ValueError("start_joints needs exactly six joint angles in degrees")
+        # Every attribute the inherited methods read (review P4, 2026-11-22: without the base constructor,
+        # close_gripper(); wait_gripper_move_complete(), set_payload(), ... raised AttributeError) — and a connection
+        # with no robot behind it.
+        super().__init__(name="dry run")
+        self._conn = _NoRobot(name="dry run")
 
         system = xml_parser.load_system_config(SYSTEM_XML, ROBOTS_DIR)
         config = xml_parser.load_full_robot_config(
@@ -332,7 +464,11 @@ class DryRunRobotClient(RobotClient):
             float(config.get("delta_t", 0.004)), robot,
             max_jerk=np.asarray(config["exec_jerk_limit"], dtype=np.float64)[:joint_num],
             joint_limits=(config["software_joint_limit_negative"],
-                          config["software_joint_limit_positive"]))
+                          config["software_joint_limit_positive"]),
+            # the gripper XML's <Ilim>, as command_executor passes it: a gripper current above it is BAD_ARGUMENTS
+            gripper_current_limit_ma=config.get("gripper_Ilim"))
+        can = config.get("gripper_CAN_gripper", 0)          # as command_executor reads it (NaN = none): NO_GRIPPER
+        self._has_can_gripper = not (isinstance(can, float) and np.isnan(can)) and int(can) == 1
         # The same safety zones command_executor checks, so a preview refuses what the robot would.
         self._gripper_xml = GRIPPERS_DIR / f"{system['active_gripper']}.xml"
         self._zone_setup = xml_parser.load_zone_setup(SYSTEM_XML, CELLS_DIR, self._gripper_xml)
@@ -343,8 +479,6 @@ class DryRunRobotClient(RobotClient):
             rg, tg = load_geometry(ROBOTS_DIR, GRIPPERS_DIR, config)
             self._planner.set_self_collision(SelfCollisionModel(robot, rg, tg, system["self_collision"],
                                                                  config["self_collision"]["pairs"] + config["gripper_collision"]["pairs"]))
-        self._sync = False
-        self._last_queued = None
         self._next_seq = 1
         self._mode = "IDLE"
         self._state = "DISABLED"
@@ -357,6 +491,9 @@ class DryRunRobotClient(RobotClient):
         self._on_motion_error = None
         self._reported_completion_ids = set()
         self._reported_error_ids = set()
+        # Failures the program has had (review P4): reported by wait_idle(), raised by a wait_*_complete(), or
+        # discarded by stop() — as the live client, wait_idle() reports each failure once.
+        self._failures_taken = set()
         self._defaults = MotionOptions(
             profile=DEFAULT_PROFILE,
             speed=100.0,
@@ -379,6 +516,8 @@ class DryRunRobotClient(RobotClient):
 
 
     def on_error(self, fn: Callable[[dict], None]) -> None:
+        # Kept, never called: the live client calls it for the robot's errors that answer no command, which a dry run
+        # has none of. A planning failure goes to on_motion_error() (review P4, 2026-11-22).
         self._on_error = fn
 
     def on_status_change(self, fn: Callable[[dict], None]) -> None:
@@ -392,16 +531,39 @@ class DryRunRobotClient(RobotClient):
 
 
     def _queued(self, command, args=None, timeout=None, options=None, gripper=False):
-        del timeout, gripper          # the base client's _queued_gripper passes it (2026-10-24); nothing waits here
-        command_id = generate_id()
+        del timeout                   # nothing waits here
+        # The executor's queue-time refusals, in its order (command_executor._submit_queued, _build_queued_command;
+        # review P4, 2026-11-22: a dry run accepted them all) — CommandRejected as the live client raises them.
+        name = canonical_command(command)
+        args = list(args or [])
+        if name in _QUEUED_GRIPPER_COMMANDS and not self._has_can_gripper:
+            raise _rejected("NO_GRIPPER", _NO_GRIPPER)
+        problem = _queued_args_problem(name, args, self._planner.joint_num)
+        if problem is not None:
+            raise _rejected("BAD_ARGS", problem)
+        aborted = self._planner.abort_info()           # known once the failure was planned (any wait plans)
+        if aborted is not None:
+            raise _rejected("MOTION_ABORTED", _motion_aborted_text(aborted))
         defaults = self._defaults
         if command.startswith(("move_arc", "move_circle", "move_spline")) and "blend" not in (options or {}):
             defaults = replace(defaults, blend=0.0)      # as the executor: a curve ignores the session blend (2026-10-24)
-        resolved = replace(MotionOptions.from_dict(options, defaults), dry_run=False)
-        queued = QueuedCommand.build(command_id, self._next_seq, command, args or [], resolved)
+        try:
+            _reject_unsupported_per_command_options(options)
+            resolved = MotionOptions.from_dict(options, defaults)
+            problem = blend_problem(name, resolved)
+            if problem is None:
+                problem = profile_option_problem(name, resolved)
+            if problem is not None:
+                raise ValueError(problem)
+        except (TypeError, ValueError) as e:
+            raise _rejected("BAD_OPTIONS", str(e)) from None
+        command_id = generate_id()
+        queued = QueuedCommand.build(command_id, self._next_seq, command, args, replace(resolved, dry_run=False))
         self._next_seq += 1
         self._planner.enqueue(queued)
         self._last_queued = command_id
+        if gripper:                                    # the base client's _queued_gripper (2026-10-24)
+            self._last_gripper_queued = command_id
         return command_id
 
     def _record_immediate_event(self, command, details):
@@ -423,8 +585,30 @@ class DryRunRobotClient(RobotClient):
         self._state = "DISABLED"
 
     def clear_errors(self, wait: bool | None = None) -> None:
+        """Lift the motion abort after a failed move, as the robot does.
+
+        It first plans what is queued, so the moves queued before the call meet
+        the failure they were queued behind, as on the robot, whose planner runs
+        ahead of the program. Then moves plan again: the next one starts where the
+        planned program ends.
+
+        Args:
+            wait: Ignored: a dry run has nothing to wait for.
+
+        See also:
+            `wait_idle()`, `stop()`
+
+        Examples:
+            >>> robot.move_joints(90, -105, 165, 0, -30, 400)
+            >>> robot.wait_idle(raise_on_error=False)
+            >>> robot.clear_errors()
+            >>> robot.move_joints(90, -100, 160, 0, -30, 180)
+            >>> robot.wait_idle()
+        """
         del wait
-        return None
+        # review P4 (2026-11-22): it did nothing, so every move after one failure stayed ABORTED for good
+        self.plan_summary()
+        self._planner.clear_abort()
 
     def home(self, wait: bool | None = None) -> None:
         del wait
@@ -435,9 +619,37 @@ class DryRunRobotClient(RobotClient):
         self._mode = "EXEC"
 
     def stop(self, wait: bool | None = None) -> None:
+        """Cancel every queued move not planned yet, as the robot's stop does.
+
+        Each move queued since the program last planned (any wait, `get_joints()`,
+        `plan_summary()`, ...) fails with `STOPPED`, and `on_motion_error()` gets
+        it; nothing is aborted, and the next move starts where the planned
+        program ends. As the live client, it discards the failures `wait_idle()`
+        has not reported yet and forgets the last commands:
+        `wait_motion_complete()` then returns at once. In EXEC mode the dry run
+        stays in EXEC mode; in any other it goes to IDLE mode.
+
+        Args:
+            wait: Ignored: a dry run has nothing to wait for.
+
+        See also:
+            `clear_errors()`, `wait_idle()`
+
+        Examples:
+            >>> robot.move_joints(90, -100, 160, 0, -30, 180)
+            >>> robot.stop()
+            >>> robot.plan_summary().errors[-1].code
+            'STOPPED'
+        """
         del wait
-        self._planner.flush()
-        self._mode = "IDLE"
+        # review P4 (2026-11-22): a flush alone dropped those moves (never completed nor failed) and re-planned the
+        # next move from the START joints
+        stopped = self._planner.stop_pending("motion stopped")       # command_executor._stop_motion's message
+        self._call_back_failures(stopped)
+        self._failures_taken.update(error.command_id for error in self._planner._errors)
+        self._last_queued = self._last_gripper_queued = None
+        if self._mode != "EXEC":
+            self._mode = "IDLE"
 
     def pause(self, wait: bool | None = None) -> None:
         del wait
@@ -477,19 +689,31 @@ class DryRunRobotClient(RobotClient):
         self._record_immediate_event("set_completion_policy", {"policy": value, "kind": "setup"})
 
     def plan_summary(self) -> DryRunPlan:
+        """Plan everything queued and return the whole preview so far.
+
+        It finishes the queued blends, plans every queued command and returns the
+        program's timestamped samples, its events and every error. It calls
+        `on_motion_complete()` once for each command that planned and
+        `on_motion_error()` once for each that failed.
+
+        Returns:
+            The preview: `segments` (one per planned move, with joint and tool
+            samples), `events` (settings, I/O and gripper commands on the
+            timeline), `errors`, `duration_s` (seconds) and `final_joints_rad`.
+
+        See also:
+            `wait_idle()`, `stop()`
+
+        Examples:
+            >>> robot.move_joints(90, -100, 160, 0, -30, 180)
+            >>> plan = robot.plan_summary()
+            >>> plan.valid, round(plan.duration_s, 2)
+        """
         summary = self._planner.summary()
         if self._setup_events:
             events = (*self._setup_events, *summary.events)
             summary = replace(summary, events=events)
-        for error in summary.errors:
-            if error.command_id in self._reported_error_ids:
-                continue
-            self._reported_error_ids.add(error.command_id)
-            payload = error.__dict__
-            if self._on_error is not None:
-                self._on_error(payload)
-            if self._on_motion_error is not None:
-                self._on_motion_error(payload)
+        self._call_back_failures(summary.errors)
         completed_ids = [segment.command_id for segment in summary.segments]
         completed_ids.extend(
             event.command_id for event in summary.events if not event.details.get("immediate", False))
@@ -501,21 +725,123 @@ class DryRunRobotClient(RobotClient):
                 self._on_motion_complete(command_id)
         return summary
 
+    def _call_back_failures(self, errors):
+        """on_motion_error() once per failure, with the live client's failure dict (review P4, 2026-11-22: it got
+        command_id, not id). Not on_error(): the live client calls it only for the robot's errors that answer no
+        command (FORBIDDEN, BAD_JSON), which a dry run never has — it got every planning failure a second time."""
+        for error in errors:
+            if error.command_id in self._reported_error_ids:
+                continue
+            self._reported_error_ids.add(error.command_id)
+            if self._on_motion_error is not None:
+                self._on_motion_error(error.failure())
 
     def wait_idle(self, timeout: float | None = None, raise_on_error: bool = True) -> list[dict]:
+        """Plan everything queued and report the failures not reported yet.
+
+        As the live client's: it reports every failure since its last call, then
+        forgets them. A failure that `wait_motion_complete()` or
+        `wait_gripper_move_complete()` already raised is not reported again, and
+        `stop()` discards the failures not reported yet. A command refused when
+        it was sent is not among them: its own call raised `CommandRejected`.
+
+        Args:
+            timeout: Ignored: planning offline takes no robot time.
+            raise_on_error: `True` raises `MotionFailed` when a command failed;
+                `False` returns the failures instead.
+
+        Returns:
+            The failures since the last call, in the order they arose: a dict
+            each, with `id` (the id the queued call returned), `code`, `message`
+            and the error catalog's `number`, `title` and `fix`, plus the
+            preview's `command_id`, `sequence` and `command`. An empty list when
+            every command planned, and always with `raise_on_error=True`.
+
+        Raises:
+            MotionFailed: With `raise_on_error=True`, a command failed. Its
+                `failures` holds the list described under Returns.
+
+        See also:
+            `wait_motion_complete()`, `plan_summary()`, `clear_errors()`
+
+        Examples:
+            >>> robot.move_joints(90, -100, 160, 0, -30, 180)
+            >>> robot.wait_idle()
+            []
+        """
         del timeout
         summary = self.plan_summary()
-        if summary.errors and raise_on_error:
-            summary.require_valid()
-        return [error.__dict__ for error in summary.errors]
+        # review P4 (2026-11-22): every call returned (or raised) every failure since the start, as `command_id`
+        failures = [error.failure() for error in summary.errors if error.command_id not in self._failures_taken]
+        self._failures_taken.update(failure["id"] for failure in failures)
+        if failures and raise_on_error:
+            raise MotionFailed(failures)
+        return failures
+
+    def _raise_if_failed(self, command_id):
+        """Plan what is queued; the command's failure as the live client raises it from a wait_*_complete():
+        CommandRejected with its code (review P4, 2026-11-22: it was MotionFailed), not reported again by
+        wait_idle()."""
+        summary = self.plan_summary()
+        if command_id is None:
+            return
+        for error in summary.errors:
+            if error.command_id == command_id:
+                self._failures_taken.add(command_id)
+                raise _rejected(error.code, error.message)
 
     def wait_motion_complete(self, timeout: float | None = None) -> None:
+        """Plan everything queued and raise the last command's failure.
+
+        As the live client's: it judges the last move, delay or gripper command
+        queued, and returns at once when nothing was queued or `stop()` was called
+        since. It does not report the failures of the commands before it:
+        `wait_idle()` does.
+
+        Args:
+            timeout: Ignored: planning offline takes no robot time.
+
+        Raises:
+            CommandRejected: The command failed, for example with `JOINT_LIMIT`
+                or `ABORTED`; its `code` names the failure. Every later call
+                raises it again, until another command is queued or `stop()` is
+                called.
+
+        See also:
+            `wait_idle()`, `wait_gripper_move_complete()`
+
+        Examples:
+            >>> robot.move_joints(90, -100, 160, 0, -30, 180)
+            >>> robot.wait_motion_complete()
+        """
         del timeout
-        summary = self.plan_summary()
-        if self._last_queued is not None:
-            for error in summary.errors:
-                if error.command_id == self._last_queued:
-                    raise MotionFailed([error.failure()])
+        self._raise_if_failed(self._last_queued)
+
+    def wait_gripper_move_complete(self, timeout: float | None = None) -> None:
+        """Plan everything queued and raise the last gripper command's failure.
+
+        As the live client's: it judges the last gripper command queued and
+        returns at once when none was queued or `stop()` was called since. Offline
+        the jaws report no outcome: `gripper_result()` stays `None`.
+
+        Args:
+            timeout: Ignored: planning offline takes no robot time.
+
+        Raises:
+            CommandRejected: The gripper command failed, for example with
+                `BAD_ARGUMENTS` (a current above the gripper's limit) or
+                `ABORTED`. Every later call raises it again, until the next
+                gripper command or `stop()`.
+
+        See also:
+            `wait_motion_complete()`, `wait_idle()`
+
+        Examples:
+            >>> robot.close_gripper()
+            >>> robot.wait_gripper_move_complete()
+        """
+        del timeout
+        self._raise_if_failed(self._last_gripper_queued)
 
     def get_joints(self) -> list[float]:
         self.plan_summary()
@@ -564,20 +890,79 @@ class DryRunRobotClient(RobotClient):
             "simulated": False,
             "virtual": True,
             "planner": self._planner.status_snapshot(),
-            "errors": [error.__dict__ for error in summary.errors],
+            "errors": [error.failure() for error in summary.errors],     # the live client's failure dicts (P4)
         }
 
     status = get_status
     latest_status = get_status     # offline, the last status and a fresh one are the same (2026-10-23)
 
     def set_digital_output(self, pin: int, value: bool | int) -> None:
+        """Record an output switch, checked as the robot checks it.
+
+        Nothing is switched: the preview shows the switch as an event at time 0.
+
+        Args:
+            pin: The output: `1`, `2` or `3`. A number with a fraction is cut to a
+                whole number first.
+            value: `True` or `1` for on, `False` or `0` for off. Any other value
+                is refused.
+
+        Raises:
+            CommandRejected: `pin` is not 1, 2 or 3 (`BAD_PIN`), as the robot
+                refuses it.
+            ValueError: `pin` cannot be read as a whole number, or `value` is not
+                `True`, `False`, 1 or 0.
+            TypeError: `pin` is `None` or another type that is no number.
+
+        See also:
+            `get_digital_input()`, `plan_summary()`
+
+        Examples:
+            >>> robot.set_digital_output(1, True)
+            >>> robot.plan_summary().events[0].details
+            {'immediate': True, 'pin': 1, 'value': True, 'kind': 'io'}
+        """
+        # The live client's value check and the executor's pin check (_handle_set_digital_output; review P4,
+        # 2026-11-22: any pin and any value were accepted)
+        if not (isinstance(value, bool) or (isinstance(value, (int, float)) and value in (0, 1))):
+            raise ValueError(f"set_digital_output: value must be True / False or 1 / 0, got {value!r}")
         pin = int(pin)
+        if pin not in _IO_PINS:
+            raise _rejected("BAD_PIN", f"output pin must be 1-3, got {pin}")
         value = bool(value)
         self._digital_outputs[pin] = value
         self._record_immediate_event(
             "set_digital_output", {"pin": pin, "value": value, "kind": "io"})
 
     def get_digital_input(self, pin: int) -> bool:
+        """Return `False`, the level of an input with no signal, for a valid pin.
+
+        Offline no input is read; a Check of a block program assumes the input
+        it waits for arrives.
+
+        Args:
+            pin: The input: `1`, `2` or `3`. A number with a fraction is cut to a
+                whole number first.
+
+        Returns:
+            `False`.
+
+        Raises:
+            CommandRejected: `pin` is not 1, 2 or 3 (`BAD_PIN`), as the robot
+                refuses it.
+            ValueError: `pin` cannot be read as a whole number.
+            TypeError: `pin` is `None` or another type that is no number.
+
+        See also:
+            `set_digital_output()`
+
+        Examples:
+            >>> robot.get_digital_input(1)
+            False
+        """
+        pin = int(pin)                         # the executor's pin check (_handle_get_digital_input; review P4)
+        if pin not in _IO_PINS:
+            raise _rejected("BAD_PIN", f"input pin must be 1-3, got {pin}")
         return False
 
     # Sound (2026-11-17): offline nothing plays and nothing is saved; a tone is checked the robot's way

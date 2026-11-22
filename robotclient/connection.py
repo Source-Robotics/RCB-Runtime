@@ -78,8 +78,9 @@ class Connection:
 
         # The program's callbacks run on a thread of their own, in arrival order (2026-10-24): on the receiver
         # thread a command sent from a callback could not get its reply — only the receiver delivers replies.
-        self._callbacks = queue.SimpleQueue()  # (name, fn, arg)
-        self._callback_thread = None
+        self._callbacks = queue.SimpleQueue()  # (name, fn, arg); None = the end mark (_end_callbacks)
+        self._callback_thread = None           # the thread reading _callbacks now; None once told to end
+        self._callback_last = None             # the thread started last: a new one waits for it (one at a time)
         self._callback_lock = threading.Lock()
         self._closing = False                  # disconnect() runs: the receiver's end is DISCONNECTED, not a loss
 
@@ -185,6 +186,7 @@ class Connection:
                 pass
             sock.close()
         self._fail_all("DISCONNECTED", "connection closed")
+        self._end_callbacks()                  # after the failures above: their callbacks still run (2026-11-22)
 
     @property
     def connected(self):
@@ -248,6 +250,9 @@ class Connection:
                 self._fail_all("DISCONNECTED", "connection closed")
             else:
                 self._fail_all("CONNECTION_LOST", "receiver stopped")
+            # The connection's last callbacks are queued (this thread queues every other one): the callback thread
+            # ends after them, also when the connection was lost rather than closed (2026-11-22).
+            self._end_callbacks()
 
     def _dispatch(self, line):
         try:
@@ -331,20 +336,41 @@ class Connection:
 
     def _call_back(self, name, fn, arg):
         """Hand a program's callback to the callback thread (2026-10-24): on the receiver thread a command sent from a
-        callback (robot.stop() in on_motion_error) waited 5 s for a reply only the busy receiver could deliver."""
+        callback (robot.stop() in on_motion_error) waited 5 s for a reply only the busy receiver could deliver.
+
+        A thread is started when there is none: at a connection's first callback, or after the last one ended
+        (_end_callbacks). It first waits for the thread before it, so callbacks still run one at a time, in order.
+        Queued under the lock, so an end mark never falls between starting a thread and its first callback."""
         with self._callback_lock:
             if self._callback_thread is None or not self._callback_thread.is_alive():
-                self._callback_thread = threading.Thread(target=self._run_callbacks, daemon=True,
-                                                         name="RobotClientCallbacks")
+                before = self._callback_last
+                self._callback_thread = self._callback_last = threading.Thread(
+                    target=self._run_callbacks, args=(before,), daemon=True, name="RobotClientCallbacks")
                 self._callback_thread.start()
-        self._callbacks.put((name, fn, arg))
+            self._callbacks.put((name, fn, arg))
 
-    def _run_callbacks(self):
-        """The callback thread: every callback in arrival order. An exception one raises is printed and dropped
-        (2026-10-24): on the receiver thread it ended the receiver, so the client called itself disconnected and
-        refused every command, stop() too, while the robot kept the connection and this client's control."""
+    def _end_callbacks(self):
+        """The connection has ended (disconnect(), or the receiver's end): the callback thread runs every callback
+        queued so far — the ended connection's failures included — and then ends (2026-11-22: it waited for the next
+        callback for ever, one idle thread left per connect / disconnect). Never joined here: a callback may itself
+        call disconnect()."""
+        with self._callback_lock:
+            if self._callback_thread is not None and self._callback_thread.is_alive():
+                self._callbacks.put(None)       # the end mark, behind everything queued before it
+            self._callback_thread = None
+
+    def _run_callbacks(self, before=None):
+        """The callback thread: every callback in arrival order, until the end mark (None). An exception one raises
+        is printed and dropped (2026-10-24): on the receiver thread it ended the receiver, so the client called itself
+        disconnected and refused every command, stop() too, while the robot kept the connection and this client's
+        control. `before`: the thread started before this one, which reads the queue up to its end mark first."""
+        if before is not None:
+            before.join()
         while True:
-            name, fn, arg = self._callbacks.get()
+            item = self._callbacks.get()
+            if item is None:
+                return
+            name, fn, arg = item
             try:
                 fn(arg)
             except Exception:

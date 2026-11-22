@@ -775,6 +775,8 @@ def setup(joints: int = 6, force_reinit: bool = False):
                                     # command_executor thread. RTI's EXEC-link watchdog trips
                                     # if it stops advancing during active EXEC motion (the
                                     # executor died/wedged). See gui_executor_migration_plan.md P5.
+        "exec_watch_beat",          # +1 per pass of the executor's status watcher (~50 Hz): its WORK loop, which
+                                    # exec_heartbeat's own thread is not — the supervisor's hang check (review I4)
         # --- RTI (real-time interface) mode live state ---
         # Fraction of RT ticks that received a valid UDP command while control was
         # claimed. The link-quality metric for an external control session.
@@ -860,7 +862,12 @@ def setup(joints: int = 6, force_reinit: bool = False):
                         # the SD card nearly full (review I6, 2026-11-20): [1 = low, the free MB] — the supervisor
                         # writes it every DISK_CHECK_S, RTI's error pass shows DISK_LOW_WARNING (never a file system
                         # call in RTI's loop)
-                        ("disk_low", 2)]:
+                        ("disk_low", 2),
+                        # a program stuck but alive (review I4, 2026-11-22; supervisor/hang_check.py): [0] how many
+                        # are hung, [1..5] seconds hung per program (RTI, executor, self-collision worker, recorder,
+                        # dashboard; 0 = fine) — the supervisor writes it, RTI's error pass shows
+                        # P_<NAME>:PROCESS_HUNG_WARNING, the health card reads it (also when RTI itself is stuck)
+                        ("process_hung", 6)]:
         shm, arr = _attach_or_create(name, np.float64, count)
         rti_shms[name] = shm
         rti[name] = arr

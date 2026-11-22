@@ -13,7 +13,7 @@ SCOPE (deliberately minimal — see TODO/executive_mode_plan.md Phase 5):
     G0  / G1         rapid / linear move  (X Y Z F)          -> move_linear
     G64 P<tol>       blend within <tol> of the programmed path
     G61              exact stop (blending off — every corner comes to rest)
-    G4  P<sec>       dwell                                   -> delay
+    G4  P<ms> | S<s> dwell, the slicers' meaning: P milliseconds, S seconds (one of them) -> delay
     M0 / M2 / M30    pause / end of program
     F<feed>          feedrate, mm/min (or in/min under G20)
 
@@ -146,8 +146,15 @@ def parse(text: str, start_xyz: Sequence[float] = (0.0, 0.0, 0.0), default_blend
                 note_ignored(w, why)
                 words.pop(w)
 
-        gs = [int(v) for v in words.pop("G", [])]
-        ms = [int(v) for v in words.pop("M", [])]
+        # A G or M number with a fraction is another command (review M8 / F18, 2026-11-22: int() read G91.1 — arc
+        # centres relative — as G91, relative positioning, without a word).
+        gs: list[int] = []
+        ms: list[int] = []
+        for letter, out in (("G", gs), ("M", ms)):
+            for v in words.pop(letter, []):
+                if v != int(v):
+                    raise GcodeError(f"line {line_no}: unsupported {letter}{v:g} in {raw.strip()!r}")
+                out.append(int(v))
 
         # Modal settings first — they affect how this same line's motion is read.
         motion = None
@@ -172,14 +179,19 @@ def parse(text: str, start_xyz: Sequence[float] = (0.0, 0.0, 0.0), default_blend
             elif g in (0, 1):
                 motion = g
             elif g == 4:
+                # The slicers' meaning (review M8 / F18, 2026-11-22, the user: "Slicer: P ms, S seconds"): P was read
+                # as seconds, so a sliced "G4 P500" paused 500 s instead of 0.5 s, and "G4 S2" was refused.
                 p = words.pop("P", [None])[0]
-                if p is None:
-                    raise GcodeError(f"line {line_no}: G4 needs a P<seconds> — got {raw.strip()!r}")
-                # P0 is a valid dwell that pauses for nothing (a runner skips it: the robot's delay() refuses a time
+                s = words.pop("S", [None])[0]
+                if (p is None) == (s is None):
+                    raise GcodeError(f"line {line_no}: G4 needs P<milliseconds> or S<seconds>, one of them — got "
+                                     f"{raw.strip()!r}")
+                secs = float(p) / 1000.0 if p is not None else float(s)
+                # 0 is a valid dwell that pauses for nothing (a runner skips it: the robot's delay() refuses a time
                 # of 0 since 2026-10-23); a negative time is a mistake, as for delay().
-                if not float(p) >= 0.0:
-                    raise GcodeError(f"line {line_no}: G4 needs P >= 0 seconds — got {raw.strip()!r}")
-                prog.ops.append(GcodeDwell(seconds=float(p), line_no=line_no))
+                if not secs >= 0.0:
+                    raise GcodeError(f"line {line_no}: G4 needs a time of 0 or more — got {raw.strip()!r}")
+                prog.ops.append(GcodeDwell(seconds=secs, line_no=line_no))
             elif g in (2, 3):
                 raise GcodeError(
                     f"line {line_no}: G{g} (arc) is not supported — this interpreter handles "
@@ -202,7 +214,9 @@ def parse(text: str, start_xyz: Sequence[float] = (0.0, 0.0, 0.0), default_blend
             feed = float(words.pop("F")[0]) * to_mm
 
         axes = {a: words.pop(a)[0] * to_mm for a in ("X", "Y", "Z") if a in words}
-        leftover = {k: v for k, v in words.items() if k not in ("P", "S")}
+        # P / S belong to G4 / G64 (taken above) or to an M code on the same line (M104 S200: the ignored M codes' own
+        # values). Anywhere else they were swallowed without a word (review M8 / F18, 2026-11-22).
+        leftover = {k: v for k, v in words.items() if not (k in ("P", "S") and ms)}
         if leftover:
             raise GcodeError(
                 f"line {line_no}: unsupported word(s) {sorted(leftover)} in {raw.strip()!r}")

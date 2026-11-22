@@ -18,6 +18,9 @@ from utility.kinematics_backend import set_kinematics_backend
 
 logger = logging.getLogger("kin")  # docs/logging.md "Logger names"
 
+# A single target's solve (move_pose) stops once its error has not shrunk for this many steps (review M6, 2026-11-22).
+DLS_STALL_STEPS = 50
+
 
 @dataclass(frozen=True)
 class IKPathResult:
@@ -178,8 +181,16 @@ class SeededIKPathSolver:
         if angle < 1e-9:
             return 0.5 * skew
         s = float(np.sin(angle))
-        if abs(s) < 1e-9:
-            return np.zeros(3, dtype=np.float64)
+        if abs(s) < 1e-6 and angle > 0.5 * np.pi:        # near a HALF turn only: a tiny angle has a tiny sine too
+            # At (or within ~1e-6 rad of) a half turn the skew part vanishes, so it names no axis: it returned zero here
+            # and the solver saw a 180 deg turn as "no rotation error" (review M6, 2026-11-22). At a half turn
+            # rel = 2 n n^T - I, so (rel + I) / 2 = n n^T: its largest diagonal entry gives the axis.
+            nn = 0.5 * (rel + np.eye(3))
+            k = int(np.argmax(np.diag(nn)))
+            axis = nn[:, k] / np.sqrt(max(float(nn[k, k]), 1e-12))
+            if float(np.dot(axis, skew)) < 0.0:          # just short of a half turn the skew still has the sign
+                axis = -axis
+            return angle * axis / float(np.linalg.norm(axis))
         return (angle / (2.0 * s)) * skew
 
     def _cartesian_error_vector(self, q, target_pose):
@@ -188,16 +199,29 @@ class SeededIKPathSolver:
         rotation_error = self._rotation_error_vector(actual.A[:3, :3], target_pose.A[:3, :3])
         return np.concatenate((translation_error, rotation_error))
 
-    def _solve_dls_sample(self, target_pose, q0, low, high):
+    def _solve_dls_sample(self, target_pose, q0, low, high, iterations=None):
+        """Damped least squares from q0, at most dls_max_step_rad per step. A path sample (iterations None) gets the
+        path budget, dls_iterations, exactly as before. A single target (solve_pose) passes its own, larger budget and
+        stops early once the error has not shrunk for DLS_STALL_STEPS steps (a joint limit or a local minimum: more
+        steps change nothing)."""
         q = np.asarray(q0, dtype=np.float64)[:self.joint_num].copy()
         damping = self.config.dls_damping
         max_step = self.config.dls_max_step_rad
+        best_err, since_better = np.inf, 0
 
-        for _ in range(self.config.dls_iterations):
+        for _ in range(int(iterations) if iterations else self.config.dls_iterations):
             err = self._cartesian_error_vector(q, target_pose)
             if (np.linalg.norm(err[:3]) <= self.pose_translation_tolerance * 0.25
                     and np.linalg.norm(err[3:]) <= self.pose_rotation_tolerance * 0.25):
                 return q
+            if iterations:
+                size = float(np.linalg.norm(err))
+                if size < best_err * (1.0 - 1e-6):
+                    best_err, since_better = size, 0
+                else:
+                    since_better += 1
+                    if since_better >= DLS_STALL_STEPS:
+                        return q
 
             jacobian = np.asarray(calculate_jacobian(self.robot, q), dtype=np.float64)[:6, :self.joint_num]
             if jacobian.shape != (6, self.joint_num) or not np.all(np.isfinite(jacobian)):
@@ -223,7 +247,7 @@ class SeededIKPathSolver:
 
         return q
 
-    def _solve_sample_ik(self, target_pose, q_seed, low, high):
+    def _solve_sample_ik(self, target_pose, q_seed, low, high, dls_iterations=None):
         # Engine dispatch:
         #   "roboticstoolbox" -> ik_LM primary; on a tolerance miss, DLS fallback.
         #   "pinocchio"       -> DLS on Pinocchio's Jacobian directly (no ik_LM). The
@@ -246,7 +270,9 @@ class SeededIKPathSolver:
                     # A broken candidate (a NaN pose, a shape error) must not abort the path — the seeded DLS
                     # below is the fallback either way — but it is no longer silent (Phase 5, 2026-10-03).
                     logger.debug("ik_LM candidate rejected by the pose check; DLS fallback", exc_info=True)
-        return self._solve_dls_sample(target_pose, q_seed, low, high)
+        if dls_iterations is None:                   # a path sample: the call as it always was
+            return self._solve_dls_sample(target_pose, q_seed, low, high)
+        return self._solve_dls_sample(target_pose, q_seed, low, high, dls_iterations)
 
     def solve_pose(self, target_pose, seed):
         """Solve IK for a SINGLE target pose (move_pose), sharing the exact engine,
@@ -259,11 +285,14 @@ class SeededIKPathSolver:
         slimit, solved to 0.009mm once the DLS fallback runs). No continuity/branch
         check here — a single target legitimately involves whatever joint motion it
         takes to reach the pose.
+
+        Its damped fallback gets dls_pose_iterations steps, not the path budget (review M6, 2026-11-22: 80 steps of
+        at most 0.02 rad could not reach a target more than ~92 deg away in any joint), and stops once it stalls.
         """
         self._select_backend()
         q_seed = np.asarray(seed, dtype=np.float64)[:self.joint_num].copy()
         low, high = self._limits()
-        return self._solve_sample_ik(target_pose, q_seed, low, high)
+        return self._solve_sample_ik(target_pose, q_seed, low, high, self.config.dls_pose_iterations)
 
     @staticmethod
     def _worst_sample(sigmas):

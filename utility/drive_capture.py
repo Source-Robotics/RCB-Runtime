@@ -22,6 +22,8 @@ import logging
 import time
 from collections import deque
 
+import numpy as np
+
 SIGNALS = ("iq", "velocity_16", "position_error")
 SIGNAL_IDS = (1, 5, 7)                    # the library's SIGNALS numbers of the three
 UNITS = ("mA", "ticks/s", "ticks")        # velocity_16 is shown x16
@@ -162,15 +164,21 @@ class DriveCapture:
         m = motors[self.node]
         cap = getattr(m, "capture", None) or {}
         params = getattr(m, "parameters", None) or {}
-        lost, last = 0, (0, 0, 0)
+        # One list, one array, three slice copies (review D16, 2026-11-22): value by value into shared memory it cost
+        # ~0.8 ms of RTI's tick for 1024 samples, now ~0.5 ms (measured off the RT core; the same numbers).
+        lost, last, rows = 0, (0, 0, 0), []
+        get = cap.get
         for i in range(self.count):
-            row = cap.get(i)
+            row = get(i)
             if row is None:
                 lost += 1
                 row = last
             last = row
+            rows.append(row)
+        if rows:
+            arr = np.asarray(rows, dtype=np.float64)
             for k in range(3):
-                self.samples[k * LENGTH + i] = float(row[k])
+                self.samples[k * LENGTH:k * LENGTH + self.count] = arr[:, k]
         meta = self.meta
         meta[1], meta[2] = float(self.node), float(self.count)
         trig = params.get(P_TRIGGER_INDEX)

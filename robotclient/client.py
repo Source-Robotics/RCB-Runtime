@@ -3312,8 +3312,8 @@ class RobotClient:
 
         From JOG mode or a real-time stream the robot switches at once, without
         braking. Homing in progress is abandoned, and the arm is then not homed.
-        It also ends motors off and
-        firmware flashing, like their own `release_safety_stop()` and
+        It is refused with motors off (`safety_stop()`) and during firmware
+        flashing: end those with `release_safety_stop()` and
         `exit_flashing_mode()`. In the error state it has no effect: the robot
         returns to it while an error is latched; call `clear_errors()`.
 
@@ -3326,8 +3326,9 @@ class RobotClient:
                 `None` follows the client's `sync` setting.
 
         Raises:
-            CommandRejected: Another client holds control. Or RTI refused it or did not
-                answer within 1 s (`Errors:`).
+            CommandRejected: The robot is in motors off or flashing (the message
+                names the command that ends it), or another client holds control.
+                Or RTI refused it or did not answer within 1 s (`Errors:`).
             RobotTimeout: The robot did not answer within 5 s, or, with `wait`, did
                 not report IDLE mode within 10 s.
             RobotConnectionError: The client is not connected.
@@ -3593,6 +3594,8 @@ class RobotClient:
                 values.
             RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
                 responding. The command may still have taken effect.
+            RTI_REFUSED: RTI refused it: the robot left JOG mode before it arrived,
+                or the message was malformed. The message says why.
 
         Warning:
             A jog has no time limit. The joint keeps moving until `jog_stop()`, a
@@ -3730,6 +3733,7 @@ class RobotClient:
             BAD_ARGS: `accel_time` is not a finite number above 0.
             RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
                 responding. The command may still have taken effect.
+            RTI_REFUSED: RTI could not read the value. The message says why.
 
         See also:
             `set_jog_profile()`, `set_jog_jerk_factor()`, `jog()`
@@ -3827,6 +3831,7 @@ class RobotClient:
             BAD_ARGS: `factor` is not a finite number above 0.
             RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
                 responding. The command may still have taken effect.
+            RTI_REFUSED: RTI could not read the value. The message says why.
 
         See also:
             `set_jog_profile()`, `set_jog_accel()`, `jog()`
@@ -4185,12 +4190,14 @@ class RobotClient:
                 to check them is missing.
             SELF_COLLISION: The path would bring two parts of the arm too close.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
 
         See also:
             `move_pose()`, `set_joint_speed()`
@@ -4251,17 +4258,26 @@ class RobotClient:
             IK_POSE_ERROR: The joint solution misses the target pose by more than
                 0.2 mm or 0.5 degrees.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
                 to check them is missing.
             SELF_COLLISION: The path would bring two parts of the arm too close.
+
+        Note:
+            The joint solution is searched from where the arm is (a local search),
+            so the move does not jump to another arm configuration on purpose.
+            When that search misses, the error message says whether another
+            configuration reaches the pose and names its joints (what
+            `is_reachable()` answers): move there with `move_joints()` first.
 
         See also:
             `move_joints()`, `move_linear()`, `is_reachable()`
@@ -4322,12 +4338,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the straight line,
                 usually near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -4398,12 +4416,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the straight line,
                 usually near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -4475,12 +4495,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the straight line,
                 usually near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -4561,12 +4583,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -4643,12 +4667,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -4723,12 +4749,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -4807,12 +4835,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -4893,12 +4923,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -4978,12 +5010,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -5060,12 +5094,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -5146,12 +5182,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -5231,12 +5269,14 @@ class RobotClient:
             CARTESIAN_PATH_DEVIATION: The tool would stray from the curve, usually
                 near a singularity.
             DURATION_INFEASIBLE: `duration` is shorter than the limits allow.
-            INVALID_DURATION: `duration` is not more than 0 seconds.
+            INVALID_DURATION: `duration` is not a finite number of seconds above 0.
             TOPPRA_UNAVAILABLE: `profile="toppra"`, but that planner is missing.
             TOPPRA_INFEASIBLE: `profile="toppra"` found no timing within the
                 limits.
             ACCEL_LIMIT_VIOLATION: The planned motion would exceed an
                 acceleration limit.
+            VELOCITY_LIMIT_VIOLATION: The planned motion would exceed a joint's
+                speed limit.
             JOINT_LIMIT: The path would take a joint outside its limits.
             ZONE_LIMIT: The path would enter a safety zone.
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
@@ -5284,7 +5324,8 @@ class RobotClient:
         `seconds` after the moves queued before it, then the next move starts.
 
         Args:
-            seconds: How long to wait, in seconds; more than 0.
+            seconds: How long to wait, in seconds; more than 0 and at most 600.
+                For a longer pause, call `delay()` again.
             timeout: Seconds to wait for the move to finish, in sync mode only;
                 `None` (the default) waits as long as the move takes.
             **options: Settings for this pause only, the same as a move's: `speed`,
@@ -5308,8 +5349,8 @@ class RobotClient:
             RobotConnectionError: The client is not connected.
 
         Errors:
-            INVALID_DURATION: The time is not more than 0 seconds, or not a
-                finite number.
+            INVALID_DURATION: The time is not more than 0 seconds, not a finite
+                number, or more than 600 seconds (the most one pause holds).
             ZONE_CHECK_UNAVAILABLE: Safety zones are active, but the robot model
                 to check them is missing.
 
@@ -6838,7 +6879,8 @@ class RobotClient:
                 `play_tune()`. `axis`: the axis of the robot's own sounds, `"q"`
                 (louder: the tone is a small torque at its pitch) or `"d"` (no
                 torque, quieter); programs' tones always play on `"d"`.
-                `current_ma`: the loudness as a current, 10 to 1000 mA.
+                `current_ma`: the loudness as a current, 10 to 1000 mA (a drive's tone
+                never takes more than that drive's own current limit).
                 `drive`: the drive that plays, 1 for J1 up to the last joint,
                 one more for a CAN gripper. `limit_mv`: the most voltage the sound may
                 use, 500 to 6000 mV. `boot_tune`, `homing_done_tune`,
@@ -6848,9 +6890,10 @@ class RobotClient:
         Defaults:
             From `config/system.xml`. As shipped: all five sounds on, `axis`
             `"q"`, `current_ma` 290 mA, `drive` 2 (J2), `limit_mv` 3600 mV (the
-            values chosen on PAR6 by ear); the tunes `boot_tune` `"power_up"`,
+            values chosen on PAR6 by ear); the tunes `boot_tune` `"arpeggio"`,
             `homing_done_tune` `"rise"`, `error_tune` `"low_double"`,
-            `identify_tune` `"fanfare"`.
+            `identify_tune` `"fanfare"`. A tune missing from the file is that
+            sound's default (`boot_tune` `"power_up"`).
 
         Raises:
             CommandRejected: The robot refused it: an unknown setting or a value

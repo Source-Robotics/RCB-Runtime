@@ -97,12 +97,13 @@ from motion.ik_config import (
     DEFAULT_IK_CONFIG, DEFAULT_FK_JACOBIAN_BACKEND, json_safe_metric,
 )
 from motion.ik_path import SeededIKPathSolver
+from motion.reachability import find_reachable, make_starts
 from motion.joint_paths import (
     build_composite_joint_path, arclen_spacing_for,
     blend_joint_zone,
 )
 from motion.planner_pipeline import (
-    PathBuilder, make_time_parameterizer, ExecBatchSampler, TimedJointPath, JointPath,
+    PathBuilder, make_time_parameterizer, ExecBatchSampler, ExecTrajectorySample, TimedJointPath, JointPath,
     RuckigTimeParameterizer, RUCKIG_JERK_FACTOR,
     TOPPRAUnavailable, TOPPRAInfeasible, TOPPRATimeParameterizer,
     path_velocity_from_joint_velocity, build_geometric_path,
@@ -145,6 +146,12 @@ class TrajectoryPlanner(Thread):
                             # size and lets RTI start moving before a long
                             # trajectory finishes sending
     MAX_BLEND_LOOKAHEAD = 100  # cap on buffered zone-blend commands before a forced flush
+    # The longest one delay() (review M8, 2026-11-22, the user: "cap at 600 s"). A pause is planned as one row per tick
+    # (150 000 rows here, ~18 MB while planned); delay(3600) held ~110 MB, and above ~8200 s the rows outran the send
+    # pipe (SEND_HWM x MAX_CHUNK_SIZE) and failed SEND_TIMEOUT mid-pause.
+    MAX_DELAY_S = 600.0
+    # Sample x segment pairs per block of the path-fidelity check: ~10 arrays of this many x 3 floats, ~40 MB at most.
+    FIDELITY_BLOCK_PAIRS = 500_000
 
     # ---- Rolling buffer (zone blend phase 5, TODO/blending_design.md §6) --------
     #
@@ -2603,6 +2610,12 @@ class TrajectoryPlanner(Thread):
                                                  cid)
         if not end_kept:
             v_corner = 0.0
+        if start_vel is not None and sample.num_points > 2:
+            # Entered at the corner speed: row 0 IS the move before's last row (the corner, at that speed). Sent twice,
+            # the arm stood one tick still at the corner while every velocity said it moves (review M8 / F6,
+            # 2026-11-22). RTI plays this move from its second row on.
+            sample = ExecTrajectorySample(positions=sample.positions[1:], velocities=sample.velocities[1:],
+                                          torque_ff=sample.torque_ff[1:])
         return sample, v_corner
 
     def _time_joint_path(self, path, time_parameterizer, options, speed_scale, start_vel, end_vel, cid):
@@ -2767,14 +2780,41 @@ class TrajectoryPlanner(Thread):
         rotation_error = float(np.arccos(np.clip(c, -1.0, 1.0)))
         return translation_error, rotation_error
 
+    def _reach_hint(self, target_pose, start):
+        """The sentence a refused move_pose ends with (review M6, 2026-11-22, the user: refuse with a hint, no automatic
+        reconfiguration): is_reachable()'s global search (motion/reachability.py) on the planner's own model, in the
+        planner's thread (one model per thread). Names the joints that reach the pose when another arm configuration
+        does, or says that none does; "" when the search itself cannot run."""
+        if self._joint_lo is None:
+            return ""
+        try:
+            if getattr(self, "_reach_starts", None) is None:
+                self._reach_starts = make_starts(self._joint_lo, self._joint_hi)
+            q = find_reachable(self._robot, np.asarray(target_pose.A, dtype=np.float64), start, self._joint_lo,
+                               self._joint_hi, self._reach_starts)
+        except Exception:  # noqa: BLE001 — a hint must never hide the refusal it explains
+            logger.debug("move_pose: the reachability search for the hint failed", exc_info=True)
+            return ""
+        if q is None:
+            return " — no arm configuration reaches this pose inside the joint limits (is_reachable() says no)"
+        return (f" — the pose is reachable in another arm configuration, joints "
+                f"{np.round(np.rad2deg(q), 1).tolist()} deg (what is_reachable() answers): move_joints() there first, "
+                f"then move_pose()")
+
     def _solve_endpoint_pose(self, start, args, cid, options):
         if self._robot is None:
             raise NotImplementedError("move_pose needs a robot model for IK")
-
-        solver = normalize_ik_solver_name(options.ik_solver or "pinocchio")
-
         target_pose = self._pose_from_args(args)
         start = np.asarray(start, dtype=np.float64)[:self.joint_num]
+        try:
+            return self._solve_endpoint_pose_from(start, target_pose, args, cid, options)
+        except PlannerError as e:
+            if e.code not in ("IK_TARGET_UNREACHABLE", "IK_PARTIAL_PATH", "IK_MARGIN_VIOLATION", "IK_POSE_ERROR"):
+                raise
+            raise PlannerError(e.code, e.message + self._reach_hint(target_pose, start)) from None
+
+    def _solve_endpoint_pose_from(self, start, target_pose, args, cid, options):
+        solver = normalize_ik_solver_name(options.ik_solver or "pinocchio")
         # Solve through the SAME machinery as every path/blend IK — SeededIKPathSolver
         # with DEFAULT_IK_CONFIG — so move_pose shares one config AND gets the DLS
         # fallback (a bare ik_LM call misses many reachable targets; see solve_pose).
@@ -2979,6 +3019,7 @@ class TrajectoryPlanner(Thread):
     # (the TOPPRA bug was 860%). Do NOT tighten this toward 1.0 — you will start rejecting
     # legitimate TOPPRA moves. Do NOT loosen it past ~1.3 without re-measuring.
     ACCEL_BACKSTOP_TOLERANCE = 1.15
+    VEL_BACKSTOP_TOLERANCE = 1.05      # the speed backstop (review M7): every lane plans at or under the limit
 
     # WHICH LIMIT THIS GUARDS — read before "improving" it.
     #
@@ -3021,23 +3062,37 @@ class TrajectoryPlanner(Thread):
 
     def _assert_commanded_accel(self, sample, accel_limit, where):
         """Refuse to SEND a trajectory whose commanded acceleration exceeds what it was
-        planned against. Read-only: returns `sample` untouched, or raises."""
+        planned against. Read-only: returns `sample` untouched, or raises.
+
+        Then the commanded SPEED against the joints' speed limits (review M7, 2026-11-22: no lane had a speed backstop;
+        the Cartesian retimer's stretch loop gives up after 8 rounds without failing). An acceleration fault is reported
+        as ACCEL_LIMIT_VIOLATION as before, even when it also overshoots the speed."""
         vel = np.asarray(sample.velocities, dtype=np.float64)
-        if vel.shape[0] < 3:
-            return sample
-        acc = np.diff(vel, axis=0) / self._dt
-        lim = np.asarray(accel_limit, dtype=np.float64) * self.ACCEL_BACKSTOP_TOLERANCE
-        ratio = np.abs(acc) / np.maximum(lim[None, :], 1e-12)
-        worst = float(ratio.max())
-        if worst > 1.0:
-            j = int(np.unravel_index(int(np.argmax(ratio)), ratio.shape)[1])
-            peak = float(np.abs(acc[:, j]).max())
-            raise PlannerError(
-                "ACCEL_LIMIT_VIOLATION",
-                f"{where}: commanded acceleration exceeds the limit it was planned against — "
-                f"J{j + 1} peaks at {peak:.3f} rad/s^2 against a {float(accel_limit[j]):.3f} rad/s^2 "   # J1 = 1 (P1)
-                f"limit ({peak / max(float(accel_limit[j]), 1e-12):.2f}x, backstop trips above "
-                f"{self.ACCEL_BACKSTOP_TOLERANCE:.2f}x). Nothing was sent.")
+        if vel.shape[0] >= 3:
+            acc = np.diff(vel, axis=0) / self._dt
+            lim = np.asarray(accel_limit, dtype=np.float64) * self.ACCEL_BACKSTOP_TOLERANCE
+            ratio = np.abs(acc) / np.maximum(lim[None, :], 1e-12)
+            worst = float(ratio.max())
+            if worst > 1.0:
+                j = int(np.unravel_index(int(np.argmax(ratio)), ratio.shape)[1])
+                peak = float(np.abs(acc[:, j]).max())
+                raise PlannerError(
+                    "ACCEL_LIMIT_VIOLATION",
+                    f"{where}: commanded acceleration exceeds the limit it was planned against — "
+                    f"J{j + 1} peaks at {peak:.3f} rad/s^2 against a {float(accel_limit[j]):.3f} rad/s^2 "   # J1 = 1
+                    f"limit ({peak / max(float(accel_limit[j]), 1e-12):.2f}x, backstop trips above "
+                    f"{self.ACCEL_BACKSTOP_TOLERANCE:.2f}x). Nothing was sent.")
+        if vel.size and self._max_vel is not None:
+            vlim = np.asarray(self._max_vel, dtype=np.float64) * self.VEL_BACKSTOP_TOLERANCE
+            vratio = np.abs(vel) / np.maximum(vlim[None, :], 1e-12)
+            if float(vratio.max()) > 1.0:
+                j = int(np.unravel_index(int(np.argmax(vratio)), vratio.shape)[1])
+                peak = float(np.abs(vel[:, j]).max())
+                raise PlannerError(
+                    "VELOCITY_LIMIT_VIOLATION",
+                    f"{where}: commanded speed exceeds the joint's speed limit — J{j + 1} peaks at {peak:.3f} rad/s "
+                    f"against {float(self._max_vel[j]):.3f} rad/s ({peak / max(float(self._max_vel[j]), 1e-12):.2f}x, "
+                    f"backstop trips above {self.VEL_BACKSTOP_TOLERANCE:.2f}x). Nothing was sent.")
         return sample
 
     def _utilization_metrics(self, vel, acc=None):
@@ -3173,11 +3228,17 @@ class TrajectoryPlanner(Thread):
         seg = ref[1:] - a
         seg_len2 = np.einsum("ij,ij->i", seg, seg)
         seg_len2 = np.where(seg_len2 > 1e-18, seg_len2, 1.0)
-        rel = xyz[:, None, :] - a[None, :, :]
-        t = np.clip(np.einsum("ijk,jk->ij", rel, seg) / seg_len2[None, :], 0.0, 1.0)
-        closest = a[None, :, :] + t[:, :, None] * seg[None, :, :]
-        dev = np.linalg.norm(xyz[:, None, :] - closest, axis=2).min(axis=1)
-        worst = float(dev.max())
+        # Every sample against every segment, in blocks of samples (review M8 / F11, 2026-11-22: at once, a 10-turn
+        # circle made samples x segments x 3 arrays of ~1.1 GB, three or four alive). The same numbers, bounded memory.
+        block = max(1, self.FIDELITY_BLOCK_PAIRS // max(1, seg.shape[0]))
+        worst = 0.0
+        for i in range(0, xyz.shape[0], block):
+            part = xyz[i:i + block]
+            rel = part[:, None, :] - a[None, :, :]
+            t = np.clip(np.einsum("ijk,jk->ij", rel, seg) / seg_len2[None, :], 0.0, 1.0)
+            closest = a[None, :, :] + t[:, :, None] * seg[None, :, :]
+            dev = np.linalg.norm(part[:, None, :] - closest, axis=2).min(axis=1)
+            worst = max(worst, float(dev.max()))
         tol = float(DEFAULT_IK_CONFIG.pose_translation_tolerance_m)
         self._last_diagnostic["cartesian_path_deviation_m"] = worst
         if worst > tol:
@@ -3241,8 +3302,13 @@ class TrajectoryPlanner(Thread):
         sdot_max = float(np.min(vlim / worst))
         sddot_max = float(np.min(alim / worst))
 
+        # The path's jerk limit, mapped from the joints' as sdot / sddot are (review M7, 2026-11-22): the six joint
+        # limits went into this one-axis problem as they were, and the solver used the first — J1's 28.8 rad/s^3 where
+        # J2 allows 9.0. make_time_parameterizer still scales it by the move's `jerk`.
+        path_jerk = (None if self._max_jerk is None
+                     else np.array([float(np.min(np.asarray(self._max_jerk, dtype=np.float64) / worst))]))
         parameterizer = make_time_parameterizer(profile, options.ramp_fraction,
-                                                self._jerk_scale_for(options), max_jerk=self._max_jerk)
+                                                self._jerk_scale_for(options), max_jerk=path_jerk)
         if options.duration is not None:
             probe = parameterizer.parameterize(
                 JointPath(start=np.zeros(1), target=np.array([total])),
@@ -3256,8 +3322,11 @@ class TrajectoryPlanner(Thread):
             sdot_max *= d_scale
             sddot_max *= d_scale * d_scale
             if isinstance(parameterizer, RuckigTimeParameterizer):
+                # The jerk limit scales with d_scale^3 (it was dropped here: a timed move fell back to accel x 3)
                 parameterizer = RuckigTimeParameterizer(
-                    jerk_factor=parameterizer.jerk_factor * d_scale)
+                    jerk_factor=parameterizer.jerk_factor * d_scale,
+                    max_jerk=(None if parameterizer.max_jerk is None
+                              else parameterizer.max_jerk * d_scale ** 3))
         stretch = 1.0
         pos = vel = acc = None
         for _ in range(8):
@@ -3635,6 +3704,12 @@ class TrajectoryPlanner(Thread):
         cid = self._cmd_id(cmd)
         args = self._cmd_args(cmd)
         options = self._cmd_options(cmd)
+        if options.duration is not None and not (np.isfinite(float(options.duration))
+                                                 and float(options.duration) > 0.0):
+            # One rule for every move (review M8, 2026-11-22): infinity was accepted and ran 1000x slower (a 2 s move,
+            # ~500 000 rows), NaN failed later under another code.
+            raise PlannerError("INVALID_DURATION",
+                               f"duration must be a finite number of seconds above 0 (got {options.duration})")
 
         if ctype in ("open_gripper", "close_gripper", "move_gripper"):
             self._last_exit_speed = None   # gripper breaks any in-flight blend chain
@@ -3667,6 +3742,10 @@ class TrajectoryPlanner(Thread):
             # failed as PLAN_FAIL).
             if not (np.isfinite(secs) and secs > 0.0):
                 raise PlannerError("INVALID_DURATION", f"a pause needs a time above 0 seconds (got {secs})")
+            if secs > self.MAX_DELAY_S:
+                raise PlannerError("INVALID_DURATION",
+                                   f"a pause of {secs:g} s is longer than {self.MAX_DELAY_S:g} s, the most one delay() "
+                                   f"holds: call delay() again, or wait in your program")
             n = max(2, int(round(secs / self._dt)))
             pos = np.repeat(start[None, :], n, axis=0)
             vel = np.zeros((n, self.joint_num))

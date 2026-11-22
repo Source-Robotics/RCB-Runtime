@@ -13,7 +13,7 @@ from robotics.homing import config as _config
 from robotics.homing import moves as _moves
 from robotics.homing.gripper import GripperHomingState
 from robotics.homing.joint import JointHomingState
-from robotics.homing.status import STATUS_DONE, STATUS_FAILED, STATUS_QUESTION, log_milestone
+from robotics.homing.status import STATUS_DONE, STATUS_FAILED, STATUS_IDLE, STATUS_QUESTION, log_milestone
 
 
 class HomingController:
@@ -392,12 +392,18 @@ class HomingController:
             self._active_j = 0
         self._active_state = None
 
-        # Clear per-joint/gripper homed flags
+        # Clear per-joint/gripper homed flags — and the last homing's per-joint results and the arm's "homed" (review
+        # C20, 2026-11-22: a re-home started with the previous homing's DONE / FAILED per joint and "HOMED" while every
+        # joint's flag above read 0; the arm is homed again when this homing completes).
         if shared_data is not None:
             if "joint_homed" in shared_data.rti:
                 shared_data.rti["joint_homed"][:] = 0
             if hasattr(shared_data, 'gripper') and "gripper_homed" in shared_data.gripper:
                 shared_data.gripper["gripper_homed"][0] = 0
+            if "homing_status" in shared_data.rti:
+                shared_data.rti["homing_status"][:] = STATUS_IDLE
+            if hasattr(shared_data, "homed_state"):
+                shared_data.homed_state.set("NOT HOMED")
 
         self._seq_ticks = 0
         self._homing_stats = {}

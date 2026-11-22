@@ -28,8 +28,8 @@ import logging
 import time
 from project_paths import PROJECT_ROOT, TEMP_DATA_DIR
 import shutil
-from utility.housekeeping import (DISK_LOW_BYTES, DISK_OK_BYTES, RECORDINGS_BUDGET_BYTES, copy_truncate, enforce_budget,
-                                  rotate_by_size)
+from utility.housekeeping import (DISK_LOW_BYTES, DISK_OK_BYTES, LOGS_BUDGET_BYTES, RECORDINGS_BUDGET_BYTES,
+                                  copy_truncate, enforce_budget, enforce_logs_budget, rotate_by_size)
 from utility.system_temperature import get_raspberry_pi_temperature
 
 logger = logging.getLogger("sup.process")  # docs/logging.md "Logger names"
@@ -113,6 +113,57 @@ def _check_recordings_budget(now=None, root=TEMP_DATA_DIR, budget=RECORDINGS_BUD
         logger.info(f"Test recordings over the {budget // 1_000_000} MB budget ({before / 1e6:.0f} MB): deleted the "
                     f"oldest {len(deleted)} run(s), now {after / 1e6:.0f} MB: {', '.join(deleted[:5])}"
                     f"{' ...' if len(deleted) > 5 else ''}")
+    _check_logs_budget()
+    return deleted
+
+
+_hang = [None]
+_hang_failed = [False]
+
+
+def _check_hangs(processes):
+    """Every monitor pass: a managed program still running but stuck (review I4, 2026-11-22; the user: detect and
+    show it, restart nothing) -> rti['process_hung'], RTI's error pass shows P_<NAME>:PROCESS_HUNG_WARNING
+    (supervisor/hang_check.py has the signals and the limits). Built on the first pass that can attach the shared
+    memory. Returns {name: seconds hung}. Never raises."""
+    try:
+        if _hang[0] is None:
+            from config.networking import GUI_PORT
+            from data import shared_data
+            from supervisor.hang_check import GuiProbe, HangCheck
+            from utility.trace_ring import read_head
+            rti = shared_data.rti
+            probe = GuiProbe(GUI_PORT).start()
+            _hang[0] = HangCheck({
+                "RTI": lambda: float(rti["loop_tick"][0]),
+                "HIGH_LEVEL": lambda: float(rti["exec_watch_beat"][0]),
+                "SELF_COLLISION": lambda: float(rti["sc_heartbeat"][0]),
+                "RECORDER": lambda: (read_head() or {}).get("rec_heartbeat"),
+                "GUI": probe.value,
+            }, rti["process_hung"])
+        return _hang[0].step(processes)
+    except Exception as exc:  # noqa: BLE001 — the check must never take the supervisor down
+        if not _hang_failed[0]:
+            logger.warning(f"hang check not running: {exc} (reported once)")
+            _hang_failed[0] = True
+        return {}
+
+
+def _check_logs_budget(logs_dir=None, budget=LOGS_BUDGET_BYTES):
+    """With the hourly recordings check: logs/ together at most `budget` (300 MB, utility/housekeeping.LOGS_BUDGET_BYTES;
+    review I6 (b), the user 2026-11-21), the oldest rotated copies deleted first, never a live log. Never raises."""
+    try:
+        before, after, deleted = enforce_logs_budget(str(LOG_DIR if logs_dir is None else logs_dir), budget)
+    except Exception as exc:                      # pragma: no cover - enforce_logs_budget does not raise
+        logger.warning(f"logs budget check failed: {exc}")
+        return []
+    if deleted:
+        logger.info(f"logs/ over the {budget // 1_000_000} MB budget ({before / 1e6:.0f} MB): deleted the oldest "
+                    f"{len(deleted)} rotated copie(s), now {after / 1e6:.0f} MB: {', '.join(deleted[:5])}"
+                    f"{' ...' if len(deleted) > 5 else ''}")
+    elif after > budget:
+        logger.warning(f"logs/ is {after / 1e6:.0f} MB, over its {budget // 1_000_000} MB budget, with no rotated "
+                       f"copy left to delete (the live logs alone)")
     return deleted
 
 
@@ -343,6 +394,7 @@ def monitor_scripts(emergency_stop, processes, SCRIPTS):
     _cap_running_out_logs(processes)
     _check_recordings_budget()
     _check_disk()                                          # review I6: DISK_LOW_WARNING
+    _check_hangs(processes)                                # review I4: PROCESS_HUNG_WARNING (nothing restarted)
 
     # Raspberry Pi temperature.
     temp = get_raspberry_pi_temperature()

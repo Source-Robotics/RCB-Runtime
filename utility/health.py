@@ -89,7 +89,7 @@ def assess(shared_data, joint_num, delta_t, has_gripper=True, watch_s=WATCH_S, s
     comps.append(_worker(rti, after[2] != before[2]))
     comps.append(_recorder(head_fn()))
     if system:
-        comps.append(_processes())
+        comps.append(_processes(rti))
         comps.append(_disk())
         comps.append(_memory())
         comps.append(_cpu_temperature())
@@ -225,13 +225,30 @@ def _recorder(head, now=None):
     return component("recorder", "OK", "recording (incidents, captures)", values)
 
 
-def _processes():
+# rti['process_hung'][1..5]'s programs (supervisor/hang_check.PROGRAMS' order; review I4, 2026-11-22)
+HUNG_NAMES = ("RTI", "executor", "self-collision worker", "recorder", "dashboard")
+
+
+def hung_programs(rti) -> list:
+    """[(name, seconds)] of the programs the supervisor finds running but stuck (rti['process_hung']); [] when none or
+    when the field is missing (a supervisor from before it)."""
+    flag = rti.get("process_hung") if hasattr(rti, "get") else None
+    if flag is None or float(flag[0]) < 0.5:
+        return []
+    return [(n, float(flag[i])) for i, n in enumerate(HUNG_NAMES, start=1) if float(flag[i]) > 0.0]
+
+
+def _processes(rti=None):
     from utility.process_utils import process_info
     rows = {r["name"]: r for r in process_info(dict(PROCESSES))}
     missing = [name for name, _ in PROCESSES if name not in rows]
     values = {name: (f"pid {rows[name]['pid']}" if name in rows else "missing") for name, _ in PROCESSES}
     if missing:
         return component("processes", "ERROR", "not running: " + ", ".join(missing), values)
+    hung = hung_programs(rti) if rti is not None else []
+    if hung:
+        return component("processes", "ERROR", "not responding: " + ", ".join(f"{n} ({s:.0f} s)" for n, s in hung),
+                         values)
     return component("processes", "OK", f"all {len(PROCESSES)} running", values)
 
 

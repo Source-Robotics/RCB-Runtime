@@ -156,6 +156,22 @@ def route_through_queue(q, listener) -> None:
         _queue_logger(name, logger)
 
 
+def _end_cut_line(log_file: str) -> None:
+    """A file whose last entry was cut off (the process ended mid-write) gets a newline first, so the next run's first
+    entry starts a line of its own (2026-11-22: on 2026-10-29 a cut entry and the next run's first one shared a line,
+    and neither could be read). Never raises."""
+    try:
+        with open(log_file, "rb+") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                return
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
+    except OSError:
+        pass
+
+
 def _get_activity_logger(name: str, log_file: str, max_bytes: int, backup_count: int = 5) -> logging.Logger:
     if name in _LOGGERS:
         return _LOGGERS[name]
@@ -166,6 +182,7 @@ def _get_activity_logger(name: str, log_file: str, max_bytes: int, backup_count:
 
     if not logger.handlers:
         os.makedirs(os.path.dirname(log_file) or "logs", exist_ok=True)
+        _end_cut_line(log_file)
         handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count)
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)

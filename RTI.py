@@ -62,16 +62,15 @@ from utility.robot_factory import create_robot
 import threading
 import zmq
 from queue import Queue, Empty
-from gpiozero import pi_info
 from utility.logger_setup import setup_logging, apply_log_level
 from utility.fault_details import fault_detail
 import config.xml_parser as read_XML2
 from utility.selfcheck import run_selfcheck
 from utility.state_machine import RobotMode, request_mode_change, request_enable, MAINTENANCE_MODES
 from utility.error_checks import (
-    process_errors_tick, clear_errors, send_clear_errors, note_clear, ExecLinkWatchdog,
+    process_errors_tick, send_clear_errors, note_clear, ExecLinkWatchdog,
     LoopDegradationMonitor,
-    CLEAR_ERROR_SETTLE_TICKS, CLEAR_ERROR_SEND_REPEATS, BOOT_CLEAR_TICK, _WARNING_SUFFIXES,
+    CLEAR_ERROR_SETTLE_TICKS, CLEAR_ERROR_SEND_REPEATS, BOOT_CLEAR_TICK,
 )
 from utility.activity_log import get_rti_activity_logger, log_activity, note_origin
 from utility.trace_ring import TraceWriter, mark_clean_stop
@@ -82,7 +81,7 @@ from robotics.limit_restore import RestoreResend
 from robotics.homing import HomingController
 from robotics.homing_arms import HomingArms
 from motion.rti_handler import RTIModeHandler
-from communication.rti_protocol import CLOCK_ROBOT, CLOCK_PC, CMD_SIZE
+from communication.rti_protocol import CLOCK_ROBOT, CMD_SIZE
 
 # ==========================================================================
 # System and Configuration
@@ -97,9 +96,8 @@ from utility.can_reply_monitor import CanReplyMonitor
 # Hardware
 # ==========================================================================
 from hardware.gpio_handler import (
-    initialize_gpio, update_gpio, check_estop_active, write_all_outputs, read_inputs_into_shared, configure_estop,
-    estop_channel_fault, outputs_off_at_exit, set_output, set_output_high, set_output_low, toggle_output, HIGH, LOW,
-    ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_2, ISOLATED_OUTPUT_3
+    initialize_gpio, check_estop_active, write_all_outputs, read_inputs_into_shared, configure_estop,
+    estop_channel_fault, outputs_off_at_exit
 )
 from hardware.motor_setup import setup_motor_system
 from hardware.can_hardware import scan_can_bus, initialize_can_communication
@@ -108,16 +106,19 @@ from hardware.can_hardware import scan_can_bus, initialize_can_communication
 # ==========================================================================
 # Networking
 # ==========================================================================
-from config.networking import RT_CPU_CORE, zmq_listener, zmq_sender_setup, zmq_answer_sender_setup, udp_socket_receive_setup, udp_socket_send_setup, broadcast_udp_telemetry, init_rti_receive_socket, drain_rti_udp, RTI_PORT_SENDER, init_rti_tcp_listener, accept_rti_tcp, drain_rti_tcp, send_rti_tcp, drain_rti_tcp_backlog
+from config.networking import RT_CPU_CORE, zmq_listener, zmq_sender_setup, zmq_answer_sender_setup, udp_socket_receive_setup, udp_socket_send_setup, broadcast_udp_telemetry, drain_rti_udp, RTI_PORT_SENDER, init_rti_tcp_listener, accept_rti_tcp, drain_rti_tcp, send_rti_tcp, drain_rti_tcp_backlog
 from communication.can_message_handlers import receive_and_process_can_messages, handle_polling_and_overrides, update_can_connection_status, drain_can_discard
-from communication.can_message_handlers import send_gripper_commands, send_motor_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
+from communication.can_message_handlers import send_gripper_commands, secondary_data_send, load_motor_configs, load_gripper_configs, handle_motor_reconnect, write_motor_config_to_shared, write_gripper_config_to_shared, GRIPPER_IDLE_PACK_REPEATS
 from communication.can_message_handlers import send_brake_on_idle, fetch_board_ids, board_ids_of
 from utility.drive_params import ParamRead, catalogue as drive_param_catalogue
 from utility.drive_capture import DriveCapture
+# Loaded here, at start: the drive checks import it inside functions that first run IN a tick (250 / 3000 and a gripper
+# change) — a first import there read and compiled files in the loop (review D16, 2026-11-22).
+import utility.drive_checks  # noqa: E402,F401
 from utility.sound import SoundPlayer
 from utility.safety_monitor import COLLISION_MODES
 from utility.kt_init import resolve_and_preload_kt
-from utility.tick_types import TickContext, TickResult
+from utility.tick_types import TickContext
 from utility.mode_dispatch import build_mode_dispatch, dispatch_step, take_command_errors as _dispatch_errors
 from utility.kinematics_backend import set_kinematics_backend
 from utility.pinocchio_attach import attach_pinocchio
@@ -779,6 +780,10 @@ def main():
     # Sound through the motors (utility/sound.py, 2026-11-17): system.xml <sound>; homing done, an error, identify,
     # programs' tones — each switched on / off
     sound = SoundPlayer(_sys["sound"])
+    # No tone above a drive's own current limit (2026-11-22)
+    sound.max_ma = {i: float(motor_Ilim[i]) for i in range(joint_num)}
+    if active_CAN_gripper:
+        sound.max_ma[joint_num] = float(st.gripper_Ilim)
     scheduled_state["sound"] = sound
     PARAM_READ_AT_START_TICK = 1000      # 4 s in: after the start-up config re-sends (ticks 50 / 150 / 300)
     # Per node, the tick before which its silence is not latched as lost: a drive saving its config to flash (save_drive)
@@ -1470,6 +1475,18 @@ def main():
         # the command check (2026-10-27): the acceleration ceilings, and which commanded values the mode computed
         acc_ceiling=cfg['joint_acceleration_limit'], cmd_valid=shared_data.rti['command_valid'],
     )
+    sound.on_q_tune = safety_monitor.mute_hold_osc     # a q tune is no buzzing joint (review C19, 2026-11-22)
+    # The supervisor's hang check (review I4, 2026-11-22; supervisor/hang_check.py): rti['process_hung'] [0] how many,
+    # [1..5] seconds per program. RTI's own slot (1) is skipped: a stuck RTI runs no error pass, and a running one
+    # is not stuck. One float compare per tick; the keys are built only while something is hung.
+    _hung_flag = shared_data.rti['process_hung']
+    _HUNG_KEYS = ((2, "P_EXECUTOR:PROCESS_HUNG_WARNING"), (3, "P_SELF_COLLISION:PROCESS_HUNG_WARNING"),
+                  (4, "P_RECORDER:PROCESS_HUNG_WARNING"), (5, "P_DASHBOARD:PROCESS_HUNG_WARNING"))
+
+    def _hung_keys():
+        if _hung_flag[0] < 0.5:
+            return ()
+        return tuple(k for i, k in _HUNG_KEYS if _hung_flag[i] > 0.0)
     _COLLISION_MODE_CODE = {"off": 0.0, "warn": 1.0, "stop": 2.0}
     _COLLISION_MODE_NAME = {0: "off", 1: "warn", 2: "stop"}
     shared_data.rti['collision_mode'][0] = _COLLISION_MODE_CODE[
@@ -1653,12 +1670,15 @@ def main():
             log_activity(_rti_activity_logger, "RTI", "info", "STATE_CHANGE", id=st.command_id,
                          message="ENABLED → DISABLED")
         _freeze_gripper("disable")
+        sound.silence()                             # a playing tune stops too (the user, 2026-11-22: stop_sound (b))
         st.pending_mode_request = RobotMode.IDLE
 
 
     def _handle_gripper_hold(cmd_msg, cmd_dict):
-        """gripper_hold — the executor's stop() (2026-10-24): the jaws stop where they are."""
+        """gripper_hold — the executor's stop() (2026-10-24): the jaws stop where they are, and a playing tune stops
+        (2026-11-22, the user: stop_sound (b))."""
         _freeze_gripper("stop")
+        sound.silence()
 
 
     def _handle_home(cmd_msg, cmd_dict):
@@ -2294,11 +2314,22 @@ def main():
 
 
     def _handle_jog_set(cmd_msg, cmd_dict):
+        # A malformed jog or one outside JOG is refused by name (review C20 / F10, 2026-11-22): it was answered "ok"
+        # and ignored, and a bad number raised into the command guard.
         parts = cmd_msg.split(":")
-        if len(parts) == 4 and st.current_mode == RobotMode.JOG:
-            _jog = MODE_HANDLERS.get(RobotMode.JOG)
-            if _jog is not None:
-                _jog.set_jog(int(parts[1]), int(parts[2]), float(parts[3]), cmd_id=st.command_id)
+        try:
+            if len(parts) != 4:
+                raise ValueError("needs joint:direction:speed")
+            axis, direction, speed = int(parts[1]), int(parts[2]), float(parts[3])
+        except ValueError as exc:
+            _refused(logger, "jog_set: %s (%r)", exc, cmd_msg)
+            return
+        if st.current_mode != RobotMode.JOG:
+            _refused(logger, "jog_set refused: the robot is in %s, not JOG", st.current_mode)
+            return
+        _jog = MODE_HANDLERS.get(RobotMode.JOG)
+        if _jog is not None:
+            _jog.set_jog(axis, direction, speed, cmd_id=st.command_id)
 
 
     def _handle_jog_stop(cmd_msg, cmd_dict):
@@ -2309,10 +2340,16 @@ def main():
 
     def _handle_jog_accel(cmd_msg, cmd_dict):
         parts = cmd_msg.split(":")
-        if len(parts) == 2:
-            _jog = MODE_HANDLERS.get(RobotMode.JOG)
-            if _jog is not None:
-                _jog.set_accel_time(float(parts[1]))
+        try:
+            value = float(parts[1]) if len(parts) == 2 else None
+        except ValueError:
+            value = None
+        if value is None:                          # review C20 / F10, 2026-11-22: it raised into the command guard
+            _refused(logger, "jog_accel: not one number: %r", cmd_msg)
+            return
+        _jog = MODE_HANDLERS.get(RobotMode.JOG)
+        if _jog is not None:
+            _jog.set_accel_time(value)
 
 
     def _handle_jog_profile(cmd_msg, cmd_dict):
@@ -2328,10 +2365,16 @@ def main():
 
     def _handle_jog_jerk_factor(cmd_msg, cmd_dict):
         parts = cmd_msg.split(":", 1)
-        if len(parts) == 2:
-            _jog = MODE_HANDLERS.get(RobotMode.JOG)
-            if _jog is not None:
-                _jog.set_jerk_factor(float(parts[1]))
+        try:
+            value = float(parts[1]) if len(parts) == 2 else None
+        except ValueError:
+            value = None
+        if value is None:                          # review C20 / F10, 2026-11-22: it raised into the command guard
+            _refused(logger, "jog_jerk_factor: not a number: %r", cmd_msg)
+            return
+        _jog = MODE_HANDLERS.get(RobotMode.JOG)
+        if _jog is not None:
+            _jog.set_jerk_factor(value)
 
 
     def _handle_jog_control_mode(cmd_msg, cmd_dict):
@@ -2397,18 +2440,25 @@ def main():
         if _gripper_change["on"]:
             _refused(log_gripper, "gripper_set refused: the gripper is being changed (end_gripper_change first)")
             return
-        if len(parts) == 5 and active_CAN_gripper:
-            try:
-                _gripper_fw_state['position'] = int(parts[1])
-                _gripper_fw_state['speed']    = int(parts[2])
-                _gripper_fw_state['current']  = int(parts[3])
-                _gripper_fw_state['action']   = int(parts[4])
-                if st._gripper_calibrate_running or st._gripper_calibrate_pending:
-                    log_gripper.info("calibrate aborted by gripper_set")
-                    st._gripper_calibrate_running = False
-                    st._gripper_calibrate_pending = False
-            except ValueError as exc:
-                _refused(log_gripper, "gripper_set: bad payload %s", exc)
+        if not active_CAN_gripper:                 # review C20 / F10, 2026-11-22: answered "ok", nothing happened
+            _refused(log_gripper, "gripper_set refused: this robot has no CAN gripper")
+            return
+        try:
+            if len(parts) != 5:
+                raise ValueError("needs position:speed:current:action")
+            # Every field read before any is applied (a bad one left the others applied).
+            position, speed, current, action = (int(v) for v in parts[1:5])
+        except ValueError as exc:
+            _refused(log_gripper, "gripper_set: bad payload %s (%r)", exc, cmd_msg)
+            return
+        _gripper_fw_state['position'] = position
+        _gripper_fw_state['speed'] = speed
+        _gripper_fw_state['current'] = current
+        _gripper_fw_state['action'] = action
+        if st._gripper_calibrate_running or st._gripper_calibrate_pending:
+            log_gripper.info("calibrate aborted by gripper_set")
+            st._gripper_calibrate_running = False
+            st._gripper_calibrate_pending = False
 
 
     def _handle_gripper_calibrate(cmd_msg, cmd_dict):
@@ -3247,6 +3297,7 @@ def main():
             check_estop_active(),
             estop_channel_fault=estop_channel_fault(),   # after check_estop_active, which updates it (review D15)
             disk_low=shared_data.rti['disk_low'][0] >= 0.5,  # the supervisor's flag, every 30 s (review I6)
+            process_hung=_hung_keys(),                       # the supervisor's hang check (review I4)
             Gripper_data=Gripper_data,
             exec_link_lost=_exec_link_lost,
             # RTI command watchdog. A KEY, not a direct error_active write — this
@@ -3286,6 +3337,7 @@ def main():
         _err_now = bool(shared_data.rti['error_active'][0])
         if _err_now and not _gripper_err_prev[0]:  # an error latched: the jaws stop where they are (2026-10-24)
             _freeze_gripper("an error latched")
+            sound.silence()                         # and a playing tune stops; the error tune is queued after it
         _gripper_err_prev[0] = _err_now
         _sound_on_error(_mode_before_errors)       # the error tune when one has just latched (utility/sound.py)
         _profile_last = _profile_mark(_profile_last, "error_checks")

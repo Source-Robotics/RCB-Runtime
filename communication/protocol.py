@@ -239,7 +239,11 @@ COMMAND_RULES = {
     # Mode entry: JOG mirrors enter_exec_mode's rule — the state machine's REQUIRES_HOMED
     # set contains JOG, and every non-IDLE transition needs ENABLED. IDLE is always allowed.
     "enter_jog_mode":  (IMMEDIATE, ["IDLE", "JOG"], "ENABLED", True),
-    "enter_idle_mode": (IMMEDIATE, None, None, False),
+    # 2026-11-22 (review C20, the user: "Refuse with a hint"): every mode but the two that have their own way out —
+    # it ended a firmware flash (CAN traffic resumed mid-flash) and a safety stop. The refusal names that way
+    # (exit_flashing_mode() / release_safety_stop(), _WAY_TO_IDLE); stop() and disable() still end both (2026-10-23).
+    "enter_idle_mode": (IMMEDIATE, ["BOOTING", "IDLE", "ACTIVE_ERROR", "HOMING", "JOG", "RTI", "SOFT_RTI", "EXEC",
+                                    "HAND_GUIDING", "IMPEDANCE"], None, False),
     # --- firmware flashing (docs/firmware_flashing.md) ---
     # FLASHING hands the CAN bus to an external flasher while RTI keeps ticking.
     # Deliberately NOT gated on ENABLED or homed here: the state machine treats it

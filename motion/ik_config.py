@@ -53,6 +53,10 @@ class IKConfig:
                                     # threshold: a rejection criterion and a solver step size
                                     # are unrelated concerns.
     dls_iterations: int = 80
+    # A single target (move_pose's endpoint) is no path: no branch to stay on, so its fallback may travel as far as it
+    # takes — 2000 steps x 0.02 rad = 40 rad. It stops earlier once its error stops shrinking (review M6, 2026-11-22:
+    # with the path budget, 1.6 rad, a target more than ~92 deg away in any joint was IK_POSE_ERROR).
+    dls_pose_iterations: int = 2000
     dls_damping: float = 1e-3
 
     # --- singularity WARNING thresholds (emit IK_SINGULARITY_WARNING; do NOT reject) ---

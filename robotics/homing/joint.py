@@ -391,6 +391,7 @@ class JointHomingState:
         if self.has_hall_sensor:
             # Hall-sensor joint (e.g. PAR6 J6)
             motor.Send_data_pack_HALL(Speed=speed, trigger_value=2)
+            self._note_valid_pos(motor)                # the newest valid read, for a trigger tick whose read is None
 
             if motor.HALL_trigger is not None and motor.HALL_trigger == 0:
                 endstop_hit      = True
@@ -434,8 +435,10 @@ class JointHomingState:
                 return 'running'
 
             if self.has_hall_sensor:
-                # Hall joints: the Hall edge/trigger IS the reference — capture now.
-                self._triggered_pos = motor.position
+                # Hall joints: the Hall edge/trigger IS the reference — capture now. A read can come back None (a
+                # health-poll reply, ~every 7th tick): the newest valid one of the approach then, one tick old (review
+                # D16 / 9, 2026-11-22: None was latched later, at the settle — after the stop, up to ~0.2 deg off).
+                self._triggered_pos = self._hall_reference(motor)
             # Stop the motor immediately
             motor.Send_data_pack_1(Position=None, Speed=0, Current=0)
 
@@ -489,6 +492,17 @@ class JointHomingState:
         return 'running'
 
     # ------------------------------------------------------------------
+    def _note_valid_pos(self, motor):
+        """Keep the newest valid position read (a read can come back None: the library wipes it for a health-poll
+        reply, ~every 7th tick)."""
+        if motor.position is not None:
+            self._last_valid_pos = int(motor.position)
+
+    def _hall_reference(self, motor):
+        """A Hall joint's home reference at its trigger: this tick's read, else the newest valid one of the approach,
+        one tick old (review D16 / 9, 2026-11-22: None was latched later, at the settle — after the stop)."""
+        return motor.position if motor.position is not None else self._last_valid_pos
+
     def _detect_stall(self, motor, speed):
         """A stall joint's endstop test for this tick: the position window, the current window, the trigger. Returns
         (endstop_hit, detection_method). Moved out of _do_homing verbatim (2026-10-14: its complexity, radon)."""

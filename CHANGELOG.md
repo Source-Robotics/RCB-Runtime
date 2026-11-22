@@ -31,6 +31,14 @@ What changed in each version of the RCB runtime. The newest version is at the to
   health card was open.
 - The recorder saves an incident when the robot's real-time loop stops without latching an error: `TRACE_STOPPED`
   (the loop stalled) or `RTI_DIED` (its process is gone) — a service stop or restart saves none.
+- A new warning, `PROCESS_HUNG_WARNING` (8004): a program of the robot software still running but stuck (its sign
+  of work has not moved: RTI 2 s, the executor 10 s, the self-collision worker 5 s, the recorder and the dashboard
+  30 s; longer at their start). The supervisor finds it, the error list names the program (`P_RECORDER:...`), the
+  health card too — also when RTI itself is stuck. Nothing is restarted on its own.
+- A new error, `VELOCITY_LIMIT_VIOLATION` (5013): a planned move would drive a joint faster than its speed limit;
+  nothing is sent (every move checked its acceleration only).
+- `logs/` keeps to 300 MB in all: over it, the supervisor deletes the oldest rotated copies (`*.log.N`) first, never
+  a live log.
 
 ### Changed
 
@@ -106,9 +114,65 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - The executor refuses a message of the wrong shape (not a JSON object, a list `id` or `cmd`: `BAD_JSON`; `args` that
   is neither a list nor an object: `BAD_ARGS`) and answers an unexpected error with `INTERNAL`, keeping the connection. Both closed it,
   which stops that client's running moves. A message over 16 MB without a newline closes the connection.
+- `delay()` pauses at most 600 s (`INVALID_DURATION` above; call it again for a longer pause): a pause is planned
+  as one row per control tick, so `delay(3600)` held ~110 MB in the executor, and above ~2.3 h it failed with
+  `SEND_TIMEOUT` partway.
+- A move's `duration` that is infinite or not a number is refused with `INVALID_DURATION` (infinity was accepted and
+  the move ran 1000 times slower).
+- A queued move with too few values, or a value that is no finite number, is refused at once (`BAD_ARGS`): it failed
+  only while planning, as `PLAN_FAIL`, and aborted the program. So are, with `BAD_OPTIONS`, `jerk` on a profile other
+  than `ruckig`, `ramp_fraction` on one other than `trapezoid`, a `blend` that is negative or not a finite number
+  (it meant no blend, infinity the largest) and a `samples` that is no whole number.
+- G-code: `G4` reads `P` as milliseconds and `S` as seconds, as slicers write it (`P` was seconds: a sliced
+  `G4 P500` paused 500 s). A G or M number with a fraction (`G91.1` was read as `G91`) and a `P` or `S` that no `G4`,
+  `G64` or M code on its line takes are refused.
+- A refused `move_pose()` says whether another arm configuration reaches the pose, and names its joints (what
+  `is_reachable()` answers), or that none does.
+- The activity log names a command passed to RTI as the program sent it: `jog(1, -1, 20)`, not RTI's
+  `jog(0, -1, 0.2)`.
+- `enter_idle_mode()` is refused with motors off (`safety_stop()`) and during firmware flashing, naming the command
+  that ends each (`release_safety_stop()`, `exit_flashing_mode()`); it ended both. `stop()` and `disable()` still
+  end both.
+- Stop, Disable and an error latching silence a tune that is playing (the error tune plays after it).
+- A tone never asks a drive for more current than that drive's own current limit from the robot XML (J6: 1200 mA).
+- A Cartesian move asked faster than its 20 % cap says so: the reply carries a `note` and the activity log the same.
+- The activity log debounces per error, not per code: six joints latching one code are six entries (they were one).
+- RTI refuses a malformed `jog`, `set_gripper`, jog acceleration or jog jerk factor by name (`RTI_REFUSED`); a jog
+  outside JOG mode too. They were answered "ok" and ignored, or a bad number raised in RTI's command guard.
+- The I/O uses only the 40-pin header's GPIO controller (the Pi 5's `pinctrl-rp1`): any GPIO chip that opened was
+  taken. `RCB_GPIO_CHIP` still picks one explicitly.
 
 ### Fixed
 
+- Cartesian moves on the default profile were jerk-limited by J1's limit alone (the solver took the first of the six
+  joint limits it was handed; J2 allows less than a third of it), and with `duration` by none; the path's limit is
+  now the joints' mapped onto the path.
+- A refused `set_joint_wall` stayed in the executor (the next `save_joint_walls()` wrote it to the robot XML);
+  `reload_zones` gave the planner zones RTI had refused; `clear_errors` cleared the motion abort when RTI had refused
+  the clear. Each now takes effect only once RTI took it.
+- `Infinity` in a whole-number argument answered `INTERNAL` (`BAD_ARGS` now); `rti_connect` with a JSON `null` rate
+  was judged SOFT_RTI before it was forwarded as hard RTI.
+- A re-home started with the last homing's per-joint results and "homed"; both are cleared at its start.
+- Two tunes in a row on the q axis at rest could raise `HOLD_OSCILLATION_WARNING` on the playing joint: the tune's
+  own current swing. That joint's check skips the tune.
+- `OVERSPEED` never armed for a joint already over its trip speed when the checks resumed (after homing, a safety stop,
+  a flash); it does now.
+- A Hall-homed joint latched its home reference after the stop (up to ~0.2 degrees off) when the trigger tick's
+  position read came back empty (about one homing in seven); it takes the newest valid read.
+- A zone file that failed while it was installed could leave the safety monitor with the new zones and the old
+  per-zone lists (an error in every tick); the new set is built first.
+- The drive checks' module was first loaded inside RTI's loop; a fault recording's copy cost ~0.8 ms of one tick
+  (now ~0.5 ms).
+- A cut-off activity-log entry (the process ended mid-write) and the next run's first entry shared one line, so
+  neither could be read; a cut line now gets its newline first.
+- The executor built its status 50 times a second with two parses of the error list and a scan of the recipe folder
+  each time; it reads each once (the recipes at most once a second).
+- `move_pose()` could not reach a target more than ~92 degrees away in any joint, nor a half turn of the tool: it
+  failed `IK_POSE_ERROR` though `is_reachable()` said the pose is fine.
+- Blending at speed (`exact_velocity`): the corner was sent twice, so the arm stood still for one tick at the corner
+  while every speed said it moves.
+- A Cartesian curve of many turns (a 10-turn circle) made arrays of over 1 GB, several at once, in its path check; it
+  now checks in blocks (the same result, ~40 MB at most).
 - The planner's `ACCEL_LIMIT_VIOLATION` named the joints from 0 (J0 for J1); it names them J1 up, like every other
   message.
 - Blending: a move blending at speed into a move that joins a blend chain (`ruckig_corner`) stopped dead at the
@@ -216,6 +280,21 @@ What changed in each version of the RCB runtime. The newest version is at the to
   with a warning (a malformed selected one still stops the start, with its reason).
 - Every program reset the shared Clear Errors / reload requests when it started, so a pending Clear Errors could be
   lost; only the real-time loop resets them now.
+- The dry-run client (`DryRunRobotClient`: the block editor's Check, the plan preview): the `RobotClient` methods it
+  does not replace raised `AttributeError` (`close_gripper()` then `wait_gripper_move_complete()`, `set_payload()`,
+  `enter_idle_mode()`, ...); a command that needs the robot raises `RobotConnectionError` now. It accepted what the
+  robot refuses when a command is sent: a per-move `completion_policy`, a blend, `jerk` or `ramp_fraction` the move's
+  profile cannot use, too few or non-finite values, an I/O pin other than 1-3, a gripper command without a CAN
+  gripper, a move after a known failure — refused with the robot's code now — and a gripper current above the
+  gripper's limit, which fails `BAD_ARGUMENTS` once planned, as on the robot.
+- The dry-run client reports failures as the live client does: every failure dict has `id`;
+  `wait_motion_complete()` raises `CommandRejected` (was `MotionFailed`); `wait_idle()` reports each failure once;
+  `on_error()` no longer gets planning failures. After a failed move, `clear_errors()` lets moves plan again (every
+  later move stayed `ABORTED`); `stop()` fails the moves not planned yet with `STOPPED` (they vanished) and the next
+  move starts where the program ended, not at the start joints.
+- `RobotClient`: the callback thread that runs `on_status_change()`, `on_motion_error()` and the other callbacks
+  never ended, one idle thread left behind per connection. It now ends when the connection is closed or lost, after
+  the callbacks already due.
 
 ## [2.0.0] - 2026-11-20
 

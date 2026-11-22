@@ -162,6 +162,7 @@ SC_STALE_S = 0.5                # the worker's heartbeat unchanged this long -> 
 SC_ESCAPE_TOL_M = 0.002         # escape rule: a pair in contact at the start of an active period may get this much closer
 SC_PAIRS = 49                   # rti['sc_pair_gaps'] = 7 x 7 frames, index a * 7 + b
 HOLD_OSC_EMA_S = 0.1            # s: the averaging of the high-passed current's square (the level's time constant)
+HOLD_OSC_MUTE_TAIL_S = 0.3      # s: after a q tune, its joint's check stays off this much longer (mute_hold_osc)
 CONTACT_WARNING = "CONTACT_WARNING"
 COLLISION = "COLLISION"
 COLLISION_WARNING = "COLLISION_WARNING"
@@ -281,6 +282,7 @@ class SafetyMonitor:
         self._c_rng, self._a_rng = z(np.int64), z(bool)
         self._c_end, self._a_end = z(np.int64), z(bool)
         self._c_spd, self._a_spd = z(np.int64), z(bool)
+        self._a_spd[:] = True              # armed from the start, as when the checks resume (_disarm, review D16 / 12)
         self._c_trk, self._a_trk = z(np.int64), z(bool)
         self._c_pb, self._a_pb = z(np.int64), z(bool)
         self._c_tcp = 0
@@ -373,6 +375,8 @@ class SafetyMonitor:
         self._ho_any = False                                                   # some HOLD_OSCILLATION_WARNING live
         self._ho_counting = False                                              # some counter may be non-zero
         self._ho_fresh = True                                                  # restart the filter on the next tick
+        self._ho_mute_j, self._ho_mute_left = -1, 0                            # a q tune's joint, ticks left (C19)
+        self._ho_dt = float(dt)
         self._k_how = [joint_key(i, HOLD_OSCILLATION_WARNING) for i in range(n)]
         # CONTACT_WARNING / COLLISION(_WARNING): a fixed view of the external torque estimate (tcp['torque_external'],
         # joints only), the per-joint thresholds (robot XML, Nm; 0 / NaN = that threshold unchecked) and the observer
@@ -440,27 +444,35 @@ class SafetyMonitor:
 
     def set_zones(self, zones, tool_spheres, log=True, haptic=None):
         """Install the active cell's zones (startup, and RTI's reload_zones command). Cold path: builds
-        the per-zone state lists that step() then only writes into."""
-        self._zones = tuple(z for z in zones if z["enabled"])
-        self._spheres = robot_spheres(tool_spheres)
-        nz = len(self._zones)
-        self._z_count = [0] * nz
-        self._z_armed = [False] * nz                     # armed only once seen clear of the zone
-        self._z_ref = [math.nan] * nz                    # depth at the last fire (NaN = not known)
+        the per-zone state lists that step() then only writes into.
+
+        Everything is built first and installed only at the end (review D16, 2026-11-22): a zone or sphere that raised
+        while building left the new zones with the old per-zone lists — an IndexError in every later step()."""
+        new_zones = tuple(z for z in zones if z["enabled"])
+        spheres = robot_spheres(tool_spheres)
+        nz = len(new_zones)
         # Reaction and trip depth per zone, ACTIVE modes vs PASSIVE (freedrive) modes.
         haptic = haptic or {}
         walls_on = bool(haptic.get("enabled", 1)) and float(haptic.get("max_force", 1.0)) > 0.0
         breakthrough = float(haptic.get("breakthrough", 0.03))
-        self._z_warn = [z["reaction"] == "warn" for z in self._zones]
-        self._z_pas_warn = [z["reaction"] == "warn" or z.get("freedrive", "warn") == "warn" for z in self._zones]
-        self._z_act_trip = [self._z_tol] * nz
-        self._z_pas_trip = [breakthrough if (walls_on and z.get("haptic", True)) else self._z_tol
-                            for z in self._zones]
-        self._z_wkeys = [zone_key(z, ZONE_WARNING) for z in self._zones]
-        self._z_ekeys = [zone_key(z, ZONE_VIOLATION) for z in self._zones]
-        ns = len(self._spheres)
-        self._z_n = [1 if z["checks"] == "tcp" else ns for z in self._zones]
-        self._cx, self._cy, self._cz = [0.0] * ns, [0.0] * ns, [0.0] * ns   # sphere centres, per tick
+        ns = len(spheres)
+        built = dict(
+            _zones=new_zones, _spheres=spheres,
+            _z_count=[0] * nz,
+            _z_armed=[False] * nz,                       # armed only once seen clear of the zone
+            _z_ref=[math.nan] * nz,                      # depth at the last fire (NaN = not known)
+            _z_warn=[z["reaction"] == "warn" for z in new_zones],
+            _z_pas_warn=[z["reaction"] == "warn" or z.get("freedrive", "warn") == "warn" for z in new_zones],
+            _z_act_trip=[self._z_tol] * nz,
+            _z_pas_trip=[breakthrough if (walls_on and z.get("haptic", True)) else self._z_tol for z in new_zones],
+            _z_wkeys=[zone_key(z, ZONE_WARNING) for z in new_zones],
+            _z_ekeys=[zone_key(z, ZONE_VIOLATION) for z in new_zones],
+            _z_n=[1 if z["checks"] == "tcp" else ns for z in new_zones],
+            _cx=[0.0] * ns, _cy=[0.0] * ns, _cz=[0.0] * ns,  # sphere centres, per tick
+        )
+        self.check_zones = False                         # off while the lists change (step() reads it first)
+        for name, value in built.items():
+            setattr(self, name, value)
         for k in [k for k in self.warnings if k.startswith("Z_")]:
             self.warnings.discard(k)                     # the soft-limit warnings stay
         self.check_zones = self._zones_on and nz > 0
@@ -554,7 +566,10 @@ class SafetyMonitor:
     def _disarm(self):
         self._a_rng[:] = False
         self._a_end[:] = False
-        self._a_spd[:] = False
+        # The speed check is ARMED when the checks resume (review D16 / 12, 2026-11-22): a joint already over its trip
+        # speed then never armed — it re-armed only once back under the ceiling. Speed has no "back in range" to wait
+        # for, as a joint resting past a limit does; after a trip it still waits under the ceiling (_fire).
+        self._a_spd[:] = True
         self._a_trk[:] = False
         self._c_rng[:] = 0
         self._c_end[:] = 0
@@ -899,6 +914,12 @@ class SafetyMonitor:
         ms += f                                              # ms = EMA of hp^2, mA^2
         still, over, fire = self._ho_b1, self._ho_b2, self._ho_b3
         np.greater(ms, self._ho_thr2, out=over)
+        if self._ho_mute_left:                               # a q tune plays on this joint: its swing is the tune
+            self._ho_mute_left -= 1
+            j = self._ho_mute_j
+            over[j] = False
+            hp[j] = 0.0                                      # the filter starts afresh once the tune is over
+            ms[j] = 0.0
         if not over.any() and not self._ho_any:              # the common tick: every joint quiet, nothing live
             if self._ho_counting:
                 self._ho_c.fill(0)
@@ -916,6 +937,19 @@ class SafetyMonitor:
             self._hold_osc_fire(fire)
         if self._ho_any:
             self._hold_osc_track(still)
+
+    def mute_hold_osc(self, joint, seconds):
+        """A tune on the q axis is a torque at its pitch: the playing joint's motor current swings on purpose (review
+        C19, 2026-11-22: two tunes in a row at rest raised J2:HOLD_OSCILLATION_WARNING). That joint's hold-oscillation
+        check skips it for the tune plus HOLD_OSC_MUTE_TAIL_S (the frames reach the drive over ~40 ms) and starts its
+        filter afresh after. Any other joint is checked as always. Cold path (a tune's start; utility/sound.py)."""
+        if not 0 <= int(joint) < self._ho_c.shape[0]:
+            return                                           # the gripper's drive: not checked here
+        ticks = int(np.ceil((float(seconds) + HOLD_OSC_MUTE_TAIL_S) / self._ho_dt))
+        if int(joint) != self._ho_mute_j:
+            self._ho_mute_left = 0
+        self._ho_mute_j = int(joint)
+        self._ho_mute_left = max(self._ho_mute_left, ticks)
 
     def _sc_take_baseline(self):
         """The escape rule's baseline, once per active period (cold): every pair already within the monitor margin

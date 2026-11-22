@@ -182,6 +182,23 @@ def blend_problem(cmd: str, options: "MotionOptions") -> str | None:
     return None
 
 
+def profile_option_problem(cmd: str, options: "MotionOptions") -> str | None:
+    """Why this move's options do not fit its profile, or None (review M8 / F14, 2026-11-22): the planner refused
+    `jerk` on a profile other than ruckig and `ramp_fraction` on one other than trapezoid only while planning — the
+    move failed PLAN_FAIL and aborted the program. The executor refuses them before anything is queued (BAD_OPTIONS).
+    A pause and the gripper commands time no path, so they are never judged."""
+    if cmd == "delay" or cmd in ("open_gripper", "close_gripper", "move_gripper"):
+        return None
+    profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
+    if options.jerk is not None and profile != "ruckig":
+        return (f"jerk only applies to profile='ruckig' (the only jerk-limited profile); this move has "
+                f"profile='{profile}'")
+    if options.ramp_fraction is not None and profile != "trapezoid":
+        return (f"ramp_fraction only applies to profile='trapezoid' (its accelerate / cruise split); this move has "
+                f"profile='{profile}'")
+    return None
+
+
 SUPPORTED_BLEND_CONTINUITY = ("c1", "c2")
 
 
@@ -332,10 +349,21 @@ class MotionOptions:
                 updates[key] = str(value).strip().lower()
             elif key in ("speed", "accel", "jerk"):
                 updates[key] = _percent(key, value)
-            elif key in ("duration", "blend"):
-                updates[key] = float(value)
+            elif key == "duration":
+                updates[key] = float(value)            # its rule is the planner's: INVALID_DURATION, one code for all
+            elif key == "blend":
+                b = float(value)
+                if not (math.isfinite(b) and b >= 0.0):
+                    # review M8, 2026-11-22: NaN or a negative blend was "no blend" without a word, infinity the
+                    # largest blend
+                    raise ValueError(f"blend must be a finite number, 0 or more (0 = no blend); got {value!r}")
+                updates[key] = b
             elif key == "samples":
-                updates[key] = int(value)
+                s = float(value)
+                if not (math.isfinite(s) and s == int(s)):
+                    # review M8, 2026-11-22: 2.7 was cut to 2, infinity escaped as an internal error
+                    raise ValueError(f"samples must be a whole number; got {value!r}")
+                updates[key] = int(s)
             elif key == "dry_run":
                 updates[key] = _parse_bool(value)
             elif key == "blend_continuity":

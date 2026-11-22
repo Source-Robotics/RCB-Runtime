@@ -200,6 +200,7 @@ def main() -> int:
     if not policy["enabled"]:
         logger.info("self-collision checking is OFF in config/system.xml — idling")
         while not _stop:
+            rti["sc_heartbeat"][0] += 1.0      # 1 Hz: the supervisor's hang check (review I4); RTI ignores it when off
             time.sleep(1.0)
         return 0
 

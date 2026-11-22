@@ -154,6 +154,12 @@ class SoundPlayer:
         self.settings = dict(settings)
         self.queue: deque = deque()
         self.on_q = False         # the last tune went out on q (a joint torque): silence_torque() stops it
+        # Told (node, seconds) when a tune goes out on q (RTI: SafetyMonitor.mute_hold_osc — review C19, 2026-11-22:
+        # the tune's swinging current read as a joint buzzing while holding).
+        self.on_q_tune = None
+        # node -> that drive's own current limit, mA (RTI: the robot XML's <Ilim> per joint, the gripper's): a tone never
+        # asks more (2026-11-22; J6's limit is 1200 mA). {} = no clamp.
+        self.max_ma: dict = {}
 
     @property
     def node(self) -> int:
@@ -167,6 +173,8 @@ class SoundPlayer:
         """Queue a tune [(Hz, ms)] on the playing drive: its sound voltage cap and axis (parameters 81, 82; `axis`
         None = the settings' — the robot's own sounds), its queue cleared, the notes, a silence, play."""
         n, current = self.node, int(self.settings.get("current_ma", 250))
+        if n in self.max_ma:
+            current = min(current, int(self.max_ma[n]))
         ax = self.settings.get("axis", "q") if axis is None else axis
         # A new tune REPLACES what still waits (2026-11-18 review S2): the queue never grows past one tune — a program
         # beeping in a loop queued thousands of frames, played them for a minute and starved RTI's other polls.
@@ -179,6 +187,16 @@ class SoundPlayer:
             self.queue.append(("event", n, hz, current if hz else 0, ms))
         self.queue.append(("event", n, 0.0, 0, 0))
         self.queue.append(("play", n))
+        if self.on_q and self.on_q_tune is not None:
+            self.on_q_tune(n, sum(ms for _, ms in events) / 1000.0)
+
+    def silence(self) -> None:
+        """A Stop, a Disable or an error latching (2026-11-22, the user's stop_sound decision (b): they silence a
+        playing tune — no command of its own): what waits is dropped and one clear frame stops the playing drive,
+        whatever the axis. An error's own tune is queued after it."""
+        self.queue.clear()
+        self.queue.append(("clear", self.node))
+        self.on_q = False
 
     def silence_torque(self) -> None:
         """Before a move (EXEC / JOG / RTI / SOFT_RTI, whose contact checks read the motor current): a tune that went

@@ -78,6 +78,7 @@ from utility.haptic_walls import (damping_ratio_window, effective_inertia_range,
                                   make_effective_inertia, resolve_joint_walls, wall_dynamics_limits, walls_public)
 from motion.exec_commands import (
     DEFAULT_PROFILE, MotionOptions, QueuedCommand, blend_problem, normalize_profile_name, normalize_ik_solver_name,
+    profile_option_problem,
 )
 from motion.ik_config import DEFAULT_FK_JACOBIAN_BACKEND
 from utility.activity_log import get_exec_activity_logger, log_activity, note_origin, origin_of
@@ -756,6 +757,7 @@ RTI_ANSWER_CODES = {
     "hall_check": ("HALL_CHECK_REFUSED",),
     "home": ("MODE_REJECTED",),
     "identify_arm": ("RTI_REFUSED",),
+    "jog": ("RTI_REFUSED",),                    # a malformed jog or one outside JOG (review C20 / F10, 2026-11-22)
     "joint_test": ("JOINT_TEST_REFUSED",),
     "play_sound": ("RTI_REFUSED",),
     "play_tune": ("RTI_REFUSED",),
@@ -782,7 +784,9 @@ RTI_ANSWER_CODES = {
     "set_completion_policy": ("RTI_REFUSED",),
     "set_gripper": ("RTI_REFUSED",),
     "set_gripper_ctrl_mode": ("RTI_REFUSED",),
+    "set_jog_accel": ("RTI_REFUSED",),          # not one number (review C20 / F10, 2026-11-22)
     "set_jog_control_mode": ("RTI_REFUSED",),
+    "set_jog_jerk_factor": ("RTI_REFUSED",),    # not a number (review C20 / F10, 2026-11-22)
     "set_jog_profile": ("RTI_REFUSED",),
     "set_joint_wall": ("RTI_REFUSED",),
     "set_log_level": ("RTI_REFUSED",),
@@ -919,6 +923,31 @@ def _reject_unsupported_per_command_options(option_overrides):
     raise ValueError(details)
 
 _CURVE_COMMANDS = ("move_arc", "move_circle", "move_spline")     # and their relative forms (prefix match)
+_POSE_ARG_COMMANDS = ("move_pose", "move_linear", "move_linear_rel_world", "move_linear_rel_tool")
+
+
+def _queued_args_problem(cmd, args):
+    """Why a queued move's values cannot be planned, or None (review M8 / F14, 2026-11-22): too few values, or one that
+    is no finite number, failed only while planning — PLAN_FAIL, and the program aborted. Refused here (BAD_ARGS),
+    nothing queued. More values than needed are ignored, as the planner always did. The curves and delay check their
+    own values in the planner (BAD_ARGUMENTS / INVALID_DURATION)."""
+    if cmd == "move_joints":
+        need, what = JOINT_NUM, f"{JOINT_NUM} joint angles in degrees"
+    elif cmd in _POSE_ARG_COMMANDS:
+        need, what = 6, "a pose: x, y, z in metres and rx, ry, rz"
+    else:
+        return None
+    if not isinstance(args, (list, tuple)) or len(args) < need:
+        got = f"{len(args)} value(s)" if isinstance(args, (list, tuple)) else repr(args)
+        return f"{cmd} needs {what}; got {got}"
+    for v in args[:need]:
+        try:
+            ok = not isinstance(v, bool) and math.isfinite(float(v))
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            return f"{cmd}: {v!r} is not a finite number ({what})"
+    return None
 
 
 def _build_queued_command(cid, cmd, args, option_overrides):
@@ -930,6 +959,8 @@ def _build_queued_command(cid, cmd, args, option_overrides):
         defaults = replace(defaults, blend=0.0)
     options = MotionOptions.from_dict(option_overrides, defaults)
     problem = blend_problem(cmd, options)      # review M2 (2026-11-19): a blend the profile cannot do -> BAD_OPTIONS
+    if problem is None:
+        problem = profile_option_problem(cmd, options)    # review M8 / F14 (2026-11-22): jerk / ramp_fraction
     if problem is not None:
         raise ValueError(problem)
     return QueuedCommand.build(cid, _next_command_seq(), cmd, args, options)
@@ -946,6 +977,19 @@ def _ik_solver_status_fields():
     except ValueError:
         engine = raw
     return engine, DEFAULT_FK_JACOBIAN_BACKEND
+
+
+_recipes_cache = {"at": float("-inf"), "names": []}
+RECIPES_REREAD_S = 1.0
+
+
+def _recipe_names_cached():
+    """_recipe_names() for the status, re-read at most every RECIPES_REREAD_S (review §6, 2026-11-22: the watcher builds
+    the status 50 times a second and globbed the folder every time). A dropped-in recipe shows within a second."""
+    now = time.monotonic()
+    if now - _recipes_cache["at"] >= RECIPES_REREAD_S:
+        _recipes_cache["names"], _recipes_cache["at"] = _recipe_names(), now
+    return _recipes_cache["names"]
 
 
 def _recipe_names():
@@ -967,12 +1011,23 @@ def _recipe_names():
         return []
 
 
-def _error_details():
-    """The latched errors with what a program needs to show its user (2026-10-15): [{"key", "number", "title",
-    "level", "since"}], newest last; [] when clean. The catalog's number and title by the key's code (a "J3:" / "Z_x:"
-    prefix stripped); `since` the epoch time it latched. Never raises (a status push must not fail on it)."""
+def _error_list():
+    """The latched error list as RTI published it (error_state's JSON), [] when clean or unreadable — read ONCE per status
+    (review §6, 2026-11-22: _error_keys and _error_details each parsed it, twice per watcher pass)."""
     try:
         data = shared_data.error_state.get_json()
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _error_details(data=None):
+    """The latched errors with what a program needs to show its user (2026-10-15): [{"key", "number", "title",
+    "level", "since"}], newest last; [] when clean. The catalog's number and title by the key's code (a "J3:" / "Z_x:"
+    prefix stripped); `since` the epoch time it latched. Never raises (a status push must not fail on it). `data`: the
+    list _error_list() read (read here when None)."""
+    try:
+        data = _error_list() if data is None else data
         if data in (None, "NONE", []):
             return []
         out = []
@@ -987,15 +1042,15 @@ def _error_details():
         return []
 
 
-def _error_keys():
+def _error_keys(data=None):
     """Active error keys from shared memory, e.g. ["RTI_LINK_LOST"]. [] when clean.
 
     error_state is a SharedString holding the JSON the GUI's Errors tab renders; we forward
     only the keys, which are self-describing and compact. Never raises — a status push must
-    not fail because an error report was malformed.
+    not fail because an error report was malformed. `data`: the list _error_list() read (read here when None).
     """
     try:
-        data = shared_data.error_state.get_json()
+        data = _error_list() if data is None else data
         if data in (None, "NONE", []):
             return []
         return [e["key"] for e in data if isinstance(e, dict) and "key" in e]
@@ -1223,13 +1278,16 @@ def _handle_reload_zones(args, cid, conn):
         _log_exec_reject(cid, "ZONE_CONFIG", str(e), command="reload_zones")
         return reply(conn, {"id": cid, "status": "error", "code": "ZONE_CONFIG",
                             "message": f"{e} — the zones in force are unchanged"})
-    _zone_setup = setup
-    if _planner is not None:
-        _planner.set_zones(setup["zones"], setup["tool_spheres"])
     # The parsed, validated setup travels WITH the command (2026-10-04): RTI rebuilds its zones from it
     # (config.xml_parser.zone_setup_from_wire) and reads no file in its loop.
-    if _answered(conn, cid, "reload_zones", {"msg": "reload_zones", "setup": zones_summary(setup)},
-                 data=zones_summary(setup)):
+    refusal = ask_rti({"msg": "reload_zones", "setup": zones_summary(setup)}, cid)
+    if refusal is None:
+        # Taken here only once RTI took them, before the reply (review C20 / 13, 2026-11-22): the planner planned with
+        # zones RTI had refused, so the two judged moves by different zones).
+        _zone_setup = setup
+        if _planner is not None:
+            _planner.set_zones(setup["zones"], setup["tool_spheres"])
+    if _reply_answer(conn, cid, "reload_zones", refusal, zones_summary(setup)):
         logger.info(f"zones reloaded: cell '{setup['cell']}', "
                     f"{sum(z['enabled'] for z in setup['zones'])} of {len(setup['zones'])} zones enabled")
 
@@ -1838,6 +1896,8 @@ def _handle_set_sound(args, cid, conn):
         if isinstance(d, bool) or not isinstance(d, (int, float)) or not (d == int(d) and 1 <= d <= n_drives):
             return _bad_args(cid, conn, "set_sound", f"set_sound: drive is 1-{n_drives} (1 is J1), not {d!r}")
         args = {("node" if k == "drive" else k): (int(v) - 1 if k == "drive" else v) for k, v in args.items()}
+    # RTI also clamps each drive's tone current to that drive's own current limit (2026-11-22). Higher caps wait for
+    # a listening test and a temperature check per joint (the user, 2026-11-22).
     bounds = {"current_ma": (10, 1000), "node": (0, n_drives - 1), "limit_mv": (500, 6000)}
     for key, value in args.items():
         if key not in SETTINGS:
@@ -2063,11 +2123,18 @@ def _handle_set_joint_wall(args, cid, conn):
                    f"model) — nothing changed")
             _log_exec_reject(cid, "WALL_OFF", msg, command=_fmt_command("set_joint_wall", args))
             return reply(conn, {"id": cid, "status": "error", "code": "WALL_OFF", "message": msg})
+        before = _walls["specs"]
         _walls["specs"] = specs
         waiter = _ask_rti({"msg": "set_joint_walls", "specs": specs}, cid)      # answered outside the walls lock
         data = _walls_reply(specs)
     if _reply_answer(conn, cid, "set_joint_wall", _rti_answer(waiter), data):
         logger.info(f"J{joint} freedrive wall set live: {spec}")
+    else:
+        # RTI did not take it: the executor keeps what RTI holds (review C20 / 13, 2026-11-22 — the refused wall stayed
+        # here, and the next save_joint_walls wrote it to the robot XML). Unless a newer change came meanwhile.
+        with _walls_lock:
+            if _walls["specs"] is specs:
+                _walls["specs"] = before
 
 
 def _handle_save_joint_walls(args, cid, conn):
@@ -2166,10 +2233,13 @@ def _handle_set_completion_policy(args, cid, conn):
 
 
 def _handle_clear_errors(args, cid, conn):
-    """Clear RTI's error latch AND the motion abort: one recovery path for both."""
-    if _planner is not None:
+    """Clear RTI's error latch AND the motion abort: one recovery path for both. The abort is cleared only once RTI
+    took the clear, before the reply (review C20 / 13, 2026-11-22: a refused clear left motion un-aborted here while
+    RTI kept its errors)."""
+    refusal = ask_rti("clear_errors", cid)
+    if refusal is None and _planner is not None:
         _planner.clear_abort()
-    _answered(conn, cid, "clear_errors", "clear_errors")
+    _reply_answer(conn, cid, "clear_errors", refusal)
 
 
 # Commands that take RTI out of EXEC (RTI.py: disable -> IDLE, home -> HOMING, the rest by name).
@@ -2739,6 +2809,9 @@ def _forward_fmt(prefix, cmd_name, argc, checks=None):
             msg = f"{cmd_name} needs {argc} arg(s), got {len(args)}"
             _log_exec_reject(cid, "BAD_ARGS", msg, command=cmd_name)
             return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
+        # The activity log names the command as the program sent it (2026-11-22, protocol 4): it showed RTI's converted
+        # values — jog(1, -1, 20) appeared as jog(0, -1, 0.2), joint 0 at a fraction, contradicting the API.
+        sent = list(args)
         if checks:
             try:
                 args = [chk(a) for chk, a in zip(checks, args)]
@@ -2747,7 +2820,7 @@ def _forward_fmt(prefix, cmd_name, argc, checks=None):
                 _log_exec_reject(cid, "BAD_ARGS", msg, command=cmd_name)
                 return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": msg})
         rti_msg = ":".join([prefix] + [str(a) for a in args])
-        _answered(conn, cid, _fmt_command(cmd_name, args), rti_msg)
+        _answered(conn, cid, _fmt_command(cmd_name, sent), rti_msg)
     return handler
 
 
@@ -3009,7 +3082,13 @@ def _handle_rti_connect(args, cid, conn):
     """rti_connect [pc_ip, rate or "", transport] — refused while a PC drives the arm (2026-10-24: it dropped the
     claim and held the measured pose at once, a hard stop from speed) and from the other RTI mode (RTI refused that
     mode change, but the pairing changed anyway). The protocol rule already limits it to IDLE / RTI / SOFT_RTI."""
-    want = "SOFT_RTI" if len(args) >= 2 and str(args[1]).strip() else "RTI"
+    # The mode follows the rate as the forwarder reads it (review C20 / 16, 2026-11-22): a JSON null rate was SOFT_RTI
+    # here (str(None) is "None") and hard RTI when forwarded. A rate it cannot read is refused there (BAD_ARGS).
+    try:
+        rate = _arg_opt_rate(args[1]) if len(args) >= 2 else ""
+    except ValueError:
+        rate = ""
+    want = "SOFT_RTI" if rate else "RTI"
     # A session that is stopping (after rti_release(), RTIClient.stop() or a lost link) ends by itself within its
     # braking + hold: wait for it rather than refuse (2026-10-25: api_tests/41 re-paired right after a release and was
     # refused). Only control that is still ACTIVE refuses at once.
@@ -3248,7 +3327,9 @@ def handle_immediate(cmd, msg, cid, conn):
     # the connection — and with it control — instead of answering (a raw client's text where a number belongs).
     try:
         handler(args, cid, conn)
-    except (TypeError, ValueError, IndexError, KeyError) as e:
+    except (TypeError, ValueError, IndexError, KeyError, OverflowError) as e:
+        # OverflowError (review C20 / 17, 2026-11-22): int(float("inf")) in a whole-number argument answered INTERNAL
+        # with a traceback in the log.
         why = f"{cmd}: an argument could not be read ({type(e).__name__}: {e})"
         _log_exec_reject(cid, "BAD_ARGS", why, command=_fmt_command(cmd, args if isinstance(args, list) else [args]))
         reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": why})
@@ -3365,6 +3446,7 @@ def current_status():
     policy_idx = int(shared_data.rti["exec_completion_policy_idx"][0])
     if policy_idx < 0 or policy_idx >= len(_COMPLETION_POLICY_NAMES):
         policy_idx = 1
+    errors_now = _error_list()          # once per status, for "errors" and "error_details" (review §6)
     evt = {
         "type": "status",
         # The runtime and the protocols' versions (versioning V3). In EVERY status message, the snapshot a client gets
@@ -3395,10 +3477,10 @@ def current_status():
         # RTI command timeout all present as "the robot stopped talking". A named error
         # field in the published state is what makes them distinguishable.
         # Push-on-change, so this costs nothing while nothing is wrong.
-        "errors": _error_keys(),
+        "errors": _error_keys(errors_now),
         # ...and for each one the catalog's number and title, its level and when it latched (2026-10-15): a program
         # shows "2103 Drive watchdog tripped (J3:WATCHDOG)" instead of a bare key; robot.errors() returns this list.
-        "error_details": _error_details(),
+        "error_details": _error_details(errors_now),
         # Why queued motion is being refused, if it is: {cid, code, message} of the failure that
         # aborted the program, or None. Cleared by clear_errors.
         "motion_aborted": _planner.abort_info() if _planner is not None else None,
@@ -3413,7 +3495,7 @@ def current_status():
         # ones rather than guessing — and knowing the ACTIVE one is what tells a remote
         # operator why a tag they expected is missing from their packets.
         "recipe": shared_data.active_recipe.get(),
-        "recipes": _recipe_names(),
+        "recipes": _recipe_names_cached(),
         # The two freedrive switches (IDLE): gravity comp (the arm floats) and friction compensation on top of it.
         "gravity_comp": bool(shared_data.rti["gravity_comp_enabled"][0] > 0.5),
         "friction_comp": bool(shared_data.rti["friction_comp_enabled"][0] > 0.5),
@@ -3505,6 +3587,9 @@ def status_watcher():
     errors = _LoopErrors(log_status, "the status watcher")    # review D11: never ends the thread
     log_status.info(f"watcher running ({STATUS_POLL_HZ:.0f} Hz check, push-on-change)")
     while True:
+        # The supervisor's hang check (review I4, 2026-11-22): this loop's beat. exec_heartbeat is a thread of its own
+        # that beats while this one is stuck (a client's send, a lock).
+        shared_data.rti["exec_watch_beat"][0] += 1.0
         try:
             _note_rti_tick()
             evt = current_status()
@@ -3694,6 +3779,10 @@ def _submit_queued(cmd, args, msg, cid, conn):
         if problem is not None:
             _log_exec_reject(cid, problem[0], problem[1], command=_fmt_command(cmd, args))
             return reply(conn, {"id": cid, "status": "error", "code": problem[0], "message": problem[1]})
+    problem = _queued_args_problem(cmd, args)
+    if problem is not None:
+        _log_exec_reject(cid, "BAD_ARGS", problem, command=_fmt_command(cmd, args))
+        return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS", "message": problem})
     aborted = _planner.abort_info() if _planner is not None else None
     if aborted is not None:
         why = (f"motion is aborted: command {aborted['cid']} failed ({aborted['code']})"
@@ -3727,9 +3816,26 @@ def _submit_queued(cmd, args, msg, cid, conn):
                           command=_fmt_command(cmd, args))
         return reply(conn, {"id": cid, "status": "error", "code": "QUEUE_FULL",
                             "message": f"motion queue full (max {MOTION_QUEUE_MAXSIZE})"})
-    reply(conn, {"id": cid, "status": "queued", "seq": queued.seq})
+    ack = {"id": cid, "status": "queued", "seq": queued.seq}
+    note = _speed_cap_note(cmd, queued.options)
+    if note:
+        ack["note"] = note
+    reply(conn, ack)
     log_activity(_exec_activity_logger, "EXEC", "info", "CMD_QUEUED", id=cid,
-                 command=_fmt_command(cmd, args))
+                 command=_fmt_command(cmd, args), message=note)
+
+
+def _speed_cap_note(cmd, options):
+    """A Cartesian move asked faster than the planner's Cartesian cap (TrajectoryPlanner.CARTESIAN_MOVE_MAX_SPEED_SCALE,
+    20 %): said in the reply's "note" and the activity log (review M7, 2026-11-22: speed=100 ran at 20 % with nothing
+    saying so). None otherwise."""
+    if not cmd.startswith(("move_linear", "move_arc", "move_circle", "move_spline")):
+        return None
+    cap = 100.0 * TrajectoryPlanner.CARTESIAN_MOVE_MAX_SPEED_SCALE
+    asked = 100.0 if options.speed is None else float(options.speed)
+    if asked <= cap + 1e-9:
+        return None
+    return f"speed {asked:g} % is capped to {cap:g} %: moves along a Cartesian path run at most {cap:g} % for now"
 
 
 def handle_client(conn, addr):

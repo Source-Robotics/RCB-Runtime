@@ -429,6 +429,12 @@ CATALOG = {
                                 "This is an internal planner check.", _MOVE,
                                 "Lower the move's speed or acceleration, or use another profile. Report it if it "
                                 "repeats."),
+    # Review M7 (2026-11-22): every lane had an acceleration backstop, none a speed one.
+    "VELOCITY_LIMIT_VIOLATION": _e(5013, "Planned speed over its limit",
+                                   "The planned trajectory would drive a joint faster than its speed limit. This is "
+                                   "an internal planner check; nothing was sent.", _MOVE,
+                                   "Lower the move's speed, or move the tool away from a singularity (a wrist "
+                                   "stretched straight). Report it if it repeats."),
     "DURATION_INFEASIBLE": _e(5010, "Requested duration too short",
                               "The move cannot be done in the requested duration within the limits.", _MOVE,
                               "Ask for a longer duration (the message gives the shortest possible), or leave the "
@@ -655,6 +661,13 @@ CATALOG = {
                            _WARN,
                            "Free space: run the disk cleanup tool (it removes old editor caches and installers), "
                            "delete old recordings in the Recordings tab, or move large files off the Pi."),
+    # Review I4 (2026-11-22, the user: detect and show it, restart nothing): supervisor/hang_check.py.
+    "PROCESS_HUNG_WARNING": _e(8004, "Program not responding",
+                               "A program of the robot software is still running but has stopped working: its sign "
+                               "of work has not moved for longer than its limit. The error names the program.",
+                               _WARN + " The program is not restarted on its own.",
+                               "Make the arm safe, then restart the named program from the control box menu, or "
+                               "restart the robot service. If it happens again, send the logs."),
     "LOOP_CRITICAL": _e(8002, "Control loop critically slow",
                         "RTI's control loop was critically slow: its period stayed over 1.5 times nominal for a "
                         "second, or one tick took over 3 times nominal.", _HARD,

@@ -55,6 +55,11 @@ RECORDINGS_BUDGET_BYTES = 500_000_000
 # 2026-10-24 and was at 99 % on 2026-11-20, with nothing saying so unless the health card was open.
 DISK_LOW_BYTES = 500_000_000
 DISK_OK_BYTES = 550_000_000
+# logs/ together (review I6, the user 2026-11-21: "(b)", a total budget like the recordings'): each log rotates on its
+# own size (Python's handlers, copy_truncate, rotate_by_size), but nothing bounded the folder — 9 rotating files of up
+# to 5 x 10 MB each. Over it, the supervisor deletes the oldest ROTATED copies (<name>.N) first, never a live log.
+LOGS_BUDGET_BYTES = 300_000_000
+_ROTATED_COPY = re.compile(r"\.log\.\d+$")
 _RUN_STAMP = re.compile(r"^(?:[a-z]+_)?(\d{8}_\d{6})")
 
 def _shift(path, keep):
@@ -177,6 +182,37 @@ def enforce_budget(root, budget_bytes=RECORDINGS_BUDGET_BYTES, names=RECORDING_D
                 pass
         total -= run["bytes"]
         deleted.append(run["key"])
+    return before, total, deleted
+
+
+def enforce_logs_budget(logs_dir, budget_bytes=LOGS_BUDGET_BYTES) -> tuple:
+    """Delete the oldest rotated log copies (<name>.log.N, by modification time) until `logs_dir`'s files together use
+    at most `budget_bytes`. A live log (no .N) is never deleted: when the live ones alone are over, it stops at the
+    last copy. Returns (bytes before, bytes after, [deleted file names]). Never raises."""
+    try:
+        entries = [e for e in os.scandir(logs_dir) if e.is_file(follow_symlinks=False)]
+    except OSError:
+        return 0, 0, []
+    sizes, copies = {}, []
+    for e in entries:
+        try:
+            st = e.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        sizes[e.path] = st.st_size
+        if _ROTATED_COPY.search(e.name):
+            copies.append((st.st_mtime, e.path, e.name))
+    before = total = sum(sizes.values())
+    deleted = []
+    for _, path, name in sorted(copies):
+        if total <= budget_bytes:
+            break
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        total -= sizes[path]
+        deleted.append(name)
     return before, total, deleted
 
 

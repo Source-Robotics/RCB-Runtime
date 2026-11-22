@@ -115,16 +115,34 @@ def _open_gpio_chip():
 
     seen = set()
     errors = []
+    explicit = os.getenv("RCB_GPIO_CHIP")
     for chip in _candidate_gpio_chips():
         if chip in seen:
             continue
         seen.add(chip)
         try:
-            _gpio_handle = lgpio.gpiochip_open(chip)
-            _gpio_chip = chip
-            return
+            handle = lgpio.gpiochip_open(chip)
         except Exception as exc:
             errors.append(f"gpiochip{chip}: {exc}")
+            continue
+        # Only the 40-pin header's controller (review D15's leftover, 2026-11-22): any chip 0-3 that opened was taken,
+        # so the E-stop and the outputs could be read / driven on another controller's lines. The header's is a
+        # "pinctrl-*" chip with GPIO 0-27 (the Pi 5: gpiochip4 "pinctrl-rp1", 54 lines). A chip named in
+        # RCB_GPIO_CHIP is taken as it is (its label logged).
+        try:
+            _, lines, _, label = lgpio.gpio_get_chip_info(handle)
+        except Exception:  # noqa: BLE001 — no info: judged by the name alone below
+            lines, label = 0, ""
+        if explicit is None and not (str(label).startswith("pinctrl-") and int(lines) >= 28):
+            errors.append(f"gpiochip{chip}: '{label}' with {lines} lines is not the 40-pin header's controller")
+            try:
+                lgpio.gpiochip_close(handle)
+            except Exception:  # noqa: BLE001  # nosec B110 — a refused chip that will not close: the next one is tried
+                pass
+            continue
+        _gpio_handle, _gpio_chip = handle, chip
+        logger.info(f"GPIO: gpiochip{chip} '{label}' ({lines} lines)")
+        return
 
     raise RuntimeError("Unable to open a GPIO chip for RCB I/O: " + "; ".join(errors))
 

@@ -403,7 +403,7 @@ _GRIPPER_MOTOR_ERROR_FIELDS = (
 
 def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
                            loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings=(),
-                           config_warnings=(), estop_channel_fault=False, disk_low=False):
+                           config_warnings=(), estop_channel_fault=False, disk_low=False, process_hung=()):
     """E-STOP, the EXEC / RTI link watchdogs, RT loop health and the safety monitor's events. The caller
     pre-computes every flag; this only turns them into keys."""
     # ------------------------------------------------------------------
@@ -419,6 +419,9 @@ def _collect_system_errors(shared_data, current_errors, estop_active, exec_link_
     # The SD card nearly full (review I6, 2026-11-20): the supervisor's flag; a live warning, gone when space is freed
     if disk_low:
         current_errors.add("DISK_LOW_WARNING")
+    # A program stuck but alive (review I4, 2026-11-22): the supervisor's flag as keys, P_<NAME>:PROCESS_HUNG_WARNING
+    if process_hung:
+        current_errors.update(process_hung)
 
     # ------------------------------------------------------------------
     # EXEC control-link lost — command_executor went silent while EXEC motion
@@ -618,6 +621,7 @@ def check_errors(
     config_warnings=(),
     estop_channel_fault: bool = False,
     disk_low: bool = False,
+    process_hung: tuple = (),
 ) -> tuple:
     """
     Inspect all error sources and update the latched error set.
@@ -633,6 +637,8 @@ def check_errors(
                             stays independent of the GPIO import.
         estop_channel_fault: Result of gpio_handler.estop_channel_fault() (review D15): ESTOP_CHANNEL_FAULT.
         disk_low:           The supervisor's rti['disk_low'][0] (review I6): DISK_LOW_WARNING.
+        process_hung:       P_<NAME>:PROCESS_HUNG_WARNING keys of the programs the supervisor finds stuck (review
+                            I4; rti['process_hung'], read by RTI).
         active_CAN_gripper: 1 if a CAN gripper is configured, 0 if not.
         driver_faults:      False = the faults the motor drivers and the gripper REPORT are not read (connection
                             losses, the E-stop, the monitor and every system error still are). RTI passes False
@@ -648,7 +654,7 @@ def check_errors(
     current_errors = set()
     _collect_system_errors(shared_data, current_errors, estop_active, exec_link_lost, rti_link_lost, rti_errors,
                            loop_degraded, loop_critical, monitor_errors, monitor_warnings, can_warnings,
-                           config_warnings, estop_channel_fault, disk_low)
+                           config_warnings, estop_channel_fault, disk_low, process_hung)
     if driver_faults:
         _collect_motor_errors(shared_data, joint_num, current_errors)
     _collect_can_errors(shared_data, joint_num, current_errors)
@@ -848,10 +854,10 @@ def _update_error_metadata(shared_data, latched_errors, error_metadata, details=
                            else f"{short_key}: {reason}")
         level = "warning" if short_key in _WARNING_SUFFIXES else "error"
         error_metadata[key] = {"timestamp": now, "tick": tick, "description": description, "level": level}
-        # Activity log — debounced per-code so a flapping/marginal fault can't
-        # spam the file (design doc §4). joint_idx folded into `message` since
-        # `code` in the catalog is the short_key, not the "J{i}:KEY" form.
-        if _activity_rate_limiter.allow(short_key, _ACTIVITY_MIN_INTERVAL):
+        # Activity log — debounced per error (the full "J{i}:KEY") so a flapping/marginal fault can't spam the file
+        # (design doc §4); per code it was, so six joints latching one code made one entry (review C20 / F9,
+        # 2026-11-22). joint_idx folded into `message` since `code` in the catalog is the short_key.
+        if _activity_rate_limiter.allow(key, _ACTIVITY_MIN_INTERVAL):
             joint_msg = _where(key)
             if reason:
                 joint_msg = f"{joint_msg}: {reason}" if joint_msg else reason
@@ -861,11 +867,15 @@ def _update_error_metadata(shared_data, latched_errors, error_metadata, details=
         # The clear, too (2026-10-15): same code as the latch, level info, so the activity log shows how long a
         # fault lasted — a warning that clears itself, or the operator's Clear Errors. Debounced like the latch.
         short_key = key.split(":", 1)[-1]
-        if _activity_rate_limiter.allow(short_key + "/cleared", _ACTIVITY_MIN_INTERVAL):
+        if _activity_rate_limiter.allow(key + "/cleared", _ACTIVITY_MIN_INTERVAL):
             where = _where(key)
             log_activity(get_rti_activity_logger(), "RTI", "info", short_key,
                          message=f"{where}: cleared" if where else "cleared")
     return error_metadata_changed
+
+
+_PROGRAM_WORDS = {"EXECUTOR": "the executor", "SELF_COLLISION": "the self-collision worker", "RECORDER": "the recorder",
+                  "DASHBOARD": "the dashboard"}
 
 
 def _where(key):
@@ -876,6 +886,9 @@ def _where(key):
         return f"joint {key.split(':')[0][1:]}"
     if key.startswith("Z_") and ":" in key:
         return f"zone {key.split(':')[0][2:]}"
+    if key.startswith("P_") and ":" in key:          # a program (review I4): P_RECORDER:PROCESS_HUNG_WARNING
+        name = key.split(":")[0][2:]
+        return _PROGRAM_WORDS.get(name, f"the {name.lower()}")
     return None
 
 
@@ -922,6 +935,7 @@ def process_errors_tick(
     config_warnings=(),
     estop_channel_fault: bool = False,
     disk_low: bool = False,
+    process_hung: tuple = (),
 ) -> tuple:
     """Run one tick of error processing in the RTI superloop.
 
@@ -982,6 +996,7 @@ def process_errors_tick(
         config_warnings=config_warnings,
         estop_channel_fault=estop_channel_fault,
         disk_low=disk_low,
+        process_hung=process_hung,
     )
     shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
     # rti['safety_violation'] (the status event's "safety" field) finally means something: 1 while
