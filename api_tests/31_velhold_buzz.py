@@ -135,7 +135,7 @@ def main():
             except ValueError:
                 print(f"ABORT: --set-gains wants KPV,KIV,KPIQ, got {a.set_gains!r}")
                 return 1
-            robot.set_pid_gains(j, KPV=kpv, KIV=kiv, KPIQ=kpiq)
+            robot.set_pid_gains(j + 1, KPV=kpv, KIV=kiv, KPIQ=kpiq)
             held = (kpv, kiv, kpiq)
             time.sleep(1.0)
             print(f"  HOLDING gains on J{j+1} for the whole run: "
@@ -173,7 +173,7 @@ def main():
                 robot.set_gravity_comp(True); time.sleep(0.3)
                 try:
                     robot.enter_jog_mode(); time.sleep(0.3)
-                    robot.jog(j, 1, 15); time.sleep(0.35)
+                    robot.jog(j + 1, 1, 15); time.sleep(0.35)
                     robot.jog_stop(); time.sleep(0.3)
                     robot.enter_idle_mode(); time.sleep(0.3)
                 except Exception as exc:
@@ -203,7 +203,7 @@ def main():
                 print(f"  IT STILL OSCILLATES at KPV={held[0]} ({loud:.1f} deg/s).")
                 print("  These gains are not low enough, or gains are not the whole story.")
             print("=" * 92)
-            robot.set_pid_gains(j, KPV=0.015, KIV=0.0015, KPIQ=7)
+            robot.set_pid_gains(j + 1, KPV=0.015, KIV=0.0015, KPIQ=7)
             print("  stock gains restored")
             return 0 if loud < REPRO else 3
 
@@ -223,19 +223,19 @@ def main():
         if a.gains:
             print(f"\nC. VELOCITY hold with J2's gains on J{j+1} (KPV 0.010, KIV 0.0010, KPIQ 2)")
             print("   THE DISCRIMINATOR: quieter here means TUNING, not a sensor.")
-            robot.set_pid_gains(j, KPV=0.010, KIV=0.0010, KPIQ=2)
+            robot.set_pid_gains(j + 1, KPV=0.010, KIV=0.0010, KPIQ=2)
             time.sleep(1.0)
             pc = sample(a.seconds)
             result = row("velocity hold, J2 gains", *pc, watch=j)
             print(f"\nD. even softer (KPV 0.006, KIV 0.0005, KPIQ 2)")
-            robot.set_pid_gains(j, KPV=0.006, KIV=0.0005, KPIQ=2)
+            robot.set_pid_gains(j + 1, KPV=0.006, KIV=0.0005, KPIQ=2)
             time.sleep(1.0)
             pd = sample(a.seconds)
             soft = row("velocity hold, soft gains", *pd, watch=j)
         # restore
         robot.set_gravity_comp(True)
         if a.gains:
-            robot.set_pid_gains(j, KPV=0.015, KIV=0.0015, KPIQ=7)
+            robot.set_pid_gains(j + 1, KPV=0.015, KIV=0.0015, KPIQ=7)
             print("\n  gains restored (they are RAM-only and reload from the XML on boot anyway)")
         time.sleep(0.8)
 

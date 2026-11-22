@@ -23,6 +23,13 @@ from utility.drive_params import (ASKED, NO_ANSWER, NOT_READ, PID_KEYS, READ, SL
 AUTO_KEY = "rcb.driveParams.autoRead"           # the browser's localStorage key of the auto-read switch
 
 
+
+def _joint_base() -> int:
+    """1 when the loaded client counts joints from 1 (command protocol 4), else 0 — the dashboard reloads this module
+    only with a service restart, together with the client."""
+    from robotclient.version import PROTOCOL_VERSION
+    return 1 if PROTOCOL_VERSION >= 4 else 0
+
 def drives(joint_num: int, has_gripper: bool) -> list:
     """[(label, node)]: J1 .. J<n>, then the gripper (a CAN gripper only)."""
     return [(f"J{i + 1}", i) for i in range(joint_num)] + ([("Gripper", joint_num)] if has_gripper else [])
@@ -179,7 +186,8 @@ def add_drive_params_tab(shared_data, joint_num: int, has_gripper: bool, xml_cfg
         if c is None or exec_fn is None:
             return
         drive, number, value = c
-        exec_fn(lambda r: r.set_pid_gains(drive - 1, **{PID_KEYS[number]: value}), "set_pid_gains")
+        # the joint's number as the client API counts it (protocol 4: from 1, like `drive`; it was drive - 1)
+        exec_fn(lambda r: r.set_pid_gains(drive - 1 + _joint_base(), **{PID_KEYS[number]: value}), "set_pid_gains")
         reread(drive)
 
     def do_xml():

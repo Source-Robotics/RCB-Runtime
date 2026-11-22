@@ -172,7 +172,7 @@ def main():
             rti.claim()
             q0 = rti.read_once(timeout=1.0)["j_p"]
             # Every knob every case: pacing is sticky and would contaminate the next case.
-            robot.rti_set_vel_scale(cfg.get("vel_scale", 1.0))
+            robot.rti_set_vel_scale(100.0 * cfg.get("vel_scale", 1.0))   # a percent (protocol 4)
             robot.rti_set_pace(cfg.get("pace", 0.0))
             robot.rti_set_min_duration(cfg.get("min_duration", 0.0))
             robot.rti_set_servo_generator(cfg["gen"], gain=cfg.get("gain"),
@@ -201,7 +201,7 @@ def main():
             while time.monotonic() < end:
                 rti.send_joint_position(q0); time.sleep(period)
             rti.release()
-            robot.rti_set_vel_scale(1.0); robot.rti_set_pace(0.0)
+            robot.rti_set_vel_scale(100.0); robot.rti_set_pace(0.0)
             robot.rti_set_min_duration(0.0)
             robot.enter_idle_mode(); time.sleep(0.4)
 

@@ -164,11 +164,11 @@ def run(robot):
     cfg = xp.load_full_robot_config(str(sysc["robot_xml_path"]), grippers_dir=GRIPPERS_DIR,
                                     active_gripper=sysc["active_gripper"])
     gains = {k: float(cfg[f"motor_{k}"][3]) for k in ("KPP", "KPV", "KIV")}
-    robot.set_pid_gains(3, **gains)                            # index 3 = J4 (set_pid_gains is 0-based)
+    robot.set_pid_gains(4, **gains)                            # J4 (joints count from 1 since protocol 4)
     settle(0.5)
     check(f"set_pid_gains J4 {gains}: RTI takes it, no error", robot.status().get("err") == 0 and ticking())
-    for label, kw in (("joint 42", dict(joint=42, KPP=1.0)), ("gain 'kpp'", dict(joint=3, kpp=1.0)),
-                      ("KPV NaN", dict(joint=3, KPV=float("nan")))):
+    for label, kw in (("joint 42", dict(joint=42, KPP=1.0)), ("joint 0 (joints count from 1)", dict(joint=0, KPP=1.0)),
+                      ("gain 'kpp'", dict(joint=4, kpp=1.0)), ("KPV NaN", dict(joint=4, KPV=float("nan")))):
         ok, code = refused(lambda kw=kw: robot.set_pid_gains(kw.pop("joint"), **kw), "BAD_ARGS")
         check(f"set_pid_gains with {label} refused ({code})", ok, code)
 

@@ -214,7 +214,7 @@ def main():
         robot.enter_idle_mode(wait=True)
         robot.enter_jog_mode(wait=True)
         direction = int(-sign)
-        robot.jog(J, direction, 3)
+        robot.jog(J + 1, direction, 3)            # J is the 0-based index; the API counts from 1
         t_end = time.monotonic() + 3.0
         while time.monotonic() < t_end and abs(float(joints(robot)[J]) - a) < 3.0:
             time.sleep(0.02)

@@ -121,7 +121,7 @@ def read_gain_sets(xml_path, joint_num=6):
 
 def apply_gains(robot, gains):
     for j, g in enumerate(gains):
-        robot.set_pid_gains(j, **g)
+        robot.set_pid_gains(j + 1, **g)                  # the API counts joints from 1 (protocol 4)
     time.sleep(0.3)                                       # RTI reloads each joint's config on its tick
 
 
@@ -433,8 +433,8 @@ def selftest():
         def __init__(self):
             self.gains, self.comp = {}, [None, None, None]
 
-        def set_pid_gains(self, j, **g):
-            self.gains[j] = g
+        def set_pid_gains(self, joint, **g):
+            self.gains[joint - 1] = g                     # as the robot: joint 1 is index 0
 
         def set_inertia_comp(self, on):
             self.comp[0] = on

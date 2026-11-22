@@ -21,6 +21,12 @@ def drive_options(joint_num: int, has_gripper: bool) -> dict:
     return out
 
 
+def api_settings(settings: dict) -> dict:
+    """The card keeps system.xml's <sound> values, the playing drive as <node> counted from 0; set_sound takes it as
+    `drive`, 1 for J1, since command protocol 4 (2026-11-22, review P1)."""
+    return {("drive" if k == "node" else k): (int(v) + 1 if k == "node" else v) for k, v in settings.items()}
+
+
 def tune_options() -> dict:
     """{name: label} of the library's tunes, in the library's order ("ding_dong" -> "ding dong")."""
     from utility.sound import TUNES
@@ -51,7 +57,7 @@ def send_setting(state: dict, key: str, value, exec_fn) -> bool:
         return False
 
     def send(r, k=key, v=value):
-        r.set_sound(**{k: v})
+        r.set_sound(**api_settings({k: v}))
         state[k] = v
 
     exec_fn(send, "set_sound")
@@ -66,7 +72,7 @@ def send_changes(state: dict, new: dict, exec_fn) -> dict:
         sent = dict(diff)
 
         def send(r):
-            r.set_sound(**sent)
+            r.set_sound(**api_settings(sent))
             state.update(sent)
 
         exec_fn(send, "set_sound")

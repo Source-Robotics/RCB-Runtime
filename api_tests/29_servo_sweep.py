@@ -236,7 +236,7 @@ def main():
                 # EVERY knob, EVERY cell. Pacing is sticky: a cell that does not name
                 # min_duration must clear it, or it silently inherits the previous cell's
                 # and the whole comparison is contaminated.
-                robot.rti_set_vel_scale(cfg.get("vel_scale", 1.0))
+                robot.rti_set_vel_scale(100.0 * cfg.get("vel_scale", 1.0))   # a percent (protocol 4)
                 robot.rti_set_pace(cfg.get("pace", 0.0))
                 robot.rti_set_min_duration(cfg.get("min_duration", 0.0))
                 robot.rti_set_servo_generator(
@@ -271,7 +271,7 @@ def main():
                       f"peak {pk:5.2f} deg  rev {rev:5.0f}  achieved {ach:6.1f} Hz    ")
             rti.release()
             # Leave nothing sticky behind for the next rate block or the next operator.
-            robot.rti_set_vel_scale(1.0)
+            robot.rti_set_vel_scale(100.0)
             robot.rti_set_pace(0.0)
             robot.rti_set_min_duration(0.0)
             robot.enter_idle_mode()

@@ -24,8 +24,10 @@ from .exceptions import VersionMismatch, VersionWarning
 
 __version__ = "2.0.0"
 
-PROTOCOL_VERSION = 3        # the command protocol (newline JSON over TCP to the executor); 2: speeds in percent;
-                            # 3: the gripper's object codes 1 / 2 swapped their meaning
+PROTOCOL_VERSION = 4        # the command protocol (newline JSON over TCP to the executor); 2: speeds in percent;
+                            # 3: the gripper's object codes 1 / 2 swapped their meaning; 4: joint numbers count
+                            # from 1, set_sound's drive, rti_set_vel_scale in percent, motion waits unbounded
+                            # by default
 RTI_PROTOCOL_VERSION = 1    # the RTI command packet
 TELEMETRY_FORMAT = 1        # the state / telemetry packets ("tag:v,v,...")
 

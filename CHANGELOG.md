@@ -15,6 +15,9 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Added
 
+- `get_motion_settings()`: the session's speed, blend, profile, IK solver and completion policy, which every queued
+  move starts from; the status carries them as `motion_settings`, and the dashboard shows them next to the control
+  badge.
 - A new warning, `BLEND_DEGRADED` (5111): a chain of blended moves that could not be planned as one path runs its moves
   one by one, each stopping at its target — the activity log now says so and why.
 - `get_status()` and the status stream carry `rti_alive`: false once the robot's real-time loop has not ticked for
@@ -31,6 +34,22 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Changed
 
+- **Command protocol 4: joint numbers count from 1 in `jog()` and `set_pid_gains()`** (`1` is J1, as everywhere
+  else in the API, the dashboard and the error messages); `0` is refused. Add 1 to the joint number a program
+  passed. `set_sound()`'s `node` is now **`drive`**: `1` for J1 up to the last joint, one more for a CAN gripper
+  (`node=1`, J2, becomes `drive=2`). A client that speaks an older protocol is refused at `connect()`; a raw JSON
+  client must send `"protocol": 4` for these commands (`CLIENT_TOO_OLD` otherwise).
+- `rti_set_vel_scale()` takes a percent like every other share: `10` is 10 % (it was `0.1`).
+- The motion waits wait as long as the move takes by default: `wait_idle()`, `wait_motion_complete()`,
+  `wait_gripper_move_complete()`, `wait_holding_part()`, `wait_released_part()` and every move's wait in sync mode
+  (they gave up after 120 s, and a timeout of `0` also meant 120 s). `None` waits as long as it takes, a number that
+  many seconds, `0` checks once without waiting. A failed or stopped move, a lost connection or a stopped RTI still
+  ends the wait with an error. The state waits (`wait_mode()`, ...) keep their short limits.
+- The session motion settings (`set_joint_speed()`, `set_blending()`, `set_profile()`, `set_ik_solver()`,
+  `set_completion_policy()`) go back to their start values when control passes to another client or is released
+  (they outlived the program that set them and reset only on an executor restart — a gripper swap does one).
+- A joint number or an I/O pin that is not a whole number is refused (`joint_test(2.7)` tested J2); a raw client's
+  `enter_flashing_mode` takes only true / false (any other value was logged as "operator confirmed parked").
 - `autorun.service` is the only service: the `rcb-runtime.service` template and `scripts/install_service.sh` are
   removed, `install.sh` points to `sudo bash scripts/setup_system.sh`, and its check names a leftover second unit.
 - RTI's real-time priority comes from the service (`rtprio.conf`, `LimitRTPRIO=99`) only: `setup_system.sh` no longer
@@ -90,6 +109,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- The planner's `ACCEL_LIMIT_VIOLATION` named the joints from 0 (J0 for J1); it names them J1 up, like every other
+  message.
 - Blending: a move blending at speed into a move that joins a blend chain (`ruckig_corner`) stopped dead at the
   corner; it now ends at rest there.
 - Blending: a move committed a corner speed into the next one after checking only the next move's two ends. A next

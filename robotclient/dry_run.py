@@ -25,7 +25,6 @@ from utility.robot_factory import create_robot
 
 from .client import RobotClient, _pose_in, _pose_out
 from .commands import generate_id
-from .constants import DEFAULT_MOVE_TIMEOUT
 from .exceptions import CommandRejected, MotionFailed, RobotTimeout
 
 
@@ -392,7 +391,7 @@ class DryRunRobotClient(RobotClient):
         self._on_motion_error = fn
 
 
-    def _queued(self, command, args=None, timeout=DEFAULT_MOVE_TIMEOUT, options=None, gripper=False):
+    def _queued(self, command, args=None, timeout=None, options=None, gripper=False):
         del timeout, gripper          # the base client's _queued_gripper passes it (2026-10-24); nothing waits here
         command_id = generate_id()
         defaults = self._defaults
@@ -621,7 +620,15 @@ class DryRunRobotClient(RobotClient):
         self._record_immediate_event("play_sound", {"name": name, "kind": "sound"})
 
     def set_sound(self, **settings) -> None:
+        if "node" in settings:                 # as the robot: 'node' is 'drive' since command protocol 4 (1 is J1)
+            raise CommandRejected("BAD_ARGS", "set_sound: 'node' is 'drive' since command protocol 4 — 1 for J1")
         self._record_immediate_event("set_sound", {"settings": dict(settings), "kind": "sound"})
+
+    def get_motion_settings(self) -> dict:
+        """As the robot's (review P8, 2026-11-22): the session's speed, blend, profile, IK solver, completion policy."""
+        d = self._defaults
+        return {"speed": float(d.speed), "blend": float(d.blend), "profile": d.profile, "ik_solver": d.ik_solver,
+                "completion_policy": d.completion_policy}
 
     def wait(self, predicate: Callable[[dict], bool], timeout: float | None = None, what: str = 'wait') -> None:
         del timeout

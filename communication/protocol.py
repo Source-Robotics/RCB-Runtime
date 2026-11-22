@@ -23,7 +23,15 @@ functions, importable by both the executor and (later) tests without side effect
 # 3 (2026-11-19, user: "Raise the version to 3"): a gripper result's object codes 1 and 2 swapped their meaning (1 =
 # an object detected while CLOSING, 2 = while OPENING: the driver library 1.22 reads the firmware's bits right) — a
 # program testing a raw code would read the other direction silently; GripperResult.object_detected is unchanged.
-PROTOCOL_VERSION = 3
+# 4 (2026-11-22, review P1 / P8, the user: "all from 1"): every joint NUMBER counts from 1 (jog, set_pid_gains;
+# set_sound's `node` became `drive`, 1 for J1 up to the last drive), rti_set_vel_scale is a percent, and the client's
+# motion waits wait as long as it takes by default — a program written for 3 would jog the joint next to the one it
+# means.
+PROTOCOL_VERSION = 4
+
+# The commands whose arguments changed their meaning in protocol 4: a connection that declares an older protocol (or
+# none) is refused (CLIENT_TOO_OLD) rather than move or tune the joint next to the one it means.
+RENUMBERED_COMMANDS = frozenset({"jog", "set_pid_gains", "set_sound", "rti_set_vel_scale"})
 
 # The commands whose arguments carry pose ANGLES (2026-10-21, with versioning V5). Pose angles changed their meaning
 # on 2026-10-21 (R = Rx(rx) Ry(ry) Rz(rz)), and a client from before then sends no "protocol" key: the executor refuses
@@ -65,6 +73,8 @@ ALWAYS_OPEN = frozenset({
     "get_hardware",
     # Every part's version (2026-10-21): the runtime, the OS, the description package, the box, each drive.
     "get_versions",
+    # The session motion settings in force (2026-11-22, review P8): a read — moves nothing, changes nothing.
+    "get_motion_settings",
     # Every drive's parameters (2026-11-16): a read, paced in RTI's poll slot — moves nothing, changes nothing.
     "read_drive_parameters", "get_drive_parameters",
     # "Which arm is this?" (2026-11-17): a short tune through one motor — moves nothing.
@@ -177,6 +187,7 @@ COMMAND_RULES = {
     "play_sound":    (IMMEDIATE, None, None, False),
     "set_sound":     (IMMEDIATE, None, None, False),
     "get_versions":      (IMMEDIATE, None, None, False),   # utility/versions.py (2026-10-21)
+    "get_motion_settings": (IMMEDIATE, None, None, False),  # the session's speed / blend / profile / ... (review P8)
     # IK only, moves nothing — any mode, any state, homed or not (`near` defaults to the measured
     # joints, which only picks WHICH solution is returned, never whether one exists).
     "is_reachable":   (IMMEDIATE, None, None, False),

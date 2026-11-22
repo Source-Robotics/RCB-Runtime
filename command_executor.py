@@ -65,7 +65,8 @@ from config.networking import (
     ZMQ_EXEC_STATUS_SOCKET,
 )
 import config.xml_parser as read_XML2
-from communication.protocol import IMMEDIATE, POSE_COMMANDS, QUEUED, kind_of, validate, is_owned, canonical_command
+from communication.protocol import (IMMEDIATE, POSE_COMMANDS, QUEUED, RENUMBERED_COMMANDS, kind_of, validate, is_owned,
+                                    canonical_command)
 from motion.trajectory_planner import TrajectoryPlanner
 from motion.cartesian_paths import pose_from_xyz_rpy
 from utility.kinematics_backend import POSE_CONVENTION, pose_angles
@@ -174,6 +175,13 @@ _motion_defaults = MotionOptions(
     completion_policy="settled",
 )
 _defaults_lock = threading.Lock()
+# The session settings the executor starts with (review P8, 2026-11-22): set_joint_speed / set_blending / set_profile /
+# set_ik_solver / set_completion_policy are robot-wide and outlived the program that set them, shown nowhere, and reset
+# only by an executor restart (a gripper swap does one) — a program tried at 10 % ran at 100 % after a swap. Now they go
+# back to these whenever control passes to a different client or is released (the user: "a"), and get_motion_settings()
+# and the status show them.
+_MOTION_START = _motion_defaults
+_settings_owner = None          # the connection whose session settings are in force (under _owner_lock)
 _seq_lock = threading.Lock()
 _next_seq = 1
 
@@ -420,11 +428,42 @@ def control_holder():
         return _owner_label
 
 
+def _motion_settings(opts=None) -> dict:
+    """The session motion settings a program can read (review P8, 2026-11-22): speed % and blend % (set_joint_speed,
+    set_blending), the profile, the IK solver and the completion policy."""
+    o = _get_motion_defaults() if opts is None else opts
+    return {"speed": float(o.speed), "blend": float(o.blend), "profile": o.profile, "ik_solver": o.ik_solver,
+            "completion_policy": o.completion_policy}
+
+
+def _reset_motion_settings(why):
+    """Back to the settings the executor starts with — the planner's speed / blend, and RTI's completion policy when it
+    differs. Called outside _owner_lock (it sends to RTI)."""
+    global _motion_defaults
+    with _defaults_lock:
+        old = _motion_defaults
+        _motion_defaults = _MOTION_START
+    if _planner is not None:        # None until main() builds it (and in the nets that drive the executor without it)
+        _planner.set_speed(_MOTION_START.speed)
+        _planner.set_blend(_MOTION_START.blend)
+    if old.completion_policy != _MOTION_START.completion_policy:
+        send_to_rti(f"exec_completion_policy:{_MOTION_START.completion_policy}", None, "TCP")
+    if _motion_settings(old) != _motion_settings(_MOTION_START):
+        log_control.info("session motion settings back to the start values (%s): %s", why, _motion_settings())
+
+
+def _handle_get_motion_settings(args, cid, conn):
+    """get_motion_settings — the session's speed, blend, profile, IK solver and completion policy (review P8,
+    2026-11-22). Open to every client; moves nothing."""
+    reply(conn, {"id": cid, "status": "ok", "data": _motion_settings()})
+
+
 def _claim_control(conn, force=False):
     """Take or refresh ownership. Returns (ok, message_if_refused). A client that loses control here (a forced or an
     idle takeover) has its collision-detection change undone (2026-10-24), outside the lock: that sends to RTI."""
-    global _owner_conn, _owner_label, _owner_since, _owner_last
+    global _owner_conn, _owner_label, _owner_since, _owner_last, _settings_owner
     lost = None
+    reset = False
     with _owner_lock:
         if _owner_conn is not None and _owner_conn is not conn:
             if not force and not _owner_stale_locked():
@@ -441,8 +480,13 @@ def _claim_control(conn, force=False):
             _owner_label = _client_label(conn)
             _owner_since = time.monotonic()
             log_control.info("control acquired by %s", _client_origin(conn))
+            # another client's session settings stop here (review P8); the same client taking control again keeps its
+            reset = _settings_owner is not None and _settings_owner is not conn
+            _settings_owner = conn
         _owner_last = time.monotonic()
     _restore_collision(lost, "control taken over")
+    if reset:                                   # outside the owner lock: it may send to RTI
+        _reset_motion_settings(f"control passed to {_client_origin(conn)}")
     return True, None
 
 
@@ -577,14 +621,16 @@ def _await_physical_confirm(who, timeout=FORCE_CONFIRM_TIMEOUT_S, alive=None):
 
 def _release_control(conn, why):
     """Give up ownership if `conn` holds it. Safe to call for a non-holder."""
-    global _owner_conn, _owner_label
+    global _owner_conn, _owner_label, _settings_owner
     with _owner_lock:
         if _owner_conn is not conn:
             return False
         log_control.info("control released by %s (%s)", _client_origin(conn), why)
         _owner_conn = None
         _owner_label = None
+        _settings_owner = None
     _restore_collision(conn, why)           # outside the owner lock: it sends to RTI
+    _reset_motion_settings(f"control released by {_client_origin(conn)}: {why}")   # review P8 (the user: "a")
     return True
 pending_client = {}             # str(command id) -> conn (queued commands awaiting completion; review C15: the id as
                                 # text, as the planner reports it back — a numeric id was never completed)
@@ -1072,6 +1118,8 @@ def _handle_get_status(args, cid, conn):
         # here are then the last ones RTI wrote, not live.
         "rti_alive": _rti_alive(),
         "homing_question": _homing_question(),
+        # The session motion settings in force (review P8, 2026-11-22): get_motion_settings()'s answer.
+        "motion_settings": _motion_settings(),
         # The pose angles this executor parses and returns (2026-10-21: "xyz-mobile" = R = Rx(rx) Ry(ry) Rz(rz)). A block
         # program refuses an executor without it — one from before the change would read its points another way.
         "pose_angles": POSE_CONVENTION,
@@ -1778,7 +1826,19 @@ def _handle_set_sound(args, cid, conn):
     from utility.sound import SETTINGS, SWITCHES, TUNE_SETTINGS, TUNES, set_values_in_block, sound_text
     if not isinstance(args, dict) or not args:
         return _bad_args(cid, conn, "set_sound", "set_sound needs settings by name, for example {'error': 0}")
-    bounds = {"current_ma": (10, 1000), "node": (0, len(_drive_nodes()) - 1), "limit_mv": (500, 6000)}
+    # The drive that plays is `drive` since command protocol 4 (2026-11-22, review P1, the user: "drive sounds ok"):
+    # 1 for J1 up to the last joint, one more for a CAN gripper — like the drive-parameter commands. It was `node`,
+    # counted from 0; system.xml's <sound><node> and RTI keep the 0-based node, converted here.
+    n_drives = len(_drive_nodes())
+    if "node" in args:
+        return _bad_args(cid, conn, "set_sound", f"set_sound: 'node' is 'drive' since command protocol 4 — 1 for J1 up "
+                                                 f"to {n_drives} (the last drive)")
+    if "drive" in args:
+        d = args["drive"]
+        if isinstance(d, bool) or not isinstance(d, (int, float)) or not (d == int(d) and 1 <= d <= n_drives):
+            return _bad_args(cid, conn, "set_sound", f"set_sound: drive is 1-{n_drives} (1 is J1), not {d!r}")
+        args = {("node" if k == "drive" else k): (int(v) - 1 if k == "drive" else v) for k, v in args.items()}
+    bounds = {"current_ma": (10, 1000), "node": (0, n_drives - 1), "limit_mv": (500, 6000)}
     for key, value in args.items():
         if key not in SETTINGS:
             return _bad_args(cid, conn, "set_sound", f"set_sound: {key!r} is not a sound setting ({', '.join(SETTINGS)})")
@@ -2248,7 +2308,7 @@ def _handle_set_digital_output(args, cid, conn):
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS",
                             "message": "set_digital_output needs [pin, value]"})
     try:
-        idx = _DIGITAL_OUTPUT_PINS.get(int(args[0]))
+        idx = _DIGITAL_OUTPUT_PINS.get(_whole_number(args[0]))
     except (TypeError, ValueError):          # a raw client's "one": BAD_PIN, not a dropped connection (2026-10-24)
         idx = None
     if idx is None:
@@ -2275,7 +2335,10 @@ def _handle_get_digital_input(args, cid, conn):
         _log_exec_reject(cid, "BAD_ARGS", "get_digital_input needs [pin]", command="get_digital_input")
         return reply(conn, {"id": cid, "status": "error", "code": "BAD_ARGS",
                             "message": "get_digital_input needs [pin]"})
-    idx = _DIGITAL_INPUT_PINS.get(int(args[0]))
+    try:
+        idx = _DIGITAL_INPUT_PINS.get(_whole_number(args[0]))
+    except (TypeError, ValueError):
+        idx = None
     if idx is None:
         _log_exec_reject(cid, "BAD_PIN", f"input pin must be 1-3, got {args[0]}",
                           command=_fmt_command("get_digital_input", args))
@@ -2308,17 +2371,20 @@ def _handle_enter_flashing_mode(args, cid, conn):
                                cannot be moved to park at all)
 
     Both claims open the gate; they are distinguished so the log records which
-    was made. A malformed argument must never be the reason a safety check is
-    skipped, so anything unrecognised falls back to the safer PARKED wording
-    rather than FORCE.
+    was made. Anything but true / false (or 1 / 0) is refused, BAD_ARGS (command
+    protocol 4, 2026-11-22, review P8: a raw client's "yes" or 2 was logged as
+    "operator confirmed PARKED" — a claim nobody made).
     """
     if not args:                            # RTI refuses it: MODE_REJECTED (no claim that the arm is safe limp)
         _answered(conn, cid, "enter_flashing_mode (NO ASSERTION)", "set_mode:FLASHING")
         return
-    # Strict identity, not truthiness: bool("nonsense") is True, so a plain
-    # bool() here would let a malformed argument select the LEAST safe path.
-    # Only a literal True/1 means FORCE; everything else degrades to PARKED.
-    force = args[0] is True or args[0] == 1
+    # Strict: true / false (or 1 / 0) only — never truthiness (bool("nonsense") is True) and never a fallback.
+    try:
+        force = _arg_switch(args[0]) == "1"
+    except ValueError:
+        return _bad_args(cid, conn, "enter_flashing_mode",
+                         f"enter_flashing_mode: {args[0]!r} is not true or false — false: the arm is parked; true: "
+                         f"it is supported without parking")
     _answered(conn, cid, "enter_flashing_mode " + ("(FORCED, NOT PARKED)" if force else "(operator confirmed PARKED)"),
               "set_mode:FLASHING:FORCE" if force else "set_mode:FLASHING:PARKED")
 
@@ -2327,6 +2393,25 @@ def _handle_enter_flashing_mode(args, cid, conn):
 # returns the text RTI gets, or raises ValueError with what it should be. Before them only the COUNT was checked: a
 # switch took any value but "1" as OFF (a JSON `true` from a non-Python client switched gravity compensation OFF), and
 # `jog_accel "abc"` was answered "ok" and then raised inside RTI (logged CRITICAL, the setting never applied).
+def _whole_number(v):
+    """A whole number (2.0 is 2) — a fraction is refused, never truncated (command protocol 4, 2026-11-22, review P8:
+    joint_test(2.7) ran J2, an input pin 1.9 read pin 1). Raises ValueError (or TypeError)."""
+    if isinstance(v, bool):
+        raise ValueError("a whole number, not true / false")
+    f = float(v)
+    if not (math.isfinite(f) and f == int(f)):
+        raise ValueError(f"a whole number, not {v!r}")
+    return int(f)
+
+
+def _declared_protocol(msg) -> int:
+    """The command protocol a message declares ("protocol"), 0 when none or unreadable."""
+    try:
+        return int(msg.get("protocol", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _arg_switch(v):
     if isinstance(v, bool):
         return "1" if v else "0"
@@ -2368,11 +2453,12 @@ def _arg_nonneg(v):
 
 
 def _arg_unit_share(v):
-    """A share above 0 and at most 1 (rti_set_vel_scale)."""
-    f = _finite_or_raise(v, "a number above 0 and at most 1")
-    if not 0 < f <= 1:
-        raise ValueError("a number above 0 and at most 1")
-    return repr(f)
+    """rti_set_vel_scale's share of the RTI speed limit: a PERCENT above 0 and at most 100 since command protocol 4
+    (2026-11-22, review P8: it was the one fraction 0-1 among percents); RTI keeps its fraction, passed on / 100."""
+    f = _finite_or_raise(v, "a percent above 0 and at most 100")
+    if not 0 < f <= 100:
+        raise ValueError("a percent above 0 and at most 100")
+    return repr(f / 100.0)
 
 
 def _arg_opt_finite(v):
@@ -2459,15 +2545,25 @@ def _arg_free_joint(v):
     return str(int(f))
 
 
-def _arg_jog_joint(v):
-    """jog's joint: counted from 0, an existing one (2026-10-24: a joint past the last was "ok" and RTI raised)."""
+def _arg_joint_number(v):
+    """A joint NUMBER as the API counts it since command protocol 4 (2026-11-22, review P1, the user: "all from 1"):
+    1 for J1 up to the last joint, a whole number — returned as the 0-based index the robot's internals use. 0 is
+    refused by name (it was J1 before protocol 4); a fraction is refused, never truncated."""
     try:
         f = float(v)
     except (TypeError, ValueError):
-        raise ValueError(f"a joint number 0-{JOINT_NUM - 1}") from None
-    if not (math.isfinite(f) and f == int(f) and 0 <= int(f) < JOINT_NUM):
-        raise ValueError(f"a joint number 0-{JOINT_NUM - 1}")
-    return str(int(f))
+        raise ValueError(f"a joint number 1-{JOINT_NUM}") from None
+    if math.isfinite(f) and f == 0:
+        raise ValueError(f"a joint number 1-{JOINT_NUM} — joints count from 1 (1 is J1) since command protocol 4")
+    if not (math.isfinite(f) and f == int(f) and 1 <= int(f) <= JOINT_NUM):
+        raise ValueError(f"a joint number 1-{JOINT_NUM}")
+    return int(f) - 1
+
+
+def _arg_jog_joint(v):
+    """jog's joint: 1 for J1 (protocol 4; it counted from 0 before), forwarded to RTI as its 0-based index
+    (2026-10-24: a joint past the last was "ok" and RTI raised)."""
+    return str(_arg_joint_number(v))
 
 
 def _arg_whole(v):
@@ -2512,7 +2608,7 @@ def _handle_joint_test(args, cid, conn):
     if len(args) != 4:
         return bad(f"joint_test needs [joint, amplitude_deg, speed_dps, current_ma], got {len(args)} arg(s)")
     try:
-        j, a, v, c = int(args[0]), float(args[1]), float(args[2]), float(args[3])
+        j, a, v, c = _whole_number(args[0]), float(args[1]), float(args[2]), float(args[3])
     except (TypeError, ValueError):
         return bad(f"joint_test: {list(args)} — expected numbers")
     if not 0 <= j <= JOINT_NUM:
@@ -2721,14 +2817,16 @@ def _pid_gains_problem(args):
         return None, {}, "set_pid_gains needs a dict with a 'joint' field and one or more gains"
     unknown = sorted(k for k in args if k != "joint" and k not in _PID_GAIN_KEYS)
     try:
-        joint = int(args["joint"])
+        # the joint counts from 1 since command protocol 4 (2026-11-22, review P1); the robot's index from 0
+        joint = _arg_joint_number(args["joint"])
+    except ValueError as e:
+        return None, {}, f"set_pid_gains: joint {args['joint']!r} — expected {e}"
+    try:
         gains = {k: float(args[k]) for k in _PID_GAIN_KEYS if k in args}
     except (TypeError, ValueError):
-        return None, {}, f"set_pid_gains: the joint and every gain must be numbers ({args})"
+        return None, {}, f"set_pid_gains: every gain must be a number ({args})"
     if not all(math.isfinite(v) for v in gains.values()):
         return None, {}, f"set_pid_gains: every gain must be a finite number ({gains})"
-    if not 0 <= joint < JOINT_NUM:
-        return None, {}, f"set_pid_gains: joint {joint} does not exist (0..{JOINT_NUM - 1}, counted from 0)"
     if any(v < 0 for k, v in gains.items() if k not in ("Ilim", "vel_lim")):
         return None, {}, f"set_pid_gains: a gain cannot be negative ({gains})"
     for key, ceiling_key, unit in (("Ilim", "motor_Ilim", " mA"), ("vel_lim", "motor_velocity_limit", "")):
@@ -2775,7 +2873,7 @@ def _handle_set_pid_gains(args, cid, conn):
     if refusal is None and "Ilim" in gains:
         _live_ilim[joint] = float(gains["Ilim"])          # joint_test checks against what the drive has now
     # The gains themselves in the activity log (2026-10-24: only the joint was recorded).
-    _reply_answer(conn, cid, _fmt_command("set_pid_gains", [payload["joint"], gains]), refusal)
+    _reply_answer(conn, cid, _fmt_command("set_pid_gains", [joint + 1, gains]), refusal)   # the joint as the API counts
 
 
 def _bool_arg(args, cid, conn, command, *, required):
@@ -3034,6 +3132,7 @@ IMMEDIATE_HANDLERS = {
     "play_sound":       _handle_play_sound,
     "set_sound":        _handle_set_sound,
     "get_versions":     _handle_get_versions,          # every part's version (2026-10-21)
+    "get_motion_settings": _handle_get_motion_settings,  # the session's motion settings (review P8, 2026-11-22)
     "set_log_level":    _handle_set_log_level,
     "capture_telemetry": _handle_capture_telemetry,
     "stop_capture": _handle_stop_capture,
@@ -3287,6 +3386,8 @@ def current_status():
         "rti_alive": _rti_alive(),
         # Homing's open question (2026-11-16): {"J6": 2.42} or None — homing holds the arm until it is answered
         "homing_question": _homing_question(),
+        # The session motion settings in force (review P8, 2026-11-22): a change (a setter, a handover) is pushed.
+        "motion_settings": _motion_settings(),
         "err": int(shared_data.rti["error_active"][0]),
         # The error KEYS, not just the 0/1 flag. Without these a remote PC can see THAT
         # something went wrong but never WHAT: every hard error forces ACTIVE_ERROR, which
@@ -3538,6 +3639,13 @@ def dispatch(msg, conn):
     if cmd in POSE_COMMANDS and "protocol" not in msg:
         why = (f"{cmd}: this client declares no command protocol version (a robotclient from before 0.9.0, or raw "
                f"JSON without \"protocol\"); pose angles changed their meaning in 0.9.0")
+        _log_exec_reject(cid, "CLIENT_TOO_OLD", why, command=_fmt_command(cmd, args))
+        return reply(conn, {"id": cid, "status": "error", "code": "CLIENT_TOO_OLD", "message": why})
+    # Joint numbers count from 1 since protocol 4 (2026-11-22, review P1): an older client's jog(1, ...) means J2.
+    if cmd in RENUMBERED_COMMANDS and _declared_protocol(msg) < 4:
+        why = (f"{cmd}: this client speaks command protocol {msg.get('protocol', 'none')}; since protocol 4 joint "
+               f"numbers count from 1 (1 is J1), set_sound's 'node' is 'drive' and rti_set_vel_scale is a percent — "
+               f"update the client (raw JSON: send \"protocol\": 4)")
         _log_exec_reject(cid, "CLIENT_TOO_OLD", why, command=_fmt_command(cmd, args))
         return reply(conn, {"id": cid, "status": "error", "code": "CLIENT_TOO_OLD", "message": why})
 

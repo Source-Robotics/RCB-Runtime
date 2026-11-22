@@ -3035,7 +3035,7 @@ class TrajectoryPlanner(Thread):
             raise PlannerError(
                 "ACCEL_LIMIT_VIOLATION",
                 f"{where}: commanded acceleration exceeds the limit it was planned against — "
-                f"J{j} peaks at {peak:.3f} rad/s^2 against a {float(accel_limit[j]):.3f} rad/s^2 "
+                f"J{j + 1} peaks at {peak:.3f} rad/s^2 against a {float(accel_limit[j]):.3f} rad/s^2 "   # J1 = 1 (P1)
                 f"limit ({peak / max(float(accel_limit[j]), 1e-12):.2f}x, backstop trips above "
                 f"{self.ACCEL_BACKSTOP_TOLERANCE:.2f}x). Nothing was sent.")
         return sample

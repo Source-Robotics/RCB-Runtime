@@ -142,7 +142,7 @@ class gap_guard:
 
 def apply_config(robot, cfg):
     """Write EVERY knob, defaults included. Pacing is sticky -- see rule 2 above."""
-    robot.rti_set_vel_scale(cfg.get("vel_scale", 1.0))
+    robot.rti_set_vel_scale(100.0 * cfg.get("vel_scale", 1.0))   # a percent (protocol 4)
     robot.rti_set_pace(cfg.get("pace", 0.0))
     robot.rti_set_min_duration(cfg.get("min_duration", 0.0))
     robot.rti_set_lowpass(cfg.get("lowpass", 0.0))
@@ -154,7 +154,7 @@ def apply_config(robot, cfg):
 
 def clear_config(robot):
     """Leave nothing sticky for the next block, the next test, or the next operator."""
-    robot.rti_set_vel_scale(1.0)
+    robot.rti_set_vel_scale(100.0)
     robot.rti_set_pace(0.0)
     robot.rti_set_min_duration(0.0)
     robot.rti_set_lowpass(0.0)

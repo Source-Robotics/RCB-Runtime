@@ -72,6 +72,13 @@ _xml_cfg = load_full_robot_config(
 )
 
 from utility.process_utils import setup_process
+# Joint numbers count from 1 in the client API since command protocol 4 (2026-11-22, review P1). Taken from the client
+# THIS process has loaded: script mode re-reads this file at every page load while the client module stays as first
+# imported, so a page loaded before the service restart must keep the old numbering with the old client (it would jog
+# the joint next to the one pressed). J<n> here is index n-1 + _JOINT_BASE.
+from robotclient.version import PROTOCOL_VERSION as _CLIENT_PROTOCOL  # noqa: E402
+_JOINT_BASE = 1 if _CLIENT_PROTOCOL >= 4 else 0
+
 setup_process(core=1, rt=False)   # GUI: own core, normal scheduling (only RTI is RT)
 
 
@@ -513,6 +520,9 @@ with ui.card().classes("w-full mb-2"):
         # Who holds control. Shown on every tab: the failure it prevents is a colleague's
         # script and this dashboard both believing they are driving.
         control_badge     = ui.badge("CONTROL: ---").props("color=grey outline")
+        # The session motion settings every queued move starts from (review P8, 2026-11-22): robot-wide, reset when
+        # control passes to another client or is released — shown so a slow (or fast) leftover is never a surprise.
+        motion_settings_lbl = ui.label("").classes("text-xs text-gray-500")
         _take_btn = ui.button("Take control", icon="pan_tool", on_click=handle_take_control) \
             .props("color=orange size=sm")
         _take_btn.set_visibility(False)
@@ -697,7 +707,7 @@ def _jog_start(joint_idx, direction):
     if _ctl_view["other"]:
         return False
     speed = _jog_state['speed_pct'] * 100.0          # the slider's fraction; jog() takes percent (protocol 2)
-    _exec(lambda r: r.jog(joint_idx, direction, speed), "jog_set")
+    _exec(lambda r: r.jog(joint_idx + _JOINT_BASE, direction, speed), "jog_set")
     return True
 
 def _jog_stop():
@@ -854,7 +864,7 @@ with ui.card().classes("w-full mb-2") as _jog_card:
         _joystick_active[0] = True
         direction = 1 if x > 0 else -1
         speed_pct = min(abs(x), 1.0) * 100.0          # jog() takes percent (command protocol 2)
-        _exec(lambda r: r.jog(joint_idx, direction, speed_pct), "jog_set")
+        _exec(lambda r: r.jog(joint_idx + _JOINT_BASE, direction, speed_pct), "jog_set")
 
     ui.separator()
     with ui.row().classes("gap-5 px-3 pt-1 pb-3 flex-wrap"):
@@ -1774,7 +1784,7 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
                     ui.notify("Not sent: the current limit is 0 (the drives had not reported their values when this "
                               "page loaded?) — press Load from Robot.", type="negative", timeout=10000)
                     return
-                _exec(lambda r: r.set_pid_gains(ji, **gains), "set_pid_gains")
+                _exec(lambda r: r.set_pid_gains(ji + _JOINT_BASE, **gains), "set_pid_gains")
 
             with ui.row().classes("gap-3 mt-4"):
                 ui.button("Load from Robot", icon="download", on_click=_load_pid_from_robot).props("color=primary outline size=sm")
@@ -4861,12 +4871,26 @@ async def _on_tab_change():
 _ctl_last = [None]
 
 
+def _motion_settings_text(st):
+    """The session's motion settings for the status bar (review P8): from the status the executor pushes to this
+    page's connection; a dash before this page has one (it connects with its first command)."""
+    try:
+        ms = _exec_sender._robot.latest_status().get("motion_settings") if st.get("connected") else None
+    except Exception:              # an older client without latest_status, a closed connection
+        ms = None
+    if not ms:
+        return "moves: —"
+    return (f"moves: {ms.get('speed', 0):g} % · blend {ms.get('blend', 0):g} % · {ms.get('profile')} · "
+            f"{ms.get('completion_policy')}")
+
+
 def _refresh_control_state():
     """Mirror the executor's control holder into the status bar. Only touches the UI when
     something changed — a 0.5 s timer that rewrote every prop every tick would flood the
     websocket for no visible effect."""
     st = _exec_sender.control_state()
     _ctl_view.update(holder=st["holder"], mine=st["mine"], other=st["other"])
+    motion_settings_lbl.text = _motion_settings_text(st)
     # Hand control back once the dashboard has been idle. Never mid-jog, mid-programme or during a
     # live RTI session (auto_release_due), and only what THIS connection actually holds.
     if not st["mine"]:

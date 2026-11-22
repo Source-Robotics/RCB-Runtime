@@ -215,7 +215,7 @@ def main():
         print(f"\n2. JOG: jog J5 towards the zone at {args.jog:g} % of the jog limit — no prevention, the monitor stops it")
         robot.enter_jog_mode(wait=True)
         start = len(capture.packets)
-        robot.jog(J, int(sign), args.jog)
+        robot.jog(J + 1, int(sign), args.jog)     # J is the 0-based index; the API counts from 1
         far = lambda: sign * (float(robot.get_joints()[J]) - q0[J]) < PAST_DEG     # never past +9 deg
         tripped = wait_trip(20.0, far)
         robot.jog_stop()
