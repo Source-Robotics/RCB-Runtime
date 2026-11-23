@@ -182,6 +182,41 @@ def blend_problem(cmd: str, options: "MotionOptions") -> str | None:
     return None
 
 
+# The profiles whose moves can carry a corner speed into the next move (planner_pipeline: supports_boundary_velocity).
+EXACT_VELOCITY_PROFILES = ("ruckig", "trapezoid")
+BLEND_CHAIN_MODES = ("zone", "tolerance", "ruckig_corner")
+
+
+def option_notes(cmd: str, options: "MotionOptions", own: dict | None = None) -> list[str]:
+    """What this move's own options ask for that will not happen as asked — said, not refused (the leftovers batch,
+    2026-11-23, the user: "a note ... rather than a refusal"; refusing would be another incompatible change). The
+    executor puts them in the reply's "note" and the activity log, next to the Cartesian speed cap's.
+
+    - an exact_velocity `blend` above 0 on a move that cannot carry a corner speed: only move_joints with profile
+      'ruckig' or 'trapezoid' does (the other profiles and every other move end at rest; review blend finding 12);
+    - a `duration` on a move that joins a chain of blended moves: it sets the speed at which that move alone would
+      take that long, so inside the chain its time is approximate (decision 2a; the user kept it, 2026-11-22).
+
+    `own`: the options the move itself passed. The blend note needs `blend` among them — a session blend
+    (set_blending) is not the move's own ask, and every move_pose after set_blending(50) would carry it (blend_problem
+    leaves session defaults alone the same way). None = judge every option (a caller without the move's own)."""
+    if not cmd.startswith("move_") or not options.blend or float(options.blend) <= 0.0:
+        return []
+    notes = []
+    mode = options.blend_mode or "exact_velocity"
+    profile = normalize_profile_name(options.profile or DEFAULT_PROFILE)
+    if (mode == "exact_velocity" and (own is None or "blend" in own)
+            and (cmd != "move_joints" or profile not in EXACT_VELOCITY_PROFILES)):
+        why = (f"profile '{profile}' cannot carry a corner speed" if cmd == "move_joints"
+               else f"{cmd} does not blend at speed")
+        notes.append(f"blend {options.blend:g} % has no effect: {why} (exact-velocity blending is for move_joints "
+                     f"with profile 'ruckig' or 'trapezoid'); the move ends at rest")
+    if mode in BLEND_CHAIN_MODES and cmd in BLEND_CHAIN_COMMANDS and options.duration is not None:
+        notes.append(f"duration {float(options.duration):g} s inside a chain of blended moves is approximate: it sets "
+                     f"the speed at which this move alone would take that long")
+    return notes
+
+
 def profile_option_problem(cmd: str, options: "MotionOptions") -> str | None:
     """Why this move's options do not fit its profile, or None (review M8 / F14, 2026-11-22): the planner refused
     `jerk` on a profile other than ruckig and `ramp_fraction` on one other than trapezoid only while planning — the

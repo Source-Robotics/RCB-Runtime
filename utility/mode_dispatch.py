@@ -921,8 +921,8 @@ def build_mode_dispatch(joint_num: int, homing_ctrl: Any, load_motor_configs_fn:
         # the same reason RTI is: both contracts share one handler so no safety layer can
         # be applied to one and forgotten in the other.
         RobotMode.SOFT_RTI:      handle_idle,
-        RobotMode.HAND_GUIDING:  handle_idle,        # Future
-        RobotMode.IMPEDANCE:     handle_idle,        # Future
+        RobotMode.HAND_GUIDING:  handle_idle,        # reserved: no command enters it (utility/state_machine.py)
+        RobotMode.IMPEDANCE:     handle_idle,        # reserved: no command enters it (utility/state_machine.py)
         RobotMode.SAFETY_STOP:   handle_safety_stop,
         RobotMode.FLASHING:      handle_flashing,
     }

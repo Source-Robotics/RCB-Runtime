@@ -44,6 +44,9 @@ class RobotMode(str, Enum):
     # is shared by construction and cannot be forgotten in one of them.
     SOFT_RTI     = "SOFT_RTI"
     EXEC         = "EXEC" # AUTO?
+    # RESERVED for force control (the teleop plan wants it): no command enters these two today, their handler is
+    # IDLE's (utility/mode_dispatch.py). Kept, not removed, so the transitions, the homed rule and the protocol's
+    # rules are in place when one is built (review §6, the user, 2026-11-23).
     HAND_GUIDING = "HAND_GUIDING"
     IMPEDANCE    = "IMPEDANCE"
     SAFETY_STOP  = "SAFETY_STOP"

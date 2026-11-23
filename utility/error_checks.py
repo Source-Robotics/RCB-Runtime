@@ -11,19 +11,10 @@ Description:
     the user explicitly calls clear_errors(). Logging is edge-triggered on
     appearance only — no log spam while the error persists.
 
-    Usage in the RTI superloop:
-
-        # Before the loop:
-        latched_errors = set()
-
-        # Inside the loop — clear if requested, then check:
-        if shared_data.clear_error_signal.get() == "1":
-            latched_errors = clear_errors(latched_errors)
-            shared_data.clear_error_signal.set("0")
-        error_active, latched_errors = check_errors(
-            shared_data, joint_num, latched_errors, estop_active=check_estop_active()
-        )
-        shared_data.rti["error_active"][0] = 1.0 if error_active else 0.0
+    Usage: RTI calls process_errors_tick(...) once per tick (its error pass). It runs a pending Clear Errors
+    (clear_errors, after the drives' settle period), checks every source (check_errors), latches new errors,
+    writes error_active and the error lists into the shared memory, and returns the mode to continue in
+    (a hard error takes the robot to ACTIVE_ERROR; KEEP_MODE_ON_ERROR modes stay).
 
     Architecture — where each safety concern lives (updated 2026-09-30)
     ------------------------------------------------------------------
@@ -94,8 +85,8 @@ BOOT_CLEAR_TICK = 2
 # Sized off measured PAR6 behaviour (2026-07-17, clean post-boot stats): p95 4.020 ms,
 # p99 4.025 ms — 99% of ticks land within 0.64% of nominal. 1.05 is ~8x that deviation:
 # wide enough that normal operation never trips it, tight enough to catch real trouble.
-# The band is one-sided by construction: RTI sleeps delta_t - exec (a relative sleep with
-# no catch-up), so the loop can overshoot its period but can never run FAST.
+# The band is one-sided by construction: RTI paces on absolute deadlines (pace_deadline), so the
+# average period is exactly delta_t; a period is short only right after a late one (its 0 s sleep).
 LOOP_WARN_PERIOD_FACTOR  = 1.05   # p99 > +5% of nominal  -> warning (4.20 ms / 238 Hz on PAR6)
 # The latching error is for a REAL loss of the real-time loop, not a slow burst (user decision 2026-10-01).
 # Measured that day: memory traffic on the other cores (an interpreter starting, the GUI, a planner) slows
@@ -926,7 +917,6 @@ def process_errors_tick(
     loop_critical: bool = False,
     monitor_errors=(),
     monitor_warnings=(),
-    on_hard_error=None,
     driver_faults: bool = True,
     rti_errors=(),
     can_warnings=(),
@@ -957,8 +947,6 @@ def process_errors_tick(
         estop_active:           Result of check_estop_active() — pre-computed by caller.
         estop_channel_fault:    gpio_handler.estop_channel_fault(), read after check_estop_active (review D15).
         Gripper_data:          Per-node deques of gripper CAN dicts.
-        on_hard_error:          Optional callable(new_hard_keys, tick), called on the ONE tick a hard error
-                                first latches (utility/incident_dump.py saves the last two seconds).
         driver_faults:          False until the settle after RTI's start-up clear is over (check_errors).
         homing_errors:          {key: reason} — the homing failures the controller reported (2026-10-14): latched
                                 as hard errors, the reason as their description and in the activity log. RTI passes
@@ -1006,12 +994,6 @@ def process_errors_tick(
 
     _invalidate_homing_on_errors(shared_data, latched_errors)
     current_mode = _apply_error_mode(shared_data, Motor, joint_num, homing_ctrl, current_mode, error_active)
-    # A hard error latching THIS tick: the keys that are not in the metadata yet. Evaluated before the metadata
-    # update that would absorb them; cold — only a tick with a new key reaches the call.
-    if on_hard_error is not None:
-        _new_hard = [k for k in latched_errors if k not in error_metadata and not k.endswith(_WARNING_SUFFIXES)]
-        if _new_hard:
-            on_hard_error(_new_hard, int(shared_data.rti["loop_tick"][0]))
     if _update_error_metadata(shared_data, latched_errors, error_metadata, homing_errors, detail_of):
         _publish_error_list(shared_data, error_metadata)
 

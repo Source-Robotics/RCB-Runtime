@@ -146,6 +146,10 @@ class TrajectoryPlanner(Thread):
                             # size and lets RTI start moving before a long
                             # trajectory finishes sending
     MAX_BLEND_LOOKAHEAD = 100  # cap on buffered zone-blend commands before a forced flush
+    # A chain is flushed this long after its FIRST command arrived (blend finding 9, 2026-11-23): the flush waited for
+    # 0.2 s of queue silence or the cap, so a trickle faster than 0.2 s kept the arm still up to 100 x its interval
+    # (~20 s). Commands arriving after the flush splice into the running chain (the held tail), as before.
+    BLEND_FLUSH_AFTER_S = 0.2
     # The longest one delay() (review M8, 2026-11-22, the user: "cap at 600 s"). A pause is planned as one row per tick
     # (150 000 rows here, ~18 MB while planned); delay(3600) held ~110 MB, and above ~8200 s the rows outran the send
     # pipe (SEND_HWM x MAX_CHUNK_SIZE) and failed SEND_TIMEOUT mid-pause.
@@ -463,6 +467,7 @@ class TrajectoryPlanner(Thread):
         self._sampler = ExecBatchSampler(joint_num)
         self._blend_buffer = []      # buffered move_joints commands awaiting a
                                       # zone-blend flush — TODO/blending_design.md §5.1
+        self._buffer_since = None    # when the buffered chain's first command arrived (BLEND_FLUSH_AFTER_S)
         self._toppra_path_parameterizer = TOPPRATimeParameterizer()
         # Composite paths are sampled at a uniform arc-length spacing (never by
         # sample index) — see motion/joint_paths.py's module docstring. Derived
@@ -630,7 +635,7 @@ class TrajectoryPlanner(Thread):
             # While a tail is held, RTI is burning through the body we already sent and
             # we are on a clock — poll fast enough that noticing a command isn't itself
             # a meaningful part of the safety margin (0.2s would be).
-            timeout = self.HOLD_POLL_S if self._held is not None else 0.2
+            timeout = self.HOLD_POLL_S if self._held is not None else self._idle_timeout()
             try:
                 cmd = self._queue.get(timeout=timeout)
                 ep = cmd.epoch if isinstance(cmd, QueuedCommand) else cmd.get("epoch")
@@ -716,7 +721,7 @@ class TrajectoryPlanner(Thread):
                     self._flush_blend_buffer()
                 if not self._buffer_append(cmd):
                     continue
-                if len(self._blend_buffer) >= self.MAX_BLEND_LOOKAHEAD:
+                if len(self._blend_buffer) >= self.MAX_BLEND_LOOKAHEAD or self._chain_due():
                     self._flush_blend_buffer()
             elif self._ends_chain(cmd):
                 # Decision 4a: the chain's last member, then the chain is flushed at once (a later blended move must
@@ -818,8 +823,21 @@ class TrajectoryPlanner(Thread):
             if self._cmd_epoch != self._epoch:
                 logger.info(f"id={self._cmd_id(cmd)} belongs to a stopped program: not buffered")
                 return False
+            if not self._blend_buffer:
+                self._buffer_since = time.monotonic()
             self._blend_buffer.append(cmd)
             return True
+
+    def _chain_due(self):
+        """The buffered chain's first command arrived BLEND_FLUSH_AFTER_S ago or more (blend finding 9)."""
+        return bool(self._blend_buffer) and self._buffer_since is not None and (
+            time.monotonic() - self._buffer_since >= self.BLEND_FLUSH_AFTER_S)
+
+    def _idle_timeout(self):
+        """How long run() may wait for the next command with no tail held: 0.2 s, or until the buffered chain is due."""
+        if not self._blend_buffer or self._buffer_since is None:
+            return 0.2
+        return max(0.001, min(0.2, self._buffer_since + self.BLEND_FLUSH_AFTER_S - time.monotonic()))
 
     def _is_blend_eligible(self, cmd):
         """True if cmd should be buffered for a zone-blend chain rather than

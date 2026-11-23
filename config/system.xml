@@ -9,10 +9,6 @@
                   SKAR   ->  robots/SKAR.xml
          ==================================================================== -->
     <active_robot>PAR6</active_robot>
-    <!-- BENCH RIG (2026-08-03): temporarily SSG48 because the test stack's node 6 is a
-         Spectral BLDC board, and SSG48.xml is the gripper that declares
-         driver_type=spectral-bldc. RESTORE TO MSG_small_motor_150mm_rail BEFORE USING THE
-         REAL ARM — this also selects gripper kt/stroke/homing offsets, not just driver type. -->
     <active_gripper>MSG_small_motor_150mm_rail</active_gripper> <!--  MSG_small_motor_150mm_rail Name of the active gripper. Must match a filename in the grippers/ folder (e.g. SSG48 -> grippers/SSG48.xml) -->
 
     <!-- ====================================================================

@@ -494,26 +494,12 @@ def _job_turn(state) -> bool:
     return state["job_turn"]
 
 
-def handle_polling_and_overrides(motors, state, overrides, override_queue, joint_num, active_CAN_gripper=0):
-    """3. Manages high-priority overrides and round-robin health polling.
-    Includes the gripper motor in the round-robin when active_CAN_gripper=1."""
-    
-    # --- Handle Override Queue ---
-    if overrides["fn"] is None and override_queue:
-        fn, count = override_queue.popleft()
-        overrides["fn"] = fn
-        overrides["count"] = count
+def handle_polling_and_overrides(motors, state, joint_num, active_CAN_gripper=0):
+    """3. Round-robin health polling, and the drive jobs that share its turn (parameter reads, fault captures,
+    sounds). Includes the gripper motor in the round-robin when active_CAN_gripper=1.
 
-    if overrides["fn"] is not None:
-        try:
-            overrides["fn"]() # Execute override (e.g., ESTOP or Reset)
-        except Exception as e:
-            logger.warning(f"Override execution failed: {e}")
-
-        overrides["count"] -= 1
-        if overrides["count"] <= 0:
-            overrides["fn"] = None
-        return # Skip polling if an override was processed this cycle
+    The name keeps "overrides" for its callers and the hot-path table; the override queue it ran first was removed
+    2026-11-23 (review F11: nothing ever put anything in it)."""
 
     # --- Handle Round-Robin Status Polling ---
     total_motors = joint_num + active_CAN_gripper  # includes gripper motor when present

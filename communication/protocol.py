@@ -242,8 +242,16 @@ COMMAND_RULES = {
     # 2026-11-22 (review C20, the user: "Refuse with a hint"): every mode but the two that have their own way out —
     # it ended a firmware flash (CAN traffic resumed mid-flash) and a safety stop. The refusal names that way
     # (exit_flashing_mode() / release_safety_stop(), _WAY_TO_IDLE); stop() and disable() still end both (2026-10-23).
+    # (HAND_GUIDING / IMPEDANCE: reserved modes, see utility/state_machine.py.)
     "enter_idle_mode": (IMMEDIATE, ["BOOTING", "IDLE", "ACTIVE_ERROR", "HOMING", "JOG", "RTI", "SOFT_RTI", "EXEC",
                                     "HAND_GUIDING", "IMPEDANCE"], None, False),
+    # Motors driven by NOTHING: Position=None, Speed=None, Current=0. The arm
+    # goes limp and WILL fall under gravity. No mode/state gate — the one
+    # command guaranteed to stop the machine acting must never be refusable.
+    "safety_stop":       (IMMEDIATE, None, None, False),
+    # The two releases act only on their own mode: they send set_mode:IDLE, which in any other mode was an
+    # enter_idle_mode() under another name (EXEC braked to IDLE, JOG / RTI dropped to freedrive) — 2026-10-23.
+    "release_safety_stop": (IMMEDIATE, ["SAFETY_STOP"], None, False),
     # --- firmware flashing (docs/firmware_flashing.md) ---
     # FLASHING hands the CAN bus to an external flasher while RTI keeps ticking.
     # Deliberately NOT gated on ENABLED or homed here: the state machine treats it
@@ -254,13 +262,6 @@ COMMAND_RULES = {
     # The MODE gate does apply (2026-10-23): FLASHING is entered only from IDLE or
     # ACTIVE_ERROR (VALID_TRANSITIONS), so anything else is refused here, before
     # _LEAVES_EXEC could abort a program for a switch RTI would refuse.
-    # Motors driven by NOTHING: Position=None, Speed=None, Current=0. The arm
-    # goes limp and WILL fall under gravity. No mode/state gate — the one
-    # command guaranteed to stop the machine acting must never be refusable.
-    "safety_stop":       (IMMEDIATE, None, None, False),
-    # The two releases act only on their own mode: they send set_mode:IDLE, which in any other mode was an
-    # enter_idle_mode() under another name (EXEC braked to IDLE, JOG / RTI dropped to freedrive) — 2026-10-23.
-    "release_safety_stop": (IMMEDIATE, ["SAFETY_STOP"], None, False),
     "enter_flashing_mode": (IMMEDIATE, ["IDLE", "ACTIVE_ERROR"], None, False),
     "exit_flashing_mode":  (IMMEDIATE, ["FLASHING"], None, False),
     # Jog actuation: START only in JOG mode (RTI ignores its jog_set outside JOG anyway). STOP is

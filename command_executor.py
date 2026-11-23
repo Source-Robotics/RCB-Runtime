@@ -78,7 +78,7 @@ from utility.haptic_walls import (damping_ratio_window, effective_inertia_range,
                                   make_effective_inertia, resolve_joint_walls, wall_dynamics_limits, walls_public)
 from motion.exec_commands import (
     DEFAULT_PROFILE, MotionOptions, QueuedCommand, blend_problem, normalize_profile_name, normalize_ik_solver_name,
-    profile_option_problem,
+    profile_option_problem, option_notes,
 )
 from motion.ik_config import DEFAULT_FK_JACOBIAN_BACKEND
 from utility.activity_log import get_exec_activity_logger, log_activity, note_origin, origin_of
@@ -2244,6 +2244,9 @@ def _handle_clear_errors(args, cid, conn):
 
 # Commands that take RTI out of EXEC (RTI.py: disable -> IDLE, home -> HOMING, the rest by name).
 # `stop` is deliberately absent: it cancels the program itself (flush + STOPPED), no abort.
+# Reached today by disable, enter_idle_mode and safety_stop. home, enter_jog_mode, enter_flashing_mode,
+# rti_connect and rti_claim are refused in EXEC by their own rule (REJECTED, before this check, 2026-10-23); they
+# stay listed so a rule widened later still aborts the program first (review §6, 2026-11-23).
 _LEAVES_EXEC = frozenset({"disable", "home", "enter_idle_mode", "enter_jog_mode", "safety_stop",
                           "enter_flashing_mode", "rti_connect", "rti_claim"})
 
@@ -3817,7 +3820,9 @@ def _submit_queued(cmd, args, msg, cid, conn):
         return reply(conn, {"id": cid, "status": "error", "code": "QUEUE_FULL",
                             "message": f"motion queue full (max {MOTION_QUEUE_MAXSIZE})"})
     ack = {"id": cid, "status": "queued", "seq": queued.seq}
-    note = _speed_cap_note(cmd, queued.options)
+    notes = [n for n in [_speed_cap_note(cmd, queued.options)]
+             + option_notes(cmd, queued.options, msg.get("options", {}) or {}) if n]
+    note = "; ".join(notes) or None    # the leftovers batch (2026-11-23): a setting that will not act as asked
     if note:
         ack["note"] = note
     reply(conn, ack)

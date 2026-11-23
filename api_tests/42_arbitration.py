@@ -69,6 +69,18 @@ def main():
 
     A = RobotClient(); A.connect(a.host)
     B = RobotClient(); B.connect(a.host)
+    # The takeover approval as found (the dashboard's "Takeover approval" button). Step 4 needs it OFF — a forced
+    # takeover would wait 20 s for B2 — so it is switched off here and restored at the end (2026-11-23: one switched on
+    # in the dashboard just before the smoke run made step 4 fail with CONFIRM_REQUIRED).
+    time.sleep(0.3)
+    found_gate = bool((A.status() or {}).get("force_confirm"))
+    if found_gate:
+        try:
+            A.set_force_confirm(False)            # allowed: nobody holds control yet (step 1 checks that)
+            time.sleep(0.2)
+            print("(takeover approval was ON: switched off for the test, restored at the end)")
+        except CommandRejected as exc:
+            print(f"(takeover approval is ON and could not be switched off: {exc})")
     try:
         print("\n1. Ownership attaches to whoever commands first")
         check("nobody holds control initially", A.control_holder() is None,
@@ -289,9 +301,10 @@ def main():
         # Leave the gate as we found it. Must come AFTER both releases — lowering it is
         # refused while anyone holds control, which is the point of the asymmetry.
         try:
-            B.set_force_confirm(False)
+            B.set_force_confirm(found_gate)
         except Exception:
             pass
+        for c in (A, B):                          # it was indented under the except: only a failed reset disconnected
             try:
                 c.disconnect()
             except Exception:

@@ -4,15 +4,16 @@
 Filename: RTI.py
 Author: Petar Crnjak
 Company: Source Robotics
-Date: 13.5.2025
-Version: 1.0
-Description: 
-    This script demonstrates a detailed 
-    header format with additional metadata.
+Created: 13.5.2025
+Description:
+    The robot's real-time loop (RTI): every tick (4 ms on PAR6) it reads the drives over CAN, runs the error pass
+    and the safety monitor, runs the handler of the current mode (IDLE, HOMING, EXEC, JOG, RTI, SOFT_RTI, ...) and
+    sends the drives their commands. It owns the shared memory the other processes read, takes its commands from
+    the executor over ZMQ, and runs under autorun.service at real-time priority (SCHED_FIFO 99) on its own core.
+    Its version is the runtime's (the VERSION file; the start-up log line names the code).
 
 License: GNU General Public License v3.0
 Contact: petar@source-robotics.com
-Dependencies: os, sys
 """
 
 import os
@@ -29,7 +30,6 @@ import signal
 import atexit
 import faulthandler
 import traceback   # used by the command-handler guard in the superloop
-from collections import deque
 import json
 # These used to arrive through `from utility.RTI_utils import *` (2026-10-03, refactor Phase 2). Until 2026-10-15
 # RTI.py also imported data_init's module LOGGER and logged through it (RTI.log labelled those lines
@@ -945,8 +945,6 @@ def main():
         if found:
             _apply_base_warnings()
     # Optional override function (set externally when needed)
-    scheduled_override_queue = deque()  # Each item is a tuple: (function, repeat_count)
-    current_override = {"fn": None,"count": 0}
 
 
     # ==========================================================================
@@ -1334,9 +1332,9 @@ def main():
     _exec_handler = MODE_HANDLERS[RobotMode.EXEC]     # its error keys (EXEC_DISCONTINUITY) feed the error pass
 
     # RTI mode handler. Replaces the handle_idle placeholder build_mode_dispatch()
-    # installs for RobotMode.RTI. Module-level so the TCP command handlers below can
-    # drive its pairing lifecycle (connect_pc / claim_control / ...), which is separate
-    # from the enter(ctx)/exit(ctx) hooks dispatch calls on mode transitions.
+    # installs for RobotMode.RTI. Made here in main(), before the command handlers below, so
+    # they can drive its pairing lifecycle (connect_pc / claim_control / ...), which is
+    # separate from the enter(ctx)/exit(ctx) hooks dispatch calls on mode transitions.
     rti_handler = RTIModeHandler(
         joint_num=joint_num,
         clock_mode=CLOCK_ROBOT,
@@ -1593,9 +1591,8 @@ def main():
     # RTI command dispatch — handlers for ZMQ commands (from command_executor,
     # GUI, or Supervisor). Keyed by the first colon-delimited segment of the
     # command string, e.g. "jog_set:2:1:0.5" dispatches on "jog_set". Handlers
-    # live here (not a separate module) because they mutate this file's own
-    # module-level state directly via `global` — the RT loop is a flat script,
-    # not a class, so this keeps the exact same data flow as before, just
+    # live here (not a separate module) because they change main()'s own state
+    # directly (`nonlocal`; the loop's state lives in main() since the refactor),
     # organized as one lookup table instead of a 130-line inline elif chain.
     # Extracted 2026-07-03 — pure reorganization, identical logic per command,
     # see TODO/exec_mode_implementation_checklist.md for the equivalence notes.
@@ -3915,7 +3912,7 @@ def main():
                 )
         _profile_last = _profile_mark(_profile_last, "gripper_send")
         if not _bus_silent:
-            handle_polling_and_overrides(Motor, scheduled_state, current_override, scheduled_override_queue, joint_num, active_CAN_gripper)
+            handle_polling_and_overrides(Motor, scheduled_state, joint_num, active_CAN_gripper)
         _profile_last = _profile_mark(_profile_last, "polling_overrides")
 
         # ==========================================================================

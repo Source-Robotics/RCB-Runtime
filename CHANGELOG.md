@@ -13,6 +13,28 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+### Changed
+
+- A chain of blended moves starts 0.2 s after its first move arrived. It waited for 0.2 s with no new move (or for
+  100 moves), so moves sent a little faster than every 0.2 s kept the arm still for up to ~20 s. Moves that arrive
+  after the start are spliced into the running chain as before. Sync mode (waiting for each move) never blends.
+- A queued move's reply (`note`) and the activity log say when one of its own settings will not act as asked: a
+  blend in percent (`exact_velocity`) on a move that cannot carry a corner speed (only `move_joints` with the ruckig
+  or trapezoid profile does; the move ends at rest), and a `duration` on a move that joins a chain of blended moves
+  (approximate there: the speed at which that move alone would take that long).
+
+### Fixed
+
+- `api_tests/42_arbitration.py` (in the smoke routine) failed when the dashboard's Takeover approval was ON: its
+  forced takeover waited for B2. It switches the approval off for the test and leaves it as it found it (it always
+  left it off), and it disconnects its two clients (only a failed reset of the approval did).
+
+### Removed
+
+- Code nothing used: RTI's override queue (checked every tick, never filled), the error pass's `on_hard_error`
+  hook (nothing passed one since the recorder makes the incident files), `hardware/can_hardware.py`'s
+  `initialize_can_system()` and its demo, which opened the CAN bus and scanned it when the file was run by hand.
+
 ## [3.0.0] - 2026-11-22
 
 ### Added
