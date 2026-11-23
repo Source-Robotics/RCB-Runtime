@@ -13,6 +13,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-11-23
+
 ### Changed
 
 - A chain of blended moves starts 0.2 s after its first move arrived. It waited for 0.2 s with no new move (or for
