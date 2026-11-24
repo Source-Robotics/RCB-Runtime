@@ -71,8 +71,12 @@ def _set_control(key: str, value) -> None:
 def _clock_text(clk: dict) -> str:
     """Where the frames' times come from (the status' "clock", P2): the camera's own clock or the driver's."""
     if clk.get("source") == "camera":
-        return (f"the camera's own clock (fit ±{clk.get('fit_us')} µs, the camera's clock {clk.get('device_mhz')} "
+        text = (f"the camera's own clock (fit ±{clk.get('fit_us')} µs, the camera's clock {clk.get('device_mhz')} "
                 f"MHz); the driver's timestamps come {clk.get('driver_after_ms')} ms after it")
+        cal = clk.get("calibration") or {}
+        if clk.get("calibrated"):
+            return text + f"; **calibrated** to the image's moment (run {cal.get('run') or '?'})"
+        return text + (f"; not calibrated: {clk['calibration_why']}" if clk.get("calibration_why") else "")
     return f"the driver's timestamps (4 ms steps): {clk.get('why') or 'the camera clock is not known yet'}"
 
 

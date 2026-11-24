@@ -23,6 +23,7 @@ The camera server reads them at its start and again within ~1 s of the file chan
 """
 from __future__ import annotations
 
+import math
 import re
 import xml.etree.ElementTree as ET  # nosec B405 — our own config/system.xml, read as config/xml_parser reads it
 
@@ -191,3 +192,66 @@ def gripper_camera(system_xml, grippers_dir) -> tuple[dict | None, str]:
         return None, name
     elem = groot.find("camera")
     return (dict(elem.attrib) if elem is not None else None), name
+
+
+# ---------------------------------------------------------------- the timing calibration (P3, 2026-11-24)
+# api_tests/80_camera_timing.py measures, per camera mode, how far the image's moment (the middle of the exposure of
+# the image's centre, as the joint data sees it) lies from the camera's own frame time (its PTS on the robot's clock),
+# and writes the result as attributes of the gripper XML's <camera> element:
+#   timing_mode="1280x720@30"   the mode it was measured in (another mode: not calibrated)
+#   timing_auto_us="..."        the offset under AUTOMATIC exposure. Valid while the camera exposes for the whole frame,
+#                               which it does indoors: in fixed-exposure mode this camera drops its gain, so a fixed
+#                               33 ms gives a black picture under the lab's lamps (0.8 / 255; automatic at the same
+#                               30 fps: 137, measured 2026-11-24) — the automatic mode is at its longest exposure plus
+#                               gain there. In bright light it may shorten the exposure: up to half a frame off then.
+#   timing_offset_us="..."      the offset at a FIXED exposure of setting 0 ...
+#   timing_us_per_unit="..."    ... and its change per unit of exposure_time_absolute (100 us per unit, the UVC
+#                               standard, confirmed 2026-11-24 by the frame rate: 1000 -> 9.92 fps, 4000 -> 2.49 fps):
+#                               +50 when the PTS marks the exposure's start, -50 when its end. Only measured where
+#                               fixed exposures are bright enough at the full frame rate.
+#   timing_readout_us="..."     the rolling shutter: the time the camera takes to read its rows out, top to bottom
+#                               (30.8 ms for 720 rows, measured 2026-11-24); the offsets above are the image's CENTRE
+#                               row's, a row's own moment is (row - rows / 2) x readout / rows from it
+#   timing_run="..."            the run it came from (temp_data/camera_timing/<run>)
+TIMING_KEYS = ("timing_mode", "timing_auto_us", "timing_offset_us", "timing_us_per_unit", "timing_readout_us",
+               "timing_run")
+EXPOSURE_UNIT_US = 100          # exposure_time_absolute's unit (UVC; confirmed on the MSG camera 2026-11-24)
+
+
+def mode_key(width, height, fps) -> str:
+    """"1280x720@30": a camera mode as the timing calibration names it."""
+    return f"{int(width)}x{int(height)}@{float(fps):g}"
+
+
+def _timing_number(attrs: dict, key: str) -> float | None:
+    try:
+        v = float(attrs[key])
+    except (KeyError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def camera_timing(gripper_cam: dict | None, mode: str) -> dict | None:
+    """The timing calibration of the gripper's camera for `mode` (mode_key), or None: {"auto_us" (or None),
+    "offset_us" (or None), "us_per_unit", "readout_us" (or None), "run"}."""
+    if not gripper_cam or gripper_cam.get("timing_mode") != mode:
+        return None
+    out = {"auto_us": _timing_number(gripper_cam, "timing_auto_us"),
+           "offset_us": _timing_number(gripper_cam, "timing_offset_us"),
+           "us_per_unit": _timing_number(gripper_cam, "timing_us_per_unit") or 0.0,
+           "readout_us": _timing_number(gripper_cam, "timing_readout_us"),
+           "run": gripper_cam.get("timing_run", "")}
+    return out if out["auto_us"] is not None or out["offset_us"] is not None else None
+
+
+def timing_offset_s(timing: dict | None, exposure_setting) -> float | None:
+    """Seconds to add to a frame's camera time to reach its image's moment: at a fixed exposure `exposure_setting`
+    (exposure_time_absolute) from the fixed-exposure line, under automatic exposure (None) the automatic offset; None
+    when that one is not calibrated."""
+    if timing is None:
+        return None
+    if exposure_setting is None:
+        return None if timing["auto_us"] is None else timing["auto_us"] * 1e-6
+    if timing["offset_us"] is None:
+        return None
+    return (timing["offset_us"] + timing["us_per_unit"] * float(exposure_setting)) * 1e-6

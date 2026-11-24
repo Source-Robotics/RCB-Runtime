@@ -37,6 +37,16 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - `robotclient.CameraClient` and `CameraFrame`: the camera's frames on a PC, each with its time and RTI tick, in order
   (for recording) or only the newest (`latest_only=True`, for a controller). Standard library only; `connect()`
   checks the camera protocol (`VersionMismatch`).
+- The camera's timing calibration, `api_tests/80_camera_timing.py`: the wrist swings a little while the robot
+  records its joints and every frame; the picture is cut into tiles whose shifts are fitted against the joint's
+  motion, which gives the delay between a frame's camera time and the joint data its image's centre row shows, and the
+  camera's rolling-shutter readout (each image row has its own moment). Tiles that do not follow the joint, such as
+  the gripper's own jaws in view, are left out. Measured on the MSG camera: +1.41 ms, rows read out over 31.8 ms. It calibrates automatic exposure (the default) and, where
+  the light allows, fixed exposures (then also which edge of the exposure the camera's timestamp marks). `--apply`
+  writes the result into the gripper XMLs of that camera (`<camera timing_*>`); the camera server then moves each
+  frame's time to its image's moment and sets the header's calibrated flag; the status and the Camera tab say whether
+  the times are calibrated, or why not. Indoors the MSG camera needs automatic exposure: at a fixed exposure it drops
+  its gain, and a fixed exposure short enough for 30 fps gives a black picture under ordinary room light.
 
 ### Changed
 
@@ -50,6 +60,12 @@ What changed in each version of the RCB runtime. The newest version is at the to
   dashboard's Sound card no longer offers it, and RTI drops a tune meant for it with one warning. The gripper's drive
   runs in controller mode 7, where the firmware plays nothing; a sound setting left on it had silenced every robot
   sound.
+
+### Fixed
+
+- A camera control taken out of `<camera controls>` (or reset with the Camera tab's "back to the defaults") stayed at
+  its last value, because the camera keeps a value until it loses power. Every control not named there now goes back
+  to the camera's own default.
 
 ## [3.0.1] - 2026-11-23
 

@@ -276,6 +276,24 @@ def choose_device(settings: dict, gripper_cam: dict | None, cameras: list[dict])
                   (f"; found {others} — set <camera device=\"usb:...\"> in system.xml to use one" if others else ""))
 
 
+def _without_timing(gcam: dict | None) -> dict | None:
+    """The gripper's camera attributes without the timing calibration's (a change of those alone needs no reopen)."""
+    return None if gcam is None else {k: v for k, v in gcam.items() if k not in camera_settings.TIMING_KEYS}
+
+
+def _timing_why(own: bool, setting, timing, mode: str) -> str:
+    """Why a frame's time is not calibrated ("" when it is)."""
+    if not own:
+        return "the camera's own clock is not in use"
+    if timing is None:
+        return f"no timing calibration for {mode} (api_tests/80_camera_timing.py)"
+    if setting is None and timing["auto_us"] is None:
+        return "calibrated for fixed exposures only; the camera is on automatic exposure"
+    if setting is not None and timing["offset_us"] is None:
+        return "calibrated for automatic exposure only; the camera is on a fixed exposure"
+    return ""
+
+
 # ---------------------------------------------------------------- the server
 
 class CameraServer:
@@ -309,6 +327,8 @@ class CameraServer:
         self.clock_frames = self.driver_frames = self.clock_disagreed = 0
         self.lags: deque = deque(maxlen=90)    # the driver's timestamp minus the camera's time, recent frames
         self.time_source = None                # "camera" / "driver": what the last frame's time came from
+        self.calibrated = False                # the last frame's time includes the timing calibration (P3)
+        self.timing_why = ""                   # ... and why not
         self.trace = None
         self.trace_cols = None
         self.next_trace = 0.0
@@ -321,16 +341,25 @@ class CameraServer:
 
     def check_settings(self) -> None:
         m = _mtime(SYSTEM_XML)
+        gcam, gname = camera_settings.gripper_camera(SYSTEM_XML, GRIPPERS_DIR)
         if m == self.settings_mtime:
-            return
+            # the gripper XML alone changed its timing calibration (api_tests/80 --apply): taken without a reopen
+            if gname == self.gripper and gcam != self.gripper_cam and _without_timing(gcam) == _without_timing(
+                    self.gripper_cam):
+                logger.info(f"camera timing calibration loaded from grippers/{gname}.xml: "
+                            f"{ {k: v for k, v in (gcam or {}).items() if k in camera_settings.TIMING_KEYS} }")
+                self.gripper_cam = gcam
+                return
+            if gcam == self.gripper_cam:
+                return
         self.settings_mtime = m
         new, problems = camera_settings.read(SYSTEM_XML)
-        gcam, gname = camera_settings.gripper_camera(SYSTEM_XML, GRIPPERS_DIR)
         for p in problems:
             logger.warning(f"system.xml <camera>: {p} — its default is used")
         self.problems = list(problems)
         reopen_keys = ("enabled", "device", "width", "height", "fps")
-        reopen = any(new[k] != self.settings[k] for k in reopen_keys) or gcam != self.gripper_cam
+        reopen = (any(new[k] != self.settings[k] for k in reopen_keys)
+                  or _without_timing(gcam) != _without_timing(self.gripper_cam))
         controls_changed = new["controls"] != self.settings["controls"]
         if new != self.settings or gname != self.gripper:
             logger.info(f"settings changed: {self.settings} -> {new}; gripper {self.gripper} -> {gname}")
@@ -341,7 +370,17 @@ class CameraServer:
         elif controls_changed and self.cam is not None:
             self.apply_controls()
 
+    def _camera_controls(self) -> dict:
+        try:
+            return {c["key"]: c for c in self.cam.controls()}
+        except (OSError, AttributeError):
+            return {}
+
     def apply_controls(self) -> None:
+        """The camera's controls = system.xml's <camera controls>; every control NOT named there goes back to the
+        camera's own default. A camera keeps a value until it loses power, so a control taken out of the setting
+        stayed where it was — found 2026-11-24: a fixed exposure stayed after it was removed, and the Camera tab's
+        "back to the defaults" reset nothing but the dynamic frame rate."""
         self.control_problems = []
         self.control_notes = []                    # set, but the camera ignores it now (its automatic mode is on)
         try:
@@ -349,22 +388,42 @@ class CameraServer:
         except ValueError as e:
             self.control_problems.append(str(e))
             wanted = []
+        named = dict(wanted)
+
+        def is_mode(key):
+            return key.startswith("auto_") or key.endswith(("_automatic", "_auto"))
+
         # The automatic modes first: a manual value (exposure_time_absolute, white_balance_temperature) is ignored
-        # while its automatic mode is still on (the control reads "inactive").
-        wanted.sort(key=lambda kv: 0 if kv[0].startswith("auto_") or kv[0].endswith(("_automatic", "_auto")) else 1)
-        for key, value in wanted:
-            try:
-                self.cam.set_control(key, value)
-            except KeyError:
-                self.control_problems.append(f"{key}: this camera has no such control")
-            except OSError as e:
-                if e.errno == errno.EACCES:        # an inactive control: kept, applied once its automatic mode is off
+        # while its automatic mode is still on (the control reads "inactive"); then the camera is asked again.
+        for modes in (True, False):
+            current = self._camera_controls()
+            steps = [(k, v, True) for k, v in wanted if is_mode(k) == modes]
+            steps += [(k, c["default"], False) for k, c in current.items()
+                      if k not in named and is_mode(k) == modes and not c["read_only"] and not c["inactive"]
+                      and c["type"] in ("int", "bool", "menu", "intmenu") and c["value"] is not None
+                      and c["value"] != c["default"]]
+            for key, value, explicit in steps:
+                self._set_one(key, value, explicit)
+        self._report_controls()
+
+    def _set_one(self, key: str, value: int, explicit: bool) -> None:
+        try:
+            self.cam.set_control(key, value)
+            if not explicit:
+                logger.info(f"camera control: {key} back to its default {value} (not in <camera controls>)")
+        except KeyError:
+            self.control_problems.append(f"{key}: this camera has no such control")
+        except OSError as e:
+            if e.errno == errno.EACCES:            # an inactive control: kept, applied once its automatic mode is off
+                if explicit:
                     self.control_notes.append(f"{key}: not used while its automatic mode is on (kept for when it is "
                                               f"off)")
-                else:
-                    self.control_problems.append(f"{key}: {e}")
-            except ValueError as e:
+            else:
                 self.control_problems.append(f"{key}: {e}")
+        except ValueError as e:
+            self.control_problems.append(f"{key}: {e}")
+
+    def _report_controls(self) -> None:
         for n in self.control_notes:
             logger.info(f"camera control: {n}")
         for p in self.control_problems:
@@ -456,13 +515,24 @@ class CameraServer:
         values = {c["key"]: c["value"] for c in self.controls}
         flags = 0
         exposure_us = 0
+        setting = None                                            # the fixed exposure setting, None = automatic
         if values.get("auto_exposure") not in (None, 1):          # 1 = manual on UVC cameras
             flags |= cp.FLAG_AUTO_EXPOSURE
         elif values.get("exposure_time_absolute") is not None:
-            exposure_us = int(values["exposure_time_absolute"]) * 100   # UVC: units of 100 us
+            setting = int(values["exposure_time_absolute"])
+            exposure_us = setting * camera_settings.EXPOSURE_UNIT_US   # UVC: 100 us units (confirmed by the frame rate)
+        timing = camera_settings.camera_timing(self.gripper_cam, camera_settings.mode_key(
+            self.cam.width, self.cam.height, self.cam.fps))
         t_frame, pts, own = self.frame_time(seq, ts)
         if own:
             flags |= cp.FLAG_CAMERA_CLOCK
+            offset = camera_settings.timing_offset_s(timing, setting)
+            if offset is not None:
+                t_frame += offset
+                flags |= cp.FLAG_CALIBRATED
+        self.calibrated = bool(flags & cp.FLAG_CALIBRATED)
+        self.timing_why = _timing_why(own, setting, timing, camera_settings.mode_key(self.cam.width, self.cam.height,
+                                                                                     self.cam.fps))
         tick = self.tickmap.tick_at(t_frame)
         if not math.isnan(tick):
             flags |= cp.FLAG_TICK
@@ -522,7 +592,11 @@ class CameraServer:
                 "device_mhz": h["device_mhz"], "frames_camera_clock": self.clock_frames,
                 "frames_driver_time": self.driver_frames, "disagreed": self.clock_disagreed,
                 "restarts": h["restarts"],
-                "driver_after_ms": round(lags[len(lags) // 2] * 1e3, 2) if lags else None}
+                "driver_after_ms": round(lags[len(lags) // 2] * 1e3, 2) if lags else None,
+                "calibrated": self.calibrated if self.cam is not None else None,
+                "calibration": (camera_settings.camera_timing(self.gripper_cam, camera_settings.mode_key(
+                    self.cam.width, self.cam.height, self.cam.fps)) if self.cam is not None else None),
+                "calibration_why": self.timing_why if self.cam is not None else ""}
 
     def poll_trace(self, now: float) -> None:
         if now < self.next_trace:
