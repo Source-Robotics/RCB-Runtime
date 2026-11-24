@@ -68,6 +68,14 @@ def _set_control(key: str, value) -> None:
     _save(controls=camera_settings.format_controls(pairs))
 
 
+def _clock_text(clk: dict) -> str:
+    """Where the frames' times come from (the status' "clock", P2): the camera's own clock or the driver's."""
+    if clk.get("source") == "camera":
+        return (f"the camera's own clock (fit ±{clk.get('fit_us')} µs, the camera's clock {clk.get('device_mhz')} "
+                f"MHz); the driver's timestamps come {clk.get('driver_after_ms')} ms after it")
+    return f"the driver's timestamps (4 ms steps): {clk.get('why') or 'the camera clock is not known yet'}"
+
+
 def _host_url(path: str) -> str:
     """A JavaScript expression: the camera server's URL on the host the browser used for the dashboard."""
     return f"location.protocol + '//' + location.hostname + ':{CAMERA_PORT}{path}'"
@@ -209,7 +217,8 @@ def add_camera_tab(is_visible) -> None:
                       f"{st.get('fps', 0)} fps, {st.get('mbit_s', 0)} Mbit/s",
                       f"- **Frames:** {st.get('frames', 0)}, lost by the driver {st.get('lost', 0)}, camera reopened "
                       f"{st.get('reopens', 0)} times",
-                      f"- **RTI tick on each frame:** {'yes' if st.get('tick_mapping') else 'no (RTI trace not read)'}"]
+                      f"- **RTI tick on each frame:** {'yes' if st.get('tick_mapping') else 'no (RTI trace not read)'}",
+                      f"- **Frame times:** {_clock_text(st.get('clock') or {})}"]
         lines.append(f"- **Clients:** {clients or 'none'}")
         details.set_content("\n".join(lines))
         problems.set_text("; ".join(st.get("problems") or []))

@@ -28,6 +28,15 @@ What changed in each version of the RCB runtime. The newest version is at the to
   the server's status, the settings and every control the camera reports.
 - The camera protocol's number in `get_versions()` / the status's `protocols` (`"camera": 1`) and in
   `robotclient.version`.
+- Frame times from the camera's own clock: the camera server reads the camera's UVC metadata with the video and turns
+  each frame's own timestamp (PTS) into the robot's clock (`utility/uvc_clock.py`). A frame's `exposure_time` then has
+  flag 1 set: consecutive frames come out 33.3295 ms apart within about 2 us, where the driver's timestamps came in
+  4 ms steps and 1.2 to 5.1 ms late. RTI's tick is taken at that time. The header's `pts` field carries the raw value.
+  Without metadata (another camera) or in the first ~0.2 s after an open, the driver's timestamp is used as before. The
+  Camera tab and the status (`clock`) say which one the frames carry.
+- `robotclient.CameraClient` and `CameraFrame`: the camera's frames on a PC, each with its time and RTI tick, in order
+  (for recording) or only the newest (`latest_only=True`, for a controller). Standard library only; `connect()`
+  checks the camera protocol (`VersionMismatch`).
 
 ### Changed
 

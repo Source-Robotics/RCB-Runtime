@@ -18,6 +18,11 @@ RTI's shared-memory trace (utility/trace_ring.py) only, to turn a frame's time i
       /preview        MJPEG at preview_fps (the dashboard's Camera tab)
       /snapshot.jpg   the latest frame;  /  a page with the stream
     A client whose previous frame is still going out SKIPS the new one: no queue, so nobody ever sees old frames.
+  * Frame times (P2, 2026-11-24): the camera's own clock. The camera's UVC metadata node is streamed with the video;
+    utility/uvc_clock.py ties the camera's clock to CLOCK_MONOTONIC (+-9 us) and turns each frame's PTS into its time
+    (FLAG_CAMERA_CLOCK; the raw PTS in the header). Until that clock is known (~0.2 s after an open), without a
+    metadata node, or when the result disagrees with the driver's timestamp: the driver's timestamp (4 ms steps).
+    RTI's tick is taken at the frame's time.
   * Status: JSON in shared memory (camera_protocol.STATUS_NAME) once a second, with a "beat" counter the supervisor's
     hang check watches (the user's D1).
 
@@ -33,6 +38,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")   # numpy (the trace reader) 
 
 import bisect                                                                     # noqa: E402
 import errno                                                                      # noqa: E402
+from collections import deque                                                     # noqa: E402
 import logging                                                                    # noqa: E402
 import math                                                                       # noqa: E402
 import resource                                                                   # noqa: E402
@@ -52,6 +58,7 @@ from config.networking import CAMERA_PORT                                       
 from project_paths import LOGS_DIR, SYSTEM_XML                                    # noqa: E402
 from utility import camera_settings                                               # noqa: E402
 from utility.logger_setup import setup_logging                                    # noqa: E402
+from utility.uvc_clock import CameraClock                                         # noqa: E402
 
 logger = logging.getLogger("cam")  # docs/logging.md "Logger names"
 LOG_FILE = os.path.join(str(LOGS_DIR), "camera.log")
@@ -65,6 +72,10 @@ TICK_WINDOW_S = 2.0               # trace rows kept for the time -> tick mapping
 TICK_EDGE_S = 0.5                 # a time this far outside the rows kept has no tick (NaN)
 MAX_CLIENTS = 8
 SEND_BUFFER = 256 * 1024          # small: a slow client skips frames instead of seeing old ones
+# The driver's timestamp (the transfer of the frame's first packet) comes this long after the camera's own time of
+# the frame: measured 1.2-5.1 ms (2026-11-24). A camera time outside is not used for that frame (counted: disagreed).
+CLOCK_LAG_S = (-0.0005, 0.025)
+PTS_KEPT = 32                     # frames' PTS kept until their video frame is read
 _stop = False
 
 
@@ -293,6 +304,11 @@ class CameraServer:
         self.last_frame = 0.0
         self.window = []                   # (time, bytes) of the last 2 s, for fps / Mbit/s
         self.tickmap = TickMap()
+        self.clock = CameraClock()             # the camera's own clock (P2)
+        self.pts: dict = {}                    # driver sequence -> its frame's PTS, until the frame is read
+        self.clock_frames = self.driver_frames = self.clock_disagreed = 0
+        self.lags: deque = deque(maxlen=90)    # the driver's timestamp minus the camera's time, recent frames
+        self.time_source = None                # "camera" / "driver": what the last frame's time came from
         self.trace = None
         self.trace_cols = None
         self.next_trace = 0.0
@@ -378,7 +394,8 @@ class CameraServer:
             return
         try:
             self.describe = self.uvc.describe(path)
-            self.cam = self.uvc.Camera(path, self.settings["width"], self.settings["height"], self.settings["fps"])
+            self.cam = self.uvc.Camera(path, self.settings["width"], self.settings["height"], self.settings["fps"],
+                                       meta=True)
         except OSError as e:
             self.cam = None
             hint = " — is the robot's user in the 'video' group? (scripts/setup_system.sh)" if e.errno == 13 else ""
@@ -392,9 +409,17 @@ class CameraServer:
             logger.warning(f"USB interrupt threads not on the general cores: {bad}")
         self.prev_seq = None
         self.last_frame = now
+        self.clock.reset()
+        self.pts.clear()
+        self.lags.clear()
         self._set_state("streaming", "")
+        meta = self.cam.meta_path
         logger.info(f"camera open: {path} ({self.device['usb_id']}), MJPEG {self.cam.width}x{self.cam.height} at "
-                    f"{self.cam.fps:g} fps; USB interrupt threads {self.irq}")
+                    f"{self.cam.fps:g} fps; USB interrupt threads {self.irq}; frame times: "
+                    + (f"the camera's own clock (metadata {meta})" if meta else "the driver's timestamps"))
+        if not meta:
+            logger.warning(f"the camera's own clock is not available ({self.cam.meta_problem}): frames carry the "
+                           f"driver's timestamps (4 ms steps)")
 
     def close_camera(self, why: str) -> None:
         if self.cam is None:
@@ -435,15 +460,18 @@ class CameraServer:
             flags |= cp.FLAG_AUTO_EXPOSURE
         elif values.get("exposure_time_absolute") is not None:
             exposure_us = int(values["exposure_time_absolute"]) * 100   # UVC: units of 100 us
-        tick = self.tickmap.tick_at(ts)
+        t_frame, pts, own = self.frame_time(seq, ts)
+        if own:
+            flags |= cp.FLAG_CAMERA_CLOCK
+        tick = self.tickmap.tick_at(t_frame)
         if not math.isnan(tick):
             flags |= cp.FLAG_TICK
         raw = part = None
         for c in self.clients:
             if c.kind == "raw":
                 if raw is None:
-                    raw = cp.pack(self.frame_no, seq, self.cam.width, self.cam.height, flags, ts, tick, exposure_us,
-                                  0, now, len(data)) + data
+                    raw = cp.pack(self.frame_no, seq, self.cam.width, self.cam.height, flags, t_frame, tick,
+                                  exposure_us, pts, now, len(data)) + data
                 c.queue(raw)
             elif c.kind in ("stream", "preview"):
                 if c.kind == "preview":
@@ -454,6 +482,47 @@ class CameraServer:
                 if part is None:
                     part = mjpeg_part(data)
                 c.queue(part)
+
+    def frame_time(self, seq: int, ts: float) -> tuple[float, int, bool]:
+        """(the frame's time, its raw PTS or 0, from the camera's own clock?). The camera's metadata that arrived is
+        taken first (it is finished just before its video frame). The driver's timestamp `ts` when the camera's clock
+        is not known yet, the camera has no metadata, or its time disagrees with `ts` (CLOCK_LAG_S)."""
+        read_meta = getattr(self.cam, "read_meta", None)
+        if read_meta is not None:
+            for mseq, err, data in read_meta():
+                p = self.clock.add(data)
+                if p is not None and not err:
+                    self.pts[mseq] = p
+            while len(self.pts) > PTS_KEPT:
+                del self.pts[next(iter(self.pts))]
+        pts = self.pts.pop(seq, None)
+        t = self.clock.time_of(pts) if pts is not None else None
+        if t is not None and CLOCK_LAG_S[0] <= ts - t <= CLOCK_LAG_S[1]:
+            self.lags.append(ts - t)
+            self.clock_frames += 1
+            self.time_source = "camera"
+            return t, pts, True
+        if t is not None:
+            self.clock_disagreed += 1
+        self.driver_frames += 1
+        self.time_source = "driver"
+        return ts, pts or 0, False
+
+    def clock_status(self) -> dict:
+        """The frame-time part of the status: where the times come from and how well the camera's clock fits."""
+        h = self.clock.health()
+        meta = getattr(self.cam, "meta_path", None) if self.cam is not None else None
+        if self.cam is not None and not meta:      # no metadata: that is why, whatever the clock held before
+            why = getattr(self.cam, "meta_problem", "") or "no UVC metadata"
+        else:
+            why = "" if h["ok"] else h["why"]
+        lags = sorted(self.lags)
+        return {"source": self.time_source if self.cam is not None else None, "metadata": meta,
+                "why": why, "pairs": h["pairs"], "fit_us": h["fit_us"],
+                "device_mhz": h["device_mhz"], "frames_camera_clock": self.clock_frames,
+                "frames_driver_time": self.driver_frames, "disagreed": self.clock_disagreed,
+                "restarts": h["restarts"],
+                "driver_after_ms": round(lags[len(lags) // 2] * 1e3, 2) if lags else None}
 
     def poll_trace(self, now: float) -> None:
         if now < self.next_trace:
@@ -498,6 +567,7 @@ class CameraServer:
             "fps": round(fps, 1), "mbit_s": round(mbit, 2),
             "frames": self.frames, "lost": self.lost, "reopens": self.reopens,
             "tick_mapping": bool(self.tickmap.times),
+            "clock": self.clock_status(),
             "clients": [{"kind": c.kind, "addr": c.addr, "frames": c.frames, "skipped": c.skipped}
                         for c in self.clients if c.kind != "http"],
             "settings": self.settings, "problems": self.problems + self.control_problems,

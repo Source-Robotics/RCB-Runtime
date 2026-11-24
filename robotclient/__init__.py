@@ -1,9 +1,9 @@
 """robotclient — Python client library for the PAR6 robot (EXEC mode + RTI streaming).
 
-    from robotclient import RobotClient, RTIClient
+    from robotclient import RobotClient, RTIClient, CameraClient
     from robotclient.rti_client import JointPositionCommand, MotionFinished
 
-Talks newline-JSON over TCP to command_executor (EXEC), UDP to RTI.
+Talks newline-JSON over TCP to command_executor (EXEC), UDP to RTI; CameraClient reads the camera server (HTTP).
 """
 
 from .client import RobotClient, GripperResult
@@ -13,6 +13,8 @@ from .rti_client import (
     RTIClient, JointPositionCommand, JointVelocityCommand, JointTorqueCommand,
     MotionFinished, RobotState, ControlLost,
 )
+# camera_client: the wrist camera's frames (2026-11-24, camera plan P2); standard library only, like rti_client.
+from .camera_client import CameraClient, CameraFrame
 from .exceptions import (
     RobotError, RobotConnectionError, RobotTimeout, CommandRejected, MotionFailed,
     GripFailed,
@@ -53,6 +55,7 @@ __all__ = [
     "RobotClient",
     "RTIClient", "JointPositionCommand", "JointVelocityCommand", "JointTorqueCommand",
     "MotionFinished", "RobotState", "ControlLost",
+    "CameraClient", "CameraFrame",
     "DryRunRobotClient", "DryRunPlan",
     "RobotError", "RobotConnectionError", "RobotTimeout", "CommandRejected",
     "MotionFailed",

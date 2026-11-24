@@ -16,14 +16,19 @@ camera's own JPEG bytes (never decoded or re-encoded on the robot):
   24      f64   exposure_time    s, the robot's CLOCK_MONOTONIC: when the image was taken (what it means: the flags)
   32      f64   rti_tick         RTI's loop tick at exposure_time, fractional; NaN when RTI's trace was not readable
   40      u32   exposure_us      the exposure length, 0 = not known (auto exposure)
-  44      u32   pts              the camera's own timestamp (its clock), 0 = not read
+  44      u32   pts              the camera's own timestamp of the frame (its clock, raw 32 bits), 0 = not read
   48      f64   send_time        s, the robot's CLOCK_MONOTONIC when the server queued the frame for this client
   56      u32   jpeg_length      bytes of JPEG after the header
 
-exposure_time is the driver's timestamp until the camera's own timestamps are used (plan P2: FLAG_CAMERA_CLOCK) and
-the calibrated offset to the middle of the exposure is applied (P3: FLAG_CALIBRATED). The driver's timestamp comes in
-4 ms steps (one USB transfer) and marks when the frame's first packet arrived, ~1 ms after the camera started reading
-the sensor out (measured 2026-11-23).
+exposure_time, by its flags:
+  FLAG_CAMERA_CLOCK  the camera's own time of the frame (its PTS: when it began the frame) on the robot's clock
+                     (utility/uvc_clock.py, P2 2026-11-24): consecutive frames +-2 us apart, the line through the
+                     camera's clock +-9 us; one constant is left — where the PTS falls in the exposure — which P3's
+                     calibration measures.
+  without it         the driver's timestamp: the USB transfer that brought the frame's first packet — 4 ms steps,
+                     1.2-5.1 ms after the camera's time (measured 2026-11-24). The first ~0.2 s after an open, and
+                     on a camera without UVC metadata.
+  FLAG_CALIBRATED    (P3) the calibrated offset to the middle of the exposure is applied.
 
 CAMERA_PROTOCOL_VERSION is raised ONLY for an incompatible change of this layout (VERSIONING.md); a new field goes
 after the last one with header_length grown, which old readers skip.
@@ -38,7 +43,7 @@ MAGIC = b"RCBF"
 HEADER = struct.Struct("<4sHHIIHHIddIIdI")
 assert HEADER.size == 60
 
-FLAG_CAMERA_CLOCK = 0x01        # exposure_time from the camera's own timestamp (else the driver's)
+FLAG_CAMERA_CLOCK = 0x01        # exposure_time from the camera's own clock (its PTS), else the driver's timestamp
 FLAG_CALIBRATED = 0x02          # exposure_time includes the calibrated offset to the middle of the exposure
 FLAG_AUTO_EXPOSURE = 0x04       # the camera chose the exposure itself (exposure_us 0)
 FLAG_TICK = 0x08                # rti_tick is valid

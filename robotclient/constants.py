@@ -1,6 +1,7 @@
 """Client-side constants."""
 
 DEFAULT_PORT = 29000          # command_executor TCP server
+CAMERA_PORT = 30050           # camera_server.py's HTTP port (config/networking.CAMERA_PORT; CameraClient)
 CONNECT_TIMEOUT = 5.0         # seconds
 IMMEDIATE_TIMEOUT = 5.0       # seconds to wait for an immediate command reply
 # A FORCED control takeover can block on the robot for its whole physical-confirmation
