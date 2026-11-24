@@ -13,6 +13,35 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+### Added
+
+- The camera server (`camera_server.py`, started by the supervisor): the gripper's USB camera relayed over the
+  network as the camera sends it (MJPEG, never re-encoded on the robot), on one HTTP port, 30050. `/frames` carries
+  every frame with a 60-byte header (camera protocol 1, `communication/camera_protocol.py`): the frame's time on the
+  robot's clock and RTI's loop tick at that moment. `/stream` is the full-rate MJPEG stream, `/preview` a reduced-rate
+  one, `/snapshot.jpg` the latest frame, `/` a page. A client that falls behind skips frames instead of queueing them. The camera is found by
+  the USB id the active gripper's XML declares (every MSG variant now has `<camera usb_id="0bda:5844" .../>`), and it
+  is opened again by itself after an unplug.
+- `config/system.xml` `<camera .../>`: on / off, which camera, the mode, the preview rate and the camera's own
+  controls. The default turns the camera's dynamic frame rate off (it fell to 16.6 fps in the dark).
+- The dashboard's **Camera** tab: the live preview (straight from the camera server, only while the tab is shown),
+  the server's status, the settings and every control the camera reports.
+- The camera protocol's number in `get_versions()` / the status's `protocols` (`"camera": 1`) and in
+  `robotclient.version`.
+
+### Changed
+
+- The supervisor's hang check also watches the camera server (`P_CAMERA:PROCESS_HUNG_WARNING`); the shared-memory
+  flag grows from 6 to 7 values, so the whole robot service must restart together.
+- `scripts/setup_system.sh` adds the robot's user to the `video` group (the camera).
+- The boot chime is off as shipped (`config/system.xml` `<sound><boot>0</boot>`; the user, 2026-11-24): it played
+  at a fixed time, 12.8 s after RTI's start, also in the middle of a homing on the joint being homed. The Sound card
+  switches it back on.
+- The robot's sounds play only on a joint's drive: `set_sound(drive=...)` refuses the gripper's drive (`BAD_ARGS`), the
+  dashboard's Sound card no longer offers it, and RTI drops a tune meant for it with one warning. The gripper's drive
+  runs in controller mode 7, where the firmware plays nothing; a sound setting left on it had silenced every robot
+  sound.
+
 ## [3.0.1] - 2026-11-23
 
 ### Changed

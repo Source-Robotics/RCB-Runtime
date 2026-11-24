@@ -81,6 +81,8 @@ NAMES = {
     # the self-collision worker — logs/self_collision.log (and the executor's planner check)
     "sc":            "self-collision: the model, margins, the worker's cycle times",
     "rec":           "the recorder (recorder.py): incident dumps and captures from RTI's shared-memory trace",
+    # the camera server — logs/camera.log
+    "cam":           "the camera server (camera_server.py): the gripper's camera, its clients, its settings",
     # code that runs in several processes
     "config":        "the robot / system / gripper XMLs, zones and walls files",
     "filters":       "signal filter specs",

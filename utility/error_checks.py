@@ -866,7 +866,7 @@ def _update_error_metadata(shared_data, latched_errors, error_metadata, details=
 
 
 _PROGRAM_WORDS = {"EXECUTOR": "the executor", "SELF_COLLISION": "the self-collision worker", "RECORDER": "the recorder",
-                  "DASHBOARD": "the dashboard"}
+                  "DASHBOARD": "the dashboard", "CAMERA": "the camera server"}
 
 
 def _where(key):

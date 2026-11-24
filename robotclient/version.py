@@ -30,9 +30,11 @@ PROTOCOL_VERSION = 4        # the command protocol (newline JSON over TCP to the
                             # by default
 RTI_PROTOCOL_VERSION = 1    # the RTI command packet
 TELEMETRY_FORMAT = 1        # the state / telemetry packets ("tag:v,v,...")
+CAMERA_PROTOCOL_VERSION = 1  # the camera server's frame header (communication/camera_protocol.py, 2026-11-24)
 
 # What a client checks at connect, by the robot's status key "protocols".
-SPOKEN = {"commands": PROTOCOL_VERSION, "rti": RTI_PROTOCOL_VERSION, "telemetry": TELEMETRY_FORMAT}
+SPOKEN = {"commands": PROTOCOL_VERSION, "rti": RTI_PROTOCOL_VERSION, "telemetry": TELEMETRY_FORMAT,
+          "camera": CAMERA_PROTOCOL_VERSION}
 
 # The first runtime whose executor knows the renamed command IDs; a robot older than it gets the IDs below
 # (every ID the 0.9.0 release accepts). The two aliases set_default_profile / set_default_ik_solver are not here:

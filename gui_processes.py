@@ -28,6 +28,7 @@ PROCESSES = (
     ("GUI", "nicegui_test.py", False),
     ("Supervisor", "supervisor.py", False),
     ("Recorder", "recorder.py", False),                  # incident dumps + captures (2026-10-16)
+    ("Camera server", "camera_server.py", False),        # the gripper's camera over the network (2026-11-24)
     ("Block program", "blockly.runner", True),
     ("Firmware flasher", "flash_motor_firmware.py", True),
 )

@@ -6881,14 +6881,17 @@ class RobotClient:
                 torque, quieter); programs' tones always play on `"d"`.
                 `current_ma`: the loudness as a current, 10 to 1000 mA (a drive's tone
                 never takes more than that drive's own current limit).
-                `drive`: the drive that plays, 1 for J1 up to the last joint,
-                one more for a CAN gripper. `limit_mv`: the most voltage the sound may
-                use, 500 to 6000 mV. `boot_tune`, `homing_done_tune`,
-                `error_tune` and `identify_tune`: the tune each of the robot's
+                `drive`: the joint whose drive plays, 1 for J1 up to the last
+                joint (a gripper's drive plays no sound and is refused).
+                `limit_mv`: the most voltage the sound may use, 500 to
+                6000 mV. `boot_tune`, `homing_done_tune`, `error_tune` and
+                `identify_tune`: the tune each of the robot's
                 own sounds plays, a name from the library (see `play_sound()`).
 
         Defaults:
-            From `config/system.xml`. As shipped: all five sounds on, `axis`
+            From `config/system.xml`. As shipped: every sound on but `boot`
+            (off since 2026-11-24: it played 12.8 s after a start, also during
+            a homing), `axis`
             `"q"`, `current_ma` 290 mA, `drive` 2 (J2), `limit_mv` 3600 mV (the
             values chosen on PAR6 by ear); the tunes `boot_tune` `"arpeggio"`,
             `homing_done_tune` `"rise"`, `error_tune` `"low_double"`,
@@ -6905,7 +6908,7 @@ class RobotClient:
 
         Errors:
             BAD_ARGS: No setting named, an unknown setting, a value out of range,
-                or a tune not in the library.
+                the gripper's drive as `drive`, or a tune not in the library.
             INTERNAL: The file could not be written, or the edited file did not
                 read back the values; the file is left unchanged.
             RTI_REFUSED: RTI did not take a setting. The message says why.

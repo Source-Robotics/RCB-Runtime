@@ -46,16 +46,18 @@ FILES = {
     "gui.log (dashboard)": ("gui.log", True),
     "self_collision.log": ("self_collision.log", True),
     "recorder.log": ("recorder.log", True),
+    "camera.log": ("camera.log", True),
     "critical_errors.log": ("critical_errors.log", True),
     "RTI.out.log (stdout: crashes, dumps)": ("RTI.out.log", False),
     "HIGH_LEVEL.out.log": ("HIGH_LEVEL.out.log", False),
     "GUI.out.log": ("GUI.out.log", False),
     "SELF_COLLISION.out.log": ("SELF_COLLISION.out.log", False),
     "RECORDER.out.log": ("RECORDER.out.log", False),
+    "CAMERA.out.log": ("CAMERA.out.log", False),
     "block_programs.log": ("block_programs.log", False),
 }
 MERGED_FILES = ("RTI.log", "high_level.log (executor)", "supervisor.log", "gui.log (dashboard)", "self_collision.log",
-                "recorder.log")
+                "recorder.log", "camera.log")
 LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
 FIRST_READ_BYTES = 512_000
 KEEP_RECORDS = 4000            # per file

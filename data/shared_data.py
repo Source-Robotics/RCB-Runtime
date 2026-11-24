@@ -864,10 +864,11 @@ def setup(joints: int = 6, force_reinit: bool = False):
                         # call in RTI's loop)
                         ("disk_low", 2),
                         # a program stuck but alive (review I4, 2026-11-22; supervisor/hang_check.py): [0] how many
-                        # are hung, [1..5] seconds hung per program (RTI, executor, self-collision worker, recorder,
-                        # dashboard; 0 = fine) — the supervisor writes it, RTI's error pass shows
-                        # P_<NAME>:PROCESS_HUNG_WARNING, the health card reads it (also when RTI itself is stuck)
-                        ("process_hung", 6)]:
+                        # are hung, [1..6] seconds hung per program (RTI, executor, self-collision worker, recorder,
+                        # dashboard, camera server — the last since 2026-11-24, TODO/camera_plan.md D1; 0 = fine) —
+                        # the supervisor writes it, RTI's error pass shows P_<NAME>:PROCESS_HUNG_WARNING, the health
+                        # card reads it (also when RTI itself is stuck)
+                        ("process_hung", 7)]:
         shm, arr = _attach_or_create(name, np.float64, count)
         rti_shms[name] = shm
         rti[name] = arr

@@ -783,6 +783,7 @@ def main():
     sound.max_ma = {i: float(motor_Ilim[i]) for i in range(joint_num)}
     if active_CAN_gripper:
         sound.max_ma[joint_num] = float(st.gripper_Ilim)
+        sound.silent_nodes = {joint_num}     # the gripper's drive (mode 7) plays nothing (2026-11-24)
     scheduled_state["sound"] = sound
     PARAM_READ_AT_START_TICK = 1000      # 4 s in: after the start-up config re-sends (ticks 50 / 150 / 300)
     # Per node, the tick before which its silence is not latched as lost: a drive saving its config to flash (save_drive)
@@ -1474,11 +1475,13 @@ def main():
     )
     sound.on_q_tune = safety_monitor.mute_hold_osc     # a q tune is no buzzing joint (review C19, 2026-11-22)
     # The supervisor's hang check (review I4, 2026-11-22; supervisor/hang_check.py): rti['process_hung'] [0] how many,
-    # [1..5] seconds per program. RTI's own slot (1) is skipped: a stuck RTI runs no error pass, and a running one
-    # is not stuck. One float compare per tick; the keys are built only while something is hung.
+    # [1..6] seconds per program. RTI's own slot (1) is skipped: a stuck RTI runs no error pass, and a running one
+    # is not stuck. One float compare per tick; the keys are built only while something is hung. Slot 6, the camera
+    # server, since 2026-11-24 (TODO/camera_plan.md D1).
     _hung_flag = shared_data.rti['process_hung']
     _HUNG_KEYS = ((2, "P_EXECUTOR:PROCESS_HUNG_WARNING"), (3, "P_SELF_COLLISION:PROCESS_HUNG_WARNING"),
-                  (4, "P_RECORDER:PROCESS_HUNG_WARNING"), (5, "P_DASHBOARD:PROCESS_HUNG_WARNING"))
+                  (4, "P_RECORDER:PROCESS_HUNG_WARNING"), (5, "P_DASHBOARD:PROCESS_HUNG_WARNING"),
+                  (6, "P_CAMERA:PROCESS_HUNG_WARNING"))
 
     def _hung_keys():
         if _hung_flag[0] < 0.5:

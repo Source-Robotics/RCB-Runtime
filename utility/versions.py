@@ -27,6 +27,7 @@ import re
 import time
 from typing import Any
 
+from communication.camera_protocol import CAMERA_PROTOCOL_VERSION
 from communication.protocol import PROTOCOL_VERSION
 from communication.rti_protocol import RTI_PROTOCOL_VERSION
 from config.schema_versions import report as config_formats_report
@@ -35,9 +36,11 @@ from project_paths import GRIPPERS_DIR, PAR6_DESCRIPTION_DIR, PROJECT_ROOT, ROBO
 from utility.code_version import git_commit
 from utility.serialization import TELEMETRY_FORMAT
 
-# The three protocols' versions (versioning V3): what the executor publishes in every status message and what
-# get_versions reports. A client refuses a robot whose number of a protocol it speaks differs from its own.
-PROTOCOLS = {"commands": PROTOCOL_VERSION, "rti": RTI_PROTOCOL_VERSION, "telemetry": TELEMETRY_FORMAT}
+# The protocols' versions (versioning V3; the camera stream's since 2026-11-24, TODO/camera_plan.md): what the
+# executor publishes in every status message and what get_versions reports. A client refuses a robot whose number of a
+# protocol it speaks differs from its own.
+PROTOCOLS = {"commands": PROTOCOL_VERSION, "rti": RTI_PROTOCOL_VERSION, "telemetry": TELEMETRY_FORMAT,
+             "camera": CAMERA_PROTOCOL_VERSION}
 
 _SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-+]+)?$")
 _static_cache: dict[str, dict] = {}

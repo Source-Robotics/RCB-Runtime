@@ -41,7 +41,7 @@ CLOCK_CACHE_S = 60.0
 # display name -> the command-line token that identifies the process (the dashboard's process card uses the same)
 PROCESSES = (("RTI", "RTI.py"), ("executor", "command_executor.py"), ("dashboard", "nicegui_test.py"),
              ("supervisor", "supervisor.py"), ("self-collision worker", "self_collision_worker.py"),
-             ("recorder", "recorder.py"))
+             ("recorder", "recorder.py"), ("camera server", "camera_server.py"))
 
 _clock_cache = {"time": 0.0, "status": None}
 
@@ -225,8 +225,9 @@ def _recorder(head, now=None):
     return component("recorder", "OK", "recording (incidents, captures)", values)
 
 
-# rti['process_hung'][1..5]'s programs (supervisor/hang_check.PROGRAMS' order; review I4, 2026-11-22)
-HUNG_NAMES = ("RTI", "executor", "self-collision worker", "recorder", "dashboard")
+# rti['process_hung'][1..6]'s programs (supervisor/hang_check.PROGRAMS' order; review I4, 2026-11-22; the camera
+# server since 2026-11-24)
+HUNG_NAMES = ("RTI", "executor", "self-collision worker", "recorder", "dashboard", "camera server")
 
 
 def hung_programs(rti) -> list:

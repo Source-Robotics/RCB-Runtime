@@ -13,12 +13,11 @@ SWITCH_LABELS = EVENT_LABELS + (("programs", "Programs' tones"),)
 AXES = {"q": "q (louder)", "d": "d (no torque)"}
 
 
-def drive_options(joint_num: int, has_gripper: bool) -> dict:
-    """{node: label} of the drives that can play: J1..J<n>, then a CAN gripper."""
-    out = {i: f"J{i + 1}" for i in range(joint_num)}
-    if has_gripper:
-        out[joint_num] = "Gripper"
-    return out
+def drive_options(joint_num: int, has_gripper: bool = False) -> dict:
+    """{node: label} of the drives that can play: J1..J<n>. Never the gripper (2026-11-24, the user): its drive runs in
+    controller mode 7 and the firmware plays sound only in modes 1-4 — a <sound><node> left on it silenced every robot
+    sound. `has_gripper` is kept for the callers and ignored."""
+    return {i: f"J{i + 1}" for i in range(joint_num)}
 
 
 def api_settings(settings: dict) -> dict:
@@ -115,8 +114,9 @@ def add_sound_card(settings: dict, joint_num: int, has_gripper: bool, exec_fn, p
         ui.switch("Programs' tones (beep, play_tune, play_sound)", value=bool(state.get("programs", 1)),
                   on_change=lambda e: set_value("programs", int(bool(e.value))))
         with ui.row().classes("items-end gap-3 flex-wrap mt-2"):
-            node = ui.select(drive_options(joint_num, has_gripper), value=int(state.get("node", 1)),
-                             label="Playing drive").classes("w-32")
+            drives = drive_options(joint_num, has_gripper)
+            node = ui.select(drives, value=int(state.get("node", 1)) if int(state.get("node", 1)) in drives else 1,
+                             label="Playing drive").classes("w-32")   # a node on the gripper (no sound): J2
             with ui.column().classes("gap-0"):
                 ui.label("Robot's own sounds on").classes("text-xs text-gray-500")
                 axis = ui.toggle(AXES, value=state.get("axis", "q"))

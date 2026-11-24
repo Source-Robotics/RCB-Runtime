@@ -13,11 +13,13 @@ not a helper thread, which can keep beating while the loop is stuck:
                     trace — judged only while RTI's loop ticks (before that the recorder has nothing to follow)
     GUI             an HTTP answer from the dashboard (GET /favicon.ico — a route registered at start; any unknown
                     path would build a whole page), probed every GUI_PROBE_S on a thread of its own
+    CAMERA          the camera server's "beat" in its status JSON (shared memory camera_status), a few times a second
+                    whether a camera is plugged in or not (2026-11-24, TODO/camera_plan.md D1)
 
 A program is ARMED at the first change of its signal after its start (a change, not an increase: shared memory keeps
 the last run's values, and RTI counts from 0 again). Armed and unchanged for its LIMIT, or never armed within its
 START limit: hung. Each hang logs one ERROR (with how long, the pid and the process's state), its end one INFO, and
-rti['process_hung'] carries it: [0] = how many programs are hung, [1..5] = seconds hung per program in PROGRAMS' order
+rti['process_hung'] carries it: [0] = how many programs are hung, [1..6] = seconds hung per program in PROGRAMS' order
 (0 = fine). RTI's error pass shows P_<NAME>:PROCESS_HUNG_WARNING (a warning: live, gone when the program works again,
 nothing stops — a stuck recorder must not stop the arm; the arm's own watchdogs cover RTI's links); the health card
 reads the flag itself, so it still shows a stuck RTI. Nothing is restarted.
@@ -31,13 +33,14 @@ import urllib.request
 
 logger = logging.getLogger("sup")
 
-# (name in supervisor.SCRIPTS, limit s, start limit s, words) — the order of rti['process_hung'][1..5]
+# (name in supervisor.SCRIPTS, limit s, start limit s, words) — the order of rti['process_hung'][1..6]
 PROGRAMS = (
     ("RTI", 2.0, 180.0, "RTI (the real-time loop)"),           # a cold boot's CAN wait took 51 s before tick 1
     ("HIGH_LEVEL", 10.0, 60.0, "the executor"),                # a stuck client's send can block it 2 s
     ("SELF_COLLISION", 5.0, 60.0, "the self-collision worker"),
     ("RECORDER", 30.0, 60.0, "the recorder"),                  # it saves a 65 s capture inside its loop
     ("GUI", 30.0, 120.0, "the dashboard"),                     # a page build blocks its event loop for seconds
+    ("CAMERA", 10.0, 60.0, "the camera server"),               # its loop waits at most 0.2 s; a camera open ~0.5 s
 )
 GUI_PROBE_S = 10.0
 GUI_PROBE_TIMEOUT_S = 2.0

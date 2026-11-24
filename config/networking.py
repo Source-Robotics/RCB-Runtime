@@ -85,6 +85,14 @@ RTI_UDP_MAX_READS    = 64     # recvfrom() calls per tick, the same bound for UD
                                #   host sending to RTI_PORT_RECEIVE could hold the loop in an unbounded drain
 RTI_OVERSIZE_LOG_S   = 10.0   # at most one "dropped an oversized datagram" line per this many seconds
 
+# --- The camera server (camera_server.py, 2026-11-23, TODO/camera_plan.md) ---
+# The gripper's camera, relayed as the camera sends it (MJPEG, never re-encoded). TCP on purpose: it slows itself down
+# on a weak link where UDP video would keep flooding the link RTI's packets share; a slow client skips frames instead of
+# queueing them. Measured 2026-11-23: no effect on the RTI link from the PC (api_tests/25 with and without video).
+# ONE port, HTTP (2026-11-24, the user: like the Pi webcam servers): "/" a page, "/stream" every frame, "/preview" (the
+# dashboard), "/snapshot.jpg", "/frames" every frame with communication/camera_protocol.py's header (programs).
+CAMERA_PORT          = 30050
+
 # --- Future / other ---
 SIMULATOR_PORT       = 27890  # Reserved for simulator connection (not yet implemented)
 

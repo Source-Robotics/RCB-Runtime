@@ -63,7 +63,7 @@ def other_rti_pids(proc_root="/proc", self_pid=None):
 # shared memory.
 RUNTIME_PROGRAMS = {b"sim.drives": "simulated drives", b"self_collision_worker.py": "self-collision worker",
                     b"recorder.py": "recorder", b"command_executor.py": "executor", b"nicegui_test.py": "dashboard",
-                    b"supervisor.py": "supervisor"}
+                    b"supervisor.py": "supervisor", b"camera_server.py": "camera server"}
 
 
 def other_runtime_pids(proc_root="/proc", self_pid=None) -> dict:

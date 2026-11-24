@@ -62,4 +62,10 @@
     <collision file="MSG_collision.json">
         <pair with="4" check="off"/>
     </collision>
+    <!-- The camera built into the MSG gripper (2026-11-23, TODO/camera_plan.md): the camera server (camera_server.py)
+         streams the camera with this USB id when config/system.xml <camera device="auto"> (a gripper without this
+         element has no camera). The id is the one unit measured (a generic UVC bridge, MJPEG 1280x720 at 30 fps); a
+         batch with another bridge needs its own id here, or <camera device="usb:vvvv:pppp"> in system.xml. frame: the
+         camera's optical frame in the PAR6 description (par6_msg.urdf msg_camera_optical_frame). -->
+    <camera usb_id="0bda:5844" frame="msg_camera_optical_frame"/>
 </gripper>

@@ -359,7 +359,7 @@
          triple_low, heartbeat, arpeggio (utility/sound.py TUNES; the Sound card plays each). The dashboard's Sound card
          changes these values here. -->
     <sound>
-        <boot>1</boot>
+        <boot>0</boot>
         <homing_done>1</homing_done>
         <error>1</error>
         <identify>1</identify>
@@ -373,4 +373,16 @@
         <error_tune>low_double</error_tune>
         <identify_tune>fanfare</identify_tune>
     </sound>
+    <!-- The camera server (camera_server.py, 2026-11-24, TODO/camera_plan.md): the gripper's USB camera relayed over
+         the network (one HTTP port, 30050: /frames with RTI's tick for programs, /stream, /preview, /snapshot.jpg), never
+         re-encoded. The dashboard's Camera tab writes this element; the server reads it within ~1 s
+         (utility/camera_settings.py documents every attribute):
+           enabled      1 = stream whenever a camera is found, 0 = leave it closed
+           device       auto = the camera the active gripper's XML declares (its camera element with a usb_id — the MSG does);
+                        usb:vvvv:pppp = the first camera with that USB id; or a /dev path
+           width, height, fps   the MJPEG mode asked for (the camera takes the nearest it has)
+           preview_fps  the dashboard preview's rate (the raw stream always carries every frame)
+           controls     the camera's own controls, key=value;key=value (keys as the Camera tab lists them), applied
+                        at every open; the default turns the dynamic frame rate off (16.6 fps in the dark) -->
+    <camera enabled="1" device="auto" width="1280" height="720" fps="30" preview_fps="15" controls="exposure_dynamic_framerate=0;white_balance_temperature=4240"/>
 </system>

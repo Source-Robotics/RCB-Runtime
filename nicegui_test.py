@@ -897,6 +897,7 @@ with ui.tabs().classes("w-full") as tabs:
     tab_activity = ui.tab('Activity Log',  icon='history')
     tab_logs    = ui.tab('Logs',           icon='article')     # the log files + support bundle (gui_logs_tab.py)
     tab_incidents = ui.tab('Recordings',   icon='video_library')  # captures + incident dumps (gui_incidents_tab.py)
+    tab_camera  = ui.tab('Camera',         icon='videocam')   # the gripper's camera (gui_camera_tab.py, 2026-11-24)
     tab_pid     = ui.tab('PID Config',     icon='tune')
     tab_filters = ui.tab('Tune Filters',   icon='graphic_eq')
     tab_preview = ui.tab('Plan Preview',   icon='play_circle')
@@ -1678,6 +1679,15 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
             add_drive_captures_card()
         except Exception:
             logger.exception("Drive captures card unavailable")
+
+    # ─── Camera: the camera server's preview, status and settings (gui_camera_tab.py, TODO/camera_plan.md) ───
+    with ui.tab_panel(tab_camera):
+        try:
+            from gui_camera_tab import add_camera_tab
+            add_camera_tab(is_visible=lambda: _active_tab_name(tabs.value) == 'Camera')
+        except Exception:
+            logger.exception("Camera tab unavailable")
+            ui.label("Camera tab unavailable — see logs/gui.log").classes("text-negative")
             ui.label("Drive captures unavailable — see logs/gui.log").classes("text-negative")
 
     # ─── PID Config ───────────────────────────────────────────

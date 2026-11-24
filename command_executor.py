@@ -1349,7 +1349,7 @@ def _handle_set_payload(args, cid, conn):
 def _other_process_logger(name):
     """A logger of a process set_log_level does not reach (2026-10-24: "ok", and nothing changed)."""
     n = str(name or "").strip()
-    return any(n == p or n.startswith(p + ".") for p in ("sup", "gui", "sc", "rec"))
+    return any(n == p or n.startswith(p + ".") for p in ("sup", "gui", "sc", "rec", "cam"))
 
 
 def _handle_set_log_level(args, cid, conn):
@@ -1876,6 +1876,21 @@ def _handle_play_sound(args, cid, conn):
     _answered(conn, cid, "play_sound", f"sound:play:{args[0]}")
 
 
+def _sound_drive_problem(d):
+    """None when `d` is a joint's drive (1 for J1 .. JOINT_NUM), else why not. Only a JOINT's drive plays (2026-11-24,
+    the user): the CAN gripper's runs in controller mode 7 and the firmware plays sound only in modes 1-4 — a
+    <sound><node> left on it silenced every robot sound (2026-11-22 .. 24)."""
+    if (isinstance(d, bool) or not isinstance(d, (int, float)) or d != d or d in (float("inf"), float("-inf"))
+            or d != int(d)):
+        return f"set_sound: drive is 1-{JOINT_NUM} (1 is J1), not {d!r}"
+    if _HAS_CAN_GRIPPER and d == JOINT_NUM + 1:
+        return (f"set_sound: the gripper's drive plays no sound (it runs in controller mode 7; sounds play in modes "
+                f"1-4) — choose a joint, drive 1-{JOINT_NUM}")
+    if not 1 <= d <= JOINT_NUM:
+        return f"set_sound: drive is 1-{JOINT_NUM} (1 is J1), not {d!r}"
+    return None
+
+
 def _handle_set_sound(args, cid, conn):
     """set_sound {setting: value, ...} — the sound's settings (utility/sound.py SETTINGS): saved in config/system.xml's
     <sound> (only those values edited, every comment kept; the edited text must read back the values before it is
@@ -1887,14 +1902,14 @@ def _handle_set_sound(args, cid, conn):
     # The drive that plays is `drive` since command protocol 4 (2026-11-22, review P1, the user: "drive sounds ok"):
     # 1 for J1 up to the last joint, one more for a CAN gripper — like the drive-parameter commands. It was `node`,
     # counted from 0; system.xml's <sound><node> and RTI keep the 0-based node, converted here.
-    n_drives = len(_drive_nodes())
+    n_drives = JOINT_NUM                               # joints only: _sound_drive_problem (2026-11-24)
     if "node" in args:
         return _bad_args(cid, conn, "set_sound", f"set_sound: 'node' is 'drive' since command protocol 4 — 1 for J1 up "
-                                                 f"to {n_drives} (the last drive)")
+                                                 f"to {n_drives} (the last joint)")
     if "drive" in args:
-        d = args["drive"]
-        if isinstance(d, bool) or not isinstance(d, (int, float)) or not (d == int(d) and 1 <= d <= n_drives):
-            return _bad_args(cid, conn, "set_sound", f"set_sound: drive is 1-{n_drives} (1 is J1), not {d!r}")
+        problem = _sound_drive_problem(args["drive"])
+        if problem:
+            return _bad_args(cid, conn, "set_sound", problem)
         args = {("node" if k == "drive" else k): (int(v) - 1 if k == "drive" else v) for k, v in args.items()}
     # RTI also clamps each drive's tone current to that drive's own current limit (2026-11-22). Higher caps wait for
     # a listening test and a temperature check per joint (the user, 2026-11-22).

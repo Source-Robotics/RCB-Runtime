@@ -132,14 +132,17 @@ def _check_hangs(processes):
             from data import shared_data
             from supervisor.hang_check import GuiProbe, HangCheck
             from utility.trace_ring import read_head
+            from communication import camera_protocol
             rti = shared_data.rti
             probe = GuiProbe(GUI_PORT).start()
+            camera_status = shared_data.SharedString(camera_protocol.STATUS_NAME, camera_protocol.STATUS_SIZE)
             _hang[0] = HangCheck({
                 "RTI": lambda: float(rti["loop_tick"][0]),
                 "HIGH_LEVEL": lambda: float(rti["exec_watch_beat"][0]),
                 "SELF_COLLISION": lambda: float(rti["sc_heartbeat"][0]),
                 "RECORDER": lambda: (read_head() or {}).get("rec_heartbeat"),
                 "GUI": probe.value,
+                "CAMERA": lambda: (camera_status.get_json() or {}).get("beat"),
             }, rti["process_hung"])
         return _hang[0].step(processes)
     except Exception as exc:  # noqa: BLE001 — the check must never take the supervisor down

@@ -1,6 +1,6 @@
 # Versioning: what to do when you change something
 
-Every part of the robot carries a version: the runtime, the Python client, three protocols, the configuration file
+Every part of the robot carries a version: the runtime, the Python client, four protocols, the configuration file
 formats, the supported drive firmware, the hardware revisions. This file says which one to change when you change
 code, and how a release is made. Follow it on every change, whether you are a person or an AI assistant.
 
@@ -18,6 +18,7 @@ What changed in each release is in [CHANGELOG.md](CHANGELOG.md). Which versions 
 | Command protocol | `communication/protocol.py` `PROTOCOL_VERSION`, and its copy in `robotclient/version.py` | integer | a command or field changes incompatibly |
 | Real-time command packet | `communication/rti_protocol.py` `RTI_PROTOCOL_VERSION`, and its copy | integer | the packet changes incompatibly |
 | Telemetry format | `utility/serialization.py` `TELEMETRY_FORMAT`, and its copy | integer | the `tag:value,...` layout changes incompatibly |
+| Camera stream | `communication/camera_protocol.py` `CAMERA_PROTOCOL_VERSION`, and its copy | integer | the frame header changes incompatibly |
 | Configuration file formats | `config/schema_versions.py` `CURRENT`, one number per kind of file | integer | a kind of file changes incompatibly |
 | Supported drive firmware | `hardware/firmware_support.py` `SUPPORTED` | a range per driver type | the runtime needs, or is tested with, other firmware |
 | Arm and gripper hardware | `<hardware_revision>` in `robots/<robot>.xml` and `grippers/<gripper>.xml` | `vMAJOR.MINOR` | a new hardware revision is built |
@@ -92,7 +93,7 @@ Go through this list before you commit:
 The runtime's test suite fails when the numbers disagree:
 
 - `VERSION` and the newest released section of `CHANGELOG.md` name the same version.
-- The newest row of `COMPATIBILITY.md` matches the code: the client series, the three protocol numbers, the
+- The newest row of `COMPATIBILITY.md` matches the code: the client series, the protocol numbers, the
   configuration formats, the firmware range, the PCB versions, the hardware revisions, the description package
   minimum, and the OS image.
 - The client's copies of the protocol numbers equal the robot's, and `robotclient.__version__` equals `VERSION`.

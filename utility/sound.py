@@ -160,6 +160,10 @@ class SoundPlayer:
         # node -> that drive's own current limit, mA (RTI: the robot XML's <Ilim> per joint, the gripper's): a tone never
         # asks more (2026-11-22; J6's limit is 1200 mA). {} = no clamp.
         self.max_ma: dict = {}
+        # Nodes whose drive plays nothing (RTI: the CAN gripper's — it runs in controller mode 7, the firmware plays
+        # only in modes 1-4; 2026-11-24: a <sound><node> left on it silenced every robot sound). A tune for one is
+        # dropped, once logged.
+        self.silent_nodes: set = set()
 
     @property
     def node(self) -> int:
@@ -237,6 +241,15 @@ class SoundPlayer:
         if not self.queue:
             return
         item = self.queue.popleft()
+        if int(item[1]) in self.silent_nodes:
+            self.queue.clear()
+            if not getattr(self, "_silent_node_logged", False):
+                self._silent_node_logged = True
+                logging.getLogger("rti").warning(
+                    "sound: node %s is the gripper's drive, which plays no sound (it runs in controller mode 7; "
+                    "sounds play in modes 1-4) — no tune played; choose a joint (the Sound card, set_sound(drive=...))",
+                    item[1])
+            return
         if not 0 <= int(item[1]) < len(motors):
             # 2026-11-18 (review D1): a node this robot does not have (a hand-edited <sound><node> of 7-15 passes the
             # parser's 0-15) indexed past the drives in RTI's unguarded poll slot and ended RTI at the boot chime, 12.8 s

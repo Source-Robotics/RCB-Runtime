@@ -208,7 +208,7 @@ fi
 # ------------------------------------------------------------------ groups
 echo "groups"
 if real; then
-    for g in dialout i2c gpio; do
+    for g in dialout i2c gpio video; do   # video: the gripper's USB camera (camera_server.py, 2026-11-24)
         if id -nG "$RUN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$g"; then
             ok "$RUN_USER is in $g"
         elif apply; then

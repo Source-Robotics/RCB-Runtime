@@ -145,6 +145,9 @@ SCRIPTS = {
     # the recorder: incident dumps and captures from RTI's shared-memory trace, in its own process so they never
     # cost RTI's loop anything (utility/trace_ring.py, utility/trace_recorder.py; 2026-10-16)
     "RECORDER": f"{_PY} {_ROOT}/recorder.py",
+    # the camera server: the gripper's USB camera relayed over the network, each frame stamped with RTI's tick; idle
+    # when no camera is declared or plugged in (TODO/camera_plan.md, 2026-11-24)
+    "CAMERA": f"{_PY} {_ROOT}/camera_server.py",
 } if RUN_ALL_SCRIPTS else {}
 
 # ==========================================================================

@@ -3,16 +3,16 @@
 Which versions of everything around the RCB runtime work with each runtime release. One row per release, newest
 first. What changed in each release is in `CHANGELOG.md`.
 
-| Runtime | Client | Command protocol | RTI protocol | Telemetry format | Config formats | Drive firmware | Control box PCB | Arm and grippers | Description package | OS image | Docs |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 3.0.1 | 3.0.x | 4 | 1 | 1 | 1 | 110 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 3.0 |
-| 3.0.0 | 3.0.x | 4 | 1 | 1 | 1 | 110 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 3.0 |
-| 2.0.0 | 2.0.x | 3 | 1 | 1 | 1 | 110 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 2.0 |
-| 1.1.1 | 1.1.x | 2 | 1 | 1 | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 1.1 |
-| 1.1.0 | 1.1.x | 2 | 1 | 1 | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 1.1 |
-| 1.0.0 | 1.0.x | 2 | 1 | 1 | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 1.0 |
-| 0.10.0 | 0.10.x | 1 | 1 | 1 | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 0.10 |
-| 0.9.0 | 0.9.x | 1 | 1 | 1 | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | not published yet |
+| Runtime | Client | Command protocol | RTI protocol | Telemetry format | Camera protocol | Config formats | Drive firmware | Control box PCB | Arm and grippers | Description package | OS image | Docs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 3.0.1 | 3.0.x | 4 | 1 | 1 | — | 1 | 110 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 3.0 |
+| 3.0.0 | 3.0.x | 4 | 1 | 1 | — | 1 | 110 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 3.0 |
+| 2.0.0 | 2.0.x | 3 | 1 | 1 | — | 1 | 110 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 2.0 |
+| 1.1.1 | 1.1.x | 2 | 1 | 1 | — | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 1.1 |
+| 1.1.0 | 1.1.x | 2 | 1 | 1 | — | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 1.1 |
+| 1.0.0 | 1.0.x | 2 | 1 | 1 | — | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 1.0 |
+| 0.10.0 | 0.10.x | 1 | 1 | 1 | — | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | 0.10 |
+| 0.9.0 | 0.9.x | 1 | 1 | 1 | — | 1 | 103 or newer | v1, v2 | PAR6 v1.0; MSG v1.0; SSG48 v1.0 | 2.0 or newer | Ubuntu 24.04.2 LTS, kernel 6.8.4-rt11-raspi | not published yet |
 
 ## What each column means
 
@@ -24,6 +24,8 @@ first. What changed in each release is in `CHANGELOG.md`.
   command or field changes incompatibly.
 - **RTI protocol:** the binary command packet of real-time streaming. Same rule.
 - **Telemetry format:** the `tag:value,...` state and telemetry packets. Same rule.
+- **Camera protocol:** the camera server's frame header (`communication/camera_protocol.py`). Same rule. "—" = the
+  release has no camera server.
 - **Config formats:** the newest format number this runtime reads, for every kind of configuration file: system,
   robot, gripper, homing, cell, filters and recipe. A file without a `schema` attribute is format 1. A file in a newer
   format is refused. A file in an older one is read with a warning.
