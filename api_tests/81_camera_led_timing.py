@@ -22,6 +22,25 @@ level, rows read out after it the new one. That edge row, against the switch's t
     .venv/bin/python api_tests/81_camera_led_timing.py --go --output 2
     .venv/bin/python api_tests/81_camera_led_timing.py --reanalyse temp_data/camera_timing/led_RUN
     .venv/bin/python api_tests/81_camera_led_timing.py --selftest   # synthetic frames, no robot
+    .venv/bin/python api_tests/81_camera_led_timing.py --go --auto  # automatic exposure: its length and moment (E1)
+    .venv/bin/python api_tests/81_camera_led_timing.py --apply temp_data/camera_timing/led_RUN   # its moment: the calibration
+
+--apply (2026-11-25, true timing — TODO/camera_review_plan.md option A, the user's choice): an --auto run's image moment
+becomes the calibration under automatic exposure (timing_auto_us in every gripper XML declaring the run's camera; the
+camera server takes it within ~1 s). It reads the run's result.json, made by --reanalyse here or, kinder to RTI, by
+the PC kit's run_analysis.py (copy result.json back into the run's folder). The joint data are paired on their own
+measurement times (RTI's trace column j_rx, utility/joint_times.py), so the picture's moment is the whole camera side.
+
+--auto (2026-11-25, TODO/camera_review_plan.md E1, Q1): the LED is found as above, then the camera goes back to
+AUTOMATIC exposure (the user's controls, as for recording) and the LED switches ~300 times. Around a switch each row
+of the LED's spot shows a SHARE of the light: the share of that row's exposure after the switch (on) or before it
+(off). Over all switches that share against the switch's moment is a ramp: its width is the exposure's length E, its
+end the row's readout. Fitted: a (the centre row's readout after the frame's camera time) and E; the image's moment of
+the centre row = a - E / 2. Each pixel's grey level is made linear in light first, (grey / 255) ^ p, with the camera's
+power p fitted too (the ramp is straight only in light, not in grey levels: with a power on whole rows instead, the
+self-test's 30 ms came out 29.3). Only pixels of the spot that are not saturated when on are used, each scaled by its
+own off and on levels (under 30 ms + gain the LED's core saturates; its soft edge does not). The room's light as when
+recording: this measures the exposure the camera picks in THAT light.
 
 Setup: aim the camera at the LED of the chosen output, 5-15 cm away — a large, out-of-focus spot covers more rows, so
 more switches land on it. The output switches on and off ~120 times; it is left OFF. The camera's settings are put
@@ -29,6 +48,7 @@ back after. Results: temp_data/camera_timing/led_<UTC>/ (run.json, frames.npz, s
 """
 from __future__ import annotations
 
+import glob
 import io
 import json
 import os
@@ -45,6 +65,7 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, _HERE)
 
 from utility import camera_settings as cs  # noqa: E402
+from utility.rti_pace import Pace  # noqa: E402  (the picture work paced on RTI's own trace)
 
 OUTPUT = 1
 EVENTS = 120
@@ -56,6 +77,14 @@ MIN_EDGES = 10                     # switches that must show an edge on the spot
                                    # 19 edges gave the readout to 0.045 ms scatter (2026-11-24)
 OLD_BELOW, NEW_ABOVE = 0.15, 0.85  # the spot's level between off (0) and on (1): old / new / in between
 LOCATE_LEVELS = (1, 0, 1, 0, 1, 0)  # finding the LED: from off, every step a CHANGE (RTI notes only a change), ends off
+AUTO_EVENTS = 300                  # --auto: switches (~70 s)
+AUTO_MARGIN = 60                   # --auto: px around the spot found at the short exposure (its soft edge grows)
+AUTO_SETTLE_S = 3.0                # --auto: automatic exposure settles after the switch back
+AUTO_MIN_CONTRAST = 20.0           # a pixel used: on minus off at least this (grey levels) ...
+AUTO_MAX_ON = 240.0                # ... and never this bright when on (saturated: its share is lost)
+AUTO_MAX_HALVES_MS = 0.2          # --apply: the run's two halves must agree this well
+AUTO_MIN_PIXELS = 3                # a row of the spot used with this many such pixels
+AUTO_MIN_SWITCHES = 40             # switches whose frames lie on the ramp
 SYSTEM_XML = os.path.join(_ROOT, "config", "system.xml")
 GRIPPERS_DIR = os.path.join(_ROOT, "grippers")
 
@@ -118,6 +147,204 @@ def edge_row(profile: np.ndarray, on_ref: np.ndarray, off_ref: np.ndarray, risin
     return float(r0 + (0.5 - v0) / (v1 - v0) * (r1 - r0)) if v1 != v0 else float(r1)
 
 
+def spot_crop_half(jpeg: bytes, spot: dict) -> np.ndarray:
+    """The spot's pixels decoded at HALF size by the JPEG decoder (a quarter of the work); row r of the crop is the
+    full-size rows spot_y0 + 2r and + 2r + 1."""
+    (y0, y1), (x0, x1) = spot["rows"], spot["cols"]
+    g = gray(jpeg, half=True)
+    return g[y0 // 2:(y1 + 1) // 2, x0 // 2:(x1 + 1) // 2]
+
+
+AUTO_POWERS = np.arange(0.8, 3.01, 0.1)    # the camera's tone curve, grey -> light: (grey / 255) ^ p, p tried
+
+
+def _auto_model(p, delta, light_on):
+    """The share of a spot row's exposure that was lit (0..1). delta = switch time - the frame's camera time - (row -
+    centre) x row time; p = (a, E) in s."""
+    a, e = p
+    s = np.clip((a - delta) / e, 0.0, 1.0)                # the share of the exposure after the switch
+    return np.where(light_on, s, 1.0 - s)
+
+
+def _auto_fit(delta, light_on, f):
+    from scipy.optimize import least_squares
+    best = None
+    for a0 in (0.010, 0.0167, 0.023):
+        for e0 in (0.008, 0.018, 0.030):
+            r = least_squares(lambda p: _auto_model(p, delta, light_on) - f, (a0, e0),
+                              bounds=((0.0, 0.0005), (0.05, 0.04)), loss="soft_l1", f_scale=0.1)
+            if best is None or r.cost < best.cost:
+                best = r
+    return best
+
+
+def _row_shares(crop_, on_ref, off_ref, use, rows_ok, p):
+    """Each usable row's lit share in one frame: every used pixel made linear in light, scaled by its own off / on."""
+    lin_off, lin_on = (off_ref / 255.0) ** p, (on_ref / 255.0) ** p
+    span = np.where(use, lin_on - lin_off, 1.0)
+    n = np.where(use, ((np.clip(crop_, 0, 255) / 255.0) ** p - lin_off) / span, np.nan)
+    return np.nanmean(n[rows_ok], axis=1)
+
+
+def analyse_auto(frames: dict, switches: list, spot: dict, full_rows: int, row_time_s: float,
+                 calib_offset_s: float = 0.0, pace=None) -> dict:
+    """E1: the exposure's length and the centre row's moment under AUTOMATIC exposure (the module's header). frames:
+    exposure_time, flags, jpegs; switches: [(time, level)]; spot: the crop (full-size rows / cols); calib_offset_s: a
+    calibration active while recording (taken back off flagged frames); pace: called with each decode's seconds."""
+    from communication import camera_protocol as cp
+    flags = np.asarray(frames["flags"])
+    times = np.asarray(frames["exposure_time"], float) - np.where((flags & cp.FLAG_CALIBRATED) > 0, calib_offset_s, 0.0)
+    ok = (flags & cp.FLAG_CAMERA_CLOCK) > 0
+    sw = sorted(switches)
+    steady = {1: [], 0: []}
+    late = {1: [], 0: []}                                 # steady frames >= 150 ms after the switch (the drift check)
+    near = []
+    for i, (ts, lv) in enumerate(sw):
+        nxt = sw[i + 1][0] if i + 1 < len(sw) else ts + 1.0
+        for k in np.nonzero(ok & (times > ts + 0.07) & (times < nxt - 0.05))[0][:3]:
+            steady[lv].append(int(k))
+            if times[k] > ts + 0.15:
+                late[lv].append(int(k))
+        for k in np.nonzero(ok & (times > ts - 0.09) & (times < ts + 0.06))[0]:
+            near.append((int(k), ts, lv))
+    if len(steady[1]) < 10 or len(steady[0]) < 10:
+        return {"ok": False, "why": "too few steady frames with the LED on and off"}
+    crops = {}
+
+    def crop(k):
+        if k not in crops:
+            t0 = time.perf_counter()
+            crops[k] = spot_crop_half(frames["jpegs"][k], spot)
+            if pace is not None:
+                pace(time.perf_counter() - t0)
+        return crops[k]
+
+    on_stack = np.array([crop(k) for k in steady[1]])
+    off_stack = np.array([crop(k) for k in steady[0]])
+    on_ref, off_ref = np.median(on_stack, axis=0), np.median(off_stack, axis=0)
+    use = ((on_ref - off_ref) >= AUTO_MIN_CONTRAST) & (on_stack.max(axis=0) < AUTO_MAX_ON)
+    rows_ok = use.sum(axis=1) >= AUTO_MIN_PIXELS
+    n_pix = int(use[rows_ok].sum())
+    if rows_ok.sum() < 2:
+        return {"ok": False, "why": f"no part of the LED's spot is bright enough and unsaturated when on ({n_pix} px): "
+                                    f"move the LED a little further away or out of focus"}
+    y_full = spot["rows"][0] // 2 * 2 + 2.0 * np.arange(on_ref.shape[0]) + 0.5       # each crop row's full-size row
+    deltas, lights, swid, near_crops = [], [], [], []
+    for k, ts, lv in near:
+        d = ts - times[k] - (y_full[rows_ok] - full_rows / 2.0) * row_time_s
+        near_crops.append(crop(k))
+        deltas.append(d)
+        lights.append(np.full(len(d), bool(lv)))
+        swid.append(np.full(len(d), ts))
+    delta, light_on, sid = (np.concatenate(x) for x in (deltas, lights, swid))
+
+    def shares(p):
+        return np.concatenate([_row_shares(c, on_ref, off_ref, use, rows_ok, p) for c in near_crops])
+
+    f = shares(1.0)
+    ramp = (f > 0.05) & (f < 0.95)
+    n_sw = len(np.unique(sid[ramp]))
+    if n_sw < AUTO_MIN_SWITCHES:
+        return {"ok": False, "why": f"only {n_sw} switches fell on the ramp (needs {AUTO_MIN_SWITCHES}): more switches "
+                                    f"(--events) or a larger spot"}
+    tried = []
+    for p in AUTO_POWERS:                                 # the camera's power: the one whose ramp is straightest
+        fp = shares(p)
+        tried.append((_auto_fit(delta, light_on, fp).cost, float(p), fp))
+    _cost, g, f = min(tried, key=lambda x: x[0])
+    fit = _auto_fit(delta, light_on, f)
+    a, e = fit.x
+    resid = _auto_model(fit.x, delta, light_on) - f
+    halves = []
+    order = np.argsort(np.unique(sid))
+    cut = np.unique(sid)[order[len(order) // 2]]
+    for sel in (sid < cut, sid >= cut):
+        h = _auto_fit(delta[sel], light_on[sel], f[sel]).x
+        halves.append((h[0] - h[1] / 2) * 1e3)
+    drift = {}
+    for lv, name in ((1, "on"), (0, "off")):
+        ks = late[lv]
+        if len(ks) >= 20:
+            third = len(ks) // 3
+            lvl = [float(np.mean(crop(k)[use])) for k in ks]
+            drift[name] = float(np.mean(lvl[-third:]) - np.mean(lvl[:third]))
+    early_on = [float(np.mean(crop(k)[use])) for k in steady[1] if k not in late[1]]
+    late_on = [float(np.mean(crop(k)[use])) for k in late[1]]
+    return {"ok": True, "method": "auto", "a_ms": a * 1e3, "exposure_ms": e * 1e3, "power": g,
+            "moment_ms": (a - e / 2) * 1e3, "halves_ms": halves, "half_diff_ms": abs(halves[0] - halves[1]),
+            "rms": float(np.sqrt(np.mean(resid ** 2))), "points": int(len(f)), "ramp_points": int(ramp.sum()),
+            "switches_on_ramp": n_sw, "pixels": n_pix, "rows": int(rows_ok.sum()),
+            "level_drift": drift,
+            "on_early_minus_late": (float(np.mean(early_on) - np.mean(late_on)) if early_on and late_on else None),
+            "row_time_us": row_time_s * 1e6}
+
+
+def report_auto(res: dict, timing: dict | None) -> list:
+    if not res.get("ok"):
+        return [f"  no result: {res.get('why')}"]
+    lines = [f"  automatic exposure: the exposure lasts {res['exposure_ms']:.2f} ms; the centre row is read out "
+             f"{res['a_ms']:+.2f} ms after the frame's camera time; the middle of its exposure (the image's moment) "
+             f"{res['moment_ms']:+.2f} ms after it (the two halves of the run: "
+             f"{res['halves_ms'][0]:+.2f} / {res['halves_ms'][1]:+.2f} ms)",
+             f"  fit: {res['switches_on_ramp']} switches on the ramp, {res['ramp_points']} of {res['points']} row "
+             f"readings on it, {res['pixels']} unsaturated pixels in {res['rows']} rows, rms {res['rms']:.3f} of the "
+             f"on-off step, the camera's tone curve: light = (grey / 255) ^ {res['power']:.1f}"]
+    d = res.get("level_drift") or {}
+    if d or res.get("on_early_minus_late") is not None:
+        lines.append(f"  steadiness: the steady levels drifted {d.get('on', float('nan')):+.1f} (on) / "
+                     f"{d.get('off', float('nan')):+.1f} (off) grey levels from the first to the last third; on-frames "
+                     f"70-150 ms after a switch minus later ones {res.get('on_early_minus_late') or 0.0:+.1f} (the "
+                     f"automatic exposure answering the LED itself, when large)")
+    in_use = (f"the calibration in use: {timing['auto_us'] / 1e3:+.2f} ms (run {timing.get('run')})"
+              if timing and timing.get("auto_us") is not None else "no calibration in use for this mode")
+    lines.append(f"  {in_use}; this run's image moment {res['moment_ms']:+.2f} ms: "
+                 + ("--apply FOLDER makes it the calibration (true timing: each joint is paired with the picture on its "
+                    "own measurement time, RTI's j_rx)" if res["half_diff_ms"] <= AUTO_MAX_HALVES_MS else
+                    f"its halves differ by more than {AUTO_MAX_HALVES_MS:g} ms, so --apply refuses it"))
+    return lines
+
+
+def apply_result(folder: str, grippers_dir: str = GRIPPERS_DIR, system_xml: str = SYSTEM_XML) -> int:
+    """--apply: an --auto run's image moment (its result.json) written as the calibration under automatic exposure
+    (timing_auto_us) into every gripper XML declaring the run's camera, for the run's mode; 0 when written."""
+    try:
+        with open(os.path.join(folder, "run.json"), encoding="utf-8") as f:
+            run_ = json.load(f)
+        with open(os.path.join(folder, "result.json"), encoding="utf-8") as f:
+            res = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"--apply: {folder} has no readable run.json and result.json ({e}); analyse it first (--reanalyse, or "
+              f"the PC kit's run_analysis.py, then copy result.json into the folder)")
+        return 1
+    if not run_.get("auto"):
+        print("--apply: only an --auto run's image moment is a calibration (a fixed exposure is black indoors)")
+        return 1
+    if not res.get("ok"):
+        print(f"--apply: the run has no result ({res.get('why')})")
+        return 1
+    if res.get("half_diff_ms", float("inf")) > AUTO_MAX_HALVES_MS:
+        print(f"--apply: the run's halves differ by {res.get('half_diff_ms')} ms (more than {AUTO_MAX_HALVES_MS:g}): "
+              f"not written")
+        return 1
+    usb_id, mode = run_.get("usb_id"), run_.get("mode")
+    if not (usb_id and mode):
+        # recorded before 2026-11-25 (no camera or mode in run.json): its stored timing was the gripper camera's for
+        # the run's mode, so that camera and its mode
+        gcam, _ = cs.gripper_camera(system_xml, grippers_dir)
+        if not (run_.get("timing") and gcam and gcam.get("usb_id") and gcam.get("timing_mode")):
+            print("--apply: the run names no camera or mode, and the gripper's camera had no timing for it")
+            return 1
+        usb_id, mode = gcam["usb_id"], gcam["timing_mode"]
+    value = f"{res['moment_ms'] * 1e3:.1f}"
+    written = [os.path.basename(p) for p in sorted(glob.glob(os.path.join(grippers_dir, "*.xml")))
+               if cs.write_timing(p, usb_id, mode, {"timing_auto_us": value}, os.path.basename(folder.rstrip("/")),
+                                  os.path.join(folder, "backup"))]
+    print(f"--apply: the image's moment {res['moment_ms']:+.2f} ms (timing_auto_us=\"{value}\", camera {usb_id}, "
+          f"mode {mode}) written into {len(written)} gripper XML(s): {', '.join(written) or 'none'}; the camera server "
+          f"takes it within ~1 s (backups in {os.path.join(folder, 'backup')})")
+    return 0 if written else 1
+
+
 def switch_bounds(sw, times, ok, level, spot, exposure_s, full_rows, row_time_s) -> dict | None:
     """Every switch bounds a, the centre row's readout after the frame's camera time (row y is read out at frame time
     + a + (y - centre) x row time, its exposure the E before): a frame whose spot still shows the OLD level read all
@@ -162,7 +389,7 @@ def switch_bounds(sw, times, ok, level, spot, exposure_s, full_rows, row_time_s)
 
 
 def analyse(frames: dict, switches: list, spot: dict, exposure_s: float, full_rows: int,
-            row_time_s: float = 31.8e-3 / 720) -> dict:
+            row_time_s: float = 31.8e-3 / 720, pace=None) -> dict:
     """The edges -> t_switch - frame time = a' + (edge row - centre) x row time; a = a' + exposure / 2 (the centre
     row's readout after the frame's camera time). Fewer than MIN_EDGES edges (a small spot): a from the bounds every
     switch sets (switch_bounds), with the row time given (api_tests/80's readout). frames: exposure_time, flags,
@@ -178,7 +405,10 @@ def analyse(frames: dict, switches: list, spot: dict, exposure_s: float, full_ro
 
     def prof(k):
         if k not in profiles:
+            t0 = time.perf_counter()
             profiles[k] = spot_crop(frames["jpegs"][k], spot).mean(axis=1)
+            if pace is not None:
+                pace(time.perf_counter() - t0)
         return profiles[k]
 
     y0 = spot["rows"][0]
@@ -423,6 +653,8 @@ def run(args) -> str | None:
         return None
     sw = shared_data.rti["output_switch"]
     base, _ = cs.read(SYSTEM_XML)
+    events = AUTO_EVENTS if args.auto and args.events == EVENTS else args.events
+    spot_core = None
     fps = float(st["mode"]["fps"])
     full_rows = int(st["mode"]["height"])
     gcam, _ = cs.gripper_camera(SYSTEM_XML, GRIPPERS_DIR)
@@ -437,12 +669,29 @@ def run(args) -> str | None:
                       f"{EXPOSURES_TRY[-1] / 10:g} ms: aim it at the LED, 5-15 cm away, and run again.")
                 return None
             setting, spot = found
+            spot_core = spot
+            if args.auto:
+                spot = {"rows": (max(0, spot["rows"][0] - AUTO_MARGIN), min(full_rows, spot["rows"][1] + AUTO_MARGIN)),
+                        "cols": (max(0, spot["cols"][0] - AUTO_MARGIN),
+                                 min(int(st["mode"]["width"]), spot["cols"][1] + AUTO_MARGIN)),
+                        "contrast": spot.get("contrast")}
+                set_controls(base, None)                   # the user's controls: automatic exposure
+                end = time.monotonic() + 8.0
+                while time.monotonic() < end:
+                    ctl = {c["key"]: c["value"] for c in camera_status().get("controls") or []}
+                    if ctl.get("auto_exposure") not in (None, 1):
+                        break
+                    time.sleep(0.2)
+                else:
+                    raise RuntimeError("the camera did not go back to automatic exposure within 8 s")
+                print(f"automatic exposure back on; {AUTO_SETTLE_S:g} s to settle; then {events} switches", flush=True)
+                time.sleep(AUTO_SETTLE_S)
             col = Frames(args.host)
             col.start()
             time.sleep(0.5)
             switches = []
             level = 1
-            for _ in range(args.events):
+            for _ in range(events):
                 time.sleep(random.uniform(*GAP_S))     # nosec B311 — a random phase, not security
                 switches.append(switch(robot, args.output, level, sw))
                 level = 1 - level
@@ -461,6 +710,9 @@ def run(args) -> str | None:
                  jpeg_bytes=np.frombuffer(blob, dtype=np.uint8))
         with open(os.path.join(out, "run.json"), "w", encoding="utf-8") as f:
             json.dump({"output": args.output, "setting": setting, "spot": spot, "switches": switches,
+                       "auto": bool(args.auto), "spot_core": spot_core,
+                       "usb_id": (st.get("device") or {}).get("usb_id"),
+                       "mode": cs.mode_key(st["mode"]["width"], st["mode"]["height"], fps),
                        "full_rows": full_rows, "fps": fps, "timing": cs.camera_timing(gcam, cs.mode_key(
                            st["mode"]["width"], st["mode"]["height"], fps))}, f, indent=1)
         print(f"{len(switches)} switches, {len(frames)} frames: {os.path.relpath(out, _ROOT)}", flush=True)
@@ -479,11 +731,20 @@ def reanalyse(folder: str) -> dict:
     spot = {"rows": tuple(run_["spot"]["rows"]), "cols": tuple(run_["spot"]["cols"])}
     timing = run_.get("timing") or {}
     readout_s = (timing.get("readout_us") or 31.8e3) * 1e-6
-    res = analyse(frames, [tuple(s) for s in run_["switches"]], spot, run_["setting"] * cs.EXPOSURE_UNIT_US * 1e-6,
-                  run_["full_rows"], row_time_s=readout_s / run_["full_rows"])
-    lines = [f"LED timing check, run {os.path.basename(folder)}: output {run_['output']}, exposure "
-             f"{run_['setting'] / 10:g} ms, the spot at rows {spot['rows'][0]}-{spot['rows'][1]}"]
-    lines += report(res, run_.get("timing"), run_["fps"])
+    if run_.get("auto"):
+        res = analyse_auto(frames, [tuple(s) for s in run_["switches"]], spot, run_["full_rows"],
+                           readout_s / run_["full_rows"], calib_offset_s=(timing.get("auto_us") or 0.0) * 1e-6,
+                           pace=Pace(say=print))
+        lines = [f"LED timing check under AUTOMATIC exposure, run {os.path.basename(folder)}: output {run_['output']}, "
+                 f"the spot's crop rows {spot['rows'][0]}-{spot['rows'][1]}, {len(run_['switches'])} switches, the "
+                 f"readout {readout_s * 1e3:.2f} ms (stored)"]
+        lines += report_auto(res, run_.get("timing"))
+    else:
+        res = analyse(frames, [tuple(s) for s in run_["switches"]], spot, run_["setting"] * cs.EXPOSURE_UNIT_US * 1e-6,
+                      run_["full_rows"], row_time_s=readout_s / run_["full_rows"], pace=Pace(say=print))
+        lines = [f"LED timing check, run {os.path.basename(folder)}: output {run_['output']}, exposure "
+                 f"{run_['setting'] / 10:g} ms, the spot at rows {spot['rows'][0]}-{spot['rows'][1]}"]
+        lines += report(res, run_.get("timing"), run_["fps"])
     text = "\n".join(lines)
     print(text)
     with open(os.path.join(folder, "report.txt"), "w", encoding="utf-8") as f:
@@ -576,6 +837,98 @@ def selftest() -> int:
     lines = report(dict(res, ok=True), {"auto_us": 1413.9, "readout_us": 31814.0}, 30.0)
     chk("A5 the report gives the joint data's lateness from api_tests/80's automatic-exposure result",
         any("joint data" in ln for ln in lines) and any("31.81" in ln for ln in lines), lines)
+    print("B. --auto: automatic exposure's length and moment (E1)")
+    e_auto, a_auto, ro_auto = 30e-3, 16.69e-3, 30.23e-3
+    rt_auto = ro_auto / h
+    cy, cx = 95.0, 170.0
+    yy, xx = np.mgrid[0:h, 0:w]
+    led = 3.0 * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 22.0 ** 2))   # its core saturates, its edge does not
+    bg = 0.0067                                                                  # off: ~26 grey levels
+    jp3 = []
+    box = {"rows": (45, 146), "cols": (110, 231)}
+    for tk in times:
+        ends = tk + a_auto + (rows - h / 2) * rt_auto
+        share = np.array([led_level_fraction(ends[y] - e_auto, ends[y]) for y in range(h)])
+        lin = bg + share[:, None] * led
+        img = 255.0 * np.clip(lin, 0, 1) ** 0.45 + rng.normal(0, 1.5, (h, w))    # a camera's tone curve
+        buf = io.BytesIO()
+        Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)).save(buf, "JPEG", quality=92)
+        jp3.append(buf.getvalue())
+    fr3 = dict(frames, jpegs=jp3, flags=np.full(len(times), 0x0B), exposure_time=times + 1.4139e-3)
+    r3 = analyse_auto(fr3, sw, box, h, rt_auto, calib_offset_s=1.4139e-3)
+    chk(f"B1 a 30 ms automatic exposure (the LED's core saturated, a tone curve, a calibration of +1.41 ms active "
+        f"while recording): the exposure {r3.get('exposure_ms', float('nan')):.2f} ms (true 30), the readout "
+        f"{r3.get('a_ms', float('nan')):+.2f} (true +16.69), the image's moment {r3.get('moment_ms', float('nan')):+.2f} "
+        f"(true +1.69) — within 0.5 / 0.3 / 0.3 ms, the halves within 0.5", r3.get("ok")
+        and abs(r3["exposure_ms"] - 30.0) < 0.5 and abs(r3["a_ms"] - 16.69) < 0.3 and abs(r3["moment_ms"] - 1.69) < 0.3
+        and r3["half_diff_ms"] < 0.5 and r3["pixels"] > 50, {k: r3.get(k) for k in ("ok", "why", "exposure_ms", "a_ms",
+                                                                                     "moment_ms", "half_diff_ms", "pixels",
+                                                                                     "switches_on_ramp", "power")})
+    lines3 = report_auto(r3, {"auto_us": 1413.9, "run": "R"})
+    chk("B2 ...the report: the exposure, the image's moment, the calibration in use and that --apply makes the moment "
+        "the calibration", any("the exposure lasts" in ln for ln in lines3)
+        and any("the calibration in use: +1.41 ms" in ln and "--apply FOLDER makes it" in ln for ln in lines3), lines3)
+    hot = {"rows": (88, 102), "cols": (163, 177)}                               # only the saturated core
+    r4 = analyse_auto(fr3, sw, hot, h, rt_auto, calib_offset_s=1.4139e-3)
+    chk("B3 a crop of only the saturated core: no result, and the reason says what to do", not r4.get("ok")
+        and "unsaturated" in (r4.get("why") or ""), r4)
+    r5 = analyse_auto(dict(fr3, flags=np.full(len(times), 0x09), exposure_time=times), sw, box, h, rt_auto,
+                      calib_offset_s=1.4139e-3)
+    chk("B4 frames recorded WITHOUT a calibration (the camera's own times, not flagged): the offset is not taken off "
+        "them, the same answer", r5.get("ok") and abs(r5["moment_ms"] - 1.69) < 0.3, r5.get("moment_ms"))
+    print("C. --apply (true timing, 2026-11-25)")
+    import shutil
+    import tempfile
+    import xml.etree.ElementTree as ET  # nosec B405 — our own gripper XMLs
+    tmp = tempfile.mkdtemp(prefix="cam81_")
+    try:
+        gdir = os.path.join(tmp, "grippers")
+        shutil.copytree(GRIPPERS_DIR, gdir)
+
+        def run_dir(name, run_, res_):
+            d = os.path.join(tmp, name)
+            os.makedirs(d)
+            for fname, obj in (("run.json", run_), ("result.json", res_)):
+                if obj is not None:
+                    with open(os.path.join(d, fname), "w", encoding="utf-8") as f:
+                        json.dump(obj, f)
+            return d
+
+        def auto_us(fname="MSG_small_motor_150mm_rail.xml"):
+            cam = ET.parse(os.path.join(gdir, fname)).getroot().find("camera")  # nosec B314
+            return dict(cam.attrib) if cam is not None else {}
+
+        good = {"ok": True, "moment_ms": 0.8, "half_diff_ms": 0.01}
+        with open(os.devnull, "w") as quiet:
+            saved_out, sys.stdout = sys.stdout, quiet
+            try:
+                rc1 = apply_result(run_dir("led_A", {"auto": True, "usb_id": "0bda:5844", "mode": "1280x720@30"}, good),
+                                   gdir)
+                after1 = auto_us()
+                other = auto_us("Flange.xml") if os.path.exists(os.path.join(gdir, "Flange.xml")) else {}
+                rc2 = apply_result(run_dir("led_B", {"auto": False, "usb_id": "0bda:5844", "mode": "1280x720@30"}, good),
+                                   gdir)
+                rc3 = apply_result(run_dir("led_C", {"auto": True, "usb_id": "0bda:5844", "mode": "1280x720@30"},
+                                           dict(good, half_diff_ms=0.5)), gdir)
+                rc4 = apply_result(run_dir("led_D", {"auto": True, "usb_id": "0bda:5844", "mode": "1280x720@30"}, None),
+                                   gdir)
+                after4 = auto_us()
+                rc5 = apply_result(run_dir("led_E", {"auto": True, "timing": {"auto_us": 800.0}},
+                                           dict(good, moment_ms=0.75)), gdir)
+                after5 = auto_us()
+            finally:
+                sys.stdout = saved_out
+        chk("C1 an --auto run's moment written as timing_auto_us (us) with the run's name, the camera's other values "
+            "kept; a gripper without that camera untouched", rc1 == 0 and after1.get("timing_auto_us") == "800.0"
+            and after1.get("timing_run") == "led_A" and after1.get("timing_readout_us") == "30230"
+            and "timing_auto_us" not in other, (rc1, after1, other))
+        chk("C2 refused: a run that was not --auto, halves more than 0.2 ms apart, no result.json", rc2 == 1 and rc3 == 1
+            and rc4 == 1 and after4.get("timing_run") == "led_A", (rc2, rc3, rc4, after4))
+        chk("C3 a run from before 2026-11-25 (no camera or mode in run.json): the gripper's camera and its stored mode",
+            rc5 == 0 and after5.get("timing_auto_us") == "750.0" and after5.get("timing_run") == "led_E"
+            and after5.get("timing_mode") == "1280x720@30", (rc5, after5))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     print()
     print(f"{len(fails)} failed" if fails else "ALL PASSED")
     return 1 if fails else 0
@@ -587,20 +940,29 @@ def main():
     ap.add_argument("--output", type=int, default=OUTPUT, choices=(1, 2, 3), help="the output whose LED the camera sees")
     ap.add_argument("--events", type=int, default=EVENTS, help="switches")
     ap.add_argument("--reanalyse", metavar="FOLDER")
+    ap.add_argument("--apply", metavar="FOLDER",
+                    help="an --auto run's image moment (its result.json) as the calibration under automatic exposure")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--auto", action="store_true",
+                    help="after finding the LED, switch it under AUTOMATIC exposure: the exposure's length and the "
+                         "image's moment (E1)")
     args = ap.parse_args()
     os.nice(19)                                    # the picture work at the lowest priority, beside RTI
     if args.selftest:
         sys.exit(selftest())
+    if args.apply:
+        sys.exit(apply_result(os.path.join(_ROOT, args.apply) if not os.path.isabs(args.apply) else args.apply))
     if args.reanalyse:
         if arm_enabled(args):
             sys.exit(2)
         res = reanalyse(os.path.join(_ROOT, args.reanalyse) if not os.path.isabs(args.reanalyse) else args.reanalyse)
         sys.exit(0 if res.get("ok") else 1)
     st, problems = checks()
+    events = AUTO_EVENTS if args.auto and args.events == EVENTS else args.events
     print(f"camera: {st.get('state')}, mode {st.get('mode')}; plan: find output {args.output}'s LED (exposures "
-          f"{', '.join(f'{s / 10:g}' for s in EXPOSURES_TRY)} ms), then {args.events} switches at random moments "
-          f"(~{args.events * 0.225 + 10:.0f} s); nothing moves; the output left off, the camera's settings put back")
+          f"{', '.join(f'{s / 10:g}' for s in EXPOSURES_TRY)} ms), then {events} switches at random moments "
+          + ("under AUTOMATIC exposure (the room's light as when recording) " if args.auto else "")
+          + f"(~{events * 0.225 + 10:.0f} s); nothing moves; the output left off, the camera's settings put back")
     if problems:
         print("NOT READY:\n  " + "\n  ".join(problems))
         sys.exit(2)

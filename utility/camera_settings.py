@@ -25,7 +25,9 @@ The camera server reads them at its start and again within ~1 s of the file chan
 from __future__ import annotations
 
 import math
+import os
 import re
+import shutil
 import xml.etree.ElementTree as ET  # nosec B405 — our own config/system.xml, read as config/xml_parser reads it
 
 from utility.config_write import edit_lock, write_atomic
@@ -196,9 +198,13 @@ def gripper_camera(system_xml, grippers_dir) -> tuple[dict | None, str]:
 
 
 # ---------------------------------------------------------------- the timing calibration (P3, 2026-11-24)
-# api_tests/80_camera_timing.py measures, per camera mode, how far the image's moment (the middle of the exposure of
-# the image's centre, as the joint data sees it) lies from the camera's own frame time (its PTS on the robot's clock),
-# and writes the result as attributes of the gripper XML's <camera> element:
+# How far the image's moment (the middle of the exposure of the image's centre row) lies from the camera's own frame
+# time (its PTS on the robot's clock), per camera mode, as attributes of the gripper XML's <camera> element. TRUE
+# TIMING since 2026-11-25 (TODO/camera_review_plan.md option A): the moment is the camera's alone, measured with an LED
+# by api_tests/81_camera_led_timing.py --auto and written by its --apply (+0.80 ms indoors); the joint data are paired
+# on their own measurement times (RTI's trace column j_rx, utility/joint_times.py). Before, api_tests/80 wrote the
+# delay at which the picture best matched the trace rows (+1.41 ms): the image's moment, the joint data's age and the
+# arm's own lag in one number. The attributes:
 #   timing_mode="1280x720@30"   the mode it was measured in (another mode: not calibrated)
 #   timing_auto_us="..."        the offset under AUTOMATIC exposure. Valid while the camera exposes for the whole frame,
 #                               which it does indoors: in fixed-exposure mode this camera drops its gain, so a fixed
@@ -258,3 +264,32 @@ def timing_offset_s(timing: dict | None, exposure_setting) -> float | None:
     if timing["offset_us"] is None or timing.get("us_per_unit") is None:
         return None
     return (timing["offset_us"] + timing["us_per_unit"] * float(exposure_setting)) * 1e-6
+
+
+def write_timing(xml_path: str, usb_id: str, mode: str, values: dict, run: str, backup_dir: str) -> bool:
+    """The timing attributes `values` (timing_auto_us and / or timing_offset_us + timing_us_per_unit) into the gripper
+    XML's <camera> element when it declares `usb_id`; the other kind's values kept when they are for the same mode;
+    a backup first; comments and everything else kept. False when the file has no such camera. (Moved here from
+    api_tests/80 on 2026-11-25: the LED check's --apply writes the calibration now.)"""
+    with open(xml_path, encoding="utf-8") as f:
+        text = f.read()
+    found = _elements(text)
+    if len(found) != 1:
+        return False
+    start, end = found[0]
+    attrs = dict(ET.fromstring(text[start:end]).attrib)  # nosec B314 — our own gripper XML
+    if attrs.get("usb_id", "").lower() != usb_id.lower():
+        return False
+    old = {k: v for k, v in attrs.items() if k in TIMING_KEYS}
+    attrs = {k: v for k, v in attrs.items() if k not in TIMING_KEYS}
+    timing = {"timing_mode": mode}
+    if old.get("timing_mode") == mode:                    # the same mode: what this run did not measure stays
+        timing.update({k: v for k, v in old.items() if k not in ("timing_mode", "timing_run")})
+    timing.update(values)
+    timing["timing_run"] = run
+    attrs.update(timing)
+    elem = "<camera " + " ".join(f'{k}="{v}"' for k, v in attrs.items()) + "/>"
+    os.makedirs(backup_dir, exist_ok=True)
+    shutil.copy2(xml_path, os.path.join(backup_dir, os.path.basename(xml_path)))
+    write_atomic(xml_path, text[:start] + elem + text[end:])
+    return True

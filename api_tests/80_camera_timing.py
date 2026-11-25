@@ -5,7 +5,17 @@ TODO/camera_plan.md P3, method B: the arm checks itself).
 After P2 every frame carries the camera's own time (its PTS on the robot's clock) and RTI's tick there, to a few
 microseconds. What is left is ONE constant per camera mode and exposure: the image's moment (the middle of the
 exposure of the image's centre rows) is not the PTS, and the joint data RTI stamps with a tick has its own delay. This
-measures that whole chain at once — the number that matters for pairing images with joint data:
+measures that whole chain at once:
+
+TRUE TIMING (2026-11-25, TODO/camera_review_plan.md option A, the user's choice): the calibration is no longer this
+test's. api_tests/81_camera_led_timing.py --auto measures the image's moment against the camera's time with an LED and
+no joint data (+0.80 ms indoors), and its --apply writes it; RTI's trace records when each joint's angle was measured
+(the column j_rx, utility/joint_times.py). This test now fits each joint on its OWN measurement times, so what it reads
+beyond the image's moment is the arm itself: the picture (the wrist's output) trailing the motors' encoders through the
+belts and gearboxes — ~2 to 3 ms at the speeds below, less when faster (2026-11-25). Recordings from before j_rx are
+fitted on the rows' times, as they were (their angles 3 to 4.5 ms old). --apply is retired.
+
+The steps:
 
   1. The arm at the api_tests' start pose, the camera looking at a still scene with some texture (shelves, a cluttered
      desk; not a blank wall), the camera's exposure as asked: "auto" (the default) and / or fixed settings. Each one is
@@ -29,15 +39,15 @@ measures that whole chain at once — the number that matters for pairing images
      = +50 us per unit when the camera's PTS marks the exposure's start and -50 when it marks its end; they need
      light bright enough for a fixed exposure shorter than a frame.
 
---apply writes the result into every gripper XML that declares this camera (<camera timing_*>,
-utility/camera_settings.py; a calibration of the other kind for the same mode is kept); the camera server then adds it
-to every frame's time and flags it (FLAG_CALIBRATED).
+--apply (retired 2026-11-25) wrote this test's delay into the gripper XMLs as the calibration; the LED check writes it
+now (81 --apply, utility/camera_settings.write_timing).
 
     .venv/bin/python api_tests/80_camera_timing.py                 # dry run: the checks, the plan; nothing moves
     .venv/bin/python api_tests/80_camera_timing.py --go            # record; analyse once the arm is disabled
-    .venv/bin/python api_tests/80_camera_timing.py --go --apply    # ... and write a confident result
     .venv/bin/python api_tests/80_camera_timing.py --go --exposures auto,150,250   # + fixed settings (bright light)
-    .venv/bin/python api_tests/80_camera_timing.py --reanalyse temp_data/camera_timing/RUN [--apply]
+    .venv/bin/python api_tests/80_camera_timing.py --reanalyse temp_data/camera_timing/RUN
+    .venv/bin/python api_tests/80_camera_timing.py --go --verify                 # J5 at 20 / 40 / 60 %, J6; auto
+    .venv/bin/python api_tests/80_camera_timing.py --go --verify --exposures 20  # ... at a fixed 2 ms (a lamp needed)
     .venv/bin/python api_tests/80_camera_timing.py --selftest      # the analysis on synthetic frames, no robot
 
 Results: temp_data/camera_timing/<UTC>/ (run.json, frames_<setting>.npz, the captures' copies, report.txt).
@@ -212,7 +222,7 @@ def _row_line(rows: np.ndarray, delays: np.ndarray) -> tuple[float, float, np.nd
 
 
 def analyse_exposure(frames: dict, capture: dict, joint: int, uncal_offset_s: float = 0.0, size=SIZE, tiles=TILES,
-                     full_rows: int = 720) -> dict:
+                     full_rows: int = 720, pace=None) -> dict:
     """One exposure's delay at the image's CENTRE row, and the rolling shutter's readout. frames: the saved frames
     (exposure_time, rti_tick, flags, jpegs); capture: the robot's capture (tick, timestamp, j_p); uncal_offset_s: a
     calibration that was ACTIVE while recording (taken back off); full_rows: the camera mode's height.
@@ -226,6 +236,15 @@ def analyse_exposure(frames: dict, capture: dict, joint: int, uncal_offset_s: fl
     cap_time = np.asarray(capture["timestamp"], dtype=float)
     tick_s = float(np.median(np.diff(cap_time) / np.diff(cap_ticks)))
     theta = np.asarray(capture["j_p"], dtype=float)[:, joint - 1]
+    # The joint on its OWN measurement times (true timing, 2026-11-25): RTI's trace records when each joint's reply
+    # arrived (j_rx); a recording from before has none and keeps the rows' times (its angles 3 to 4.5 ms old).
+    joint_ticks, joint_theta, joint_times = cap_ticks, theta, "rows"
+    if "j_rx" in capture:
+        from utility.joint_times import joint_samples
+        mt, jth = joint_samples(np.asarray(capture["j_rx"], dtype=float)[:, joint - 1], theta)
+        span = (mt >= cap_time[0]) & (mt <= cap_time[-1])
+        if span.sum() >= 2:
+            joint_ticks, joint_theta, joint_times = np.interp(mt[span], cap_time, cap_ticks), jth[span], "measured"
     # Each frame's tick from its OWN time and the capture's rows (both on the robot's clock), never the header's
     # rti_tick: that is the camera server's work, which this test checks instead of resting on it.
     flags = np.asarray(frames["flags"])
@@ -246,8 +265,14 @@ def analyse_exposure(frames: dict, capture: dict, joint: int, uncal_offset_s: fl
                - np.interp(t_frame[stamped], cap_time, cap_ticks)) * tick_s * 1e3
         tick_check = {"frames": int(stamped.sum()), "rms_ms": float(np.sqrt(np.mean(err ** 2))),
                       "mean_ms": float(err.mean()), "worst_ms": float(np.abs(err).max())}
-    # 8-bit: a quarter of the memory (a 794-frame run kept as floats was ~730 MB on a Pi with ~1 GB free, 2026-11-24)
-    grays = [decode_gray(frames["jpegs"][k], size).astype(np.uint8) for k in idx]
+    # 8-bit: a quarter of the memory (a 794-frame run kept as floats was ~730 MB on a Pi with ~1 GB free, 2026-11-24);
+    # paced on RTI's trace (pace: utility/rti_pace.Pace, the decoding slowed RTI's loop beside it)
+    grays = []
+    for k in idx:
+        t0 = time.perf_counter()
+        grays.append(decode_gray(frames["jpegs"][k], size).astype(np.uint8))
+        if pace is not None:
+            pace(time.perf_counter() - t0)
     h, w = grays[0].shape
     nr, nc = tiles
     th, tw = h // nr, w // nc
@@ -255,14 +280,14 @@ def analyse_exposure(frames: dict, capture: dict, joint: int, uncal_offset_s: fl
     for r in range(nr):
         for c in range(nc):
             fit = _tile_fit([g[r * th:(r + 1) * th, c * tw:(c + 1) * tw].astype(np.float32) for g in grays], ticks,
-                            cap_ticks, theta)
+                            joint_ticks, joint_theta)
             if fit is not None:
                 fit.update(row=(r + 0.5) * th * full_rows / h, tile=(r, c))
                 results.append(fit)
     good = [t for t in results if t["r2"] >= MIN_TILE_R2 and not t["at_edge"]
             and abs(t["h1_ticks"] - t["h2_ticks"]) * tick_s * 1e3 <= MAX_TILE_HALVES_MS]
     fps = 1.0 / float(np.median(np.diff(frames["exposure_time"][idx])))
-    base = {"frames": int(len(idx)), "frames_outside": outside, "tick_check": tick_check,
+    base = {"frames": int(len(idx)), "frames_outside": outside, "tick_check": tick_check, "joint_times": joint_times,
             "tick_s": tick_s, "fps": fps, "brightness": float(np.mean(grays[0])),
             "texture": texture(grays[0]), "tiles_total": nr * nc, "tiles_good": len(good),
             "tiles": [{k: (list(v) if k == "tile" else v) for k, v in t.items()} for t in results]}
@@ -336,45 +361,6 @@ def exposure_line(results: dict) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------------- --apply
-def write_timing(xml_path: str, usb_id: str, mode: str, values: dict, run: str, backup_dir: str) -> bool:
-    """The timing attributes `values` (timing_auto_us and / or timing_offset_us + timing_us_per_unit) into the gripper
-    XML's <camera> element when it declares `usb_id`; the other kind's values kept when they are for the same mode;
-    a backup first; comments and everything else kept. False when the file has no such camera."""
-    with open(xml_path, encoding="utf-8") as f:
-        text = f.read()
-    found = cs._elements(text)
-    if len(found) != 1:
-        return False
-    start, end = found[0]
-    attrs = dict(ET.fromstring(text[start:end]).attrib)  # nosec B314 — our own gripper XML
-    if attrs.get("usb_id", "").lower() != usb_id.lower():
-        return False
-    old = {k: v for k, v in attrs.items() if k in cs.TIMING_KEYS}
-    attrs = {k: v for k, v in attrs.items() if k not in cs.TIMING_KEYS}
-    timing = {"timing_mode": mode}
-    if old.get("timing_mode") == mode:                    # the same mode: what this run did not measure stays
-        timing.update({k: v for k, v in old.items() if k not in ("timing_mode", "timing_run")})
-    timing.update(values)
-    timing["timing_run"] = run
-    attrs.update(timing)
-    elem = "<camera " + " ".join(f'{k}="{v}"' for k, v in attrs.items()) + "/>"
-    os.makedirs(backup_dir, exist_ok=True)
-    shutil.copy2(xml_path, os.path.join(backup_dir, os.path.basename(xml_path)))
-    from utility.config_write import write_atomic
-    write_atomic(xml_path, text[:start] + elem + text[end:])
-    return True
-
-
-def apply(run_dir: str, summary: dict) -> list:
-    """Write a confident result into every gripper XML declaring the run's camera; the files written."""
-    written = []
-    for path in sorted(glob.glob(os.path.join(GRIPPERS_DIR, "*.xml"))):
-        if write_timing(path, summary["usb_id"], summary["mode"], summary["values"], os.path.basename(run_dir),
-                        os.path.join(run_dir, "backup")):
-            written.append(os.path.basename(path))
-    return written
-
-
 # ------------------------------------------------------------------------------------------------------- files
 def save_frames(path: str, frames: list) -> None:
     blob = b"".join(f.jpeg for f in frames)
@@ -408,14 +394,15 @@ def summarise(run: dict, results: dict) -> tuple[dict, list]:
     if auto is not None:
         if auto.get("ok") and auto.get("confident"):
             values["timing_auto_us"] = f"{auto['delay_ms'] * 1e3:.1f}"
-            lines.append(f"  -> automatic exposure: image moment = camera time {auto['delay_ms']:+.2f} ms (holds while "
-                         f"the camera exposes for the whole frame: indoors; in bright light up to half a frame off)")
+            lines.append(f"  -> automatic exposure: the picture matches the joint data at camera time "
+                         f"{auto['delay_ms']:+.2f} ms (with the joints on their measurement times: the image's moment "
+                         f"minus the arm's own lag; the calibration is the LED check's since 2026-11-25)")
         else:
             confident = False
     if len(fixed) >= 2:
         line = exposure_line(fixed)
         ok = line["residual_ms"] <= MAX_LINE_RESIDUAL_MS and line["unit_error_us"] <= MAX_UNIT_ERROR_US
-        lines.append(f"  -> fixed exposures: image moment = camera time {line['offset_ms']:+.2f} ms "
+        lines.append(f"  -> fixed exposures: the picture matches the joint data at camera time {line['offset_ms']:+.2f} ms "
                      f"{line['k_ms'] * 1e3:+.2f} us x setting (expected +-{cs.EXPOSURE_UNIT_US / 2:g}: the PTS marks "
                      f"{line['pts_marks']}); the settings' scatter about the line {line['residual_ms']:.2f} ms"
                      + ("" if ok else "  — NOT confident"))
@@ -435,7 +422,7 @@ def summarise(run: dict, results: dict) -> tuple[dict, list]:
         confident and bool(values)
 
 
-def reanalyse(run_dir: str, do_apply: bool = False) -> dict:
+def reanalyse(run_dir: str) -> dict:
     with open(os.path.join(run_dir, "run.json"), encoding="utf-8") as f:
         run = json.load(f)
     results = {}
@@ -446,12 +433,14 @@ def reanalyse(run_dir: str, do_apply: bool = False) -> dict:
         frames = load_frames(os.path.join(run_dir, e["frames"]))
         capture = dict(np.load(os.path.join(run_dir, e["capture"])))
         active = cs.timing_offset_s(run.get("timing_active"), None if setting == "auto" else setting) or 0.0
+        from utility.rti_pace import Pace
         r = analyse_exposure(frames, capture, e.get("joint", run["joint"]), active,
-                             full_rows=int(run["mode"].split("x")[1].split("@")[0]))
+                             full_rows=int(run["mode"].split("x")[1].split("@")[0]), pace=Pace(say=print))
         r.update(joint=e.get("joint", run["joint"]), speed=e.get("speed", run.get("swing_speed")),
                  amplitude_deg=e.get("amplitude_deg", run["amplitude_deg"]))
-        label = (f"J{r['joint']} +-{r['amplitude_deg']:g} deg at {r['speed']:g} %" if run.get("verify")
-                 else setting_name(setting))
+        label = (f"J{r['joint']} +-{r['amplitude_deg']:g} deg at {r['speed']:g} %"
+                 + ("" if setting == "auto" else f", {setting * cs.EXPOSURE_UNIT_US / 1000:g} ms")
+                 if run.get("verify") else setting_name(setting))
         results[e.get("tag", setting) if run.get("verify") else setting] = r
         if r["ok"]:
             lines.append(f"  {label:>22}: delay at the centre row {r['delay_ms']:+7.2f} ms (halves "
@@ -465,19 +454,14 @@ def reanalyse(run_dir: str, do_apply: bool = False) -> dict:
         else:
             lines.append(f"  {label:>22}: no result — {r['why']}")
         lines += tick_lines(r)
+        if r.get("ok") and r.get("joint_times") == "rows":
+            lines.append("      (recorded before 2026-11-25: the joint on the rows' times, its angles 3 to 4.5 ms old)")
     if run.get("verify"):
         return _verify_report(run_dir, run, results, lines)
     values, more, confident = summarise(run, results)
     lines += more
     summary = {"usb_id": run["usb_id"], "mode": run["mode"], "results": {str(k): v for k, v in results.items()},
                "values": values, "confident": confident}
-    if do_apply:
-        if confident:
-            written = apply(run_dir, summary)
-            lines.append(f"  --apply: written into {len(written)} gripper XML(s): {', '.join(written) or 'none'}; the "
-                         f"camera server takes it within ~1 s (backups in {os.path.relpath(run_dir, _ROOT)}/backup)")
-        else:
-            lines.append("  --apply: not confident — nothing written")
     text = "\n".join(lines)
     print(text)
     with open(os.path.join(run_dir, "report.txt"), "w", encoding="utf-8") as f:
@@ -534,7 +518,26 @@ def verify_verdict(results: dict, applied_ms: float | None) -> tuple[bool, list]
 
 def _verify_report(run_dir: str, run: dict, results: dict, lines: list) -> dict:
     active = run.get("timing_active") or {}
-    ok, more = verify_verdict(results, None if active.get("auto_us") is None else active["auto_us"] / 1e3)
+    setting = parse_setting(run.get("verify_setting", "auto"))
+    good = [r for r in results.values() if r.get("ok") and r.get("confident")]
+    measured = bool(good) and all(r.get("joint_times") == "measured" for r in good)
+    # the automatic-exposure calibration is the yardstick only for a run under automatic exposure with the joints on
+    # the rows' times (before true timing); on their own measurement times the delay is the image's moment minus the
+    # arm's own lag, so the variants are compared with each other only
+    applied = active.get("auto_us") if setting == "auto" and not measured else None
+    ok, more = verify_verdict(results, None if applied is None else applied / 1e3)
+    if measured and setting == "auto" and active.get("auto_us") is not None:
+        m = active["auto_us"] / 1e3
+        more.append("  the arm's own lag (the picture, at the wrist's output, behind the motors' encoders): "
+                    + ", ".join(f"J{r['joint']} {r['speed']:g} % {m - r['delay_ms']:.2f}" for r in good)
+                    + f" ms, from the image's moment {m:+.2f} ms (calibration run {active.get('run')})"
+                    + ("" if str(active.get("run") or "").startswith("led_") else
+                       " — NOT the LED check's: these are relative to it (81 --auto, then --apply)"))
+    if setting != "auto":
+        e_ms = setting * cs.EXPOSURE_UNIT_US / 1000
+        more.append(f"  (a fixed {e_ms:g} ms exposure: the LED check's centre-row readout a gives the image's moment "
+                    f"a - {e_ms / 2:g} ms after the camera time; the delay above minus that = how old the joint data "
+                    f"stamped with a tick are)")
     lines += more + ["  (--verify writes nothing)"]
     text = "\n".join(lines)
     print(text)
@@ -735,11 +738,15 @@ def run_arm(args) -> str | None:
         try:
             if args.verify:
                 run["verify"] = True
-                set_exposure(base, "auto")
-                if wait_exposure("auto"):
+                setting = args.exposures[0]                  # one exposure (main() refuses more): auto by default
+                run["verify_setting"] = setting
+                set_exposure(base, setting)
+                if wait_exposure(setting):
                     for joint, amplitude, speed in VERIFY_VARIANTS:
-                        record_setting(robot, args, "auto", q0, out_dir, run, mode_fps, joint=joint,
-                                       amplitude=amplitude, speed=speed, tag=f"auto_J{joint}_{speed:g}")
+                        record_setting(robot, args, setting, q0, out_dir, run, mode_fps, joint=joint,
+                                       amplitude=amplitude, speed=speed, tag=f"{setting}_J{joint}_{speed:g}")
+                else:
+                    print(f"{setting_name(setting)}: the camera did not take it within 8 s — nothing recorded")
             for setting in ([] if args.verify else args.exposures):
                 set_exposure(base, setting)
                 if not wait_exposure(setting):
@@ -869,6 +876,22 @@ def selftest() -> int:
     r_late = analyse(late, uncal_offset_s=2e-3)
     chk("A6 frames all past the capture: no result, said why",
         not r_late["ok"] and "inside the capture" in r_late["why"], r_late)
+    from utility.joint_times import REPLY_AFTER_MEASURE_S
+    age = 3.5e-3                                               # each row's angle measured 3.5 ms before the row (as on
+    aged = np.interp((t - age) / tick_s, ticks, theta)         # the arm, 2026-11-25), its reply in 0.21 ms later
+    rx = t - age + REPLY_AFTER_MEASURE_S
+    miss = np.arange(50, len(t), 50)                           # a missed reply: the row repeats the last one
+    aged[miss], rx[miss] = aged[miss - 1], rx[miss - 1]
+    cap_aged = {"tick": ticks, "timestamp": t, "j_p": np.repeat(aged[:, None], 6, axis=1),
+                "j_rx": np.repeat(rx[:, None], 6, axis=1)}
+    r7 = analyse_exposure(fr, cap_aged, JOINT, 2e-3, size=size, full_rows=h)
+    r7b = analyse_exposure(fr, {k: v for k, v in cap_aged.items() if k != "j_rx"}, JOINT, 2e-3, size=size, full_rows=h)
+    chk("A7 true timing: rows whose angles are 3.5 ms old (every 50th a missed reply, repeated) — with RTI's j_rx the "
+        f"joint on its own measurement times gives the true +5.0 ms ({r7.get('delay_ms', float('nan')):+.2f}); "
+        f"without it (a recording from before) the rows' times give +8.5 ({r7b.get('delay_ms', float('nan')):+.2f})",
+        r7["ok"] and abs(r7["delay_ms"] - 5.0) < 0.3 and r7["joint_times"] == "measured"
+        and r7b["ok"] and abs(r7b["delay_ms"] - 8.5) < 0.4 and r7b["joint_times"] == "rows",
+        (r7.get("delay_ms"), r7.get("joint_times"), r7b.get("delay_ms"), r7b.get("joint_times")))
     print("B. the summary")
     good = {"ok": True, "confident": True}
     good = dict(good, readout_ms=30.8)
@@ -898,14 +921,51 @@ def selftest() -> int:
         not ok_v2 and any("+2.00 ms" in ln for ln in lines_v2), lines_v2)
     ok_v3, _ = verify_verdict(dict(v, J6_40={"ok": False, "why": "dark"}), 1.41)
     chk("B8 ...a variant without a confident delay: not verified", not ok_v3)
-    print("C. --apply's writer")
+    import tempfile as _tempfile
+    vf = {k: dict(r, delay_ms=r["delay_ms"] + 16.0) for k, r in v.items()}   # a fixed 2 ms: the moment ~+15.7 ms later
+    tmp_v = _tempfile.mkdtemp(prefix="cam80v_")
+    try:
+        with open(os.devnull, "w") as quiet:
+            saved_out, sys.stdout = sys.stdout, quiet
+            try:
+                s_auto = _verify_report(tmp_v, {"timing_active": {"auto_us": 1413.9}}, vf, [])
+                lines_f = []
+                s_fix = _verify_report(tmp_v, {"timing_active": {"auto_us": 1413.9}, "verify_setting": 20}, vf, lines_f)
+            finally:
+                sys.stdout = saved_out
+    finally:
+        shutil.rmtree(tmp_v, ignore_errors=True)
+    chk("B9 --verify at a fixed exposure (E3): the variants agree, so verified — the automatic-exposure calibration is "
+        "no yardstick there (the same delays under automatic exposure fail against it); the report says how to read "
+        "the delay", s_fix["verified"] and not s_auto["verified"] and any("fixed 2 ms exposure" in ln for ln in lines_f),
+        (s_fix["verified"], s_auto["verified"], lines_f))
+    vm = {k: dict(r, joint_times="measured", delay_ms=r["delay_ms"] - 3.4) for k, r in v.items()}
+    tmp_m = _tempfile.mkdtemp(prefix="cam80m_")
+    try:
+        with open(os.devnull, "w") as quiet:
+            saved_out, sys.stdout = sys.stdout, quiet
+            try:
+                lines_m, lines_o = [], []
+                s_m = _verify_report(tmp_m, {"timing_active": {"auto_us": 800.0, "run": "led_X"}}, vm, lines_m)
+                _verify_report(tmp_m, {"timing_active": {"auto_us": 1413.9, "run": "20261124_200140"}}, vm, lines_o)
+            finally:
+                sys.stdout = saved_out
+    finally:
+        shutil.rmtree(tmp_m, ignore_errors=True)
+    lag = [ln for ln in lines_m if "the arm's own lag" in ln]
+    chk("B10 true timing (the joints on their measurement times): the variants compared with each other only (verified "
+        "although far from the calibration), the arm's own lag = the image's moment minus each delay; a calibration "
+        "that is not the LED check's is named as such",
+        s_m["verified"] and lag and "J5 20 % 2.90" in lag[0] and "led_X" in lag[0] and "NOT the LED" not in lag[0]
+        and any("NOT the LED check's" in ln for ln in lines_o), (s_m["verified"], lines_m, lines_o))
+    print("C. the timing writer (utility/camera_settings.write_timing; the LED check's --apply writes with it)")
     import tempfile
     tmp = tempfile.mkdtemp(prefix="cam80_")
     try:
         dst = os.path.join(tmp, "MSG.xml")
         shutil.copy2(os.path.join(GRIPPERS_DIR, "MSG_small_motor_150mm_rail.xml"), dst)
         before = open(dst, encoding="utf-8").read()
-        ok = write_timing(dst, "0bda:5844", "1280x720@30", {"timing_auto_us": "12340.0"}, "RUN1",
+        ok = cs.write_timing(dst, "0bda:5844", "1280x720@30", {"timing_auto_us": "12340.0"}, "RUN1",
                           os.path.join(tmp, "backup"))
         after = open(dst, encoding="utf-8").read()
         root = ET.parse(dst).getroot()  # nosec B314
@@ -914,18 +974,18 @@ def selftest() -> int:
             ok and timing is not None and timing["auto_us"] == 12340.0 and timing["offset_us"] is None
             and root.find("camera").attrib["usb_id"] == "0bda:5844" and after.count("<!--") == before.count("<!--")
             and os.path.exists(os.path.join(tmp, "backup", "MSG.xml")), timing)
-        write_timing(dst, "0bda:5844", "1280x720@30", {"timing_offset_us": "3000.0", "timing_us_per_unit": "50.0"},
+        cs.write_timing(dst, "0bda:5844", "1280x720@30", {"timing_offset_us": "3000.0", "timing_us_per_unit": "50.0"},
                      "RUN2", os.path.join(tmp, "backup2"))
         two = cs.camera_timing(dict(ET.parse(dst).getroot().find("camera").attrib), "1280x720@30")  # nosec B314
         again = open(dst, encoding="utf-8").read()
         chk("C2 a later run of the other kind for the same mode: both kept, the run replaced, each key once",
             two["auto_us"] == 12340.0 and two["offset_us"] == 3000.0 and two["run"] == "RUN2"
             and again.count("timing_mode=") == 1, two)
-        write_timing(dst, "0bda:5844", "640x480@30", {"timing_auto_us": "1.0"}, "RUN3", os.path.join(tmp, "b3"))
+        cs.write_timing(dst, "0bda:5844", "640x480@30", {"timing_auto_us": "1.0"}, "RUN3", os.path.join(tmp, "b3"))
         three = dict(ET.parse(dst).getroot().find("camera").attrib)  # nosec B314
         chk("C3 another mode: the old mode's values go", "timing_offset_us" not in three and three["timing_mode"]
             == "640x480@30", three)
-        chk("C4 another camera's file is not touched", not write_timing(dst, "046d:0825", "1280x720@30",
+        chk("C4 another camera's file is not touched", not cs.write_timing(dst, "046d:0825", "1280x720@30",
                                                                         {"timing_auto_us": "1"}, "X",
                                                                         os.path.join(tmp, "b4")))
         chk("C5 the server's formula: automatic -> its offset, fixed -> offset + k x setting, missing -> None",
@@ -951,25 +1011,29 @@ def main():
     ap.add_argument("--exposures", default=",".join(map(str, EXPOSURES)),
                     help="auto and / or fixed settings (exposure_time_absolute, 100 us each), comma-separated")
     ap.add_argument("--reanalyse", metavar="FOLDER")
-    ap.add_argument("--apply", action="store_true", help="write a confident result into the gripper XMLs")
+    ap.add_argument("--apply", action="store_true", help="retired 2026-11-25: the LED check writes the calibration")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--verify", action="store_true",
-                    help="record J5 at 20 / 40 / 60 %% and J6 +-15 deg under automatic exposure; compare; write nothing")
+                    help="record J5 at 20 / 40 / 60 %% and J6 +-15 deg at one exposure (automatic, or --exposures N "
+                         "for a fixed one); compare; write nothing")
     args = ap.parse_args()
     args.exposures = [parse_setting(x) for x in str(args.exposures).split(",") if x.strip()]
-    if args.verify and args.apply:
-        sys.exit("--verify writes nothing: leave --apply out")
+    if args.apply:
+        sys.exit("--apply is retired (2026-11-25, true timing): the calibration is the LED check's image moment — "
+                 "api_tests/81_camera_led_timing.py --apply FOLDER")
+    if args.verify and len(args.exposures) != 1:
+        sys.exit("--verify records at ONE exposure: --exposures auto (the default) or one fixed setting, e.g. 20")
     if args.selftest:
         sys.exit(selftest())
     if args.reanalyse:
         summary = reanalyse(os.path.join(_ROOT, args.reanalyse) if not os.path.isabs(args.reanalyse)
-                            else args.reanalyse, args.apply)
+                            else args.reanalyse)
         sys.exit(0 if summary.get("confident") else 1)
     st, problems = checks(args)
     print(f"camera: {st.get('state')}, {(st.get('device') or {}).get('usb_id')}, mode {st.get('mode')}; frame times: "
           f"{(st.get('clock') or {}).get('source')}")
     if args.verify:
-        print(f"plan (--verify): the start pose, then under automatic exposure "
+        print(f"plan (--verify): the start pose, then at {setting_name(args.exposures[0])} "
               f"{'; '.join(f'J{j} +-{a:g} deg at {v:g} %' for j, a, v in VERIFY_VARIANTS)}, {args.swings} moves each "
               f"(~{len(VERIFY_VARIANTS) * (args.swings * 2.5 + 8):.0f} s); compared, nothing written; the analysis once "
               f"the arm is disabled")
@@ -987,7 +1051,7 @@ def main():
         return
     out_dir = run_arm(args)
     if out_dir:
-        summary = reanalyse(out_dir, args.apply)
+        summary = reanalyse(out_dir)
         sys.exit(0 if summary.get("confident") else 1)
     sys.exit(1)
 

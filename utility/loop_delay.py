@@ -17,6 +17,10 @@ changes) RTI's tick waited for it: 8-44 ms single-tick stalls, LOOP_CRITICAL, th
 How the pairing works (loop_delay_per_joint): every joint gets a command and answers every tick, so by time alone — the
 newest reply before RTI's read in tick k -> the first command to that joint after tick k+lag's read (lag 0 in option
 B, 1 in the old order). Times are CLOCK_REALTIME: candump's kernel stamps and RTI's `can_read_t`.
+
+The joint data's age (joint_data_age, 2026-11-25, TODO/camera_review_plan.md E2): how old a trace row's joint angles
+are at the row's own timestamp. The camera's frames are paired with the rows by that timestamp, so this age is the
+joint side of the camera's timing.
 """
 from __future__ import annotations
 
@@ -119,18 +123,69 @@ def loop_delay_per_joint(c, ts, read_t, tick, lag, gaps=(), joints=JOINT_NODES):
     return out
 
 
+AGE_MAX_REPLY_S = 0.004           # a reply more than one tick after the newest command is not that command's answer
+
+
+def joint_data_age(c, row_t, read_t, gaps=(), joints=JOINT_NODES, rx_t=None):
+    """How old a trace row's joint angles are at the row's timestamp. Per joint and row: the row's timestamp (RTI's
+    clock reading for the row, `_hist_t`, put on CLOCK_REALTIME by the caller) minus
+      "reply"    the bus time of the reply the row's tick read (the newest reply before its CAN read `read_t`), and
+      "command"  the bus time of the command that reply answered (the newest command to that joint before the reply).
+                 The drive takes its angle when the command arrives: firmware 110 builds the reply in its CAN handler
+                 from the newest position of its 6250 Hz loop (at most 0.16 ms old), so this is the angle's age.
+    And "read_to_row": the row's timestamp minus its own CAN read, the same tick. It must be positive and under a tick,
+    or the clock offset the caller used is wrong. Rows without a read or a timestamp, or with a read inside a stretch
+    candump missed, are left out (the caller blanks reads outside the log as NaN).
+    rx_t (rows x joints, CLOCK_REALTIME; RTI's trace column j_rx, 2026-11-25): RTI's own record of each reply's receive
+    time. Given, each joint also carries "rx_vs_reply" (j_rx minus the bus's time of the reply the row read: ~0, the
+    same frame's kernel time on two sockets) and "measured_vs_command" (j_rx - REPLY_AFTER_MEASURE_S minus the bus
+    time of the command it answered: ~0 when utility/joint_times' constant holds).
+    -> {"joints": {"J1": {"reply": stats, "command": stats[, "rx_vs_reply", "measured_vs_command"]}, ...},
+        "read_to_row": stats}, all in ms."""
+    from utility.joint_times import REPLY_AFTER_MEASURE_S
+    row_t = np.asarray(row_t, float)
+    read_t = np.asarray(read_t, float)
+    ok = np.isfinite(read_t) & (read_t > 0) & np.isfinite(row_t)
+    for g0, g1 in gaps:
+        ok &= ~((read_t > g0) & (read_t < g1 + 0.005))
+    out = {}
+    for j in range(joints):
+        tc = node_frames(c, j, (CMD_DATA_PACK_1, CMD_DATA_PACK_PD))[0]
+        tr = node_frames(c, j, (RESP_DATA_PACK_1,))[0]
+        if tc.size == 0 or tr.size == 0:
+            out[f"J{j + 1}"] = {"reply": {"n": 0}, "command": {"n": 0}}
+            continue
+        ir = np.searchsorted(tr, np.where(ok, read_t, -np.inf), "right") - 1    # the newest reply before the read
+        have = ok & (ir >= 0)
+        rep = np.where(have, tr[np.clip(ir, 0, None)], np.nan)
+        ic = np.searchsorted(tc, np.where(have, rep, -np.inf), "left") - 1     # the newest command before the reply
+        cmd = np.where(have & (ic >= 0), tc[np.clip(ic, 0, None)], np.nan)
+        answered = have & np.isfinite(cmd) & (rep - np.where(np.isfinite(cmd), cmd, rep) < AGE_MAX_REPLY_S)
+        out[f"J{j + 1}"] = {"reply": _stats((row_t - rep)[have] * 1e3),
+                            "command": _stats((row_t - cmd)[answered] * 1e3)}
+        if rx_t is not None:
+            rx = np.asarray(rx_t, float)[:, j]
+            okr = have & np.isfinite(rx)
+            okc = answered & np.isfinite(rx)
+            out[f"J{j + 1}"]["rx_vs_reply"] = _stats((rx - rep)[okr] * 1e3)
+            out[f"J{j + 1}"]["measured_vs_command"] = _stats((rx - REPLY_AFTER_MEASURE_S - cmd)[okc] * 1e3)
+    return {"joints": out, "read_to_row": _stats((row_t - read_t)[ok] * 1e3)}
+
+
 SKIP_MODES = ("HOMING", "FLASHING")    # they send their own frames, not a command to every joint each tick: not judged
 
 
-def report(candump_lines, tick, read_t, modes, lag, joints=JOINT_NODES):
+def report(candump_lines, tick, read_t, modes, lag, joints=JOINT_NODES, row_t=None, rx_t=None):
     """The on-request measurement's result (tools/loop_delay.py) from what it recorded: the `candump -L` lines, and per
     RTI tick its number, its CAN read time (`can_read_t`, CLOCK_REALTIME) and its mode's name. Not judged: ticks in
     SKIP_MODES, reads outside the log (their reply or command may be missing from it) and reads in a stretch candump
     missed (candump_gaps). The read time stands in for the tick's clock reading too (loop_delay_per_joint's `ts`, used
-    only to drop commands inside a gap). lag: 0 in option B's order, 1 in the old one.
+    only to drop commands inside a gap). lag: 0 in option B's order, 1 in the old one. row_t: each row's timestamp on
+    CLOCK_REALTIME; given, the result also carries "age" (joint_data_age; with rx_t, RTI's j_rx on CLOCK_REALTIME,
+    its check against the bus too).
     -> {"joints": {"J1": {"n", "med", "p99", "max", "min"} in ms (only {"n": 0} when none judged), ...},
         "ticks": the ticks judged, "frames": the frames in the log, "skipped_mode": ticks skipped for their mode,
-        "gaps": the stretches candump missed, [(t0, t1)]}"""
+        "gaps": the stretches candump missed, [(t0, t1)], and with row_t "age"}"""
     c = parse_candump(candump_lines)
     tick = np.asarray(tick, float)
     read_t = np.array(read_t, float)
@@ -146,5 +201,8 @@ def report(candump_lines, tick, read_t, modes, lag, joints=JOINT_NODES):
     joints_out = loop_delay_per_joint(c, read_t, read_t, tick, lag, gaps, joints)
     for j in range(joints):
         joints_out.setdefault(f"J{j + 1}", {"n": 0})
-    return {"joints": joints_out, "ticks": int(np.isfinite(read_t).sum()), "frames": int(c["t"].size),
-            "skipped_mode": int(skip.sum()), "gaps": gaps}
+    out = {"joints": joints_out, "ticks": int(np.isfinite(read_t).sum()), "frames": int(c["t"].size),
+           "skipped_mode": int(skip.sum()), "gaps": gaps}
+    if row_t is not None:
+        out["age"] = joint_data_age(c, row_t, read_t, gaps, joints, rx_t=rx_t)
+    return out

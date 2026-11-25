@@ -14,6 +14,11 @@ held it — the single-tick LOOP_CRITICAL stalls (utility/loop_delay.py). Here o
     tools/loop_delay.py                  # 3 s, a table
     tools/loop_delay.py --seconds 5 --json
 
+It also gives how old a trace row's joint angles are at the row's own timestamp (2026-11-25, utility/loop_delay.py
+joint_data_age): the camera's frames are paired with the rows by that timestamp. The rows' timestamps are RTI's
+time.perf_counter() (CLOCK_MONOTONIC); this tool puts them on CLOCK_REALTIME, candump's clock, with the offset
+between the two clocks read here before and after the recording (the drift between the two readings is reported).
+
 Exit code 0 with a result, 1 when it could not measure (RTI not running, no candump, the tick order changed meanwhile,
 no frames) — the reason printed (with --json: {"ok": false, "error": ...}).
 """
@@ -54,6 +59,18 @@ def _read_first_flag():
     return float(arr[0])
 
 
+def _clock_offset():
+    """CLOCK_REALTIME minus CLOCK_MONOTONIC in s, from the tightest of 50 bracketed readings (to a few us)."""
+    best = None
+    for _ in range(50):
+        m1 = time.clock_gettime(time.CLOCK_MONOTONIC)
+        r = time.clock_gettime(time.CLOCK_REALTIME)
+        m2 = time.clock_gettime(time.CLOCK_MONOTONIC)
+        if best is None or m2 - m1 < best[0]:
+            best = (m2 - m1, r - 0.5 * (m1 + m2))
+    return best[1]
+
+
 def measure(seconds=SECONDS_DEFAULT, interface=None):
     """Record and pair; -> the report (utility.loop_delay.report) + "seconds", "order", "lag", "interface",
     "measured_utc", "lost_rows". Raises MeasureError with the reason."""
@@ -71,6 +88,7 @@ def measure(seconds=SECONDS_DEFAULT, interface=None):
     modes = list(reader.layout["modes"])
     joints = next((size for name, _start, size in reader.layout["arrays"] if name == "j_p"), 6)
     order_before = _read_first_flag()
+    offset_before = _clock_offset()
     with tempfile.TemporaryFile("w+") as log:
         dump = subprocess.Popen(["candump", "-L", interface], stdout=log, stderr=subprocess.PIPE, text=True)
         try:
@@ -99,6 +117,7 @@ def measure(seconds=SECONDS_DEFAULT, interface=None):
                 dump.kill()
         log.seek(0)
         lines = log.readlines()
+    offset_after = _clock_offset()
     if _read_first_flag() != order_before:
         raise MeasureError("the tick order (can_read_first) changed during the measurement — measure again")
     data = np.concatenate([r for r in rows if r.size] or [np.empty((0, reader.width))])
@@ -107,11 +126,16 @@ def measure(seconds=SECONDS_DEFAULT, interface=None):
     mode_idx = data[:, cols["mode"]].astype(int)
     mode_names = [modes[i] if 0 <= i < len(modes) else "?" for i in mode_idx]
     lag = 0 if order_before > 0.5 else 1
-    rep = report(lines, data[:, cols["tick"]], data[:, cols["can_read_t"]], mode_names, lag, joints)
+    offset = 0.5 * (offset_before + offset_after)
+    # RTI's own reply times (the trace's j_rx, 2026-11-25), when this RTI records them: checked against the bus
+    rx = next(((start, size) for name, start, size in reader.layout["arrays"] if name == "j_rx"), None)
+    rx_t = data[:, rx[0]:rx[0] + rx[1]] + offset if rx else None
+    rep = report(lines, data[:, cols["tick"]], data[:, cols["can_read_t"]], mode_names, lag, joints,
+                 row_t=data[:, cols["timestamp"]] + offset, rx_t=rx_t)
     if rep["frames"] == 0:
         raise MeasureError(f"no CAN frames on {interface}")
     rep.update({"seconds": seconds, "order": "read first (option B)" if lag == 0 else "normal", "lag": lag,
-                "interface": interface, "lost_rows": lost,
+                "interface": interface, "lost_rows": lost, "clock_drift_us": (offset_after - offset_before) * 1e6,
                 "measured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
     return rep
 
@@ -127,6 +151,35 @@ def format_table(rep):
             lines.append(f"{name:5s} {s['med']:7.2f} {s['p99']:7.2f} {s['max']:7.2f}        {s['n']:6d}")
         else:
             lines.append(f"{name:5s}       —       —       —             0")
+    age = rep.get("age")
+    if age:
+        r2r = age["read_to_row"]
+        lines.append("")
+        lines.append("the joint angles' age at their trace row's timestamp (ms; the camera pairs frames by that "
+                     "timestamp)")
+        lines.append("joint   from the command it answered (median p99)   from the reply (median p99)   rows")
+        for name, a in age["joints"].items():
+            cmd, rep_ = a["command"], a["reply"]
+            if cmd.get("n") and rep_.get("n"):
+                lines.append(f"{name:5s}   {cmd['med']:7.2f} {cmd['p99']:7.2f}                          "
+                             f"{rep_['med']:7.2f} {rep_['p99']:7.2f}          {cmd['n']:6d}")
+            else:
+                lines.append(f"{name:5s}         —       —                                —       —               0")
+        rx_lines = [f"{name:5s}   {a['rx_vs_reply']['med']:+7.3f} {a['rx_vs_reply']['max']:7.3f}"
+                    f"                        {a['measured_vs_command']['med']:+7.3f} "
+                    f"{a['measured_vs_command']['p99']:7.3f}"
+                    for name, a in age["joints"].items()
+                    if a.get("rx_vs_reply", {}).get("n") and a.get("measured_vs_command", {}).get("n")]
+        if rx_lines:
+            lines.append("")
+            lines.append("RTI's own record of each reply (the trace's j_rx; the camera pairs each joint on it, minus "
+                         "0.21 ms), against the bus (ms)")
+            lines.append("joint   j_rx - the reply's bus time (median max)   j_rx - 0.21 - the command's (median p99)")
+            lines += rx_lines
+        if r2r.get("n"):
+            lines.append(f"(check: a row's timestamp comes {r2r['med']:.2f} ms after its own CAN read, max "
+                         f"{r2r['max']:.2f}; the two clocks drifted {rep.get('clock_drift_us', 0.0):+.1f} us apart "
+                         f"during the recording)")
     return "\n".join(lines)
 
 

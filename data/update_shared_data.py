@@ -329,6 +329,8 @@ def update_motor_and_gripper_data(
     """
 
     tick = shared_data.rti["loop_tick"][0]
+    # The replies' receive times are the kernel's (CLOCK_REALTIME); this puts them on RTI's clock (2026-11-25)
+    rx_to_rti = time.perf_counter() - time.time()
 
     # === Always update ===
     # One pass over the joints writing in place (2026-10-03) — the four list comprehensions this replaces built
@@ -340,6 +342,8 @@ def update_motor_and_gripper_data(
         shared_data.motor['motor_speed'][i] = latest["speed"]
         shared_data.motor['motor_current'][i] = latest["current"]
         shared_data.motor['global_motor_error'][i] = latest["error"]
+        rx = latest["timestamp"]                  # the reply's receive time; -1 (the default entry) before any reply
+        shared_data.motor['motor_reply_time'][i] = rx + rx_to_rti if rx is not None and rx > 0 else np.nan
 
     # === 5-tick staggered updates ===
     if tick % 5 == 0:

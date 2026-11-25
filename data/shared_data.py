@@ -405,6 +405,11 @@ def setup(joints: int = 6, force_reinit: bool = False):
         ("motor_calibration_id", np.int64),
         ("HALL_INDEX",          np.int32),
         ("ADDITIONAL_PIN2",     np.int32),
+        # When the reply that carried motor_position arrived: the kernel's receive time, put on RTI's own clock
+        # (time.perf_counter, the clock of the trace rows and the camera's frame times); NaN before the first reply.
+        # The drive measured that angle REPLY_AFTER_MEASURE_S before (utility/joint_times.py). The camera's true
+        # timing (TODO/camera_review_plan.md, option A, 2026-11-25) pairs each joint with a picture on this time.
+        ("motor_reply_time",    np.float64),
         ("HALL_EDGE_DETECT",    np.int32),
         # ---- What was actually PUT ON THE CAN WIRE this tick (motor space) ----
         # Everything else in motor[] is measured FROM the driver; these three are what RTI

@@ -29,9 +29,12 @@ _POLL_S = 0.5                     # socket timeout inside a read: a stop or a de
 class CameraFrame(NamedTuple):
     """One image from the wrist camera, with the moment it was taken.
 
-    `rti_tick` pairs the image with the robot's joint data: the real-time
-    client's state packets carry the same tick (`state["tick"]`), so no clock
-    needs to be shared between the robot and the PC.
+    `rti_tick` places the image on the robot's control-loop ticks: the
+    real-time client's state packets carry the same tick (`state["tick"]`),
+    so no clock needs to be shared between the robot and the PC. A tick's
+    joint angles were measured 3 to 4.5 ms before that tick (each joint its
+    own age); the robot's recordings keep each joint's measurement time, so
+    a recording pairs every joint with the image at its true moment.
 
     Attributes:
         jpeg: The image as the camera sent it, as JPEG bytes. Decode it with
@@ -44,7 +47,8 @@ class CameraFrame(NamedTuple):
             to a few microseconds, rather than the driver's timestamp, which
             comes in 4 ms steps and 1 to 5 ms late.
         calibrated: Whether `exposure_time` includes the calibrated offset to
-            the middle of the exposure.
+            the middle of the exposure of the image's centre row (the image's
+            moment, measured with an LED).
         auto_exposure: Whether the camera chose its exposure itself.
         exposure_us: The exposure length in microseconds; 0 when the camera
             chooses it (automatic exposure).

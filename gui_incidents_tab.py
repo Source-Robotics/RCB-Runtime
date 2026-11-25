@@ -68,6 +68,7 @@ CHANNELS = {
     "j_tt": ("Target torque", "Nm", 1.0, None),
     "j_t_inertia": ("Inertia feedforward", "Nm", 1.0, None),
     "j_t_coriolis": ("Coriolis feedforward", "Nm", 1.0, None),
+    "j_rx": ("Reply received (RTI's clock)", "s", 1.0, None),
     "j_err": ("Motor error bytes", "", 1.0, "motors"),
     "TCP_p": ("TCP pose", "mm, deg", _POSE_SCALE, _POSE),
     "TCP_p_c": ("Commanded TCP pose", "mm, deg", _POSE_SCALE, _POSE),

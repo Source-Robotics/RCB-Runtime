@@ -744,6 +744,8 @@ def main():
     # Every tick's values into a ring in shared memory, for recorder.py — the incident dumps and captures are made THERE,
     # with its own interpreter (utility/trace_ring.py, 2026-10-16: made in RTI's process they cost loop time). The same
     # arrays and names as the history entry (utility/data_init.process_joint_data); each keeps its identity for the run.
+    # j_rx is the trace's alone (2026-11-25): each joint's reply receive time on RTI's clock (data/shared_data.py
+    # motor_reply_time), for recordings that pair joints with camera pictures on their true times; no telemetry tag.
     trace = TraceWriter((
         ("j_p", shared_data.joint['joint_position']), ("j_s", shared_data.joint['joint_speed']),
         ("j_t", shared_data.joint['joint_torque']), ("j_a", shared_data.joint['joint_acceleration']),
@@ -762,7 +764,7 @@ def main():
         ("j_at", shared_data.joint['joint_acceleration_target']), ("j_tt", shared_data.joint['joint_torque_target']),
         ("j_t_inertia", shared_data.joint['joint_inertia_torque']), ("j_t_coriolis", shared_data.joint['joint_coriolis_torque']),
         ("TCP_p_t", shared_data.tcp['TCP_pose_target']), ("TCP_s_t", shared_data.tcp['TCP_speed_target']),
-        ("j_err", motor_error_bytes),
+        ("j_err", motor_error_bytes), ("j_rx", shared_data.motor['motor_reply_time']),
     ), tick_s=delta_t)
 
 

@@ -38,35 +38,51 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - `robotclient.CameraClient` and `CameraFrame`: the camera's frames on a PC, each with its time and RTI tick, in order
   (for recording) or only the newest (`latest_only=True`, for a controller). Standard library only; `connect()`
   checks the camera protocol (`VersionMismatch`).
-- The camera's timing calibration, `api_tests/80_camera_timing.py`: the wrist swings a little while the robot
-  records its joints and every frame; the picture is cut into tiles whose shifts are fitted against the joint's
-  motion, which gives the delay between a frame's camera time and the joint data its image's centre row shows, and the
-  camera's rolling-shutter readout (each image row has its own moment). Tiles that do not follow the joint, such as
-  the gripper's own jaws in view, are left out. A frame's tick is worked out from its time and the recording's own
-  rows; the tick in the frame's header is checked against it and the report gives the difference. It calibrates
-  automatic exposure (the default) and, where the light allows, fixed exposures (then also which edge of the exposure
-  the camera's timestamp marks). `--apply` writes the result into the gripper XMLs of that camera
-  (`<camera timing_*>`); the camera server then moves each frame's time to its image's moment and sets the header's
-  calibrated flag. It does so only for that gripper's own camera, in the calibrated mode, and when the camera's
-  controls say whether the exposure is automatic or fixed; the status and the Camera tab say whether the times are
-  calibrated, or why not. Indoors the MSG camera needs automatic exposure: at a fixed exposure it drops its gain, and
-  a fixed exposure short enough for 30 fps gives a black picture under ordinary room light. Measured on the MSG
-  camera under automatic exposure: +1.0 to +2.3 ms, growing with the wrist's speed (17 to 37 deg/s; the cause is not
-  known yet). The stored value is +1.41 ms, so a calibrated time pairs an image with the joint data to about 1 ms
-  there. It holds while the camera exposes for as long as a frame allows, as it does in room light; in brighter light
-  the camera shortens its exposure and the image's moment moves later by an amount not measured yet.
+- True timing for the camera. A calibrated frame's time is its image's moment, the middle of the exposure of the
+  image's centre row, as the LED check measures it under automatic exposure:
+  `api_tests/81_camera_led_timing.py --apply FOLDER` writes an `--auto` run's moment into the gripper XMLs of that
+  camera (`<camera timing_auto_us>`). The camera server moves each frame's time by it and sets the header's
+  calibrated flag, only for that gripper's own camera, in the calibrated mode, and when the camera's controls say
+  whether the exposure is automatic or fixed; the status and the Camera tab say whether the times are calibrated, or
+  why not. Measured on the MSG camera in room light: a 30.05 ms exposure, the moment +0.80 ms after the camera's frame
+  time. In brighter light the camera shortens its exposure and the moment moves later: measure in the light you
+  record in. And RTI's trace records when each joint's angle was measured: the column `j_rx` (new shared memory
+  `motor_reply_time`), the kernel's receive time of the drive's reply on RTI's clock; the drive measured the angle
+  0.21 ms before (`utility/joint_times.py`, which also interpolates each joint on its own measurement times). A row's
+  angles are 2.9 to 4.5 ms older than the row itself, so a recording pairs each joint with a picture on the joint's
+  own time. The shared memory grows, so the whole robot service must restart together.
+- The camera's arm check, `api_tests/80_camera_timing.py`: the wrist swings a little while the robot records its
+  joints and every frame; the picture is cut into tiles whose shifts are fitted against the joint's motion, on the
+  joint's own measurement times, which gives how far the picture trails the joint data (the arm's own lag between the
+  motors' encoders and the wrist's output) and the camera's rolling-shutter readout (each image row has its own
+  moment). Tiles that do not follow the joint, such as the gripper's own jaws in view, are left out. A frame's tick is
+  worked out from its time and the recording's own rows; the tick in the frame's header is checked against it and the
+  report gives the difference. Measured on the MSG arm: about 2 to 3 ms (J5 at 17 to 37 deg/s, less when faster; J6
+  alike). Indoors the MSG camera needs automatic exposure: at a fixed exposure it drops its gain, and a fixed exposure
+  short enough for 30 fps gives a black picture under ordinary room light.
 - The camera's LED timing check, `api_tests/81_camera_led_timing.py`, the cross-check of the one above without joint
   data: an LED on one of the box's outputs, in the camera's view, is switched about 120 times at random moments while
   the camera runs a short fixed exposure; the rolling shutter turns each switch into an edge row, which against the
-  switch's moment gives when each row is read out and the readout time, and with the calibration above how late the
-  joint data RTI stamps with a tick is; a spot too small for edges is handled by the bounds every switch sets.
+  switch's moment gives when each row is read out and the readout time; a spot too small for edges is handled by the
+  bounds every switch sets.
   Measured on the MSG camera: the rows are read out over 30.23 ms and the centre row 16.7 ms after the frame's camera
   time. Nothing moves; it refuses to run while the arm is enabled.
-- `api_tests/80_camera_timing.py --verify`: the delay from several motions (J5 at 20, 40 and 60 % speed, J6), compared,
-  nothing written. The stored readout is now the LED check's 30.23 ms.
+- `api_tests/80_camera_timing.py --verify`: the arm's lag from several motions (J5 at 20, 40 and 60 % speed, J6),
+  compared, nothing written. The stored readout is now the LED check's 30.23 ms.
 - RTI notes each switch of an isolated output (new shared memory `output_switch`: how many, the output, its level,
   the moment right after the pin's write). The shared memory grows, so the whole robot service must restart
   together.
+
+- `tools/loop_delay.py` (and the RT Diagnostics card's measurement in its `--json`) also gives how old a trace row's
+  joint angles are at the row's own timestamp, per joint: the row's timestamp minus the bus time of the command the
+  drive's reply answered, and of the reply itself (measured with the read-first order: J1 4.4 to J6 2.9 ms), and
+  checks RTI's own `j_rx` against the bus.
+- `api_tests/81_camera_led_timing.py --auto`: the LED check under automatic exposure. It measures how long the camera
+  exposes in automatic mode (the camera does not report it) and where the image's moment lies, from the share of
+  each LED switch each row of the spot shows. Only unsaturated pixels are used, each made linear in light. Its
+  `--apply` makes the moment the calibration (true timing, above).
+- `api_tests/80_camera_timing.py --verify --exposures N`: the verification motions at one fixed exposure instead of
+  automatic exposure.
 
 ### Changed
 
