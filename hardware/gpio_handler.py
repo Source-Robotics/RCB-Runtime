@@ -16,6 +16,7 @@ Contact: petar@source-robotics.com
 
 import logging
 import os
+import time
 
 import lgpio
 from data.shared_memory_index import (
@@ -384,11 +385,24 @@ def check_estop_active():
 _OUTPUTS = ((ISOLATED_OUTPUT_1, ISOLATED_OUTPUT_1_PIN), (ISOLATED_OUTPUT_2, ISOLATED_OUTPUT_2_PIN),
             (ISOLATED_OUTPUT_3, ISOLATED_OUTPUT_3_PIN))
 _last_written = {ISOLATED_OUTPUT_1: None, ISOLATED_OUTPUT_2: None, ISOLATED_OUTPUT_3: None}
+_OUTPUT_NUMBER = {ISOLATED_OUTPUT_1: 1, ISOLATED_OUTPUT_2: 2, ISOLATED_OUTPUT_3: 3}
+
+
+def _note_switch(idx, value):
+    """The switch just written, with the time right after it (shared memory rti['output_switch'], TODO/camera_plan.md
+    D2): the LED timing check lines it up with the camera's rows. The values first, the count last (a reader that
+    sees the count change sees the values). Nothing allocated."""
+    sw = shared_data.rti["output_switch"]
+    sw[3] = time.perf_counter()
+    sw[1] = _OUTPUT_NUMBER[idx]
+    sw[2] = value
+    sw[0] += 1
 
 
 def write_all_outputs():
     """
-    Write the GPIO outputs from shared memory to the physical pins — each one only when its level changed.
+    Write the GPIO outputs from shared memory to the physical pins — each one only when its level changed — and note
+    each switch's time (_note_switch).
     """
     if _simulated:                       # simulation: the level stays in shared memory, no pin is driven
         return
@@ -396,6 +410,7 @@ def write_all_outputs():
         value = int(shared_data.gpio_states[idx])
         if value != _last_written[idx]:
             lgpio.gpio_write(_gpio_handle, pin, value)
+            _note_switch(idx, value)
             _last_written[idx] = value
 
 

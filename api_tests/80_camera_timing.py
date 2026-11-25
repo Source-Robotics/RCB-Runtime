@@ -17,7 +17,10 @@ measures that whole chain at once — the number that matters for pairing images
   3. With the arm disabled (decoding a thousand JPEGs is CPU work), each pair of consecutive frames gives the
      picture's shift to a fraction of a pixel (phase correlation on a quarter-size grey image), and the shifts are
      fitted against J5's motion between the same two ticks, moved by a delay d: shift = c x (theta(tick + d) -
-     theta(previous tick + d)). The d that fits best is the delay at that exposure.
+     theta(previous tick + d)). The d that fits best is the delay at that exposure. A frame's tick is worked out
+     here, from its time and the capture's own rows; the tick in the frame's header (the camera server's) is only
+     CHECKED against it, and the report says how far it was off (review 2026-11-25: it was ~2 ms rms off, and the
+     first calibration was measured through it).
   4. Automatic exposure gives one offset. Indoors it holds: this camera drops its gain at a FIXED exposure (a fixed
      33 ms is black under the lab's lamps, 0.8 / 255, while automatic gives 137 at the same 30 fps — measured
      2026-11-24), so its automatic mode exposes for the whole frame and adds gain there; in bright light it may
@@ -66,10 +69,20 @@ AMPLITUDE_DEG = 8.0
 SWING_SPEED = 40.0                 # percent of the joint's EXEC limits
 SWINGS = 8                         # moves per exposure, each to the other side
 EXPOSURES = ("auto",)              # what works under the lab's lamps (a fixed exposure is black there)
+# --verify (2026-11-24, the user: "confirm that these tests we did are really correct"): the same delay from other
+# motions, nothing written. A pure timing delay does not change with the SPEED. On the MSG gripper J5's delay does
+# (+1.0 to +2.3 ms at 17 to 37 deg/s) and the cause is not known: a gearbox gap and an acceleration term were fitted
+# to the recordings and rejected (review 2026-11-25). Another joint (J6 turns the picture: the tiles see it move
+# round) has another gearbox and another lever.
+VERIFY_VARIANTS = ((5, 8.0, 20.0), (5, 8.0, 40.0), (5, 8.0, 60.0), (6, 15.0, 40.0))   # (joint, +-deg, speed %)
+VERIFY_SPREAD_MS = 1.0             # the variants' delays must agree this well
 SIZE = (640, 360)                  # the grey image the shifts are measured on (the JPEG decoded at 1/2 size)
 TILES = (6, 4)                     # rows x columns of tiles, each fitted on its own (the rolling shutter: every row
                                    # band has its own moment; the gripper's jaws in view move WITH the camera)
 MIN_PAIRS = 150                    # frame pairs a tile needs
+SEARCH_TICKS = 40.0                # the delay is searched this far each way; a frame nearer than this to the
+                                   # capture's first / last row is left out (np.interp holds the end value there)
+MAX_TICK_RMS_MS = 0.2              # the header's rti_tick against the capture's rows: more is said in the report
 MIN_TILE_R2 = 0.95                 # a tile whose shifts follow the joint less well is left out (the jaws: 0.1-0.6)
 MAX_TILE_HALVES_MS = 3.0           # ... and one whose two halves disagree more
 MIN_GOOD_TILES = 8
@@ -209,30 +222,48 @@ def analyse_exposure(frames: dict, capture: dict, joint: int, uncal_offset_s: fl
     tile's row (measured 2026-11-24: -12 ms at the top, +13 ms at the bottom, 30.8 ms for 720 rows). A line through
     the good tiles' delays over their rows gives the delay at the centre row and the readout."""
     from communication import camera_protocol as cp
-    ok = ((frames["flags"] & cp.FLAG_CAMERA_CLOCK) > 0) & np.isfinite(frames["rti_tick"])
-    idx = np.nonzero(ok)[0]
-    if len(idx) < MIN_PAIRS + 1:
-        return {"ok": False, "why": f"only {len(idx)} frames with the camera's clock and a tick"}
     cap_ticks = np.asarray(capture["tick"], dtype=float)
-    tick_s = float(np.median(np.diff(capture["timestamp"]) / np.diff(cap_ticks)))
+    cap_time = np.asarray(capture["timestamp"], dtype=float)
+    tick_s = float(np.median(np.diff(cap_time) / np.diff(cap_ticks)))
     theta = np.asarray(capture["j_p"], dtype=float)[:, joint - 1]
-    ticks = frames["rti_tick"][idx] - np.where((frames["flags"][idx] & cp.FLAG_CALIBRATED) > 0,
-                                               uncal_offset_s / tick_s, 0.0)
-    grays = [decode_gray(frames["jpegs"][k], size) for k in idx]
+    # Each frame's tick from its OWN time and the capture's rows (both on the robot's clock), never the header's
+    # rti_tick: that is the camera server's work, which this test checks instead of resting on it.
+    flags = np.asarray(frames["flags"])
+    t_frame = np.asarray(frames["exposure_time"], dtype=float)
+    own_tick = np.interp(t_frame - np.where((flags & cp.FLAG_CALIBRATED) > 0, uncal_offset_s, 0.0), cap_time, cap_ticks)
+    clock = (flags & cp.FLAG_CAMERA_CLOCK) > 0
+    inside = (own_tick >= cap_ticks[0] + SEARCH_TICKS) & (own_tick <= cap_ticks[-1] - SEARCH_TICKS)
+    idx = np.nonzero(clock & inside)[0]
+    outside = int((clock & ~inside).sum())
+    if len(idx) < MIN_PAIRS + 1:
+        return {"ok": False, "why": f"only {len(idx)} frames with the camera's clock inside the capture ({outside} at "
+                                    f"or past its ends)"}
+    ticks = own_tick[idx]
+    stamped = clock & inside & np.isfinite(frames["rti_tick"])
+    tick_check = None                      # the header's tick against the rows, at the time the header gives
+    if stamped.sum() >= 2:
+        err = (np.asarray(frames["rti_tick"], dtype=float)[stamped]
+               - np.interp(t_frame[stamped], cap_time, cap_ticks)) * tick_s * 1e3
+        tick_check = {"frames": int(stamped.sum()), "rms_ms": float(np.sqrt(np.mean(err ** 2))),
+                      "mean_ms": float(err.mean()), "worst_ms": float(np.abs(err).max())}
+    # 8-bit: a quarter of the memory (a 794-frame run kept as floats was ~730 MB on a Pi with ~1 GB free, 2026-11-24)
+    grays = [decode_gray(frames["jpegs"][k], size).astype(np.uint8) for k in idx]
     h, w = grays[0].shape
     nr, nc = tiles
     th, tw = h // nr, w // nc
     results = []
     for r in range(nr):
         for c in range(nc):
-            fit = _tile_fit([g[r * th:(r + 1) * th, c * tw:(c + 1) * tw] for g in grays], ticks, cap_ticks, theta)
+            fit = _tile_fit([g[r * th:(r + 1) * th, c * tw:(c + 1) * tw].astype(np.float32) for g in grays], ticks,
+                            cap_ticks, theta)
             if fit is not None:
                 fit.update(row=(r + 0.5) * th * full_rows / h, tile=(r, c))
                 results.append(fit)
     good = [t for t in results if t["r2"] >= MIN_TILE_R2 and not t["at_edge"]
             and abs(t["h1_ticks"] - t["h2_ticks"]) * tick_s * 1e3 <= MAX_TILE_HALVES_MS]
     fps = 1.0 / float(np.median(np.diff(frames["exposure_time"][idx])))
-    base = {"frames": int(len(idx)), "tick_s": tick_s, "fps": fps, "brightness": float(np.mean(grays[0])),
+    base = {"frames": int(len(idx)), "frames_outside": outside, "tick_check": tick_check,
+            "tick_s": tick_s, "fps": fps, "brightness": float(np.mean(grays[0])),
             "texture": texture(grays[0]), "tiles_total": nr * nc, "tiles_good": len(good),
             "tiles": [{k: (list(v) if k == "tile" else v) for k, v in t.items()} for t in results]}
     if len(good) < MIN_GOOD_TILES:
@@ -257,7 +288,7 @@ def analyse_exposure(frames: dict, capture: dict, joint: int, uncal_offset_s: fl
 
 
 def fit_delay_pairs(t0: np.ndarray, t1: np.ndarray, disp: np.ndarray, cap_ticks: np.ndarray, theta: np.ndarray,
-                    lo: float = -40.0, hi: float = 40.0) -> dict:
+                    lo: float = -SEARCH_TICKS, hi: float = SEARCH_TICKS) -> dict:
     """The delay d (ticks) for which the picture's shifts best follow the joint, over frame pairs (t0 -> t1, the
     pictures' shift disp along the motion): disp = c x (theta(t1 + d) - theta(t0 + d)), c fitted for each d (the
     pixels per unit of theta); a 0.25-tick grid over lo..hi, then a golden-section search to 0.001 tick."""
@@ -415,11 +446,15 @@ def reanalyse(run_dir: str, do_apply: bool = False) -> dict:
         frames = load_frames(os.path.join(run_dir, e["frames"]))
         capture = dict(np.load(os.path.join(run_dir, e["capture"])))
         active = cs.timing_offset_s(run.get("timing_active"), None if setting == "auto" else setting) or 0.0
-        r = analyse_exposure(frames, capture, run["joint"], active,
+        r = analyse_exposure(frames, capture, e.get("joint", run["joint"]), active,
                              full_rows=int(run["mode"].split("x")[1].split("@")[0]))
-        results[setting] = r
+        r.update(joint=e.get("joint", run["joint"]), speed=e.get("speed", run.get("swing_speed")),
+                 amplitude_deg=e.get("amplitude_deg", run["amplitude_deg"]))
+        label = (f"J{r['joint']} +-{r['amplitude_deg']:g} deg at {r['speed']:g} %" if run.get("verify")
+                 else setting_name(setting))
+        results[e.get("tag", setting) if run.get("verify") else setting] = r
         if r["ok"]:
-            lines.append(f"  {setting_name(setting):>22}: delay at the centre row {r['delay_ms']:+7.2f} ms (halves "
+            lines.append(f"  {label:>22}: delay at the centre row {r['delay_ms']:+7.2f} ms (halves "
                          f"differ {r['half_diff_ms']:.2f} ms), readout {r['readout_ms']:.1f} ms, {r['tiles_used']} of "
                          f"{r['tiles_total']} tiles (scatter {r['scatter_ms']:.2f} ms, median R2 {r['r2']:.3f}), "
                          f"{r['fps']:.2f} fps, brightness {r['brightness']:.0f}/255"
@@ -428,7 +463,10 @@ def reanalyse(run_dir: str, do_apply: bool = False) -> dict:
                 f"[{t['tile'][0]},{t['tile'][1]}] {t['delay_ticks'] * r['tick_s'] * 1e3:+.1f} {t['r2']:.2f}"
                 for t in r["tiles"]))
         else:
-            lines.append(f"  {setting_name(setting):>22}: no result — {r['why']}")
+            lines.append(f"  {label:>22}: no result — {r['why']}")
+        lines += tick_lines(r)
+    if run.get("verify"):
+        return _verify_report(run_dir, run, results, lines)
     values, more, confident = summarise(run, results)
     lines += more
     summary = {"usb_id": run["usb_id"], "mode": run["mode"], "results": {str(k): v for k, v in results.items()},
@@ -447,6 +485,65 @@ def reanalyse(run_dir: str, do_apply: bool = False) -> dict:
     with open(os.path.join(run_dir, "result.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1, default=float)
     return summary
+
+
+def tick_lines(r: dict) -> list:
+    """The report's lines on a recording's ticks: the frames left out at the capture's ends, and how far the tick in
+    the frames' headers (the camera server's) lay from the capture's rows."""
+    lines = []
+    if r.get("frames_outside"):
+        lines.append(f"      {r['frames_outside']} frames at or past the capture's ends left out")
+    c = r.get("tick_check")
+    if c:
+        lines.append(f"      the frames' own rti_tick against the capture's rows: {c['rms_ms']:.3f} ms rms, mean "
+                     f"{c['mean_ms']:+.3f}, worst {c['worst_ms']:.2f} ms ({c['frames']} frames)"
+                     + ("" if c["rms_ms"] <= MAX_TICK_RMS_MS else
+                        f"  — MORE than {MAX_TICK_RMS_MS:g} ms: the camera server's tick is off (the delay above "
+                        f"does not use it)"))
+    return lines
+
+
+def verify_verdict(results: dict, applied_ms: float | None) -> tuple[bool, list]:
+    """The variants' delays side by side: consistent when every one is confident and they agree within
+    VERIFY_SPREAD_MS (and with the applied calibration); the lines saying so, and how the delay moves with J5's
+    speed (a trend = mechanics, not timing)."""
+    good = {k: r for k, r in results.items() if r.get("ok") and r.get("confident")}
+    lines = []
+    if len(good) < 2:
+        return False, ["  VERIFY: fewer than two confident variants — no verdict"]
+    d = np.array([r["delay_ms"] for r in good.values()])
+    spread = float(d.max() - d.min())
+    j5 = sorted((r["speed"], r["delay_ms"]) for r in good.values() if r["joint"] == 5)
+    if len(j5) >= 2:
+        sp, dl = np.array(j5).T
+        trend = float(np.polyfit(sp, dl, 1)[0]) * (sp.max() - sp.min()) if len(j5) > 1 else 0.0
+        lines.append(f"  J5's delay from {sp.min():g} to {sp.max():g} % speed changes by {trend:+.2f} ms (a pure "
+                     f"timing delay does not change with the speed)")
+    lines.append(f"  the variants' delays: {', '.join(f'{x:+.2f}' for x in d)} ms -> spread {spread:.2f} ms (mean "
+                 f"{d.mean():+.2f})" + (f"; the calibration in use: {applied_ms:+.2f} ms" if applied_ms is not None
+                                        else ""))
+    readouts = [r["readout_ms"] for r in good.values()]
+    lines.append(f"  the readout from each: {', '.join(f'{x:.1f}' for x in readouts)} ms")
+    ok = (len(good) == len(results) and spread <= VERIFY_SPREAD_MS
+          and (applied_ms is None or abs(d.mean() - applied_ms) <= VERIFY_SPREAD_MS))
+    lines.append("  VERIFIED: the same delay from every motion" if ok else
+                 f"  NOT verified: the variants differ by more than {VERIFY_SPREAD_MS:g} ms, from the calibration, or "
+                 f"not all are confident")
+    return ok, lines
+
+
+def _verify_report(run_dir: str, run: dict, results: dict, lines: list) -> dict:
+    active = run.get("timing_active") or {}
+    ok, more = verify_verdict(results, None if active.get("auto_us") is None else active["auto_us"] / 1e3)
+    lines += more + ["  (--verify writes nothing)"]
+    text = "\n".join(lines)
+    print(text)
+    with open(os.path.join(run_dir, "report.txt"), "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    summary = {"verify": True, "verified": ok, "results": {str(k): v for k, v in results.items()}}
+    with open(os.path.join(run_dir, "result.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=1, default=float)
+    return dict(summary, confident=ok)
 
 
 # ------------------------------------------------------------------------------------------------------- the arm
@@ -552,9 +649,15 @@ def checks(args) -> tuple[dict, list]:
     return st, problems
 
 
-def record_setting(robot, args, setting, q0, out_dir, run, mode_fps) -> None:
-    """One exposure: check it, swing, keep the frames and the capture."""
+def record_setting(robot, args, setting, q0, out_dir, run, mode_fps, joint=None, amplitude=None, speed=None,
+                   tag=None) -> None:
+    """One recording at an exposure: check it, swing (args' joint / amplitude / speed unless given), keep the frames
+    and the capture under `tag` (default: the setting)."""
     from project_paths import TEMP_DATA_DIR
+    joint = args.joint if joint is None else joint
+    amplitude = args.amplitude if amplitude is None else amplitude
+    speed = args.swing_speed if speed is None else speed
+    tag = str(setting) if tag is None else tag
     fps, bright = precheck(args.host, mode_fps)
     if fps < MIN_FPS_SHARE * mode_fps:
         print(f"{setting_name(setting)}: the camera runs at {fps:.1f} fps, not {mode_fps:g} (a fixed exposure longer "
@@ -564,19 +667,21 @@ def record_setting(robot, args, setting, q0, out_dir, run, mode_fps) -> None:
         print(f"{setting_name(setting)}: the picture is too dark ({bright:.1f}/255; this camera drops its gain at a "
               f"fixed exposure — more light, or automatic exposure) — skipped")
         return
-    name = f"cam80_{setting}"
+    name = f"cam80_{tag}"
     before = set(glob.glob(os.path.join(str(TEMP_DATA_DIR), "captures", f"*_{name}.npz")))
-    robot.capture_telemetry(args.swings * 2.5 + 6.0, name)
+    # long enough for a slow swing too (stop_capture ends it; at 20 % a capture sized for 40 % ended 0.4 s before
+    # the frames, 2026-11-24); the recorder takes 60 s at most
+    robot.capture_telemetry(min(60.0, (args.swings * 2.5 + 6.0) * max(1.0, SWING_SPEED / speed)), name)
     col = Collector(args.host)
     col.start()
     time.sleep(0.7)
-    j = args.joint - 1
+    j = joint - 1
     for i in range(args.swings):
         q = list(q0)
-        q[j] = q0[j] + (args.amplitude if i % 2 == 0 else -args.amplitude)
-        robot.move_joints(q, speed=args.swing_speed, timeout=args.timeout)
+        q[j] = q0[j] + (amplitude if i % 2 == 0 else -amplitude)
+        robot.move_joints(q, speed=speed, timeout=args.timeout)
         robot.wait_idle(timeout=args.timeout)
-    robot.move_joints(q0, speed=args.swing_speed, timeout=args.timeout)
+    robot.move_joints(q0, speed=speed, timeout=args.timeout)
     robot.wait_idle(timeout=args.timeout)
     time.sleep(0.7)
     frames = col.finish()
@@ -585,12 +690,13 @@ def record_setting(robot, args, setting, q0, out_dir, run, mode_fps) -> None:
     if cap is None or col.error is not None or len(frames) < MIN_PAIRS:
         print(f"{setting_name(setting)}: no usable recording (capture {cap}, {len(frames)} frames, {col.error})")
         return
-    shutil.copy2(cap, os.path.join(out_dir, f"capture_{setting}.npz"))
-    save_frames(os.path.join(out_dir, f"frames_{setting}.npz"), frames)
-    run["exposures"].append({"setting": setting, "frames": f"frames_{setting}.npz", "capture": f"capture_{setting}.npz",
-                             "n_frames": len(frames)})
-    print(f"{setting_name(setting)}: {len(frames)} frames at {fps:.1f} fps, brightness {bright:.0f}/255, capture "
-          f"{os.path.basename(cap)}", flush=True)
+    shutil.copy2(cap, os.path.join(out_dir, f"capture_{tag}.npz"))
+    save_frames(os.path.join(out_dir, f"frames_{tag}.npz"), frames)
+    run["exposures"].append({"setting": setting, "frames": f"frames_{tag}.npz", "capture": f"capture_{tag}.npz",
+                             "n_frames": len(frames), "tag": tag, "joint": joint, "amplitude_deg": amplitude,
+                             "speed": speed})
+    print(f"{setting_name(setting)}, J{joint} +-{amplitude:g} deg at {speed:g} %: {len(frames)} frames at {fps:.1f} fps, "
+          f"brightness {bright:.0f}/255, capture {os.path.basename(cap)}", flush=True)
 
 
 def run_arm(args) -> str | None:
@@ -627,7 +733,14 @@ def run_arm(args) -> str | None:
                   "with --no-start-pose, or place something in front of it.")
             return None
         try:
-            for setting in args.exposures:
+            if args.verify:
+                run["verify"] = True
+                set_exposure(base, "auto")
+                if wait_exposure("auto"):
+                    for joint, amplitude, speed in VERIFY_VARIANTS:
+                        record_setting(robot, args, "auto", q0, out_dir, run, mode_fps, joint=joint,
+                                       amplitude=amplitude, speed=speed, tag=f"auto_J{joint}_{speed:g}")
+            for setting in ([] if args.verify else args.exposures):
                 set_exposure(base, setting)
                 if not wait_exposure(setting):
                     print(f"{setting_name(setting)}: the camera did not take it within 8 s — skipped")
@@ -724,13 +837,38 @@ def selftest() -> int:
         chk("A1b ...the tiles on the jaws (they move with the camera) left out",
             jaw_tiles and all(t["r2"] < MIN_TILE_R2 for t in jaw_tiles), jaw_tiles)
     fr = synth(5.0e-3, 10e-3)
-    fr["flags"] = np.full(len(fr["flags"]), 0x0B)              # recorded with a calibration of +2 ms active
-    fr["rti_tick"] = fr["rti_tick"] + 2e-3 / tick_s
+    fr["flags"] = np.full(len(fr["flags"]), 0x0B)              # recorded with a calibration of +2 ms active: the
+    fr["exposure_time"] = fr["exposure_time"] + 2e-3           # server adds it to the frame's time and takes the
+    fr["rti_tick"] = fr["rti_tick"] + 2e-3 / tick_s            # tick there
     r = analyse(fr, uncal_offset_s=2e-3)
     chk("A2 a calibration active while recording is taken back off", r["ok"] and abs(r["delay_ms"] - 5.0) < 0.3, r)
+    chk("A2b ...the headers' ticks agree with the capture's rows: the tick check says ~0",
+        r["ok"] and r["tick_check"]["frames"] == r["frames"] and r["tick_check"]["rms_ms"] < 1e-6, r.get("tick_check"))
+    bad = dict(fr, rti_tick=fr["rti_tick"] + rng.normal(0, 2e-3 / tick_s, len(fr["rti_tick"])))
+    bad["rti_tick"][::7] = np.nan
+    r_bad = analyse(bad, uncal_offset_s=2e-3)
+    chk("A4 headers whose rti_tick is 2 ms rms off, one in seven without a tick: the SAME delay (a frame's tick comes "
+        "from its time and the capture's rows), and the tick check reports the 2 ms",
+        r_bad["ok"] and abs(r_bad["delay_ms"] - r["delay_ms"]) < 1e-9 and r_bad["frames"] == r["frames"]
+        and 1.5 < r_bad["tick_check"]["rms_ms"] < 2.5 and r_bad["tick_check"]["frames"] < r["frames"]
+        and any("MORE than" in ln for ln in tick_lines(r_bad)) and not any("MORE than" in ln for ln in tick_lines(r)),
+        (r_bad.get("delay_ms"), r.get("delay_ms"), r_bad.get("tick_check")))
+    n_cap = 2000                                               # the capture ends at 8 s, the frames go on to 10.3 s
+    short = {"tick": ticks[:n_cap], "timestamp": t[:n_cap], "j_p": cap["j_p"][:n_cap]}
+    r_short = analyse_exposure(fr, short, JOINT, 2e-3, size=size, full_rows=h)
+    want_out = int(np.sum(fr["exposure_time"] - 2e-3 > t[n_cap - 1] - SEARCH_TICKS * tick_s))
+    chk(f"A5 a capture that ends before the frames do: the {want_out} frames at or past its end left out and counted, "
+        f"the delay from the rest",
+        r_short["ok"] and r_short["frames_outside"] == want_out and r_short["frames"] == len(fr["jpegs"]) - want_out
+        and abs(r_short["delay_ms"] - 5.0) < 0.4 and any("left out" in ln for ln in tick_lines(r_short)),
+        (r_short.get("frames_outside"), want_out, r_short.get("delay_ms"), r_short.get("why")))
     flat = synth(3e-3, 10e-3, n=200)
     flat["flags"] = np.zeros(200, int)
     chk("A3 frames without the camera's clock: no result, said why", not analyse(flat)["ok"])
+    late = dict(fr, exposure_time=fr["exposure_time"] + 60.0)
+    r_late = analyse(late, uncal_offset_s=2e-3)
+    chk("A6 frames all past the capture: no result, said why",
+        not r_late["ok"] and "inside the capture" in r_late["why"], r_late)
     print("B. the summary")
     good = {"ok": True, "confident": True}
     good = dict(good, readout_ms=30.8)
@@ -749,6 +887,17 @@ def selftest() -> int:
         not conf and "timing_offset_us" not in vals, vals)
     vals, _, conf = summarise({}, {"auto": {"ok": False, "why": "dark"}})
     chk("B5 nothing confident: nothing to write", not conf and not vals)
+    v = {"J5_20": dict(good, joint=5, speed=20.0, delay_ms=1.30, readout_ms=31.8),
+         "J5_60": dict(good, joint=5, speed=60.0, delay_ms=1.62, readout_ms=31.7),
+         "J6_40": dict(good, joint=6, speed=40.0, delay_ms=1.48, readout_ms=31.9)}
+    ok_v, lines_v = verify_verdict(v, 1.41)
+    chk("B6 --verify: three motions within 1 ms of each other and of the calibration: verified", ok_v, lines_v)
+    v2 = dict(v, J5_20=dict(v["J5_20"], delay_ms=0.40), J5_60=dict(v["J5_60"], delay_ms=2.40))
+    ok_v2, lines_v2 = verify_verdict(v2, 1.41)
+    chk("B7 ...a delay that moves 2 ms with J5's speed (not a pure timing delay): not verified, the trend shown",
+        not ok_v2 and any("+2.00 ms" in ln for ln in lines_v2), lines_v2)
+    ok_v3, _ = verify_verdict(dict(v, J6_40={"ok": False, "why": "dark"}), 1.41)
+    chk("B8 ...a variant without a confident delay: not verified", not ok_v3)
     print("C. --apply's writer")
     import tempfile
     tmp = tempfile.mkdtemp(prefix="cam80_")
@@ -804,8 +953,12 @@ def main():
     ap.add_argument("--reanalyse", metavar="FOLDER")
     ap.add_argument("--apply", action="store_true", help="write a confident result into the gripper XMLs")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--verify", action="store_true",
+                    help="record J5 at 20 / 40 / 60 %% and J6 +-15 deg under automatic exposure; compare; write nothing")
     args = ap.parse_args()
     args.exposures = [parse_setting(x) for x in str(args.exposures).split(",") if x.strip()]
+    if args.verify and args.apply:
+        sys.exit("--verify writes nothing: leave --apply out")
     if args.selftest:
         sys.exit(selftest())
     if args.reanalyse:
@@ -815,10 +968,16 @@ def main():
     st, problems = checks(args)
     print(f"camera: {st.get('state')}, {(st.get('device') or {}).get('usb_id')}, mode {st.get('mode')}; frame times: "
           f"{(st.get('clock') or {}).get('source')}")
-    print(f"plan: the start pose, then J{args.joint} +-{args.amplitude:g} deg x {args.swings} at {args.swing_speed:g} % "
-          f"for each of {', '.join(setting_name(s) for s in args.exposures)} "
-          f"(~{len(args.exposures) * (args.swings * 2.5 + 10):.0f} s); the camera's settings put back after; the "
-          f"analysis once the arm is disabled")
+    if args.verify:
+        print(f"plan (--verify): the start pose, then under automatic exposure "
+              f"{'; '.join(f'J{j} +-{a:g} deg at {v:g} %' for j, a, v in VERIFY_VARIANTS)}, {args.swings} moves each "
+              f"(~{len(VERIFY_VARIANTS) * (args.swings * 2.5 + 8):.0f} s); compared, nothing written; the analysis once "
+              f"the arm is disabled")
+    else:
+        print(f"plan: the start pose, then J{args.joint} +-{args.amplitude:g} deg x {args.swings} at {args.swing_speed:g} % "
+              f"for each of {', '.join(setting_name(s) for s in args.exposures)} "
+              f"(~{len(args.exposures) * (args.swings * 2.5 + 10):.0f} s); the camera's settings put back after; the "
+              f"analysis once the arm is disabled")
     if problems:
         print("NOT READY:\n  " + "\n  ".join(problems))
         sys.exit(2)

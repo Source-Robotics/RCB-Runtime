@@ -13,9 +13,10 @@ the dashboard's Camera tab.
   preview_fps   the dashboard preview's rate (the user's D4: 15, "maybe even less if it will hinder performance");
                 the raw stream always carries every frame
   controls      the camera's own controls by key, "key=value;key=value" — keys as hardware/uvc_camera.control_key
-                makes them (auto_exposure, exposure_time_absolute, brightness, ...). Applied at every open, in the
-                written order, and whenever this file changes. The default turns the camera's dynamic frame rate OFF:
-                it dropped to 16.6 fps in the dark (2026-11-23), which a recording must not do silently.
+                makes them (auto_exposure, exposure_time_absolute, brightness, ...). Applied at every open
+                and whenever they change here, the automatic modes first. The default turns the camera's dynamic
+                frame rate OFF: it dropped to 16.6 fps in the dark (2026-11-23), which a recording must not do
+                silently.
 
 The camera server reads them at its start and again within ~1 s of the file changing (its mtime), like the recorder
 (utility/recorder_settings.py). A missing element or attribute is its default; a value out of its bounds is refused by
@@ -208,7 +209,8 @@ def gripper_camera(system_xml, grippers_dir) -> tuple[dict | None, str]:
 #   timing_us_per_unit="..."    ... and its change per unit of exposure_time_absolute (100 us per unit, the UVC
 #                               standard, confirmed 2026-11-24 by the frame rate: 1000 -> 9.92 fps, 4000 -> 2.49 fps):
 #                               +50 when the PTS marks the exposure's start, -50 when its end. Only measured where
-#                               fixed exposures are bright enough at the full frame rate.
+#                               fixed exposures are bright enough at the full frame rate. A fixed exposure is
+#                               calibrated only with BOTH numbers (one alone: not calibrated, 2026-11-25).
 #   timing_readout_us="..."     the rolling shutter: the time the camera takes to read its rows out, top to bottom
 #                               (30.8 ms for 720 rows, measured 2026-11-24); the offsets above are the image's CENTRE
 #                               row's, a row's own moment is (row - rows / 2) x readout / rows from it
@@ -233,12 +235,12 @@ def _timing_number(attrs: dict, key: str) -> float | None:
 
 def camera_timing(gripper_cam: dict | None, mode: str) -> dict | None:
     """The timing calibration of the gripper's camera for `mode` (mode_key), or None: {"auto_us" (or None),
-    "offset_us" (or None), "us_per_unit", "readout_us" (or None), "run"}."""
+    "offset_us" (or None), "us_per_unit" (or None), "readout_us" (or None), "run"}."""
     if not gripper_cam or gripper_cam.get("timing_mode") != mode:
         return None
     out = {"auto_us": _timing_number(gripper_cam, "timing_auto_us"),
            "offset_us": _timing_number(gripper_cam, "timing_offset_us"),
-           "us_per_unit": _timing_number(gripper_cam, "timing_us_per_unit") or 0.0,
+           "us_per_unit": _timing_number(gripper_cam, "timing_us_per_unit"),
            "readout_us": _timing_number(gripper_cam, "timing_readout_us"),
            "run": gripper_cam.get("timing_run", "")}
     return out if out["auto_us"] is not None or out["offset_us"] is not None else None
@@ -247,11 +249,12 @@ def camera_timing(gripper_cam: dict | None, mode: str) -> dict | None:
 def timing_offset_s(timing: dict | None, exposure_setting) -> float | None:
     """Seconds to add to a frame's camera time to reach its image's moment: at a fixed exposure `exposure_setting`
     (exposure_time_absolute) from the fixed-exposure line, under automatic exposure (None) the automatic offset; None
-    when that one is not calibrated."""
+    when that one is not calibrated. The fixed-exposure line needs both its numbers: a missing change per unit used
+    to count as 0 and the frame was still flagged calibrated (review 2026-11-25)."""
     if timing is None:
         return None
     if exposure_setting is None:
         return None if timing["auto_us"] is None else timing["auto_us"] * 1e-6
-    if timing["offset_us"] is None:
+    if timing["offset_us"] is None or timing.get("us_per_unit") is None:
         return None
     return (timing["offset_us"] + timing["us_per_unit"] * float(exposure_setting)) * 1e-6

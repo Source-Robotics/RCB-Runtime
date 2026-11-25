@@ -22,7 +22,9 @@ RTI's shared-memory trace (utility/trace_ring.py) only, to turn a frame's time i
     utility/uvc_clock.py ties the camera's clock to CLOCK_MONOTONIC (+-9 us) and turns each frame's PTS into its time
     (FLAG_CAMERA_CLOCK; the raw PTS in the header). Until that clock is known (~0.2 s after an open), without a
     metadata node, or when the result disagrees with the driver's timestamp: the driver's timestamp (4 ms steps).
-    RTI's tick is taken at the frame's time.
+    RTI's tick is taken at the frame's time: the trace is read when the frame arrives, so that time lies between two
+    rows already read (review 2026-11-25: read only every 0.1 s, nearly every frame's tick was a line through two
+    rows extended up to 0.1 s — about 2 ms rms off, 29 ms at worst).
   * Status: JSON in shared memory (camera_protocol.STATUS_NAME) once a second, with a "beat" counter the supervisor's
     hang check watches (the user's D1).
 
@@ -70,6 +72,8 @@ REOPEN_S = 1.0                    # a missing or failed camera is tried again th
 TRACE_POLL_S = 0.1
 TICK_WINDOW_S = 2.0               # trace rows kept for the time -> tick mapping
 TICK_EDGE_S = 0.5                 # a time this far outside the rows kept has no tick (NaN)
+TICK_FIT_S = 0.5                  # outside the rows: a line fitted through this much of the nearest rows ...
+TICK_FIT_ROWS = 25                # ... and only with this many of them or more (0.1 s), else no tick (NaN)
 MAX_CLIENTS = 8
 SEND_BUFFER = 256 * 1024          # small: a slow client skips frames instead of seeing old ones
 # The driver's timestamp (the transfer of the frame's first packet) comes this long after the camera's own time of
@@ -96,7 +100,12 @@ def _mtime(path):
 class TickMap:
     """CLOCK_MONOTONIC time -> RTI's loop tick, from the trace rows' (timestamp, tick) pairs (each row's timestamp is
     time.perf_counter() taken mid-tick, RTI.py's _hist_t: CLOCK_MONOTONIC on Linux, the clock of V4L2's timestamps).
-    Interpolated between rows, extrapolated at most TICK_EDGE_S beyond them; NaN without rows."""
+
+    Between two rows: interpolated. Outside the rows held, at most TICK_EDGE_S: a least-squares line through the
+    nearest TICK_FIT_S of rows, and only with TICK_FIT_ROWS of them or more; NaN otherwise. A line through two
+    neighbouring rows is never extended: a row's timestamp is not on a 4 ms grid (measured 2026-11-25: one interval is
+    3.65 to 4.4 ms for 98 % of the rows, 2.3 to 6.7 ms at worst), and extended 0.1 s that error is multiplied by 25 —
+    the tick of nearly every frame until then."""
 
     def __init__(self, window_s: float = TICK_WINDOW_S):
         self.window_s = window_s
@@ -118,12 +127,30 @@ class TickMap:
         self.ticks.clear()
 
     def tick_at(self, t: float) -> float:
-        n = len(self.times)
-        if n < 2 or t < self.times[0] - TICK_EDGE_S or t > self.times[-1] + TICK_EDGE_S:
+        times, ticks = self.times, self.ticks
+        n = len(times)
+        if n < 2 or t < times[0] - TICK_EDGE_S or t > times[-1] + TICK_EDGE_S:
             return math.nan
-        i = min(max(bisect.bisect_left(self.times, t), 1), n - 1)
-        t0, t1, k0, k1 = self.times[i - 1], self.times[i], self.ticks[i - 1], self.ticks[i]
-        return k0 + (t - t0) * (k1 - k0) / (t1 - t0) if t1 > t0 else k1
+        if times[0] <= t <= times[-1]:                        # between two rows (add() keeps the times rising)
+            i = min(max(bisect.bisect_left(times, t), 1), n - 1)
+            t0, t1, k0, k1 = times[i - 1], times[i], ticks[i - 1], ticks[i]
+            return k0 + (t - t0) * (k1 - k0) / (t1 - t0)
+        if t > times[-1]:
+            return self._line_at(t, bisect.bisect_left(times, times[-1] - TICK_FIT_S), n)
+        return self._line_at(t, 0, bisect.bisect_right(times, times[0] + TICK_FIT_S))
+
+    def _line_at(self, t: float, lo: int, hi: int) -> float:
+        """The least-squares line through rows lo .. hi - 1, at t; NaN with fewer than TICK_FIT_ROWS rows."""
+        m = hi - lo
+        if m < TICK_FIT_ROWS:
+            return math.nan
+        t_ref, k_ref = self.times[lo], self.ticks[lo]         # differences from the first row: small numbers
+        dt = [x - t_ref for x in self.times[lo:hi]]
+        dk = [x - k_ref for x in self.ticks[lo:hi]]
+        mt, mk = sum(dt) / m, sum(dk) / m
+        stt = sum((a - mt) ** 2 for a in dt)
+        stk = sum((a - mt) * (b - mk) for a, b in zip(dt, dk))
+        return k_ref + mk + (t - t_ref - mt) * stk / stt
 
 
 # ---------------------------------------------------------------- the camera's USB interrupt threads
@@ -281,16 +308,36 @@ def _without_timing(gcam: dict | None) -> dict | None:
     return None if gcam is None else {k: v for k, v in gcam.items() if k not in camera_settings.TIMING_KEYS}
 
 
-def _timing_why(own: bool, setting, timing, mode: str) -> str:
-    """Why a frame's time is not calibrated ("" when it is)."""
+def exposure_kind(values: dict) -> tuple[str | None, int | None]:
+    """("auto", None), ("fixed", the exposure_time_absolute setting) or (None, None) when the camera's control values
+    (key -> value) do not say: the list is empty after a failed read, or the camera has no exposure controls. Not
+    known = not calibrated (review 2026-11-25: an empty list counted as automatic, so a fixed-exposure frame got the
+    automatic offset and the calibrated flag)."""
+    auto = values.get("auto_exposure")
+    if auto is not None and auto != 1:                        # 1 = manual on UVC cameras
+        return "auto", None
+    if values.get("exposure_time_absolute") is not None:
+        return "fixed", int(values["exposure_time_absolute"])
+    return None, None
+
+
+def _timing_why(own: bool, kind, timing, mode: str, gripper_camera: bool = True) -> str:
+    """Why a frame's time is not calibrated ("" when it is). kind: exposure_kind()'s; gripper_camera: the open camera
+    is the active gripper's."""
     if not own:
         return "the camera's own clock is not in use"
+    if not gripper_camera:
+        return "the open camera is not the active gripper's camera (by USB id): its timing calibration does not apply"
     if timing is None:
         return f"no timing calibration for {mode} (api_tests/80_camera_timing.py)"
-    if setting is None and timing["auto_us"] is None:
+    if kind is None:
+        return "the camera's exposure mode is not known (its controls could not be read)"
+    if kind == "auto" and timing["auto_us"] is None:
         return "calibrated for fixed exposures only; the camera is on automatic exposure"
-    if setting is not None and timing["offset_us"] is None:
+    if kind == "fixed" and timing["offset_us"] is None:
         return "calibrated for automatic exposure only; the camera is on a fixed exposure"
+    if kind == "fixed" and timing.get("us_per_unit") is None:
+        return "the fixed-exposure calibration is incomplete: timing_us_per_unit is missing in the gripper XML"
     return ""
 
 
@@ -460,7 +507,9 @@ class CameraServer:
             hint = " — is the robot's user in the 'video' group? (scripts/setup_system.sh)" if e.errno == 13 else ""
             self._set_state("error", f"{path}: {e}{hint}")
             return
-        self.device = {"path": path, "usb_id": next((c["usb_id"] for c in cameras if c["path"] == path), "")}
+        node = os.path.realpath(path)                          # a /dev/videoN given as the device: its USB id too
+        self.device = {"path": path, "usb_id": next((c["usb_id"] for c in cameras
+                                                      if path == c["path"] or node == c.get("node")), "")}
         self.apply_controls()
         self.irq = pin_usb_irq_threads(GENERAL_CPU_CORES)
         bad = {k: v for k, v in self.irq.items() if v not in ("moved", "already")}
@@ -512,27 +561,26 @@ class CameraServer:
         self.frames += 1
         self.latest = data
         self.window.append((now, len(data)))
-        values = {c["key"]: c["value"] for c in self.controls}
         flags = 0
         exposure_us = 0
-        setting = None                                            # the fixed exposure setting, None = automatic
-        if values.get("auto_exposure") not in (None, 1):          # 1 = manual on UVC cameras
+        kind, setting = exposure_kind({c["key"]: c["value"] for c in self.controls})
+        if kind == "auto":
             flags |= cp.FLAG_AUTO_EXPOSURE
-        elif values.get("exposure_time_absolute") is not None:
-            setting = int(values["exposure_time_absolute"])
+        elif kind == "fixed":
             exposure_us = setting * camera_settings.EXPOSURE_UNIT_US   # UVC: 100 us units (confirmed by the frame rate)
-        timing = camera_settings.camera_timing(self.gripper_cam, camera_settings.mode_key(
-            self.cam.width, self.cam.height, self.cam.fps))
+        timing = self.timing()
+        mode = camera_settings.mode_key(self.cam.width, self.cam.height, self.cam.fps)
         t_frame, pts, own = self.frame_time(seq, ts)
         if own:
             flags |= cp.FLAG_CAMERA_CLOCK
-            offset = camera_settings.timing_offset_s(timing, setting)
+            offset = camera_settings.timing_offset_s(timing, setting) if kind else None
             if offset is not None:
                 t_frame += offset
                 flags |= cp.FLAG_CALIBRATED
         self.calibrated = bool(flags & cp.FLAG_CALIBRATED)
-        self.timing_why = _timing_why(own, setting, timing, camera_settings.mode_key(self.cam.width, self.cam.height,
-                                                                                     self.cam.fps))
+        self.timing_why = _timing_why(own, kind, timing, mode, self.gripper_camera_open())
+        if self.trace is not None:                 # RTI's newest rows first: the frame's time then lies between two
+            self.poll_trace(now, force=True)
         tick = self.tickmap.tick_at(t_frame)
         if not math.isnan(tick):
             flags |= cp.FLAG_TICK
@@ -552,6 +600,20 @@ class CameraServer:
                 if part is None:
                     part = mjpeg_part(data)
                 c.queue(part)
+
+    def gripper_camera_open(self) -> bool:
+        """The open camera is the one the active gripper's XML declares (by USB id)."""
+        want = ((self.gripper_cam or {}).get("usb_id") or "").strip().lower()
+        return bool(want) and ((self.device or {}).get("usb_id") or "").lower() == want
+
+    def timing(self) -> dict | None:
+        """The timing calibration that applies to the open camera's frames: the active gripper's, for the open mode,
+        and only when the open camera IS that gripper's camera (review 2026-11-25: with <camera device> pointing at
+        another camera in the same mode, its frames got the gripper camera's offset and the calibrated flag)."""
+        if self.cam is None or not self.gripper_camera_open():
+            return None
+        return camera_settings.camera_timing(self.gripper_cam, camera_settings.mode_key(
+            self.cam.width, self.cam.height, self.cam.fps))
 
     def frame_time(self, seq: int, ts: float) -> tuple[float, int, bool]:
         """(the frame's time, its raw PTS or 0, from the camera's own clock?). The camera's metadata that arrived is
@@ -594,12 +656,14 @@ class CameraServer:
                 "restarts": h["restarts"],
                 "driver_after_ms": round(lags[len(lags) // 2] * 1e3, 2) if lags else None,
                 "calibrated": self.calibrated if self.cam is not None else None,
-                "calibration": (camera_settings.camera_timing(self.gripper_cam, camera_settings.mode_key(
-                    self.cam.width, self.cam.height, self.cam.fps)) if self.cam is not None else None),
+                "calibration": self.timing(),
                 "calibration_why": self.timing_why if self.cam is not None else ""}
 
-    def poll_trace(self, now: float) -> None:
-        if now < self.next_trace:
+    def poll_trace(self, now: float, force: bool = False) -> None:
+        """RTI's new trace rows into the tick map: every TRACE_POLL_S, and (`force`, an attached trace) when a frame
+        arrives — its time is at least its transfer in the past, so it then lies between two rows already read. A
+        trace that is not attached (RTI not running) is tried again every TRACE_POLL_S only."""
+        if now < self.next_trace and not (force and self.trace is not None):
             return
         self.next_trace = now + TRACE_POLL_S
         try:

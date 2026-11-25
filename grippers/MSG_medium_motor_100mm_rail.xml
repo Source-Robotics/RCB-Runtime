@@ -66,5 +66,5 @@
          element has no camera). The id is the one unit measured (a generic UVC bridge, MJPEG 1280x720 at 30 fps); a
          batch with another bridge needs its own id here, or <camera device="usb:vvvv:pppp"> in system.xml. frame: the
          camera's optical frame in the PAR6 description (par6_msg.urdf msg_camera_optical_frame). -->
-    <camera usb_id="0bda:5844" frame="msg_camera_optical_frame" timing_mode="1280x720@30" timing_readout_us="31814" timing_auto_us="1413.9" timing_run="20261124_200140"/>
+    <camera usb_id="0bda:5844" frame="msg_camera_optical_frame" timing_mode="1280x720@30" timing_readout_us="30230" timing_auto_us="1413.9" timing_run="20261124_200140"/>
 </gripper>
