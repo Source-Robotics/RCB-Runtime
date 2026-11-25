@@ -103,6 +103,7 @@ MIN_TEXTURE = 2.0                  # mean gradient of the grey picture (0..255):
 MIN_BRIGHTNESS = 15.0              # mean grey (0..255) an exposure must give
 MIN_FPS_SHARE = 0.9                # an exposure must keep this share of the mode's frame rate
 DISABLE_WAIT_S = 900.0
+STATUS_STALE_S = 3.0               # the camera server's status older than this: it is not running (one a second)
 TD = os.path.join(_ROOT, "temp_data", "camera_timing")
 SYSTEM_XML = os.path.join(_ROOT, "config", "system.xml")
 GRIPPERS_DIR = os.path.join(_ROOT, "grippers")
@@ -374,10 +375,16 @@ def save_frames(path: str, frames: list) -> None:
 
 
 def load_frames(path: str) -> dict:
+    """A recording's frames. An unfinished JPEG loses FLAG_CAMERA_CLOCK, so the analysis leaves it out (review
+    2026-11-25, F9: one stopped the analysis; the camera server relays none since)."""
+    from communication import camera_protocol as cp
     z = np.load(path)
     blob, offs = z["jpeg_bytes"].tobytes(), z["jpeg_offsets"]
-    return {"exposure_time": z["exposure_time"], "rti_tick": z["rti_tick"], "flags": z["flags"], "pts": z["pts"],
-            "frame": z["frame"], "jpegs": [blob[offs[i]:offs[i + 1]] for i in range(len(offs) - 1)]}
+    jpegs = [blob[offs[i]:offs[i + 1]] for i in range(len(offs) - 1)]
+    flags = np.array(z["flags"], dtype=np.int64)
+    flags[np.array([i for i, j in enumerate(jpegs) if not cp.is_complete_jpeg(j)], dtype=int)] &= ~cp.FLAG_CAMERA_CLOCK
+    return {"exposure_time": z["exposure_time"], "rti_tick": z["rti_tick"], "flags": flags, "pts": z["pts"],
+            "frame": z["frame"], "jpegs": jpegs}
 
 
 def summarise(run: dict, results: dict) -> tuple[dict, list]:
@@ -641,6 +648,9 @@ def checks(args) -> tuple[dict, list]:
     """The camera server's state; the problems that stop a run."""
     st = camera_status()
     problems = []
+    age = time.time() - float(st.get("time") or 0)
+    if age > STATUS_STALE_S:                       # a dead server's last status still says "streaming" (F23e)
+        return st, [f"the camera server is not running (its status is {age:.0f} s old): the robot service starts it"]
     if st.get("state") != "streaming":
         problems.append(f"the camera is not streaming ({st.get('state')}: {st.get('message')})")
     clk = st.get("clock") or {}
@@ -653,9 +663,10 @@ def checks(args) -> tuple[dict, list]:
 
 
 def record_setting(robot, args, setting, q0, out_dir, run, mode_fps, joint=None, amplitude=None, speed=None,
-                   tag=None) -> None:
+                   tag=None, pending=None) -> None:
     """One recording at an exposure: check it, swing (args' joint / amplitude / speed unless given), keep the frames
-    and the capture under `tag` (default: the setting)."""
+    and the capture under `tag` (default: the setting). With `pending` (a list) the frames go there, to be saved once
+    the arm is disabled (review 2026-11-25, F12); without it they are saved at once."""
     from project_paths import TEMP_DATA_DIR
     joint = args.joint if joint is None else joint
     amplitude = args.amplitude if amplitude is None else amplitude
@@ -694,7 +705,10 @@ def record_setting(robot, args, setting, q0, out_dir, run, mode_fps, joint=None,
         print(f"{setting_name(setting)}: no usable recording (capture {cap}, {len(frames)} frames, {col.error})")
         return
     shutil.copy2(cap, os.path.join(out_dir, f"capture_{tag}.npz"))
-    save_frames(os.path.join(out_dir, f"frames_{tag}.npz"), frames)
+    if pending is None:
+        save_frames(os.path.join(out_dir, f"frames_{tag}.npz"), frames)
+    else:                       # kept in memory: saving ~50 MB beside RTI while the arm held slowed its loop (F12)
+        pending.append((os.path.join(out_dir, f"frames_{tag}.npz"), frames))
     run["exposures"].append({"setting": setting, "frames": f"frames_{tag}.npz", "capture": f"capture_{tag}.npz",
                              "n_frames": len(frames), "tag": tag, "joint": joint, "amplitude_deg": amplitude,
                              "speed": speed})
@@ -720,6 +734,17 @@ def run_arm(args) -> str | None:
     run = {"joint": args.joint, "amplitude_deg": args.amplitude, "swing_speed": args.swing_speed, "swings": args.swings,
            "mode": mode, "usb_id": usb_id, "controls_before": base["controls"],
            "timing_active": cs.camera_timing(gcam, mode), "exposures": []}
+    pending: list = []              # (file, frames): saved once the arm is disabled (F12), or at an error / a stop
+
+    def save_pending(note: str = "") -> None:
+        while pending:
+            path, frames = pending.pop(0)
+            save_frames(path, frames)
+        with open(os.path.join(out_dir, "run.json"), "w", encoding="utf-8") as f:
+            json.dump(run, f, indent=1)
+        if note:
+            print(note, flush=True)
+
     robot = connect(args)
     try:
         prepare_exec(robot, args)
@@ -744,7 +769,8 @@ def run_arm(args) -> str | None:
                 if wait_exposure(setting):
                     for joint, amplitude, speed in VERIFY_VARIANTS:
                         record_setting(robot, args, setting, q0, out_dir, run, mode_fps, joint=joint,
-                                       amplitude=amplitude, speed=speed, tag=f"{setting}_J{joint}_{speed:g}")
+                                       amplitude=amplitude, speed=speed, tag=f"{setting}_J{joint}_{speed:g}",
+                                       pending=pending)
                 else:
                     print(f"{setting_name(setting)}: the camera did not take it within 8 s — nothing recorded")
             for setting in ([] if args.verify else args.exposures):
@@ -752,27 +778,49 @@ def run_arm(args) -> str | None:
                 if not wait_exposure(setting):
                     print(f"{setting_name(setting)}: the camera did not take it within 8 s — skipped")
                     continue
-                record_setting(robot, args, setting, q0, out_dir, run, mode_fps)
+                record_setting(robot, args, setting, q0, out_dir, run, mode_fps, pending=pending)
         finally:
             set_exposure(base, None)
             print("the camera's settings put back:", base["controls"])
-        with open(os.path.join(out_dir, "run.json"), "w", encoding="utf-8") as f:
-            json.dump(run, f, indent=1)
         if not run["exposures"]:
+            save_pending()
             print("nothing recorded")
             return None
-        print(f"\nRecorded: {os.path.relpath(out_dir, _ROOT)}. Disable the arm now (the dashboard's Disable): the "
-              f"analysis decodes ~{sum(e['n_frames'] for e in run['exposures'])} frames and starts once it is "
-              f"disabled. (Ctrl-C: later, with --reanalyse {os.path.relpath(out_dir, _ROOT)})", flush=True)
+        rel = os.path.relpath(out_dir, _ROOT)
+        mb = sum(len(fr.jpeg) for _, frs in pending for fr in frs) / 1e6
+        print(f"\nRecorded: {rel}. Disable the arm now (the dashboard's Disable): the "
+              f"{sum(e['n_frames'] for e in run['exposures'])} frames ({mb:.0f} MB) are saved once it is disabled "
+              f"(saved beside RTI while the arm holds, they slowed its loop), then analysed here. Ctrl-C after "
+              f"\"frames saved\": analyse on a PC (the kit) or later with --reanalyse {rel}", flush=True)
         end = time.monotonic() + DISABLE_WAIT_S
         while time.monotonic() < end and robot.get_status().get("state") == "ENABLED":
             time.sleep(0.5)
         if robot.get_status().get("state") == "ENABLED":
-            print(f"still enabled after {DISABLE_WAIT_S:.0f} s: analyse later with --reanalyse")
+            save_pending(f"still enabled after {DISABLE_WAIT_S:.0f} s: the frames saved now, with the arm enabled; "
+                         f"analyse later with --reanalyse {rel}")
             return None
+        save_pending(f"frames saved: {rel}")
     finally:
+        if pending:                 # an error or a stop on the way: the frames are never lost (saved as things are)
+            save_pending("the frames saved before stopping (the arm may still be enabled)")
         finish(robot)
     return out_dir
+
+
+def arm_enabled(args) -> bool:
+    """True (and said why) while the arm is enabled: the analysis decodes frames, which must not compete with RTI's
+    loop while the arm holds (review 2026-11-25, F12; as 81's)."""
+    from _common import connect
+    probe = connect(args)
+    try:
+        state = probe.get_status().get("state")
+    finally:
+        probe.disconnect()
+    if state == "ENABLED":
+        print("The arm is ENABLED: disable it first (the dashboard's Disable), then run this again — or analyse on a "
+              "PC with the kit.")
+        return True
+    return False
 
 
 # ------------------------------------------------------------------------------------------------------- selftest
@@ -1025,7 +1073,13 @@ def main():
         sys.exit("--verify records at ONE exposure: --exposures auto (the default) or one fixed setting, e.g. 20")
     if args.selftest:
         sys.exit(selftest())
+    from _common import interrupt_on_hangup
+    from utility.rti_pace import robot_guards
+    interrupt_on_hangup()                          # a dropped session still puts the camera's settings back (F14)
     if args.reanalyse:
+        if arm_enabled(args):
+            sys.exit(2)
+        robot_guards()                             # the lowest priority and a memory cap for the picture work (F12)
         summary = reanalyse(os.path.join(_ROOT, args.reanalyse) if not os.path.isabs(args.reanalyse)
                             else args.reanalyse)
         sys.exit(0 if summary.get("confident") else 1)
@@ -1051,6 +1105,7 @@ def main():
         return
     out_dir = run_arm(args)
     if out_dir:
+        robot_guards()
         summary = reanalyse(out_dir)
         sys.exit(0 if summary.get("confident") else 1)
     sys.exit(1)

@@ -99,6 +99,30 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ### Fixed
 
+- The camera server under abnormal conditions (review 2026-11-25): connections that never sent a whole request, or
+  stopped reading, held client slots for ever (eight of them locked every client out) — closed after 5 s / 10 s now,
+  and the ninth client gets a 503; a frame the driver flagged as bad, or a JPEG that does not end, was relayed — now
+  dropped and counted (`bad_frames`); the metadata node failing alone stopped every frame — the video goes on with the
+  driver's timestamps; a stalled stream was never reopened — after 5 s (then 10, 20, 40, every 80 s); a status too big
+  for its string was not written, so the beat froze and a hang was reported — it is cut to fit; a `system.xml` or
+  gripper XML that does not parse read as "no camera" and closed the camera — the camera now keeps its settings until
+  the file is fixed; the 6.8 kernel's continuous autofocus counts as an automatic mode; the camera's clock no longer
+  keeps pairs without bound when no frame is timed, stops extending its line 2 s after the last pair, and takes a
+  changed microframe only when three buffers agree; the status' `tick_mapping` says yes only with recent rows.
+- `CameraClient.connect()` let a raw `OSError` through (a connection reset at once); it raises
+  `RobotConnectionError`. After a broken stream its socket is closed at once, and a short `read()` timeout is kept to
+  the millisecond (it waited in 0.5 s steps).
+- The Camera tab: a preview rate or a menu value outside the offered choices broke its settings row; a value the
+  camera changes by itself rebuilt the controls every second (an open menu closed) — updated in place now; a
+  restarted camera server left the preview dead.
+- The camera checks (`api_tests/80`, `81`): `80` saved its frames beside RTI while the arm held (RTI's loop slowed in
+  the second of each save) — kept in memory and saved once the arm is disabled; `80 --reanalyse` refuses while the
+  arm is enabled; both analyse at the lowest priority with a 2 GB memory cap; an unfinished JPEG in a recording is
+  left out instead of stopping the analysis; a dropped SSH session or SIGTERM puts the camera's settings (and `81`'s
+  output) back like Ctrl-C; a dead camera server's last status no longer passes the start check; `81` tries the next
+  exposure when the camera refuses one. The timing writer (`utility/camera_settings.write_timing`) works under the
+  file's edit lock, escapes its values, reads the result back before writing, and never overwrites a run's first
+  backup.
 - A camera control taken out of `<camera controls>` (or reset with the Camera tab's "back to the defaults") stayed at
   its last value, because the camera keeps a value until it loses power. Every control not named there now goes back
   to the camera's own default.

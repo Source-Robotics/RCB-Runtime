@@ -83,6 +83,7 @@ AUTO_SETTLE_S = 3.0                # --auto: automatic exposure settles after th
 AUTO_MIN_CONTRAST = 20.0           # a pixel used: on minus off at least this (grey levels) ...
 AUTO_MAX_ON = 240.0                # ... and never this bright when on (saturated: its share is lost)
 AUTO_MAX_HALVES_MS = 0.2          # --apply: the run's two halves must agree this well
+STATUS_STALE_S = 3.0              # the camera server's status older than this: it is not running (one a second)
 AUTO_MIN_PIXELS = 3                # a row of the spot used with this many such pixels
 AUTO_MIN_SWITCHES = 40             # switches whose frames lie on the ramp
 SYSTEM_XML = os.path.join(_ROOT, "config", "system.xml")
@@ -517,6 +518,10 @@ def checks() -> tuple[dict, list]:
         problems.append("RTI does not note its output switches yet (no shared memory 'output_switch'): the robot "
                         "service must restart with the code from 2026-11-24 (the simulator first)")
     st = camera_status()
+    age = time.time() - float(st.get("time") or 0)
+    if age > STATUS_STALE_S:                       # a dead server's last status still says "streaming" (F23e)
+        return st, problems + [f"the camera server is not running (its status is {age:.0f} s old): the robot "
+                               f"service starts it"]
     if st.get("state") != "streaming":
         problems.append(f"the camera is not streaming ({st.get('state')}: {st.get('message')})")
     clk = st.get("clock") or {}
@@ -597,7 +602,11 @@ def as_arrays(frames: list) -> dict:
 def locate(robot, output, sw, host, base) -> tuple[int, dict] | None:
     """The shortest exposure that shows the LED: (its setting, the spot)."""
     for setting in EXPOSURES_TRY:
-        set_controls(base, setting)
+        try:
+            set_controls(base, setting)
+        except RuntimeError as e:                  # this camera refuses it: the next one (review 2026-11-25, F18)
+            print(f"exposure {setting / 10:g} ms: {e} — trying the next", flush=True)
+            continue
         output_off(robot, output)
         col = Frames(host)
         col.start()
@@ -726,8 +735,12 @@ def reanalyse(folder: str) -> dict:
         run_ = json.load(f)
     z = np.load(os.path.join(folder, "frames.npz"))
     blob, offs = z["jpeg_bytes"].tobytes(), z["jpeg_offsets"]
-    frames = {"exposure_time": z["exposure_time"], "flags": z["flags"],
-              "jpegs": [blob[offs[i]:offs[i + 1]] for i in range(len(offs) - 1)]}
+    from communication import camera_protocol as cp
+    jpegs = [blob[offs[i]:offs[i + 1]] for i in range(len(offs) - 1)]
+    flags = np.array(z["flags"], dtype=np.int64)
+    # an unfinished JPEG loses FLAG_CAMERA_CLOCK: every analysis leaves it out (review 2026-11-25, F9)
+    flags[np.array([i for i, j in enumerate(jpegs) if not cp.is_complete_jpeg(j)], dtype=int)] &= ~cp.FLAG_CAMERA_CLOCK
+    frames = {"exposure_time": z["exposure_time"], "flags": flags, "jpegs": jpegs}
     spot = {"rows": tuple(run_["spot"]["rows"]), "cols": tuple(run_["spot"]["cols"])}
     timing = run_.get("timing") or {}
     readout_s = (timing.get("readout_us") or 31.8e3) * 1e-6
@@ -947,7 +960,10 @@ def main():
                     help="after finding the LED, switch it under AUTOMATIC exposure: the exposure's length and the "
                          "image's moment (E1)")
     args = ap.parse_args()
-    os.nice(19)                                    # the picture work at the lowest priority, beside RTI
+    from _common import interrupt_on_hangup
+    from utility.rti_pace import robot_guards
+    robot_guards()                                 # the picture work at the lowest priority, with a memory cap (F12)
+    interrupt_on_hangup()                          # a dropped session puts the output and the camera back (F14)
     if args.selftest:
         sys.exit(selftest())
     if args.apply:

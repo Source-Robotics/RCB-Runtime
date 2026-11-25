@@ -1688,7 +1688,6 @@ with ui.tab_panels(tabs, value=tab_joints).classes("w-full"):
         except Exception:
             logger.exception("Camera tab unavailable")
             ui.label("Camera tab unavailable — see logs/gui.log").classes("text-negative")
-            ui.label("Drive captures unavailable — see logs/gui.log").classes("text-negative")
 
     # ─── PID Config ───────────────────────────────────────────
     with ui.tab_panel(tab_pid):

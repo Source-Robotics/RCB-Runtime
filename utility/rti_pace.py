@@ -19,6 +19,27 @@ from typing import Callable, Optional
 PERIOD_MS = 4.5
 EXEC_MS = 3.5
 STRIKES = 3
+HEAVY_CAP_MB = 2048     # robot_guards' address-space cap: a run's frames (~150 MB) + one exposure's pictures as 8 bit
+                        # (~180 MB) + the JPEGs, numpy and Pillow fit well inside
+
+
+def robot_guards(cap_mb: int = HEAVY_CAP_MB) -> None:
+    """Before heavy picture work on Linux (the robot's Pi): the lowest CPU priority and an address-space cap of
+    `cap_mb` (review 2026-11-25, F12: a runaway analysis must not take the Pi down — memory ran out there on
+    2026-10-16 and the Pi hung on 2026-11-21). Elsewhere (a PC with the analysis kit) it does nothing."""
+    import os
+    import sys
+    if not sys.platform.startswith("linux"):
+        return
+    import resource
+    try:
+        os.nice(19 - os.nice(0))
+    except OSError:
+        pass
+    cap = int(cap_mb) << 20
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if soft == resource.RLIM_INFINITY or soft > cap:
+        resource.setrlimit(resource.RLIMIT_AS, (cap if hard == resource.RLIM_INFINITY else min(cap, hard), hard))
 
 
 class Pace:

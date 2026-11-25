@@ -13,7 +13,7 @@ not a helper thread, which can keep beating while the loop is stuck:
                     trace — judged only while RTI's loop ticks (before that the recorder has nothing to follow)
     GUI             an HTTP answer from the dashboard (GET /favicon.ico — a route registered at start; any unknown
                     path would build a whole page), probed every GUI_PROBE_S on a thread of its own
-    CAMERA          the camera server's "beat" in its status JSON (shared memory camera_status), a few times a second
+    CAMERA          the camera server's "beat" in its status JSON (shared memory camera_status), once a second
                     whether a camera is plugged in or not (2026-11-24, TODO/camera_plan.md D1)
 
 A program is ARMED at the first change of its signal after its start (a change, not an increase: shared memory keeps

@@ -409,6 +409,13 @@ class Camera:
         os.close(fd)
         self.meta_fd = None
 
+    def stop_meta(self, problem: str) -> None:
+        """Close the metadata node while the video goes on (it failed alone; review 2026-11-25, F10): read_meta()
+        returns nothing from now on, meta_path is None and meta_problem says why."""
+        self._close_meta()
+        self.meta_path = None
+        self.meta_problem = problem
+
     def read_meta(self) -> list[tuple]:
         """Every metadata buffer the driver has finished, oldest first: [(sequence, error, data)] — the sequence is
         the video frame's it belongs to, error the driver's flag (a buffer that overflowed), data its bytes
@@ -480,6 +487,5 @@ class Camera:
         self.closed = True
 
 
-def is_complete_jpeg(data: bytes) -> bool:
-    """Starts with SOI and ends (trailing zero padding aside) with EOI."""
-    return data[:2] == b"\xff\xd8" and data.rstrip(b"\0")[-2:] == b"\xff\xd9"
+# is_complete_jpeg moved to communication/camera_protocol.py on 2026-11-25 (the analysis kit needs it on a PC)
+from communication.camera_protocol import is_complete_jpeg  # noqa: E402,F401

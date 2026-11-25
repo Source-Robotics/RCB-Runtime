@@ -188,8 +188,11 @@ class CameraClient:
 
         Raises:
             RobotConnectionError: The camera server cannot be reached, did not
-                answer within `timeout`, or answered with something other than
-                camera frames, for example because the camera is switched off.
+                answer within `timeout`, broke the connection, or answered with
+                something other than camera frames, for example because it
+                serves its most clients already. With the camera switched off
+                or unplugged the connection succeeds and `read()` raises
+                `RobotTimeout`.
             VersionMismatch: The robot speaks another camera protocol version,
                 and `allow_mismatch` is false.
             RuntimeError: This client is connected already; call `close()`
@@ -220,7 +223,10 @@ class CameraClient:
         except socket.timeout as e:
             sock.close()
             raise RobotConnectionError(f"the camera server at {host}:{port} did not answer within {timeout} s") from e
-        except (OSError, RobotConnectionError):
+        except OSError as e:                       # e.g. reset at once (review 2026-11-25, F2: it escaped raw)
+            sock.close()
+            raise RobotConnectionError(f"the camera server at {host}:{port} broke the connection: {e}") from e
+        except RobotConnectionError:
             sock.close()
             raise
         text, _, rest = bytes(head).partition(b"\r\n\r\n")
@@ -281,7 +287,16 @@ class CameraClient:
         if self._sock is None:
             raise RobotConnectionError("the camera client is not connected — call connect() first")
         if not self.latest_only:
-            return self._receive(time.monotonic() + timeout)
+            if self._error is not None:
+                raise self._error
+            try:
+                return self._receive(time.monotonic() + timeout)
+            except RobotConnectionError as e:      # the stream broke: its socket closed now, not at close() (review
+                self._error = e                    # 2026-11-25); every later read() raises the same error
+                sock = self._sock
+                if sock is not None:
+                    sock.close()
+                raise
         with self._cond:
             if not self._cond.wait_for(lambda: self._newest_n > self._returned_n or self._error is not None
                                        or self._sock is None, timeout):
@@ -405,8 +420,11 @@ class CameraClient:
         while len(self._buf) < n:
             if self._stop or sock is None:
                 raise RobotConnectionError("the camera client was closed")
-            if deadline is not None and time.monotonic() > deadline:
-                raise RobotTimeout(f"no camera frame within the timeout ({len(self._buf)} of {n} bytes)")
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RobotTimeout(f"no camera frame within the timeout ({len(self._buf)} of {n} bytes)")
+                sock.settimeout(min(_POLL_S, max(0.001, left)))     # a timeout kept to the ms, not 0.5 s steps
             try:
                 part = sock.recv(max(65536, n - len(self._buf)))
             except socket.timeout:

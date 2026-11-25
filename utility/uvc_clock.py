@@ -36,6 +36,11 @@ SAME_TRANSFER_NS = 300_000        # blocks read within this of each other came i
                                   # transfers 1-4 ms)
 STEP_MIN = 20                     # STC steps inside transfers needed to know one microframe (a buffer has ~240)
 STEP_EVERY = 300                  # ... re-checked every this many buffers (~10 s)
+STEP_AGREE = 3                    # a CHANGED microframe is taken only when this many buffers in a row agree on it
+                                  # (one odd buffer shifted every time by a microframe, 125 us, for 10 s: review
+                                  # 2026-11-25, F8)
+PAIR_AGE_S = 2.0                  # no time from a line whose newest pair is older than this at the frame (F8: when the
+                                  # pairs stopped, the last line was extended for ever)
 OUTLIER_S = 50e-6                 # a pair further than this (or 5 robust sigmas) from the median residual is left out
 MAX_RESIDUAL_S = 200e-6           # a fit scattering more is not used (the camera's clock jumped, or no clean pairs)
 UVC_PTS, UVC_SCR = 0x04, 0x08
@@ -80,6 +85,8 @@ class CameraClock:
         self.prev: tuple | None = None         # (ns, STC unwrapped) of the previous block
         self.buffers = 0                       # metadata buffers taken
         self.step: int | None = None           # one microframe in the camera's clock (1875 at 15 MHz)
+        self.step_new: int | None = None       # another microframe seen, not yet agreed (STEP_AGREE)
+        self.step_votes = 0
         self.fit: tuple | None = None          # (STC at the reference, time there, seconds per tick)
         self.residual: float | None = None
         self.rejected = 0                      # pairs the last fit left out
@@ -87,6 +94,7 @@ class CameraClock:
         self.last_fit_t: float | None = None   # the newest pair's time at the last fit
         self.fit_span = 0.0                    # the pairs' time span at the last fit
         self.why = "no camera clock pairs yet"
+        self.stale = False                     # the last frame asked for came too long after the newest pair (F8)
 
     def add(self, data) -> int | None:
         """Take one metadata buffer (its bytes); return its frame's PTS (raw, 32 bits), or None when it has none."""
@@ -109,19 +117,39 @@ class CameraClock:
         dx = unw - px
         same = (ns - pns) < SAME_TRANSFER_NS
         self.buffers += 1
-        if self.step is None or self.buffers % STEP_EVERY == 0:        # one microframe: found once, then re-checked
-            inside = dx[same & (dx > 0)]
+        if self.step is None or self.buffers % STEP_EVERY == 0 or self.step_new is not None:
+            inside = dx[same & (dx > 0)]                       # one microframe: found once, then re-checked
             if len(inside) >= STEP_MIN:
-                self.step = int(np.median(inside))
+                self._vote_step(int(np.median(inside)))
         if self.step:
             ends = ~same & (np.abs(dx - self.step) <= max(2, self.step // 500))
             if ends.any():
                 self.px = np.concatenate((self.px, px[ends]))
                 self.pt = np.concatenate((self.pt, pns[ends] * 1e-9))
+                # the window kept here too, not only at a refit: buffers whose frames are never timed (every one
+                # flagged by the driver) grew the pairs without bound (review 2026-11-25, F7)
+                keep_from = int(np.searchsorted(self.pt, self.pt[-1] - self.window_s))
+                if keep_from:
+                    self.px, self.pt = self.px[keep_from:], self.pt[keep_from:]
         self.prev = (int(ns_all[-1]), int(unw_all[-1]))
         self.unw = int(unw_all[-1])
         self.last_raw = int(stc[-1])
         return pts
+
+    def _vote_step(self, seen: int) -> None:
+        """The microframe one buffer shows: the first is taken; a different one only once STEP_AGREE buffers in a row
+        show it (F8)."""
+        if self.step is None:
+            self.step = seen
+            return
+        if abs(seen - self.step) <= max(2, self.step // 500):
+            self.step_new, self.step_votes = None, 0
+        elif self.step_new is not None and abs(seen - self.step_new) <= max(2, self.step_new // 500):
+            self.step_votes += 1
+            if self.step_votes >= STEP_AGREE:
+                self.step, self.step_new, self.step_votes = seen, None, 0
+        else:
+            self.step_new, self.step_votes = seen, 1
 
     def refit(self) -> None:
         if len(self.pt):
@@ -170,7 +198,13 @@ class CameraClock:
             return None
         x0, t0, b = self.fit
         x = self.unw + ((pts - self.last_raw + _HALF) % _U32 - _HALF) - self.step
-        return t0 + b * (x - x0)
+        t = t0 + b * (x - x0)
+        age = t - float(self.pt[-1]) if len(self.pt) else np.inf
+        self.stale = bool(age > PAIR_AGE_S)
+        if self.stale:
+            self.why = f"no clock pairs for {age:.1f} s" if len(self.pt) else "no clock pairs"
+            return None
+        return t
 
     def _refit_due(self) -> bool:
         """A new line: none yet; at every new pair while the window is still filling (a line through a short span has
@@ -184,7 +218,7 @@ class CameraClock:
     def health(self) -> dict:
         """For the status: ok, why not, the pairs, the fit's scatter (us), the camera's clock (MHz)."""
         f = self.fit
-        return {"ok": f is not None, "why": self.why, "pairs": int(len(self.pt)),
+        return {"ok": f is not None and not self.stale, "why": self.why, "pairs": int(len(self.pt)),
                 "fit_us": round(self.residual * 1e6, 1) if f is not None and self.residual is not None else None,
                 "device_mhz": round(1.0 / f[2] / 1e6, 6) if f is not None else None,
                 "step": self.step, "rejected": self.rejected, "restarts": self.restarts}

@@ -68,6 +68,31 @@ def _set_control(key: str, value) -> None:
     _save(controls=camera_settings.format_controls(pairs))
 
 
+def preview_options(current: float) -> dict:
+    """The preview rates offered, the configured one among them even when it is none of them (review 2026-11-25,
+    F15: a hand-edited 20 made the select raise, and the settings row stayed half built)."""
+    options = {5.0: "5 fps", 10.0: "10 fps", 15.0: "15 fps", 30.0: "30 fps"}
+    if float(current) not in options:
+        options[float(current)] = f"{float(current):g} fps (system.xml)"
+    return options
+
+
+def menu_options(control: dict, value) -> dict:
+    """A menu control's choices, its current value among them even when the camera's menu lacks it (F15)."""
+    options = {int(v): str(n) for v, n in control["menu"]}
+    if int(value) not in options:
+        options[int(value)] = f"{int(value)} (not in the camera's menu)"
+    return options
+
+
+def controls_shape(st: dict) -> tuple:
+    """What the controls grid is built from — not the values: a value the camera changes itself (under an automatic
+    mode) is updated in place (F17: the grid was rebuilt every second, closing an open menu)."""
+    return tuple((c["key"], c.get("type"), c.get("min"), c.get("max"), c.get("step"), c.get("default"),
+                  tuple(tuple(m) for m in c.get("menu") or []), c.get("read_only"), c.get("inactive"))
+                 for c in st.get("controls") or [])
+
+
 def _clock_text(clk: dict) -> str:
     """Where the frames' times come from (the status' "clock", P2): the camera's own clock or the driver's."""
     if clk.get("source") == "camera":
@@ -86,7 +111,14 @@ def _host_url(path: str) -> str:
 
 
 def add_camera_tab(is_visible) -> None:
-    state = {"preview_on": False, "controls_key": None, "modes_key": None}
+    state = {"preview_on": False, "controls_key": None, "modes_key": None, "pid": None,
+             "widgets": {}, "seen": {}}    # seen: each control's value as the camera reported it (F17)
+
+    def from_ui(key: str, value) -> None:
+        """A widget's change: stored, unless it is the camera's own value being shown (update_values sets it)."""
+        if state["seen"].get(key) == int(value):
+            return
+        _set_control(key, int(value))
 
     with ui.row().classes("w-full items-start gap-4"):
         with ui.column().classes("gap-2").style("flex: 2 1 480px; min-width: 320px"):
@@ -132,8 +164,8 @@ def add_camera_tab(is_visible) -> None:
                 h, f = rest.split("@", 1)
                 _save(width=int(w), height=int(h), fps=float(f))
             ui.select(options, value=current, label="Mode (MJPEG)", on_change=on_mode).classes("min-w-[220px]")
-            ui.select({5.0: "5 fps", 10.0: "10 fps", 15.0: "15 fps", 30.0: "30 fps"},
-                      value=float(cfg.get("preview_fps", 15.0)), label="Dashboard preview",
+            fps_now = float(cfg.get("preview_fps", 15.0))
+            ui.select(preview_options(fps_now), value=fps_now, label="Dashboard preview",
                       on_change=lambda e: _save(preview_fps=float(e.value))).classes("min-w-[140px]")
             devices = {"auto": "the gripper's camera (auto)"}
             for c in st.get("cameras") or []:
@@ -143,8 +175,12 @@ def add_camera_tab(is_visible) -> None:
             ui.select(devices, value=cfg.get("device", "auto"), label="Which camera",
                       on_change=lambda e: _save(device=e.value)).classes("min-w-[220px]")
 
+    def int_text(c: dict, label: str, value) -> str:
+        return f"{label}: {value} (default {c['default']}, {c['min']}..{c['max']})"
+
     def draw_controls(st: dict) -> None:
         controls_box.clear()
+        state["widgets"], state["seen"] = {}, {}
         with controls_box:
             controls = [c for c in st.get("controls") or [] if not c.get("read_only")]
             if not controls:
@@ -157,26 +193,51 @@ def add_camera_tab(is_visible) -> None:
                     inactive = bool(c.get("inactive"))
                     label = c["name"] + ("  (switch its automatic mode off to change it)" if inactive else "")
                     value = c["value"] if c["value"] is not None else c["default"]
+                    state["seen"][c["key"]] = int(value)
                     with ui.column().classes("gap-0"):
+                        text = None
                         if c["type"] == "bool":
                             w = ui.switch(label, value=bool(value),
-                                          on_change=lambda e, k=c["key"]: _set_control(k, 1 if e.value else 0))
+                                          on_change=lambda e, k=c["key"]: from_ui(k, 1 if e.value else 0))
                         elif c["type"] in ("menu", "intmenu") and c["menu"]:
-                            w = ui.select({int(v): str(n) for v, n in c["menu"]}, value=int(value), label=label,
-                                          on_change=lambda e, k=c["key"]: _set_control(k, e.value)).classes("w-full")
+                            w = ui.select(menu_options(c, value), value=int(value), label=label,
+                                          on_change=lambda e, k=c["key"]: from_ui(k, e.value)).classes("w-full")
                         elif c["type"] == "int":
-                            ui.label(f"{label}: {value} (default {c['default']}, {c['min']}..{c['max']})"
-                                     ).classes("text-xs text-gray-600")
+                            text = ui.label(int_text(c, label, value)).classes("text-xs text-gray-600")
                             w = ui.slider(min=c["min"], max=c["max"], step=max(1, int(c["step"] or 1)),
                                           value=int(value)).props("label").on(
                                 "change", lambda e, k=c["key"]: _set_control(k, e.args))
                         else:
                             continue
+                        state["widgets"][c["key"]] = (c["type"], w, text, label)
                         if inactive:
                             w.props("disable")
             ui.button("Controls back to the defaults", icon="restart_alt",
                       on_click=lambda: _save(controls=camera_settings.DEFAULTS["controls"])
                       ).props("flat size=sm")
+
+    def update_values(st: dict) -> None:
+        """The camera's own value changes, in place (F17); the handlers see them as the camera's (from_ui)."""
+        for c in st.get("controls") or []:
+            entry = state["widgets"].get(c["key"])
+            if entry is None:
+                continue
+            kind, w, text, label = entry
+            value = int(c["value"] if c["value"] is not None else c["default"])
+            if state["seen"].get(c["key"]) == value:
+                continue
+            state["seen"][c["key"]] = value
+            if kind == "bool":
+                w.value = bool(value)
+            elif kind in ("menu", "intmenu"):
+                if value not in w.options:
+                    w.set_options(menu_options(c, value), value=value)
+                else:
+                    w.value = value
+            else:
+                w.value = value
+                if text is not None:
+                    text.set_text(int_text(c, label, value))
 
     def set_preview(on: bool) -> None:
         if on == state["preview_on"]:
@@ -203,6 +264,10 @@ def add_camera_tab(is_visible) -> None:
             problems.set_text("")
             return
         streaming = st.get("state") == "streaming"
+        if st.get("pid") != state["pid"]:          # the camera server restarted: its stream is a new one (F16)
+            if state["pid"] is not None:
+                set_preview(False)
+            state["pid"] = st.get("pid")
         set_preview(streaming)
         mode = st.get("mode") or {}
         dev = st.get("device") or {}
@@ -219,9 +284,10 @@ def add_camera_tab(is_visible) -> None:
         if mode:
             lines += [f"- **Mode:** {mode['width']} x {mode['height']} at {float(mode['fps']):g} fps; delivered "
                       f"{st.get('fps', 0)} fps, {st.get('mbit_s', 0)} Mbit/s",
-                      f"- **Frames:** {st.get('frames', 0)}, lost by the driver {st.get('lost', 0)}, camera reopened "
-                      f"{st.get('reopens', 0)} times",
-                      f"- **RTI tick on each frame:** {'yes' if st.get('tick_mapping') else 'no (RTI trace not read)'}",
+                      f"- **Frames:** {st.get('frames', 0)}, lost by the driver {st.get('lost', 0)}, broken and "
+                      f"dropped {st.get('bad_frames', 0)}, camera reopened {st.get('reopens', 0)} times",
+                      "- **RTI tick on each frame:** " + ("yes" if st.get("tick_mapping") else
+                                                          "no (no recent rows of RTI's trace: RTI not running?)"),
                       f"- **Frame times:** {_clock_text(st.get('clock') or {})}"]
         lines.append(f"- **Clients:** {clients or 'none'}")
         details.set_content("\n".join(lines))
@@ -233,10 +299,11 @@ def add_camera_tab(is_visible) -> None:
         if modes_key != state["modes_key"]:
             state["modes_key"] = modes_key
             draw_settings(st)
-        controls_key = (dev.get("path"), repr(st.get("settings", {}).get("controls")),
-                        tuple((c["key"], c.get("value"), c.get("inactive")) for c in st.get("controls") or []))
+        controls_key = (dev.get("path"), repr(st.get("settings", {}).get("controls")), controls_shape(st))
         if controls_key != state["controls_key"]:
             state["controls_key"] = controls_key
             draw_controls(st)
+        else:
+            update_values(st)
 
     ui.timer(STATUS_REFRESH_S, refresh)

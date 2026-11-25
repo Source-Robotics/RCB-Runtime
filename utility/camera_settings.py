@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import xml.etree.ElementTree as ET  # nosec B405 — our own config/system.xml, read as config/xml_parser reads it
+from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — escape() writes our own values; it parses nothing
 
 from utility.config_write import edit_lock, write_atomic
 
@@ -45,7 +46,8 @@ _DEVICE = re.compile(r"^(auto|usb:[0-9a-f]{4}:[0-9a-f]{4}|/dev/[A-Za-z0-9_./:-]+
 
 
 def parse_controls(text: str) -> list[tuple[str, int]]:
-    """"a=1;b=-2" -> [("a", 1), ("b", -2)], in the written order. Raises ValueError for a malformed entry or a key
+    """"a=1;b=-2" -> [("a", 1), ("b", -2)], in the written order (the camera server applies the automatic modes
+    first, whatever the order). Raises ValueError for a malformed entry or a key
     given twice."""
     out, seen = [], set()
     for part in (text or "").replace(",", ";").split(";"):
@@ -179,22 +181,35 @@ def write(path, values: dict) -> dict:
     return clean
 
 
-def gripper_camera(system_xml, grippers_dir) -> tuple[dict | None, str]:
-    """(the active gripper's <camera> attributes or None, the gripper's name) — read straight from the files (no
-    robot model). A gripper file that is missing or unreadable reads as no camera."""
+def read_gripper_camera(system_xml, grippers_dir) -> tuple[dict | None, str, str]:
+    """gripper_camera()'s two values and a problem: "" or why a file that exists does not parse (a hand edit). The
+    camera server then keeps what it runs with (review 2026-11-25, F23c: such a file read as "no camera" and closed
+    the camera)."""
     try:
         root = ET.parse(str(system_xml)).getroot()  # nosec B314 — our own config file
-    except (OSError, ET.ParseError):
-        return None, ""
+    except ET.ParseError as e:
+        return None, "", f"{system_xml} does not parse: {e}"
+    except OSError:
+        return None, "", ""
     name = (root.findtext("active_gripper") or "").strip()
     if name.lower() in ("", "none", "unknown"):
-        return None, name
+        return None, name, ""
+    path = f"{grippers_dir}/{name}.xml"
     try:
-        groot = ET.parse(f"{grippers_dir}/{name}.xml").getroot()  # nosec B314 — our own gripper file
-    except (OSError, ET.ParseError):
-        return None, name
+        groot = ET.parse(path).getroot()  # nosec B314 — our own gripper file
+    except ET.ParseError as e:
+        return None, name, f"{path} does not parse: {e}"
+    except OSError:
+        return None, name, ""
     elem = groot.find("camera")
-    return (dict(elem.attrib) if elem is not None else None), name
+    return (dict(elem.attrib) if elem is not None else None), name, ""
+
+
+def gripper_camera(system_xml, grippers_dir) -> tuple[dict | None, str]:
+    """(the active gripper's <camera> attributes or None, the gripper's name) — read straight from the files (no
+    robot model). A gripper file that is missing, unreadable or does not parse reads as no camera."""
+    cam, name, _problem = read_gripper_camera(system_xml, grippers_dir)
+    return cam, name
 
 
 # ---------------------------------------------------------------- the timing calibration (P3, 2026-11-24)
@@ -270,26 +285,42 @@ def write_timing(xml_path: str, usb_id: str, mode: str, values: dict, run: str, 
     """The timing attributes `values` (timing_auto_us and / or timing_offset_us + timing_us_per_unit) into the gripper
     XML's <camera> element when it declares `usb_id`; the other kind's values kept when they are for the same mode;
     a backup first; comments and everything else kept. False when the file has no such camera. (Moved here from
-    api_tests/80 on 2026-11-25: the LED check's --apply writes the calibration now.)"""
-    with open(xml_path, encoding="utf-8") as f:
-        text = f.read()
-    found = _elements(text)
-    if len(found) != 1:
-        return False
-    start, end = found[0]
-    attrs = dict(ET.fromstring(text[start:end]).attrib)  # nosec B314 — our own gripper XML
-    if attrs.get("usb_id", "").lower() != usb_id.lower():
-        return False
-    old = {k: v for k, v in attrs.items() if k in TIMING_KEYS}
-    attrs = {k: v for k, v in attrs.items() if k not in TIMING_KEYS}
-    timing = {"timing_mode": mode}
-    if old.get("timing_mode") == mode:                    # the same mode: what this run did not measure stays
-        timing.update({k: v for k, v in old.items() if k not in ("timing_mode", "timing_run")})
-    timing.update(values)
-    timing["timing_run"] = run
-    attrs.update(timing)
-    elem = "<camera " + " ".join(f'{k}="{v}"' for k, v in attrs.items()) + "/>"
-    os.makedirs(backup_dir, exist_ok=True)
-    shutil.copy2(xml_path, os.path.join(backup_dir, os.path.basename(xml_path)))
-    write_atomic(xml_path, text[:start] + elem + text[end:])
+    api_tests/80 on 2026-11-25: the LED check's --apply writes the calibration now.)
+
+    Review 2026-11-25 (F13): under the file's edit lock (utility/config_write: one edit at a time across processes);
+    the values escaped (an & made the file unparsable, which stops the robot at start); the edited file parsed back
+    and its <camera> compared with what was meant before anything is written (ValueError, the file unchanged); the
+    backup is the file as it was before the FIRST write into this backup folder — a second --apply of one run never
+    overwrites it with an edited file."""
+    with edit_lock(xml_path):
+        with open(xml_path, encoding="utf-8") as f:
+            text = f.read()
+        found = _elements(text)
+        if len(found) != 1:
+            return False
+        start, end = found[0]
+        attrs = dict(ET.fromstring(text[start:end]).attrib)  # nosec B314 — our own gripper XML
+        if attrs.get("usb_id", "").lower() != usb_id.lower():
+            return False
+        old = {k: v for k, v in attrs.items() if k in TIMING_KEYS}
+        attrs = {k: v for k, v in attrs.items() if k not in TIMING_KEYS}
+        timing = {"timing_mode": mode}
+        if old.get("timing_mode") == mode:                # the same mode: what this run did not measure stays
+            timing.update({k: v for k, v in old.items() if k not in ("timing_mode", "timing_run")})
+        timing.update(values)
+        timing["timing_run"] = run
+        attrs.update({k: str(v) for k, v in timing.items()})
+        elem = "<camera " + " ".join(f'{k}="{_xml_escape(v, {chr(34): "&quot;"})}"' for k, v in attrs.items()) + "/>"
+        new = text[:start] + elem + text[end:]
+        try:
+            back = ET.fromstring(new).find("camera")  # nosec B314 — the text just built from our own file
+        except ET.ParseError as e:
+            raise ValueError(f"{xml_path}: the edited file would not parse ({e}); nothing written") from e
+        if back is None or dict(back.attrib) != attrs:
+            raise ValueError(f"{xml_path}: the edited <camera> would not read back as written; nothing written")
+        os.makedirs(backup_dir, exist_ok=True)
+        backup = os.path.join(backup_dir, os.path.basename(xml_path))
+        if not os.path.exists(backup):
+            shutil.copy2(xml_path, backup)
+        write_atomic(xml_path, new)
     return True

@@ -182,3 +182,16 @@ def main_guard(fn):
     except RobotError as exc:
         print(f"ROBOT ERROR: {exc}")
         raise SystemExit(4)
+
+
+def interrupt_on_hangup() -> None:
+    """A hang-up (the SSH session dropped) or a stop request (SIGTERM) raises KeyboardInterrupt, as Ctrl-C does, so a
+    script's finally blocks put back what it changed (review 2026-11-25, F14: they were skipped — a fixed exposure
+    stayed in system.xml, an output could stay on)."""
+    import signal
+
+    def _raise(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+    for name in ("SIGHUP", "SIGTERM"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _raise)

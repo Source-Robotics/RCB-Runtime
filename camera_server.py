@@ -17,7 +17,15 @@ RTI's shared-memory trace (utility/trace_ring.py) only, to turn a frame's time i
       /stream         every frame as MJPEG (multipart), browsers and video tools
       /preview        MJPEG at preview_fps (the dashboard's Camera tab)
       /snapshot.jpg   the latest frame;  /  a page with the stream
-    A client whose previous frame is still going out SKIPS the new one: no queue, so nobody ever sees old frames.
+    A client whose previous frame is still going out SKIPS the new one: the server keeps no queue. The two sockets'
+    buffers still hold a few frames, so a reader that falls behind gets older frames before the skipping starts
+    (review 2026-11-25, F22): CameraClient(latest_only=True) reads the newest, and the header's send time tells a
+    frame's age.
+  * Robustness (review 2026-11-25, TODO/camera_review_plan.md 3.3): a connection without a whole request in
+    REQUEST_TIMEOUT_S, or one that takes nothing for CLIENT_STUCK_S, is closed (eight of them locked every client
+    out); the ninth client gets a 503; a buffer the driver flags or an unfinished JPEG is dropped; the metadata node
+    failing alone leaves the video running; a stream without frames for STALL_REOPEN_S is opened again; a status too
+    big for its string is cut, never left unwritten; a configuration file that does not parse keeps what runs.
   * Frame times (P2, 2026-11-24): the camera's own clock. The camera's UVC metadata node is streamed with the video;
     utility/uvc_clock.py ties the camera's clock to CLOCK_MONOTONIC (+-9 us) and turns each frame's PTS into its time
     (FLAG_CAMERA_CLOCK; the raw PTS in the header). Until that clock is known (~0.2 s after an open), without a
@@ -80,6 +88,13 @@ SEND_BUFFER = 256 * 1024          # small: a slow client skips frames instead of
 # the frame: measured 1.2-5.1 ms (2026-11-24). A camera time outside is not used for that frame (counted: disagreed).
 CLOCK_LAG_S = (-0.0005, 0.025)
 PTS_KEPT = 32                     # frames' PTS kept until their video frame is read
+BUF_FLAG_ERROR = 0x0040           # V4L2_BUF_FLAG_ERROR (hardware/uvc_camera.py): the driver says the buffer is bad
+# Review 2026-11-25 (TODO/camera_review_plan.md 3.3):
+REQUEST_TIMEOUT_S = 5.0           # F3: a connection that has not sent its whole request by then is closed
+CLIENT_STUCK_S = 10.0             # F3: a client that has taken nothing of a waiting frame for this long is closed
+STALL_REOPEN_S = 5.0              # F11: no frame for this long: the camera is closed and opened again; while it stays
+STALL_REOPEN_MAX_S = 80.0         #      silent, after 10, 20, 40, then every 80 s
+TICK_FRESH_S = 1.0                # the status' tick_mapping: RTI's newest row no older than this
 _stop = False
 
 
@@ -207,6 +222,7 @@ class Client:
         self.inbuf = b""
         self.frames = self.skipped = 0
         self.last_preview = 0.0
+        self.since = self.last_progress = time.monotonic()   # connected; a payload taken or bytes sent (F3)
 
     def queue(self, payload: bytes, is_frame: bool = True) -> bool:
         if self.pending is not None:
@@ -214,6 +230,7 @@ class Client:
             return False
         self.pending = memoryview(payload)
         self.frames += is_frame
+        self.last_progress = time.monotonic()
         return True
 
     def flush(self) -> bool:
@@ -225,6 +242,8 @@ class Client:
                 return True
             except OSError:
                 return False
+            if n:
+                self.last_progress = time.monotonic()
             self.pending = self.pending[n:] if n < len(self.pending) else None
         return not (self.closing and self.pending is None)
 
@@ -381,6 +400,12 @@ class CameraServer:
         self.next_trace = 0.0
         self.beat = 0
         self.irq = {}
+        self.bad_frames = 0                    # frames dropped: flagged by the driver or an unfinished JPEG (F9)
+        self.bad_logged = -1e9
+        self.stalls = 0                        # reopens for no frames in a row (F11); 0 again at a frame
+        self.config_problem = ""               # a configuration file that does not parse (F23c): nothing changed
+        self.status_trim = ""                  # how far the last status had to be cut to fit (F6)
+        self.status_error = ""
         for p in self.problems:
             logger.warning(f"system.xml <camera>: {p} — its default is used")
 
@@ -388,7 +413,15 @@ class CameraServer:
 
     def check_settings(self) -> None:
         m = _mtime(SYSTEM_XML)
-        gcam, gname = camera_settings.gripper_camera(SYSTEM_XML, GRIPPERS_DIR)
+        gcam, gname, broken = camera_settings.read_gripper_camera(SYSTEM_XML, GRIPPERS_DIR)
+        if broken:                                 # a hand edit that does not parse: keep what runs (F23c)
+            if broken != self.config_problem:
+                logger.warning(f"{broken} — the camera keeps its settings until the file is fixed")
+            self.config_problem = broken
+            return
+        if self.config_problem:
+            logger.info("the configuration files parse again")
+            self.config_problem = ""
         if m == self.settings_mtime:
             # the gripper XML alone changed its timing calibration (api_tests/80 --apply): taken without a reopen
             if gname == self.gripper and gcam != self.gripper_cam and _without_timing(gcam) == _without_timing(
@@ -438,7 +471,8 @@ class CameraServer:
         named = dict(wanted)
 
         def is_mode(key):
-            return key.startswith("auto_") or key.endswith(("_automatic", "_auto"))
+            # "_automatic_continuous": the 6.8 kernel's continuous autofocus (review 2026-11-25, F21)
+            return key.startswith("auto_") or key.endswith(("_automatic", "_auto", "_automatic_continuous"))
 
         # The automatic modes first: a manual value (exposure_time_absolute, white_balance_temperature) is ignored
         # while its automatic mode is still on (the control reads "inactive"); then the camera is asked again.
@@ -550,13 +584,24 @@ class CameraServer:
     # ---- frames
 
     def on_frame(self, frame, now: float) -> None:
-        data, ts, seq, _flags = frame
+        data, ts, seq, buf_flags = frame
         self.last_frame = now
+        self.stalls = 0
         if self.message:                           # "no frame for N s" is over
             self._set_state("streaming", "")
         if self.prev_seq is not None:
             self.lost += max(0, seq - self.prev_seq - 1)
         self.prev_seq = seq
+        if buf_flags & BUF_FLAG_ERROR or not cp.is_complete_jpeg(data):
+            # never relayed (review 2026-11-25, F9: a truncated JPEG reached the clients, and one stopped the
+            # analyses); not numbered, so no client counts it as skipped
+            self.bad_frames += 1
+            if now - self.bad_logged > 60.0:
+                self.bad_logged = now
+                why = "flagged by the driver" if buf_flags & BUF_FLAG_ERROR else "an unfinished JPEG"
+                logger.warning(f"a broken frame dropped (driver sequence {seq}, {len(data)} bytes, {why}); "
+                               f"{self.bad_frames} so far")
+            return
         self.frame_no += 1
         self.frames += 1
         self.latest = data
@@ -621,7 +666,12 @@ class CameraServer:
         is not known yet, the camera has no metadata, or its time disagrees with `ts` (CLOCK_LAG_S)."""
         read_meta = getattr(self.cam, "read_meta", None)
         if read_meta is not None:
-            for mseq, err, data in read_meta():
+            try:
+                metas = read_meta()
+            except OSError as e:                   # the metadata node alone failed: the video goes on (F10)
+                self._meta_failed(e)
+                metas = []
+            for mseq, err, data in metas:
                 p = self.clock.add(data)
                 if p is not None and not err:
                     self.pts[mseq] = p
@@ -639,6 +689,18 @@ class CameraServer:
         self.driver_frames += 1
         self.time_source = "driver"
         return ts, pts or 0, False
+
+    def _meta_failed(self, e: OSError) -> None:
+        """The camera's metadata node raised (review 2026-11-25, F10: the error left on_frame, so no frame went out
+        while the video was fine): the node closed, the clock forgotten; the frames carry the driver's timestamps
+        until the camera is opened again."""
+        stop = getattr(self.cam, "stop_meta", None)
+        if stop is not None:
+            stop(f"the metadata node failed while streaming: {e}")
+        self.clock.reset()
+        self.pts.clear()
+        logger.warning(f"the camera's metadata node failed ({e}): frames carry the driver's timestamps until the "
+                       f"camera is opened again")
 
     def clock_status(self) -> dict:
         """The frame-time part of the status: where the times come from and how well the camera's clock fits."""
@@ -704,20 +766,57 @@ class CameraServer:
                                             "read_only", "inactive")} for c in self.controls],
             "fps": round(fps, 1), "mbit_s": round(mbit, 2),
             "frames": self.frames, "lost": self.lost, "reopens": self.reopens,
-            "tick_mapping": bool(self.tickmap.times),
+            # rows held AND recent (review 2026-11-25: it said yes with RTI stopped, its last rows still held)
+            "tick_mapping": bool(self.tickmap.times) and now - self.tickmap.times[-1] <= TICK_FRESH_S,
+            "bad_frames": self.bad_frames,
             "clock": self.clock_status(),
             "clients": [{"kind": c.kind, "addr": c.addr, "frames": c.frames, "skipped": c.skipped}
                         for c in self.clients if c.kind != "http"],
-            "settings": self.settings, "problems": self.problems + self.control_problems,
+            "settings": self.settings,
+            "problems": self.problems + self.control_problems + ([self.config_problem] if self.config_problem else []),
             "notes": self.control_notes,
             "irq_threads": self.irq,
             "port": CAMERA_PORT,
             "protocol": cp.CAMERA_PROTOCOL_VERSION,
         }
-        try:
-            self.status_str.set_json(status)
-        except Exception as e:                     # too big for the segment, or shared memory gone
-            logger.warning(f"status not published: {e}")
+        self.publish_fitting(status)
+
+    STATUS_BASICS = ("beat", "time", "pid", "state", "message", "gripper", "device", "card", "mode", "fps", "mbit_s",
+                     "frames", "lost", "reopens", "bad_frames", "tick_mapping", "settings", "problems", "notes", "port",
+                     "protocol")
+
+    def publish_fitting(self, status: dict) -> None:
+        """The status into its shared-memory string. When it does not fit (a camera with many controls or modes): the
+        control menus and the mode list left out, then everything but STATUS_BASICS — never not written at all
+        (review 2026-11-25, F6: an oversized status was not written, the beat froze, the supervisor reported a hang
+        and the log got a line a second). Every change of the cut is logged once."""
+        for trim in ("", "menus", "basics"):
+            if trim == "menus":
+                status = dict(status, modes=[], controls=[{k: v for k, v in c.items() if k != "menu"}
+                                                          for c in status.get("controls") or []])
+            elif trim == "basics":
+                status = {k: status[k] for k in self.STATUS_BASICS if k in status}
+            status["trimmed"] = trim or None
+            try:
+                self.status_str.set_json(status)
+            except ValueError:                     # too long for the string: cut more
+                continue
+            except Exception as e:                 # shared memory gone
+                if str(e) != self.status_error:
+                    logger.warning(f"status not published: {e}")
+                self.status_error = str(e)
+                return
+            if trim != self.status_trim:
+                if trim:
+                    left_out = "the control menus and the mode list" if trim == "menus" else "all but the basics"
+                    logger.warning(f"the status did not fit its {cp.STATUS_SIZE} bytes: published without {left_out}")
+                else:
+                    logger.info("the status fits its string again")
+            self.status_trim, self.status_error = trim, ""
+            return
+        if self.status_trim != "failed":
+            logger.warning("the status does not fit even cut to its basics: not published")
+        self.status_trim = "failed"
 
     # ---- the loop
 
@@ -725,8 +824,16 @@ class CameraServer:
         self.beat += 1
         if self.cam is None and now >= self.next_open:
             self.open_camera(now)
+        elif self.cam is not None and now - self.last_frame > min(STALL_REOPEN_S * 2 ** self.stalls,
+                                                                   STALL_REOPEN_MAX_S):
+            # a stalled stream is opened again (review 2026-11-25, F11: never, and the snapshot kept its last frame);
+            # twice as long each time while it stays silent
+            self.close_camera(f"no frame for {now - self.last_frame:.0f} s: opening it again")
+            self.reopens += 1
+            self.stalls += 1
+            self.next_open = now
         elif self.cam is not None and now - self.last_frame > 3.0:
-            self._set_state("streaming", f"no frame for {now - self.last_frame:.0f} s")
+            self._set_state("streaming", "no frame for 3 s or more")     # one log line, not one a second
         self.poll_trace(now)
         rlist = list(self.listeners) + [c.sock for c in self.clients] + ([self.cam] if self.cam else [])
         wlist = [c.sock for c in self.clients if c.pending is not None]
@@ -749,6 +856,12 @@ class CameraServer:
                 except OSError:
                     continue
                 if len(self.clients) >= MAX_CLIENTS:
+                    try:                           # told, not just closed: CameraClient names the reason (F2)
+                        conn.setblocking(False)
+                        conn.send(_http_reply("503 Service Unavailable", "text/plain",
+                                              b"the camera server has %d clients already" % MAX_CLIENTS))
+                    except OSError:
+                        pass
                     conn.close()
                     logger.warning(f"refused {addr[0]}: {MAX_CLIENTS} clients already")
                     continue
@@ -772,6 +885,12 @@ class CameraServer:
                             logger.info(f"frames client connected: {c.addr}")
             if alive and (c.sock in writable or c.pending is not None):
                 alive = c.flush()
+            if alive and c.kind == "http" and not c.closing and now - c.since > REQUEST_TIMEOUT_S:
+                alive = False                      # no whole request: a browser's preconnect, a port scan (F3)
+                logger.debug(f"closed {c.addr}: no request within {REQUEST_TIMEOUT_S:g} s")
+            elif alive and c.pending is not None and now - c.last_progress > CLIENT_STUCK_S:
+                alive = False                      # takes nothing: gone without a goodbye, a PC asleep (F3)
+                logger.info(f"closed {c.kind} client {c.addr}: it took nothing for {CLIENT_STUCK_S:g} s")
             if not alive:
                 gone.append(c)
         for c in gone:

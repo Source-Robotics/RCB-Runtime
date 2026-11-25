@@ -71,3 +71,11 @@ def unpack(data: bytes) -> dict:
     return {"header_length": hlen, "frame": frame, "driver_seq": seq, "width": w, "height": h, "flags": flags,
             "exposure_time": t_exp, "rti_tick": tick if not math.isnan(tick) else None, "exposure_us": exp_us,
             "pts": pts, "send_time": t_send, "jpeg_length": n}
+
+
+def is_complete_jpeg(data) -> bool:
+    """Starts with SOI and ends (trailing zero padding aside) with EOI: a frame the camera finished. The camera server
+    relays no other (review 2026-11-25, F9) and the analyses (api_tests/80, 81) leave such frames of older recordings
+    out. Here, not in hardware/uvc_camera.py (which needs Linux), so that the analysis kit has it on a PC."""
+    data = bytes(data)
+    return data[:2] == b"\xff\xd8" and data.rstrip(b"\0")[-2:] == b"\xff\xd9"
