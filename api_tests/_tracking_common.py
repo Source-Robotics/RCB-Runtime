@@ -38,7 +38,7 @@ class Capture:
         """The newest tick received (scans back past packets of another recipe)."""
         for raw in reversed(self.packets[-50:]):
             try:
-                r = parse_state_packet(raw.decode())
+                r = parse_state_packet(raw)             # text or binary (2026-11-26)
             except Exception:
                 continue
             if "tick" in r and "j_ac" in r:
@@ -56,7 +56,7 @@ def to_arrays(packets, joint_num=6):
     rows = {}
     for raw in packets:
         try:
-            r = parse_state_packet(raw.decode() if isinstance(raw, bytes) else raw)
+            r = parse_state_packet(raw)                 # text or binary (2026-11-26)
         except Exception:
             continue
         if all(k in r for k in NEED):

@@ -48,6 +48,10 @@ class TickContext:
     # Defaulted so existing TickContext(...) construction stays valid.
     motor_buffers: object = None
 
+    # This tick's state packet (bytes / bytearray: text or binary), built ONCE by RTI.py's _state_payload after the
+    # measurement (2026-11-26) and sent to the paired PC (rti_handler) and the telemetry. None: not built this tick.
+    payload: object = None
+
     # How many UDP packets drain_rti_udp() pulled off the socket this tick, accepted or
     # not. Only the NEWEST can be applied, so anything above 1 was discarded — and that is
     # invisible in every other metric: success rate still reads 100%, misses still read 0.

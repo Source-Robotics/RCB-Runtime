@@ -259,7 +259,7 @@ def parse_raw(captured):
     rows = []
     for ts, data in captured:
         try:
-            rows.append((ts, parse_state_packet(data.decode())))
+            rows.append((ts, parse_state_packet(data)))   # text or binary (2026-11-26)
         except Exception:
             continue
     return rows

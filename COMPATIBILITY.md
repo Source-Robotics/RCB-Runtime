@@ -23,7 +23,9 @@ first. What changed in each release is in `CHANGELOG.md`.
 - **Command protocol:** the newline JSON the executor speaks on TCP port 29000. Its number goes up only when a
   command or field changes incompatibly.
 - **RTI protocol:** the binary command packet of real-time streaming. Same rule.
-- **Telemetry format:** the `tag:value,...` state and telemetry packets. Same rule.
+- **Telemetry format:** the state and telemetry packets. Same rule. 1: text (`tag:value,...`); 2 (2026-11-26): text
+  or binary, binary the robot's default. A client of format 2 also reads a robot of format 1; a client of format 1
+  cannot read binary and refuses a robot of format 2.
 - **Camera protocol:** the camera server's frame header (`communication/camera_protocol.py`). Same rule. "—" = the
   release has no camera server.
 - **Config formats:** the newest format number this runtime reads, for every kind of configuration file: system,

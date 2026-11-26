@@ -73,7 +73,11 @@ from utility.error_checks import (
     CLEAR_ERROR_SETTLE_TICKS, CLEAR_ERROR_SEND_REPEATS, BOOT_CLEAR_TICK,
 )
 from utility.activity_log import get_rti_activity_logger, log_activity, note_origin
-from utility.trace_ring import TraceWriter, mark_clean_stop
+from utility.trace_ring import TraceWriter, mark_clean_stop, mode_names
+from data.trace_channels import trace_sources
+from utility.binary_packet import BinaryPacker
+from communication.telemetry_link import TelemetryLink
+from config.networking import TELEMETRY_PORT, parse_telemetry_destination
 from robotics.hall_check import HallCheck, hall_joint_index
 from robotics.free_joint import FreeJoint
 from robotics.joint_test import JointTest
@@ -205,6 +209,8 @@ class LoopState:
         "rti_pc_ip", "rti_transport", "rti_tcp_conn",
         # freedrive walls
         "_joint_walls", "_wall_haptic",
+        # RTI's packets (2026-11-26): the format, the UDP destination, the recorder link's drops already logged
+        "telemetry_binary", "telemetry_dest", "telemetry_drops_logged",
     )
 
 
@@ -420,6 +426,9 @@ def main():
     # cheap and idle until a PC dials in; nothing accepts a connection unless rti_connect has
     # named an allowed IP and asked for "tcp".
     RTI_tcp_listener = init_rti_tcp_listener()
+    # The recorder link (2026-11-26, communication/telemetry_link.py): a program connects to TELEMETRY_TCP_PORT and gets
+    # every tick's packet over TCP. Bound at startup like the listener above; looked at every 25 ticks.
+    telemetry_link = TelemetryLink()
 
     # ==========================================================================
     # Get robot data from XML
@@ -744,28 +753,59 @@ def main():
     # Every tick's values into a ring in shared memory, for recorder.py — the incident dumps and captures are made THERE,
     # with its own interpreter (utility/trace_ring.py, 2026-10-16: made in RTI's process they cost loop time). The same
     # arrays and names as the history entry (utility/data_init.process_joint_data); each keeps its identity for the run.
-    # j_rx is the trace's alone (2026-11-25): each joint's reply receive time on RTI's clock (data/shared_data.py
-    # motor_reply_time), for recordings that pair joints with camera pictures on their true times; no telemetry tag.
-    trace = TraceWriter((
-        ("j_p", shared_data.joint['joint_position']), ("j_s", shared_data.joint['joint_speed']),
-        ("j_t", shared_data.joint['joint_torque']), ("j_a", shared_data.joint['joint_acceleration']),
-        ("j_j", shared_data.joint['joint_jerk']), ("j_s_f", shared_data.joint['joint_speed_filtered']),
-        ("j_t_f", shared_data.joint['joint_torque_filtered']), ("j_a_f", shared_data.joint['joint_acceleration_filtered']),
-        ("j_j_f", shared_data.joint['joint_jerk_filtered']), ("TCP_p", shared_data.tcp['robot_pose']),
-        ("TCP_p_SE3", shared_data.tcp['robot_pose_matrix']), ("TCP_p_quat", shared_data.tcp['robot_pose_quaternion']),
-        ("TCP_s", shared_data.tcp['TCP_speed']), ("TCP_s_f", shared_data.tcp['TCP_speed_filtered']),
-        ("TCP_a", shared_data.tcp['TCP_acceleration_raw']), ("TCP_a_f", shared_data.tcp['TCP_acceleration_filtered']),
-        ("t_ext", shared_data.tcp['torque_external']), ("TCP_f_ext", shared_data.tcp['force_external']),
-        ("TCP_f_ext_tool", shared_data.tcp['force_external_tool']),
-        ("j_pc", shared_data.joint['joint_position_commanded']), ("j_sc", shared_data.joint['joint_speed_commanded']),
-        ("j_ac", shared_data.joint['joint_acceleration_commanded']), ("j_tc", shared_data.joint['joint_torque_commanded']),
-        ("TCP_p_c", shared_data.tcp['TCP_pose_commanded']), ("TCP_s_c", shared_data.tcp['TCP_speed_commanded']),
-        ("j_pt", shared_data.joint['joint_position_target']), ("j_st", shared_data.joint['joint_speed_target']),
-        ("j_at", shared_data.joint['joint_acceleration_target']), ("j_tt", shared_data.joint['joint_torque_target']),
-        ("j_t_inertia", shared_data.joint['joint_inertia_torque']), ("j_t_coriolis", shared_data.joint['joint_coriolis_torque']),
-        ("TCP_p_t", shared_data.tcp['TCP_pose_target']), ("TCP_s_t", shared_data.tcp['TCP_speed_target']),
-        ("j_err", motor_error_bytes), ("j_rx", shared_data.motor['motor_reply_time']),
-    ), tick_s=delta_t)
+    # j_rx (2026-11-25): each joint's reply receive time on RTI's clock (data/shared_data.py motor_reply_time), for
+    # recordings that pair joints with camera pictures on their true times. Since 2026-11-26 the trace carries every
+    # telemetry tag (data/trace_channels.py: the first 35 channels are the ones listed here before), the seldom-changing
+    # ones in a slow block refreshed a fifth per tick (TODO/p4_recording_plan.md 2B).
+    _trace_fast, _trace_slow = trace_sources(shared_data, motor_error_bytes)
+    trace = TraceWriter(_trace_fast, tick_s=delta_t, slow=_trace_slow)
+    _gripper_target_arrays = (shared_data.gripper['gripper_position_target'],
+                              shared_data.gripper['gripper_speed_target'],
+                              shared_data.gripper['gripper_current_target'],
+                              shared_data.gripper['gripper_action_target'])
+    # RTI's packets (2026-11-26, TODO/p4_recording_plan.md 2B): ONE a tick (_state_payload), text or binary (system.xml
+    # <telemetry format>, set_telemetry_format), to the paired PC, the UDP destination (<telemetry destination>,
+    # set_telemetry_destination) and the recorder link. Binary packets are copied out of the trace row.
+    binary_packer = BinaryPacker(trace.columns, mode_names())
+    st.telemetry_binary = _sys["telemetry"]["format"] == "binary"
+    st.telemetry_dest = (_sys["telemetry"]["destination"], TELEMETRY_PORT)
+    st.telemetry_drops_logged = 0
+
+    def _publish_telemetry_status():
+        """The status string (shared_data.telemetry_status): at the start and when something in it changes."""
+        telemetry_link.changed = False
+        peer = telemetry_link.peer
+        shared_data.telemetry_status.set(json.dumps({
+            "format": "binary" if st.telemetry_binary else "text",
+            "destination": st.telemetry_dest[0], "port": st.telemetry_dest[1],
+            "tcp_port": telemetry_link.port, "tcp_peer": f"{peer[0]}:{peer[1]}" if peer else "",
+            "tcp_drops": telemetry_link.drops}))
+        if peer:
+            log_recipe.info("recorder link: %s:%d connected (TCP %d)", peer[0], peer[1], telemetry_link.port)
+        if telemetry_link.drops > st.telemetry_drops_logged:
+            st.telemetry_drops_logged = telemetry_link.drops
+            log_recipe.warning("recorder link dropped: the program stopped reading (%d MB queued); %d so far",
+                               telemetry_link.max_backlog >> 20, telemetry_link.drops)
+
+    _publish_telemetry_status()
+    log_recipe.info("telemetry: %s packets to %s:%d over UDP; a recorder can connect over TCP %d",
+                    "binary" if st.telemetry_binary else "text", st.telemetry_dest[0], st.telemetry_dest[1],
+                    telemetry_link.port)
+
+    def _state_payload(recipe):
+        """This tick's packet, built ONCE for every receiver (2026-11-26; in RTI mode the text was built twice). Binary:
+        the recipe's tags copied out of the trace row just written (~4 us, any recipe); the packet's map is rebuilt
+        when the recipe changes. Text: build_payload, as before."""
+        if st.telemetry_binary:
+            if trace.last is None:
+                return None
+            if binary_packer.recipe is not recipe:
+                skipped = binary_packer.set_fields(recipe.fields, recipe)
+                if skipped:
+                    log_recipe.warning("recipe %s: %s not in RTI's trace — left out of the binary packets",
+                                       recipe.name, ", ".join(skipped))
+            return binary_packer.pack(trace.last)
+        return build_payload(recipe, Joint_data, Gripper_data, motor_buffers, joint_num, trace=trace).encode()
 
 
     scheduled_state = {"step": 0,"joint_index": 0,"device_info_counter": 0}
@@ -2911,6 +2951,32 @@ def main():
         log_recipe.info("Active recipe -> %s", name)
 
 
+    def _handle_set_telemetry_format(cmd_msg, cmd_dict):
+        """set_telemetry_format:<text|binary> — the format of every packet RTI sends (2026-11-26): the paired PC's, the
+        UDP telemetry's and the recorder link's. Takes effect on the next tick; the status shows it."""
+        parts = cmd_msg.split(":", 1)
+        fmt = parts[1].strip().lower() if len(parts) == 2 else ""
+        if fmt not in ("text", "binary"):
+            _refused(log_recipe, "set_telemetry_format refused: %r is not text / binary", fmt)
+            return
+        st.telemetry_binary = fmt == "binary"
+        binary_packer.recipe = None                   # the binary packet's map is rebuilt on its next tick
+        _publish_telemetry_status()
+        log_recipe.info("telemetry format -> %s", fmt)
+
+    def _handle_set_telemetry_destination(cmd_msg, cmd_dict):
+        """set_telemetry_destination:<IPv4 address|broadcast> — where the UDP telemetry goes (2026-11-26); system.xml's
+        <telemetry destination> is the start value. A name is refused: RTI never resolves names in its tick."""
+        parts = cmd_msg.split(":", 1)
+        try:
+            dest = parse_telemetry_destination(parts[1] if len(parts) == 2 else "")
+        except ValueError as e:
+            _refused(log_recipe, "set_telemetry_destination refused: %s", e)
+            return
+        st.telemetry_dest = (dest, TELEMETRY_PORT)
+        _publish_telemetry_status()
+        log_recipe.info("telemetry destination -> %s:%d", dest, TELEMETRY_PORT)
+
     def _handle_rti_set_start_pose_check(cmd_msg, cmd_dict):
         """rti_set_start_pose_check:<0|1> — validate the first setpoint after rti_claim."""
         parts = cmd_msg.split(":", 1)
@@ -3025,6 +3091,8 @@ def main():
         "set_joint_walls":          _handle_set_joint_walls,
         "rti_set_min_duration":     _handle_rti_set_min_duration,
         "set_recipe":               _handle_set_recipe,
+        "set_telemetry_format":     _handle_set_telemetry_format,
+        "set_telemetry_destination": _handle_set_telemetry_destination,
         "rti_set_start_pose_check": _handle_rti_set_start_pose_check,
         "rti_set_lowpass":          _handle_rti_set_lowpass,
     }
@@ -3192,6 +3260,13 @@ def main():
                            # when this tick's CAN read ran (CLOCK_REALTIME, the clock candump stamps frames with)
                            can_read_t=_can_age_buf[2],
                         )
+        # The firmware gripper's command state as the trace's g_pt / g_st / g_ct / g_at (2026-11-26): what RTI asks the
+        # gripper for this tick; NaN outside firmware mode (the motor mode's targets are g_jpt / g_jst / g_jft)
+        _fw = active_CAN_gripper and shared_data.rti['gripper_ctrl_mode'][0] == 2
+        _gripper_target_arrays[0][0] = _gripper_fw_state['position'] if _fw else np.nan
+        _gripper_target_arrays[1][0] = _gripper_fw_state['speed'] if _fw else np.nan
+        _gripper_target_arrays[2][0] = _gripper_fw_state['current'] if _fw else np.nan
+        _gripper_target_arrays[3][0] = _gripper_fw_state['action'] if _fw else np.nan
         # ...and the same tick into the shared-memory trace for recorder.py (one C call of these arrays, ~9 us)
         trace.write(_hist_t, st.loop_execution_time, _tick_now, shared_data.rti["rti_seq_rx_last"][0],
                     shared_data.rti["control_success_rate"][0], shared_data.rti["rti_consecutive_misses"][0],
@@ -3679,8 +3754,8 @@ def main():
         # Resolved here rather than at the telemetry block below because RTI mode's
         # handler serialises its own state packet during dispatch, which runs first.
         # recipe_mgr.get() is a cached name comparison, so this is the same one
-        # resolution per tick it always was — the telemetry block reuses it.
-        ctx.recipe = recipe = recipe_mgr.get(shared_data.active_recipe.get())
+        # resolution per tick it always was — the tick's one packet (_state_payload) uses it.
+        ctx.recipe = recipe_mgr.get(shared_data.active_recipe.get())
         _profile_last = _profile_mark(_profile_last, "udp_rx_context")
 
         # The Hall sensor check (robotics/hall_check.py): read the joint's pin; stop it — the joint's limits restored —
@@ -3843,7 +3918,8 @@ def main():
         # Mode dispatch — each handler sends its own CAN commands
         # ==========================================================================
         shared_data.rti["can_read_first"][0] = _read_first
-        rti_handler.defer_state = _read_first   # option B: the state packet after the send (flush_state, below)
+        rti_handler.defer_state = True          # the state packet after the measurement, in both orders (flush_state,
+                                                # below: the packet is built once a tick, 2026-11-26)
         if first_frame_wait.enabled:
             first_frame_wait.prepare()           # stale echoes out BEFORE this tick's commands are queued
         _tick_result = dispatch_step(MODE_HANDLERS.get(st.current_mode), ctx)
@@ -3968,7 +4044,6 @@ def main():
             # Option B: the rest of the measurement and the history entry now, after the commands left; then the RTI
             # state packet (this tick's measurement with this tick's command).
             _measure_rest()
-            rti_handler.flush_state(ctx)
         else:
             _measure()
 
@@ -3986,6 +4061,12 @@ def main():
                 shared_data.gripper['gripper_joint_force_commanded'][0],
             ) 
         _profile_last = _profile_mark(_profile_last, "gripper_history")
+        # This tick's packet, built ONCE (2026-11-26) after the whole measurement and the gripper's entry: the paired
+        # PC's state packet now (both tick orders: the handler only marks it), the UDP telemetry and the recorder link
+        # below — the same bytes.
+        ctx.payload = _state_payload(ctx.recipe)
+        rti_handler.flush_state(ctx)
+        _profile_last = _profile_mark(_profile_last, "state_packet")
 
 
 
@@ -3996,9 +4077,13 @@ def main():
         # ==========================================================================
         # Recipe and filter reloads arrive as commands carrying the parsed data (reload_recipes / reload_filters,
         # 2026-10-04) — the loop reads no file for them; the two shared-memory signals are no longer polled.
-        # `recipe` was resolved into ctx near the top of this tick (see udp_rx_context).
-        payload = build_payload(recipe, Joint_data, Gripper_data, motor_buffers, joint_num)
-        broadcast_udp_telemetry(telemetry_socket, payload)
+        # The packet built once this tick (_state_payload, after the measurement, 2026-11-26): the UDP telemetry and the
+        # recorder link get the bytes the paired PC got.
+        if ctx.payload is not None:
+            broadcast_udp_telemetry(telemetry_socket, ctx.payload, st.telemetry_dest)
+        telemetry_link.tick(ctx.current_tick, ctx.payload)
+        if telemetry_link.changed:
+            _publish_telemetry_status()
         _profile_last = _profile_mark(_profile_last, "telemetry")
 
 

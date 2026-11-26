@@ -15,6 +15,7 @@ from .rti_client import (
 )
 # camera_client: the wrist camera's frames (2026-11-24, camera plan P2); standard library only, like rti_client.
 from .camera_client import CameraClient, CameraFrame
+from .telemetry import TelemetryClient, decode_packet
 from .exceptions import (
     RobotError, RobotConnectionError, RobotTimeout, CommandRejected, MotionFailed,
     GripFailed,
@@ -56,6 +57,7 @@ __all__ = [
     "RTIClient", "JointPositionCommand", "JointVelocityCommand", "JointTorqueCommand",
     "MotionFinished", "RobotState", "ControlLost",
     "CameraClient", "CameraFrame",
+    "TelemetryClient", "decode_packet",
     "DryRunRobotClient", "DryRunPlan",
     "RobotError", "RobotConnectionError", "RobotTimeout", "CommandRejected",
     "MotionFailed",

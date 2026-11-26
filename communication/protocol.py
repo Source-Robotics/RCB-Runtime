@@ -337,6 +337,9 @@ COMMAND_RULES = {
     "release_control":          (IMMEDIATE, None, None, False),
     "rti_set_min_duration":     (IMMEDIATE, None, None, False),
     "set_recipe":               (IMMEDIATE, None, None, False),
+    # RTI's packets (2026-11-26, TODO/p4_recording_plan.md 2B): text / binary, and where the UDP telemetry goes
+    "set_telemetry_format":     (IMMEDIATE, None, None, False),
+    "set_telemetry_destination": (IMMEDIATE, None, None, False),
     "rti_set_start_pose_check": (IMMEDIATE, None, None, False),
     "rti_set_lowpass":          (IMMEDIATE, None, None, False),
     # Gripper immediate controls (distinct from the queued open_gripper / close_gripper / move_gripper

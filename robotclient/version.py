@@ -29,12 +29,16 @@ PROTOCOL_VERSION = 4        # the command protocol (newline JSON over TCP to the
                             # from 1, set_sound's drive, rti_set_vel_scale in percent, motion waits unbounded
                             # by default
 RTI_PROTOCOL_VERSION = 1    # the RTI command packet
-TELEMETRY_FORMAT = 1        # the state / telemetry packets ("tag:v,v,...")
+TELEMETRY_FORMAT = 2        # the state / telemetry packets: 1 text ("tag:v,v,..."); 2 (2026-11-26) text or binary,
+                            # binary the robot's default (robotclient/telemetry.py reads both)
 CAMERA_PROTOCOL_VERSION = 1  # the camera server's frame header (communication/camera_protocol.py, 2026-11-24)
 
 # What a client checks at connect, by the robot's status key "protocols".
 SPOKEN = {"commands": PROTOCOL_VERSION, "rti": RTI_PROTOCOL_VERSION, "telemetry": TELEMETRY_FORMAT,
           "camera": CAMERA_PROTOCOL_VERSION}
+# Older numbers this client still reads in full (2026-11-26): a robot of telemetry format 1 sends only text, which
+# robotclient/telemetry.py reads — so a new client works with that robot. Every other protocol: equal numbers only.
+ALSO_READS = {"telemetry": (1,)}
 
 # The first runtime whose executor knows the renamed command IDs; a robot older than it gets the IDs below
 # (every ID the 0.9.0 release accepts). The two aliases set_default_profile / set_default_ik_solver are not here:
@@ -86,7 +90,7 @@ def check_protocols(status: dict | None, which: tuple[str, ...], allow_mismatch:
     """Compare the robot's protocol versions (its status message's "protocols") with this client's, for the protocols
     in `which`. Returns True when the robot reported them all.
 
-    - equal: nothing happens.
+    - equal, or an older number this client still reads (ALSO_READS: telemetry 1): nothing happens.
     - different: VersionMismatch (names each protocol, both numbers and both versions), unless allow_mismatch.
     - the robot reports none (its runtime predates versioning, before 0.9.0): a VersionWarning, unless allow_mismatch —
       it works as it did, but this client may use commands that robot does not have.
@@ -100,7 +104,8 @@ def check_protocols(status: dict | None, which: tuple[str, ...], allow_mismatch:
                           f"UNKNOWN_CMD). Update the robot's runtime, or connect with allow_mismatch=True to silence this.",
                           VersionWarning, stacklevel=3)
         return False
-    wrong = [f"{k}: robot {theirs[k]}, this client {SPOKEN[k]}" for k in which if theirs[k] != SPOKEN[k]]
+    wrong = [f"{k}: robot {theirs[k]}, this client {SPOKEN[k]}" for k in which
+             if theirs[k] != SPOKEN[k] and theirs[k] not in ALSO_READS.get(k, ())]
     if wrong and not allow_mismatch:
         raise VersionMismatch(
             f"incompatible protocol ({'; '.join(wrong)}). The robot runs runtime {status.get('runtime_version', '?')}, "

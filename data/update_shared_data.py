@@ -438,6 +438,10 @@ def update_motor_and_gripper_data(
         shared_data.gripper['gripper_motor_position'][:] = m["position"]
         shared_data.gripper['gripper_motor_speed'][:] = m["speed"]
         shared_data.gripper['gripper_motor_current'][:] = m["current"]
+        # The latest reply's receive time on RTI's clock (2026-11-26): firmware mode answers into Gripper_data, motor
+        # mode into Motor_data — the newer of the two is the reply in use (-1 / None = none yet)
+        rx = max(g.get("timestamp") or -1.0, m.get("timestamp") or -1.0)
+        shared_data.gripper['gripper_reply_time'][0] = rx + rx_to_rti if rx > 0 else np.nan
 
         # --- Gripper motor health (polled fields, same cadence as joint motors) ---
         gm_idx = joint_num  # gripper is the last motor in all data arrays

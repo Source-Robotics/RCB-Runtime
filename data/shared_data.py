@@ -202,6 +202,7 @@ control_board = {}
 control_board_data = None   # flat (4,) int32 — backward-compatible PCB register array
 cb_command_ = cb_status = cb_current_error = None
 active_recipe = None                       # SharedString: name of the active data recipe
+telemetry_status = None                    # SharedString: RTI's packets as JSON (format, destination, recorder link)
 recipe_reload_signal = None                # SharedString: set to "1" to trigger recipe_mgr.reload()
 filter_reload_signal = None                # SharedString: set to "1" to rebuild filter banks from config/filters.xml (hot reload, no restart)
 clear_error_signal = None                  # SharedString: GUI sets to "1" to clear the RTI error latch
@@ -279,6 +280,7 @@ def setup(joints: int = 6, force_reinit: bool = False):
     global shm_GPIO, gpio_states
     global control_board_shms, control_board, control_board_data
     global cb_command_, cb_status, cb_current_error, active_recipe, recipe_reload_signal, filter_reload_signal, clear_error_signal
+    global telemetry_status
     global loop_stats_reset_signal
     global rti, rti_shms, gripper_shms, gripper
     global system_info_shms
@@ -607,6 +609,10 @@ def setup(joints: int = 6, force_reinit: bool = False):
     active_recipe = SharedString("active_recipe", 64)
     if active_recipe.created or not active_recipe.get():
         active_recipe.set("standard")   # the default for a new segment only; RTI sets it at its own start (2026-10-24)
+    # RTI's packets (2026-11-26, TODO/p4_recording_plan.md 2B): {"format": "text" | "binary", "destination": the UDP
+    # address, "port": its port, "tcp_port": the recorder link's port, "tcp_peer": "ip:port" or "", "tcp_drops": n}.
+    # RTI sets it at its start and when one of them changes (never per tick); the executor's status shows it.
+    telemetry_status = SharedString("telemetry_status", 512)
 
     # Signal flag: GUI sets to "1" after uploading a new recipe XML file;
     # RTI calls recipe_mgr.reload() and clears it back to "0".
@@ -954,6 +960,15 @@ def setup(joints: int = 6, force_reinit: bool = False):
         "gripper_joint_position_commanded",  # When in motor mode (Unit: m)
         "gripper_joint_speed_commanded",     # When in motor mode (Unit: m/s)
         "gripper_joint_force_commanded",     # When in motor mode (Unit: N)
+        # Firmware mode (2026-11-26, TODO/p4_recording_plan.md 2B): what RTI asks the gripper for — position and speed
+        # on the firmware's 0-255 scale, current in mA, action 1 = move / hold, 0 = idle; NaN outside firmware mode.
+        # RTI writes them every tick from its command state, just before the trace row.
+        "gripper_position_target",
+        "gripper_speed_target",
+        "gripper_current_target",
+        "gripper_action_target",
+        # When the gripper's latest reply arrived, on RTI's clock (as motor_reply_time); NaN before the first reply.
+        "gripper_reply_time",
     ]:
         shm, arr = _attach_or_create(name, np.float64, 1)
         gripper_shms[name] = shm

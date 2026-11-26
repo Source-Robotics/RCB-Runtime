@@ -95,7 +95,7 @@ def to_arrays(packets, joint_num=6):
     rows = []
     for raw in packets:
         try:
-            r = parse_state_packet(raw.decode() if isinstance(raw, bytes) else raw)
+            r = parse_state_packet(raw)                 # text or binary (2026-11-26)
         except Exception:
             continue
         if all(k in r for k in need):

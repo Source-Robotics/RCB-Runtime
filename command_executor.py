@@ -793,6 +793,8 @@ RTI_ANSWER_CODES = {
     "set_payload": ("RTI_REFUSED",),
     "set_pid_gains": ("RTI_REFUSED",),          # in FLASHING (review C4, 2026-11-20)
     "set_recipe": ("RTI_REFUSED",),
+    "set_telemetry_destination": ("RTI_REFUSED",),
+    "set_telemetry_format": ("RTI_REFUSED",),
     "set_sound": ("RTI_REFUSED",),
     "stop": ("RTI_REFUSED",),
     "store_gripper_tool_id": ("RTI_REFUSED",),
@@ -2616,6 +2618,20 @@ def _arg_one_of(*allowed):
     return check
 
 
+def _arg_telemetry_destination(v):
+    """set_telemetry_destination's address: an IPv4 address or "broadcast" (config/networking, 2026-11-26)."""
+    from config.networking import parse_telemetry_destination
+    return parse_telemetry_destination(v)
+
+
+def _telemetry_status() -> dict:
+    """RTI's packets as RTI last published them (shared_data.telemetry_status): {} before RTI has started."""
+    try:
+        return json.loads(shared_data.telemetry_status.get() or "{}")
+    except ValueError:
+        return {}
+
+
 def _arg_recipe(v):
     if str(v).strip() not in _recipe_names():
         raise ValueError("a recipe on disk: " + ", ".join(_recipe_names()))
@@ -3321,6 +3337,10 @@ IMMEDIATE_HANDLERS = {
     "set_force_confirm":        _handle_set_force_confirm,
     "rti_set_min_duration":     _forward_fmt("rti_set_min_duration", "rti_set_min_duration", 1, (_arg_nonneg,)),
     "set_recipe":               _forward_fmt("set_recipe", "set_recipe", 1, (_arg_recipe,)),
+    "set_telemetry_format":     _forward_fmt("set_telemetry_format", "set_telemetry_format", 1,
+                                             (_arg_one_of("text", "binary"),)),
+    "set_telemetry_destination": _forward_fmt("set_telemetry_destination", "set_telemetry_destination", 1,
+                                              (_arg_telemetry_destination,)),
     "rti_set_start_pose_check": _forward_fmt("rti_set_start_pose_check",
                                              "rti_set_start_pose_check", 1, (_arg_switch,)),
     "rti_set_lowpass":  _forward_fmt("rti_set_lowpass", "rti_set_lowpass", 1, (_arg_nonneg,)),
@@ -3514,6 +3534,9 @@ def current_status():
         # operator why a tag they expected is missing from their packets.
         "recipe": shared_data.active_recipe.get(),
         "recipes": _recipe_names_cached(),
+        # RTI's packets (2026-11-26): format (text / binary), the UDP destination and port, the recorder link's TCP
+        # port and who is connected to it ("ip:port" or ""), and how many links it dropped for falling behind.
+        "telemetry": _telemetry_status(),
         # The two freedrive switches (IDLE): gravity comp (the arm floats) and friction compensation on top of it.
         "gravity_comp": bool(shared_data.rti["gravity_comp_enabled"][0] > 0.5),
         "friction_comp": bool(shared_data.rti["friction_comp_enabled"][0] > 0.5),

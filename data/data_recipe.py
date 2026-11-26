@@ -60,6 +60,7 @@ import logging
 from config.schema_versions import SchemaError, check_schema
 from data.robotics_data import TAGS
 from utility.serialization import (
+    serialize_trace,
     serialize_optimized,
     serialize_motor_data,
     serialize_gripper_motor_data,
@@ -86,7 +87,7 @@ class DataRecipe:
         "_joint_fields", "_gripper_fields",
         "_motor_fields", "_gripper_motor_fields",
         "_motor_config_fields", "_gripper_config_fields",
-        "_prec_map",
+        "_trace_fields", "_prec_map",
     )
 
     def __init__(self, name: str, fields: list, precision_overrides: dict):
@@ -100,6 +101,7 @@ class DataRecipe:
         self._gripper_motor_fields  = [t for t in fields if t in TAGS and TAGS[t]["src"] == "gripper_motor"]
         self._motor_config_fields   = [t for t in fields if t in TAGS and TAGS[t]["src"] == "motor_config"]
         self._gripper_config_fields = [t for t in fields if t in TAGS and TAGS[t]["src"] == "gripper_config"]
+        self._trace_fields          = [t for t in fields if t in TAGS and TAGS[t]["src"] == "trace"]
 
         # Pre-compute full precision map — used directly by serialize_optimized()
         self._prec_map = {
@@ -192,9 +194,12 @@ def _recipe_from_root(root: ET.Element, label: str) -> Optional[DataRecipe]:
 # Payload builder  — called every RTI tick — zero allocation
 # ================================================================
 
-def build_payload(recipe: DataRecipe, Joint_data, Gripper_data, motor_buffers, joint_num: int) -> str:
+def build_payload(recipe: DataRecipe, Joint_data, Gripper_data, motor_buffers, joint_num: int, trace=None) -> str:
     """
     Serialize the recipe into one comma-separated string.
+
+    trace: RTI's TraceWriter (utility/trace_ring.py) — the src "trace" tags (2026-11-26) are formatted from its newest
+    row; without it (or before its first row) they are left out.
 
     motor_buffers is a dict bundling the three per-node motor deque dicts:
         {"data": Motor_data, "temperature": Motor_temperature_data,
@@ -227,6 +232,9 @@ def build_payload(recipe: DataRecipe, Joint_data, Gripper_data, motor_buffers, j
             parts.append(
                 serialize_optimized(Gripper_data[gripper_id], recipe._gripper_fields, recipe._prec_map)
             )
+
+    if recipe._trace_fields and trace is not None and trace.last is not None:
+        parts.append(serialize_trace(trace.last, trace.columns, recipe._trace_fields, recipe._prec_map))
 
     return ",".join(p for p in parts if p)
 

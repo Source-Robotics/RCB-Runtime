@@ -36,6 +36,7 @@ import struct
 import time
 
 from .version import check_protocols   # stdlib only (versioning V3): the RTI packet + telemetry format check
+from .telemetry import decode_packet    # text or binary state packets (2026-11-26)
 
 # --- Command types. MUST match communication/rti_protocol.py ---------------
 CMD_JOINT_POSITION = 0x01
@@ -54,6 +55,7 @@ CMD_TS_SIZE = CMD_SIZE + 8            # + the optional send time (communication/
 RTI_PORT_RECEIVE = 30001
 RTI_PORT_SENDER = 30002
 RTI_PORT_STREAM_TCP = 30003
+_MAX_DATAGRAM = 65535       # a state packet with every tag is ~5 KB in binary, more as text (2026-11-26: was 4096)
 
 # Recipe tags whose values are per-joint vectors rather than scalars are not
 # enumerated here — the parser infers arity from how many values follow a tag.
@@ -71,39 +73,14 @@ def pack_command_packet(seq: int, cmd_type: int, payload: Sequence[float], feedf
     return data
 
 
-def parse_state_packet(text: str) -> dict:
-    """Parse the robot's recipe payload into {tag: value or [values]}.
+def parse_state_packet(packet) -> dict:
+    """Parse one of the robot's state packets into {tag: value or [values]}.
 
-    Wire format (utility/serialization.py) is a flat comma-separated list where only
-    the FIRST value of a vector carries its tag:
-
-        j_p:0.12,1.45,-0.78,0.0,1.23,-0.56,j_s:0.01,-0.02,...,tick:12345
-
-    So a chunk containing ':' opens a new tag and every following bare chunk belongs
-    to it. Splitting on ',' alone (and requiring ':' per chunk) silently drops every
-    joint array — that was the 2026-08-01 draft's bug.
+    `packet`: the text (str) or the packet as received (bytes): text or binary, told apart by its first bytes
+    (robotclient/telemetry.py describes both formats). A tag with one value maps to a number, a tag with several to a
+    list, `mode` to its name.
     """
-    out = {}
-    tag = None
-    for chunk in text.split(','):
-        if not chunk:
-            continue
-        if ':' in chunk:
-            tag, _, first = chunk.partition(':')
-            tag = tag.strip()
-            out[tag] = [_num(first)]
-        elif tag is not None:
-            out[tag].append(_num(chunk))
-    # Collapse single-element lists to scalars so state["tick"] is a number.
-    return {k: (v[0] if len(v) == 1 else v) for k, v in out.items()}
-
-
-def _num(s):
-    s = s.strip()
-    try:
-        return float(s)
-    except ValueError:
-        return s
+    return decode_packet(packet)
 
 
 class RobotState(dict):
@@ -1341,7 +1318,7 @@ class RTIClient:
         try:
             while True:
                 try:
-                    data, addr = self._recv_sock.recvfrom(4096)
+                    data, addr = self._recv_sock.recvfrom(_MAX_DATAGRAM)
                 except (BlockingIOError, socket.timeout):
                     break
                 if not self._from_robot(addr):
@@ -1376,7 +1353,7 @@ class RTIClient:
             if left <= 0:
                 raise socket.timeout()
             self._recv_sock.settimeout(left)
-            data, addr = self._recv_sock.recvfrom(4096)
+            data, addr = self._recv_sock.recvfrom(_MAX_DATAGRAM)
             if self._from_robot(addr):
                 return data
 
@@ -1395,7 +1372,7 @@ class RTIClient:
     def _decode(self, data):
         self.bytes_rx += len(data)
         state = RobotState()
-        state.update(parse_state_packet(data.decode('utf-8', errors='replace')))
+        state.update(decode_packet(data))
         self._match_echo(state)
         if "rti_ok" in state:
             self._last_ok = state["rti_ok"]

@@ -40,6 +40,7 @@ GUI_PORT             = 8081   # NiceGUI web dashboard (local)
 
 # --- Telemetry broadcast (robot → local network, always running) ---
 TELEMETRY_PORT        = 30003  # Destination port for UDP broadcast telemetry
+TELEMETRY_TCP_PORT    = 30004  # RTI listens: a recorder connects and gets every tick's packet (2026-11-26, P4)
 SOURCE_PORT_BROADCAST = 30030  # Robot's fixed source port for telemetry sends
 
 # Destination address for telemetry packets.
@@ -470,24 +471,45 @@ def drain_rti_udp(sock, allowed_ip, allowed_port):
     return latest_data, received
 
 
-def broadcast_udp_telemetry(sock, data):
+TELEMETRY_FORMATS = ("text", "binary")   # RTI's packet formats (TELEMETRY_FORMAT 1 and 2, 2026-11-26)
+
+
+def parse_telemetry_destination(text) -> str:
+    """Where the UDP telemetry goes, from system.xml or set_telemetry_destination (2026-11-26): an IPv4 address, or
+    "broadcast" for 255.255.255.255 (every device on the network, as before). Raises ValueError for anything else
+    (a host name, 0.0.0.0, IPv6) — RTI sends with a plain sendto and never resolves names inside its tick."""
+    import ipaddress
+    text = str(text).strip()
+    if text.lower() == "broadcast":
+        return "255.255.255.255"
+    try:
+        addr = ipaddress.IPv4Address(text)
+    except ValueError:
+        raise ValueError(f"{text!r} is not an IPv4 address (or \"broadcast\")") from None
+    if addr.is_unspecified:
+        raise ValueError("0.0.0.0 is no destination")
+    return str(addr)
+
+
+def broadcast_udp_telemetry(sock, data, dest=None):
     """
-    Sends telemetry data to TELEMETRY_DESTINATION:TELEMETRY_PORT.
+    Sends telemetry data to `dest` ((host, port)), by default TELEMETRY_DESTINATION:TELEMETRY_PORT.
 
-    'data' can be a string, number, or dictionary.
+    'data' can be bytes (RTI's packet, text or binary: sent as it is), a string, number, or dictionary.
 
-    Change TELEMETRY_DESTINATION in this file to switch between broadcast
-    (255.255.255.255) and unicast (specific dashboard PC IP).  Unicast
-    eliminates WiFi degradation caused by high-rate broadcast traffic.
+    RTI passes the destination of system.xml's <telemetry destination=...>, which set_telemetry_destination changes
+    while it runs (2026-11-26): broadcast (255.255.255.255) or one PC's address. Unicast eliminates WiFi degradation
+    caused by high-rate broadcast traffic.
     """
     try:
-        # Convert dict to JSON string if necessary
-        if isinstance(data, (dict, list)):
-            msg = json.dumps(data)
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            msg = data
+        elif isinstance(data, (dict, list)):              # Convert dict to JSON string if necessary
+            msg = json.dumps(data).encode()
         else:
-            msg = str(data)
+            msg = str(data).encode()
 
-        sock.sendto(msg.encode(), (TELEMETRY_DESTINATION, TELEMETRY_PORT))
+        sock.sendto(msg, dest if dest is not None else (TELEMETRY_DESTINATION, TELEMETRY_PORT))
     except Exception:
         # Avoid heavy printing in the real-time loop; consider logging instead
         pass

@@ -15,7 +15,10 @@ DEFAULT_PRECISION = 3
 # changes its meaning or unit, a value order changed. A new tag is NOT a new version (a reader ignores tags it does not
 # know; a recipe picks the tags). robotclient/version.py keeps the client's copy; RTIClient.connect refuses a robot whose
 # number differs.
-TELEMETRY_FORMAT = 1
+# 2 (2026-11-26): the binary format (utility/binary_packet.py: a header, the map, float64 values) next to the text, and
+# the DEFAULT (system.xml <telemetry format>); text stays one command away (set_telemetry_format). A client of format 1
+# cannot read binary; a client of format 2 reads both, so it also accepts a robot of format 1.
+TELEMETRY_FORMAT = 2
 
 
 def serialize_joint_data(Joint_data, fields, precision_map=None):
@@ -82,6 +85,21 @@ def serialize_optimized(Joint_data: deque, fields: Sequence[str], precision_map:
 
         parts.append(f"{field}:{value_str}")
 
+    return ",".join(parts)
+
+
+def serialize_trace(row, columns: dict, fields: Sequence[str], precision_map: dict | None = None) -> str:
+    """The tags whose text comes from the tick's row of RTI's trace (src "trace", 2026-11-26): `row` the newest row
+    (TraceWriter.last), `columns` {tag: (start, size)} (TraceWriter.columns). The same wire form as the others:
+    "tag:v1,v2,..." — a value the row holds as NaN is written "nan". A tag the row lacks is left out."""
+    parts = []
+    for field in fields:
+        col = columns.get(field)
+        if col is None:
+            continue
+        start, size = col
+        precision = precision_map.get(field, DEFAULT_PRECISION) if precision_map else DEFAULT_PRECISION
+        parts.append(f"{field}:" + ",".join([f"{v:.{precision}f}" for v in row[start:start + size].tolist()]))
     return ",".join(parts)
 
 

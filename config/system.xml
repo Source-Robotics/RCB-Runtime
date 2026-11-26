@@ -45,6 +45,15 @@
          switches it at runtime; RTI.log says which order it started in. -->
     <can_read_first>1</can_read_first>
 
+    <!-- RTI's state and telemetry packets at every start (2026-11-26). One packet a tick, the active recipe's values, to
+         the PC paired in RTI / SOFT_RTI mode, to the destination below over UDP, and to a recorder connected over TCP
+         (port 30004). format: binary = a map of the tags, then every value exact (the default since 2026-11-26: measured
+         on the arm, the text of the record recipe cost RTI ~0.48 ms more a tick); text = "tag:v,v,..." (each value
+         rounded to the recipe's decimals; for a program that reads the text itself). robotclient reads both.
+         destination: broadcast (255.255.255.255: every device on the network) or one PC's IPv4 address (kinder to
+         Wi-Fi). robot.set_telemetry_format() and robot.set_telemetry_destination() change them while RTI runs. -->
+    <telemetry format="binary" destination="broadcast"/>
+
     <!-- Every drive's CAN watchdog, in ms (2026-10-13; was 5000 per drive in the robot / gripper XMLs, a bring-up value
          that is no longer read). A drive that gets no command or poll from RTI for this long goes idle (the joints
          brake and sink slowly, the gripper coasts), so no drive can keep running RTI's last speed or torque once RTI

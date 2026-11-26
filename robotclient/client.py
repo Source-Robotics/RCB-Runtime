@@ -2672,6 +2672,105 @@ class RobotClient:
         """
         self._immediate("set_recipe", [str(name)])
 
+    def set_telemetry_format(self, fmt: str) -> None:
+        """Choose the format of the robot's state and telemetry packets.
+
+        The robot sends one packet every control tick, built once and sent to
+        every receiver: the PC paired in RTI or SOFT_RTI mode, the UDP telemetry
+        destination (`set_telemetry_destination()`), and a program connected to
+        the robot's TCP port 30004. All of them get the same format. Both formats
+        carry the active recipe's values (`set_recipe()`), and `RTIClient` reads
+        both, so a program that uses it needs no change.
+
+        Args:
+            fmt: `"text"`: each value as text rounded to the recipe's decimals,
+                only the first value of a tag carrying its name
+                (`j_p:0.1235,1.4500,...,tick:12345`). `"binary"`: a header and a
+                map naming every tag and its number of values, then the values as
+                exact 8-byte floats. Every binary packet carries its map, so one
+                packet can be read alone. `robotclient.telemetry.decode_packet()`
+                reads both; that module describes the binary layout byte by byte.
+
+        Defaults:
+            system.xml's `<telemetry format=...>` (`"binary"` as shipped), set each
+            time the robot software starts.
+
+        Raises:
+            CommandRejected: The robot refused it: `fmt` is not `"text"` or
+                `"binary"`, or another client holds control. Or RTI refused it or did
+                not answer within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `fmt` is not `"text"` or `"binary"`.
+            RTI_REFUSED: RTI could not use the value. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        Note:
+            Binary costs the robot's real-time loop a few microseconds a tick for
+            any recipe; text costs more with every value (the `record` recipe as
+            text: about 0.5 ms a tick more, measured on the arm). A binary value is
+            exact; a text value is rounded. Choose `"text"` for a program that reads
+            the packets' text itself. The status field `telemetry` shows the format
+            in use.
+
+        See also:
+            `set_telemetry_destination()`, `set_recipe()`, `RTIClient`
+
+        Examples:
+            >>> robot.set_telemetry_format("binary")
+        """
+        self._immediate("set_telemetry_format", [str(fmt).strip().lower()])
+
+    def set_telemetry_destination(self, address: str) -> None:
+        """Choose where the robot's UDP telemetry goes.
+
+        Every control tick the robot sends its telemetry packet (the active
+        recipe, `set_recipe()`, in the format of `set_telemetry_format()`) over UDP
+        to port 30003 of this destination. Broadcast reaches every device on the
+        network; one PC's address reaches only that PC, which spares a Wi-Fi
+        network the robot's traffic. The packets to a PC paired in RTI or SOFT_RTI
+        mode and to a program on TCP port 30004 do not depend on it.
+
+        Args:
+            address: One PC's IPv4 address, such as `"192.168.1.20"`, or
+                `"broadcast"` (the same as `"255.255.255.255"`). A host name,
+                `"0.0.0.0"` or an IPv6 address is refused.
+
+        Defaults:
+            system.xml's `<telemetry destination=...>` (`"broadcast"` as shipped),
+            set each time the robot software starts.
+
+        Raises:
+            CommandRejected: The robot refused it: `address` is not an IPv4
+                address or `"broadcast"`, or another client holds control. Or RTI
+                refused it or did not answer within 1 s (`Errors:`).
+            RobotTimeout: The robot did not answer within 5 s.
+            RobotConnectionError: The client is not connected.
+
+        Errors:
+            BAD_ARGS: `address` is not an IPv4 address or `"broadcast"`. The
+                message says why.
+            RTI_REFUSED: RTI could not use the address. The message says why.
+            RTI_NOT_RUNNING: RTI did not answer within 1 s: it is not running or not
+                responding. The command may still have taken effect.
+
+        Note:
+            The status field `telemetry` shows the destination in use, and the
+            recorder link: who is connected to TCP port 30004 and how many links
+            the robot dropped because the program stopped reading.
+
+        See also:
+            `set_telemetry_format()`, `set_recipe()`
+
+        Examples:
+            >>> robot.set_telemetry_destination("192.168.1.20")
+            >>> robot.set_telemetry_destination("broadcast")
+        """
+        self._immediate("set_telemetry_destination", [str(address).strip()])
+
     def stop(self, wait: bool | None = None) -> None:
         """Stop the robot's motion and cancel every queued move.
 

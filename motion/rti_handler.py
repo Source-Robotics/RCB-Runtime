@@ -3505,13 +3505,15 @@ class RTIModeHandler:
     def _send_state(self, ctx):
         """Unicast the active recipe payload to the paired PC.
 
-        Same build_payload() the telemetry broadcast uses (plan §2.2) — one
-        serialisation per tick, just routed to the PC instead of broadcast.
+        The packet RTI built ONCE this tick (ctx.payload, text or binary, 2026-11-26 — it was built here a second time
+        before), the same bytes the telemetry sends. Without one (a caller that builds none: the offline tests) the
+        text is built here as before.
         """
         try:
-            payload = build_payload(ctx.recipe, ctx.Joint_data, ctx.Gripper_data,
-                                    ctx.motor_buffers, self.joint_num)
-            encoded = payload.encode()
+            encoded = ctx.payload
+            if encoded is None:
+                encoded = build_payload(ctx.recipe, ctx.Joint_data, ctx.Gripper_data,
+                                        ctx.motor_buffers, self.joint_num).encode()
             ctx.socket_sender.sendto(encoded, self.pc_addr)
             self._tx_acc += len(encoded)
             if self._send_failures:

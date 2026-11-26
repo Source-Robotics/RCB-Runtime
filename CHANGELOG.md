@@ -83,8 +83,44 @@ What changed in each version of the RCB runtime. The newest version is at the to
   `--apply` makes the moment the calibration (true timing, above).
 - `api_tests/80_camera_timing.py --verify --exposures N`: the verification motions at one fixed exposure instead of
   automatic exposure.
+- Binary state and telemetry packets (telemetry format 2): a 16-byte header, a map naming each tag and its number of
+  values, then every value as an exact little-endian float64. Every packet carries its map, so one packet can be read
+  alone. The values are copied out of RTI's trace row, which costs the real-time loop about 4 µs a tick for any
+  recipe; the text of every tag costs about 0.3 ms. `robot.set_telemetry_format("text" | "binary")` switches every
+  packet RTI sends; `config/system.xml` `<telemetry format=...>` is the start value. Text stays as it was.
+- `robotclient.telemetry`: `decode_packet()` reads a text or a binary packet into the same dictionary;
+  `parse_state_packet()` and `RTIClient` read both. `TelemetryClient` receives the packets over TCP or UDP.
+- The recorder link: a program connected to the robot's TCP port 30004 gets every tick's packet on that connection,
+  each preceded by its length. One connection at a time; one that stops reading for seconds is dropped and counted,
+  and the arm is never affected.
+- `robot.set_telemetry_destination(address)`: where the UDP telemetry goes (one PC's IPv4 address, or `"broadcast"`),
+  while RTI runs; `config/system.xml` `<telemetry destination=...>` is the start value.
+- The status field `telemetry`: the format, the UDP destination and port, the recorder link's port, who is connected
+  to it and how many links were dropped.
+- Telemetry tags for every value the robot has per tick: `j_rx` (each joint's reply time), `j_t_grav` (gravity
+  torque), `j_t_fric` (friction compensation torque), `m_pc` / `m_sc` / `m_cc` (what was sent to each drive), the
+  gripper's targets and commands (`g_jpt` .. `g_jfc`; in firmware mode `g_pt` / `g_st` / `g_ct` / `g_at`), its
+  filtered speed (`g_js_f`), flags (`g_cal`, `g_temp_err`, `g_tim_err`, `g_estop_err`) and reply time (`g_rx`), the
+  box's GPIO (`io`) and the control board's readings (`cb_vbus1` .. `cb_power`).
+- The `record` recipe: every tag but the drives' gains, for recording training data in the binary format.
+- `tools/show_packets.py`: the robot's packets live as readable lines, text or binary, over TCP or UDP.
 
 ### Changed
+
+- RTI's trace (the shared-memory rows the incident captures come from) carries every telemetry tag: the gripper, the
+  drives' raw values, temperatures, voltages and error flags, the gains, the gravity and friction torques, the box's
+  GPIO and the control board. The seldom-changing values are refreshed one fifth per tick, so in a row they can be up
+  to 4 ticks old. Captures and incident dumps get the new channels.
+- RTI builds each tick's packet once and sends the same bytes to the PC paired in RTI / SOFT_RTI mode, to the UDP
+  destination and to the recorder link. In RTI mode it was built twice. The paired PC's packet now goes out after
+  the gripper's data in both tick orders, so it carries the gripper's values of the same tick.
+- `RTIClient` receives datagrams of up to 64 KB (was 4 KB): a big recipe's packet no longer arrives cut.
+- **Binary is the default packet format** (`config/system.xml` `<telemetry format="binary">`): measured on the arm,
+  the text of the `record` recipe cost RTI's loop about 0.48 ms more a tick than the binary copy. The telemetry
+  format is now 2: a robotclient of format 1 cannot read binary packets and refuses the robot at connect; this
+  robotclient reads both formats and also accepts a robot of format 1. A program that reads the packets' text
+  itself: `robot.set_telemetry_format("text")`, or `robotclient.telemetry.decode_packet()` for both. The robot's own
+  test scripts that read packets now hand the bytes to `parse_state_packet()`.
 
 - The supervisor's hang check also watches the camera server (`P_CAMERA:PROCESS_HUNG_WARNING`); the shared-memory
   flag grows from 6 to 7 values, so the whole robot service must restart together.

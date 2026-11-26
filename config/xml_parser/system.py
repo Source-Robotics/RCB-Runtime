@@ -128,6 +128,13 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         if _crf_text not in ("1", "true", "yes", "on"):
             logger.warning(f"system.xml <can_read_first>{_crf_text!r} is not 0/1 — ON (read first, send early)")
         can_read_first = 1
+    # <telemetry format="text|binary" destination="..."/> (2026-11-26, TODO/p4_recording_plan.md 2B): RTI's state and
+    # telemetry packets at every RTI start. format: text ("tag:v,v,...", TELEMETRY_FORMAT 1) or binary (2: a map and
+    # exact float64 values, robotclient/telemetry.py). destination: where the UDP telemetry goes — "broadcast" /
+    # 255.255.255.255 (every device on the network) or one PC's IPv4 address. Missing -> binary, broadcast (binary the
+    # default since 2026-11-26, the user); a bad value -> that default with a warning. set_telemetry_format /
+    # set_telemetry_destination change them while RTI runs.
+    telemetry = _parse_telemetry(root.find("telemetry"))
     # <drive_watchdog_ms>: every drive's CAN watchdog in ms (2026-10-13, user: "normal times" — it was 5000 per drive in
     # the robot / gripper XMLs, a bring-up value, no longer read). One value for every drive: it is about RTI's link,
     # not the arm. Missing -> the default; not a whole number in [MIN, MAX] -> the default with a warning.
@@ -180,6 +187,7 @@ def load_system_config(system_xml_path: str | Path, robots_dir: str | Path) -> d
         "kt_tolerance":   kt_tolerance,
         "realtime_required": realtime_required,
         "can_read_first": can_read_first,
+        "telemetry":      telemetry,
         "drive_watchdog_ms": drive_watchdog_ms,
         "homing_question_timeout_s": homing_question_timeout_s,
         "pcb_version":    pcb_version,
@@ -395,6 +403,27 @@ def _parse_sound(elem: ET.Element | None) -> dict:
                 logger.warning("system.xml <sound><%s> = %s is outside [%s, %s] — using %s", key, val, lo, hi, default)
                 continue
             out[key] = int(val) if key == "node" else val
+    return out
+
+
+def _parse_telemetry(elem: ET.Element | None) -> dict:
+    """<telemetry format=... destination=...> in system.xml -> {"format": "binary" | "text", "destination": an IPv4
+    address}. Missing -> binary, broadcast; a bad value -> that default with a warning."""
+    from config.networking import TELEMETRY_FORMATS, parse_telemetry_destination
+    out = {"format": "binary", "destination": "255.255.255.255"}
+    if elem is None:
+        return out
+    fmt = (elem.get("format") or "binary").strip().lower()
+    if fmt in TELEMETRY_FORMATS:
+        out["format"] = fmt
+    else:
+        logger.warning("system.xml <telemetry format=%r> is not text / binary — binary", fmt)
+    dest = (elem.get("destination") or "").strip()
+    if dest:
+        try:
+            out["destination"] = parse_telemetry_destination(dest)
+        except ValueError as e:
+            logger.warning("system.xml <telemetry destination=%r>: %s — broadcast", dest, e)
     return out
 
 

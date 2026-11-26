@@ -1,9 +1,13 @@
 """Registry of all available telemetry tags.
 
 Each entry maps a short tag name to:
-  src  — which deque holds this field: "joint" | "gripper"
+  src  — where its TEXT is read: "joint" (the Joint_data history entry), "gripper" (the Gripper_data history entry),
+         "motor" / "gripper_motor" (the per-drive deques), "motor_config" / "gripper_config" (the gains loaded into
+         the drives), "trace" (the tick's row of RTI's trace, utility/trace_ring.py — the tags added 2026-11-26)
   prec — default decimal precision (0 = integer)
   desc — human-readable description
+
+Every tag is also a channel of RTI's trace (data/trace_channels.py, 2026-11-26), which a binary packet is copied from.
 
 These tags are the only valid values in a data recipe XML <field tag="..."/>.
 """
@@ -94,6 +98,37 @@ TAGS = {
     # replies each read took (api_tests/69_can_gaps.py, TODO/can_tx_timing_plan.md, 2026-10-12).
     "can_read_t": {"src": "joint",  "prec": 6, "desc": "when this tick's CAN read ran (time.time(), s)"},
 
+    # --- Read from the trace row (2026-11-26, TODO/p4_recording_plan.md 2B) ----------------------------------------
+    # Values the history entries never carried; their text is formatted from the tick's row of RTI's trace.
+    # j_rx: when each joint's reply arrived, on RTI's clock (time.perf_counter); the drive measured the angle a fixed
+    # time before (utility/joint_times.py) — what pairs a joint with a camera picture on its true time. NaN before the
+    # first reply.
+    "j_rx":      {"src": "trace",   "prec": 6, "desc": "each joint's reply receive time on RTI's clock (s)"},
+    "j_t_grav":  {"src": "trace",   "prec": 3, "desc": "gravity compensation torque per joint (Nm)"},
+    "j_t_fric":  {"src": "trace",   "prec": 3, "desc": "friction compensation torque added this tick (Nm; 0 when off)"},
+    # What RTI put on the CAN wire this tick, in the drives' own units (encoder ticks, ticks/s, mA): NaN = the channel
+    # was not commanded this tick. Arm joints on the dispatch path only (homing and the gripper send their own).
+    "m_pc":      {"src": "trace",   "prec": 0, "desc": "motor position sent to each drive (encoder ticks; NaN = none)"},
+    "m_sc":      {"src": "trace",   "prec": 0, "desc": "motor speed sent to each drive (raw; NaN = none)"},
+    "m_cc":      {"src": "trace",   "prec": 0, "desc": "motor current sent to each drive (mA; NaN = none)"},
+    # The gripper (one value each)
+    "g_js_f":    {"src": "trace",   "prec": 3, "desc": "gripper joint speed, filtered (m/s, motor mode)"},
+    "g_pt":      {"src": "trace",   "prec": 0, "desc": "gripper position asked for (0-255, firmware mode; NaN otherwise)"},
+    "g_st":      {"src": "trace",   "prec": 0, "desc": "gripper speed asked for (0-255, firmware mode; NaN otherwise)"},
+    "g_ct":      {"src": "trace",   "prec": 0, "desc": "gripper current asked for (mA, firmware mode; NaN otherwise)"},
+    "g_at":      {"src": "trace",   "prec": 0, "desc": "gripper action asked for (1 move/hold, 0 idle; firmware mode)"},
+    "g_rx":      {"src": "trace",   "prec": 6, "desc": "the gripper's latest reply receive time on RTI's clock (s)"},
+    # The control box
+    "io":        {"src": "trace",   "prec": 0, "desc": "the box's GPIO states: buttons, E-stop, inputs, outputs, LEDs (16)"},
+    "cb_vbus1":  {"src": "trace",   "prec": 0, "desc": "control board: bus voltage 1, filtered (mV)"},
+    "cb_vbus2":  {"src": "trace",   "prec": 0, "desc": "control board: bus voltage 2, filtered (mV)"},
+    "cb_current": {"src": "trace",  "prec": 0, "desc": "control board: current, filtered (mA)"},
+    "cb_relay":  {"src": "trace",   "prec": 0, "desc": "control board: relay state"},
+    "cb_precharge": {"src": "trace", "prec": 0, "desc": "control board: precharge state"},
+    "cb_brake_res": {"src": "trace", "prec": 0, "desc": "control board: brake resistor state"},
+    "cb_err":    {"src": "trace",   "prec": 0, "desc": "control board: error state"},
+    "cb_power":  {"src": "trace",   "prec": 2, "desc": "control board: power use"},
+
     # ================================================================
     # Motor tags  (raw per-node deques, arm joints 0..joint_num-1 only)
     # Sourced from Motor_data / Motor_temperature_data / Motor_voltage_data.
@@ -163,5 +198,16 @@ TAGS = {
     "g_jp":         {"src": "gripper", "prec": 4, "desc": "gripper joint position (m)"},
     "g_js":         {"src": "gripper", "prec": 3, "desc": "gripper joint speed (m/s)"},
     "g_jf":         {"src": "gripper", "prec": 3, "desc": "gripper joint force (N)"},
+    # Added 2026-11-26 (the history entry carried them; no tag named them)
+    "g_jpt":        {"src": "gripper", "prec": 4, "desc": "gripper joint position target (m, motor mode)"},
+    "g_jst":        {"src": "gripper", "prec": 3, "desc": "gripper joint speed target (m/s, motor mode)"},
+    "g_jft":        {"src": "gripper", "prec": 3, "desc": "gripper joint force target (N, motor mode)"},
+    "g_jpc":        {"src": "gripper", "prec": 4, "desc": "gripper joint position commanded (m, motor mode)"},
+    "g_jsc":        {"src": "gripper", "prec": 3, "desc": "gripper joint speed commanded (m/s, motor mode)"},
+    "g_jfc":        {"src": "gripper", "prec": 3, "desc": "gripper joint force commanded (N, motor mode)"},
+    "g_cal":        {"src": "gripper", "prec": 0, "desc": "gripper calibrated flag (firmware mode)"},
+    "g_temp_err":   {"src": "gripper", "prec": 0, "desc": "gripper temperature error flag (firmware mode)"},
+    "g_tim_err":    {"src": "gripper", "prec": 0, "desc": "gripper timeout error flag (firmware mode)"},
+    "g_estop_err":  {"src": "gripper", "prec": 0, "desc": "gripper E-stop error flag (firmware mode)"},
 }
 

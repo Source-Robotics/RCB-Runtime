@@ -8,7 +8,10 @@ history from inside RTI's process walks Python objects under that lock (pickling
 
 So RTI only WRITES: once per tick, `TraceWriter.write()` copies the tick's values into the next row of a ring in shared
 memory — one `np.concatenate(..., out=row)` of RTI's own persistent arrays (the same ones the history entry copies)
-plus ten scalars, ~9 us, the same every tick, nothing allocated. The recorder process (recorder.py,
+plus ten scalars, ~9 us, the same every tick, nothing allocated. Since 2026-11-26 the row carries every telemetry tag
+(data/trace_channels.py: the gripper, the drives' raw values, the gains, the box's IO and control board), so RTI's
+packets can be copied out of it (TODO/p4_recording_plan.md 2B); the values that change seldom form a SLOW block,
+refreshed one fifth at a time, one fifth per tick (a slow value in a row is up to 4 ticks old). The recorder process (recorder.py,
 utility/trace_recorder.py) reads the rows with its own interpreter and does the incidents, the captures, the
 conversion and the files; RTI never waits for it.
 
@@ -64,13 +67,35 @@ def _layout_string():
 
 class TraceWriter:
     """RTI's side. `sources`: [(name, array)] — RTI's own arrays that keep their identity for the whole run (shared
-    memory views, the motor error buffer); a source replaced by a new object would be traced stale. Built once, before
-    the loop."""
+    memory views, the motor error buffer); a source replaced by a new object would be traced stale. `slow`: the same,
+    for values that change seldom: copied into a block of the row that is refreshed one of `slow_groups` parts per
+    tick (each part every `slow_groups` ticks). Built once, before the loop.
 
-    def __init__(self, sources, tick_s: float, rows: int = ROWS, generation: float | None = None):
-        self.names = [str(n) for n, _ in sources]
-        self._src = tuple(np.asarray(a) for _, a in sources)
-        sizes = [int(a.size) for a in self._src]
+    `columns` = {name: (start, size)} of every channel in a row; `last` = the newest row written (None before the
+    first) — RTI's packets are copied out of it (utility/binary_packet.py)."""
+
+    def __init__(self, sources, tick_s: float, rows: int = ROWS, generation: float | None = None, slow=(),
+                 slow_groups: int = 5):
+        fast_names = [str(n) for n, _ in sources]
+        fast = [np.asarray(a) for _, a in sources]
+        slow_names = [str(n) for n, _ in slow]
+        slow_src = [np.asarray(a) for _, a in slow]
+        slow_sizes = [int(a.size) for a in slow_src]
+        self._slow = np.zeros(sum(slow_sizes))                # the slow block: refreshed in parts, copied every tick
+        self._slow_parts = []
+        if slow_src:
+            k = max(1, min(int(slow_groups), len(slow_src)))
+            bounds = [round(i * len(slow_src) / k) for i in range(k + 1)]
+            offsets = [0]
+            for s in slow_sizes:
+                offsets.append(offsets[-1] + s)
+            for a, b in zip(bounds, bounds[1:]):
+                self._slow_parts.append((tuple(slow_src[a:b]), self._slow[offsets[a]:offsets[b]]))
+            for srcs, out in self._slow_parts:                # filled whole once: the first rows are not zeros
+                np.concatenate(srcs, out=out)
+        self.names = fast_names + slow_names
+        self._src = tuple(fast) + ((self._slow,) if slow_src else ())
+        sizes = [int(a.size) for a in fast] + slow_sizes
         n_data = sum(sizes)
         self.rows = int(rows)
         self.width = 1 + n_data + len(SCALARS)
@@ -85,9 +110,12 @@ class TraceWriter:
         self._n = 0
         generation = time.time() if generation is None else float(generation)
         arrays, start = [], 1
-        for name, size in zip(self.names, sizes):
+        for name, size in zip(self.names, sizes):           # the slow channels follow the fast ones, as in the copy
             arrays.append([name, start, size])
             start += size
+        self.columns = {name: (start, size) for name, start, size in arrays}
+        self.columns.update({s: (c, 1) for s, c in zip(SCALARS, range(self._s0, self._s0 + len(SCALARS)))})
+        self.last = None
         self.layout = {"generation": generation, "rows": self.rows, "width": self.width, "tick_s": float(tick_s),
                        "arrays": arrays, "scalars": [[s, self._s0 + i] for i, s in enumerate(SCALARS)],
                        "modes": list(self._modes)}
@@ -108,6 +136,9 @@ class TraceWriter:
         k = (n - 1) % self.rows
         row = self._row_views[k]
         row[0] = -1.0                                         # being written
+        if self._slow_parts:                                  # one part of the slow block, round robin
+            srcs, out = self._slow_parts[self._n % len(self._slow_parts)]
+            np.concatenate(srcs, out=out)
         np.concatenate(self._src, out=self._data_views[k])
         s = self._s0
         row[s] = timestamp
@@ -123,6 +154,7 @@ class TraceWriter:
         row[0] = n
         self._head[H_COUNT] = n
         self._n = n
+        self.last = row
 
 
 def mark_clean_stop() -> None:
