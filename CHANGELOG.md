@@ -13,6 +13,8 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-11-27
+
 ### Added
 
 - The camera server (`camera_server.py`, started by the supervisor): the gripper's USB camera relayed over the
