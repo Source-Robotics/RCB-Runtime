@@ -9,7 +9,9 @@ Threads: per robot one for its packets (TCP 30004: every tick) and one for its c
 stamp each item on arrival, put the robot's own time on this PC's clock (recording.clock) and queue it; the writer
 alone touches the files. An episode holds what HAPPENED between `begin` and `end` (by each item's own moment, not its
 arrival): after `end` the writer waits up to CLOSE_GRACE_S for the items still on their way (a camera frame arrives
-~35-60 ms after its image moment), then closes the files.
+~35-60 ms after its image moment), then closes the files. At the other end, the items that arrive while no episode is
+open are kept for PREROLL_S: an item can reach the writer before `begin` does (on Windows the first platform.platform()
+in `begin` runs a command, tens of ms), and the new episode takes every kept item that happened at or after its start.
 
 A format is a module (FORMATS) with: NAME, EXTENSION, missing(), open_episode(path, info), add_packet(...),
 add_frame(...), add_clock(...), close_episode(handle, meta) -> path, discard_episode(handle). A new format = a new
@@ -25,6 +27,7 @@ import shutil
 import socket
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 from ..camera_client import CameraClient
@@ -41,6 +44,7 @@ RECIPE = "record"                 # every tag but the gains (data_recipe/record.
 CAMERA = "wrist"                  # the name of each robot's own camera in a recording
 MIN_FREE_BYTES = 1 << 30          # an episode is not started with less free disk space than this
 CLOSE_GRACE_S = 1.0               # after end(): the longest wait for items still on their way
+PREROLL_S = 1.0                   # while no episode is open: how long the newest items are kept, for one that begins
 RECONNECT_S = 1.0                 # a lost link is tried again after this long
 
 
@@ -367,6 +371,8 @@ class Recorder:
     # ------------------------------------------------------------------ the writer
     def _writer_loop(self) -> None:
         ep: dict | None = None
+        recent: deque = deque()                     # while no episode is open: the items of the last PREROLL_S
+        preroll_ns = int(PREROLL_S * 1e9)
         while True:
             try:
                 item = self._q.get(timeout=0.05 if ep is not None and ep["stop_ns"] is not None else 0.5)
@@ -380,12 +386,21 @@ class Recorder:
                     return
                 if kind == "begin":
                     ep = self._open(*item[1:])
+                    if ep is not None:                  # what happened after the start but reached the queue first
+                        for old in recent:
+                            if old[2] >= ep["start_ns"]:
+                                self._write(ep, old)
+                    recent.clear()
                 elif kind == "end":
                     if ep is not None:
                         _, ep["stop_ns"], ep["keep"], ep["notes"], ep["done"], ep["result"] = item
                         ep["deadline"] = time.monotonic() + CLOSE_GRACE_S
                 elif ep is not None:
                     self._write(ep, item)
+                else:
+                    recent.append(item)
+                    while item[2] - recent[0][2] > preroll_ns:      # by log time (item[2] in every kind)
+                        recent.popleft()
             if ep is not None and ep["stop_ns"] is not None and (not ep["pending"]
                                                                   or time.monotonic() >= ep["deadline"]):
                 self._finish(ep)
