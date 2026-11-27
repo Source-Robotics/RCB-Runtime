@@ -7,9 +7,11 @@ of 2026-11-27).
 What it does:
 
 - **Connect.** A `RobotClient`, the arm's state checked: not homed or with errors -> refused (it never homes the
-  arm and never clears an error); disabled -> enabled (the arm holds where it is). The robot's ``record`` recipe for
-  the session (each joint's reply time is in it; the old recipe back at the end), the wrist camera (newest frame
-  only), and the real-time link in SOFT_RTI at `fps` with control claimed. The first target is the measured pose.
+  arm and never clears an error). Then what can fail without touching the arm: the PC's UDP port for the state
+  packets (the real-time client binds it; another program holding it -> refused, saying how to find it) and the wrist
+  camera (newest frame only). Only then the arm: disabled -> enabled (it holds where it is), the robot's ``record``
+  recipe for the session (each joint's reply time is in it; the old recipe back at the end), the real-time link in
+  SOFT_RTI at `fps` with control claimed. The first target is the measured pose.
 - **Observe.** The newest camera frame, and the state AT THAT FRAME'S MOMENT, computed by the export's own functions
   (`robotclient.recording.export.columns` / `state_at` / `image`): each joint interpolated on its own measurement
   times, the gripper 0 open .. 1 closed, the image resized the same way. A policy sees what it was trained on.
@@ -23,6 +25,11 @@ What it does:
   `KEEPALIVE_PERIODS` intervals.
 - **Close.** The stream ended with `rti_disconnect` (the arm comes to rest and holds in IDLE, ENABLED: never
   disabled, J2 / J3 would sink), the recipe back, the connections closed. Never raises.
+- **Clock.** Every time it measures is ``time.perf_counter()``, and its threads wait with ``time.sleep``: on Windows
+  with Python <= 3.12 ``time.monotonic()`` advances only every 15.6 ms (and an ``Event.wait`` of 1 ms takes about as
+  long). The cap's steps were sized with it on the first arm run (2026-11-27): 31.25 or 46.9 ms of travel for each
+  33.3 ms, which the robot, reading the real-time client's own send times (perf_counter), played as a speed jumping
+  by half four times a second (the arm jittered; COMMAND_JUMP warnings in pairs).
 
 The library stays quiet (robotclient's rule): problems go to this module's logger, failures are raised.
 """
@@ -110,7 +117,8 @@ class Link:
         self._failed: BaseException | None = None
         self._sent = np.zeros(JOINTS)      # the last joint target sent (rad)
         self._desired = np.zeros(JOINTS)   # the last action's joints: the sent target walks towards it
-        self._last_send = 0.0              # time.monotonic() of the last target sent
+        self._last_send = 0.0              # time.perf_counter() of the last target sent
+        self._streaming = False            # the stream was asked for (rti.connect): close() ends it
         self._last_act = 0.0               # ... of the last act()
         self._grip_sent = 0.0              # the gripper target in force (0..1): the measured one until one is sent
         self._grip_desired: float | None = None
@@ -145,8 +153,8 @@ class Link:
         self.robot = rc
         rc.connect(self.host, self.port)
         st: dict = {}
-        end = time.monotonic() + STATUS_WAIT_S
-        while time.monotonic() < end and "state" not in st:
+        end = time.perf_counter() + STATUS_WAIT_S
+        while time.perf_counter() < end and "state" not in st:
             st = rc.latest_status() or {}
             if "state" not in st:
                 time.sleep(0.05)
@@ -160,6 +168,20 @@ class Link:
         if errors:
             raise RuntimeError(f"the arm at {self.host} has errors ({', '.join(map(str, errors))}): find out why and "
                                "clear them from the dashboard, then connect again")
+        # What can fail without touching the arm comes first: the PC's UDP port (the real-time client binds it when
+        # made and sends nothing) and the camera. The first arm run (2026-11-27) found a taken port only after the
+        # arm had been enabled.
+        try:
+            rti = self._make_rti(rc, clock="pc", transport=self.transport)
+        except OSError as e:
+            raise OSError(f"{e}. On Windows, `netstat -ano -p udp | findstr :30002` gives the PID of the program "
+                          "holding it (`tasklist /fi \"PID eq <pid>\"` its name); or use --robot.transport=tcp") from e
+        self.rti = rti
+        if self.camera:
+            cam = self._make_camera()
+            self.cam = cam
+            cam.connect(self.host, latest_only=True)
+            self._last_frame = cam.read(timeout=5.0)          # the camera sends: RobotTimeout otherwise
         if st.get("state") != "ENABLED":
             log.info("enabling the arm at %s (it holds where it is)", self.host)
             rc.enable(wait=True)
@@ -167,14 +189,8 @@ class Link:
         if old != RECIPE:
             rc.set_recipe(RECIPE)
             self.old_recipe = old
-        if self.camera:
-            cam = self._make_camera()
-            self.cam = cam
-            cam.connect(self.host, latest_only=True)
-            self._last_frame = cam.read(timeout=5.0)          # the camera sends: RobotTimeout otherwise
-        rti = self._make_rti(rc, clock="pc", transport=self.transport)
-        self.rti = rti
         rti.capture(True)
+        self._streaming = True                                # from here on, close() ends the stream
         rti.connect(rate_hz=self.fps)
         rc.wait_mode("SOFT_RTI")
         try:
@@ -193,8 +209,8 @@ class Link:
         self._grip_desired = None
         rti.claim()
         with self._lock:
-            self._send_locked(time.monotonic(), keepalive=False)
-        self._last_act = time.monotonic()
+            self._send_locked(time.perf_counter(), keepalive=False)
+        self._last_act = time.perf_counter()
         for fn, name in ((self._reader, "par6 packets"), (self._keepalive, "par6 keep-alive")):
             t = threading.Thread(target=fn, name=name, daemon=True)
             t.start()
@@ -209,8 +225,9 @@ class Link:
         self._threads = []
         rc, rti, cam = self.robot, self.rti, self.cam
         self.robot = self.rti = self.cam = None
+        streaming, self._streaming = self._streaming, False
         steps = []
-        if rc is not None and rti is not None:
+        if rc is not None and rti is not None and streaming:
             steps.append(("end the stream", lambda: rc.rti_disconnect(wait=True)))
         if rti is not None:
             steps.append(("close the real-time link", rti.close))
@@ -241,7 +258,7 @@ class Link:
                         self._packets.append(decode_packet(data))
                     except ValueError as e:
                         log.warning("a state packet could not be read: %s", e)
-                self._stop.wait(POLL_S)
+                time.sleep(POLL_S)                  # not Event.wait: ~15.6 ms on Windows (see Clock above)
         except Exception as e:  # noqa: BLE001  ControlLost / OSError: the link is gone; observe / act raise it
             self._fail(e)
 
@@ -249,8 +266,11 @@ class Link:
         """Send the target again whenever LeRobot sent no action for KEEPALIVE_PERIODS intervals; flush a gripper
         target the rate limit held back."""
         try:
-            while not self._stop.wait(self.period / 2.0):
-                now = time.monotonic()
+            while True:
+                time.sleep(self.period / 2.0)       # not Event.wait (see Clock above)
+                if self._stop.is_set():
+                    return
+                now = time.perf_counter()
                 with self._lock:
                     if now - self._last_send >= KEEPALIVE_PERIODS * self.period:
                         self._send_locked(now, keepalive=True)
@@ -317,7 +337,7 @@ class Link:
         g = None if g is None else float(g)
         if not np.isfinite(q).all() or (g is not None and not math.isfinite(g)):
             raise ValueError(f"the action has a value that is not a finite number: {dict(action)}")
-        now = time.monotonic()
+        now = time.perf_counter()
         with self._lock:
             self._desired[:] = q
             self._send_locked(now, keepalive=False)
@@ -340,19 +360,19 @@ class Link:
     def _frame(self):
         """The newest frame, waiting up to 1.5 intervals for one newer than the last returned."""
         last = self._last_frame
-        end = time.monotonic() + 1.5 * self.period
+        end = time.perf_counter() + 1.5 * self.period
         while True:
             f = self.cam.latest()
             if f is not None and (last is None or f.frame != last.frame):
                 return f
-            if time.monotonic() >= end:
+            if time.perf_counter() >= end:
                 self.counts["repeated_frame"] += 1
                 return f if f is not None else last
             time.sleep(POLL_S)
 
     def _state(self, t: float | None):
         """The 7 state values at the robot-clock moment t (None: the newest packet's)."""
-        end = time.monotonic() + STATE_WAIT_S
+        end = time.perf_counter() + STATE_WAIT_S
         while True:
             rows = list(self._packets)
             if rows and t is None:
@@ -361,7 +381,7 @@ class Link:
                 state, _ = X.state_at([t], X.columns(rows))
                 if np.isfinite(state[0]).all():
                     return state[0]
-            if time.monotonic() >= end:
+            if time.perf_counter() >= end:
                 break
             time.sleep(POLL_S)
         if not rows:
