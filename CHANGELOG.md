@@ -111,7 +111,12 @@ What changed in each version of the RCB runtime. The newest version is at the to
   episode with every packet and JPEG exactly as received, plus a decoded copy of the values and the images as
   standard types that MCAP viewers can show; the task, the robot's versions and each episode's counts are stored in
   the file. It sets the robot's `record` recipe while it runs and puts the old one back. Needs `pip install mcap` on
-  the PC; `import robotclient` still needs nothing but Python.
+  the PC; `import robotclient` still needs nothing but Python. After each episode it checks it (camera gaps and
+  flags, missing or slow ticks, error flags, a new error in the robot's status, a mode change, each frame's tick),
+  asks before keeping one that failed, and asks for success and a note; it also records each robot's status changes.
+  Keys act without Enter; `g` opens or closes the gripper at any time (freedrive included; a foot pedal that types
+  `g` works the same), `r` deletes the last episode to record it again, `--episode-s` / `--reset-s` time the
+  episodes and the resets.
 
 ### Changed
 

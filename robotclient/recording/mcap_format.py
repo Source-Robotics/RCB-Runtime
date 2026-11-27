@@ -26,12 +26,21 @@ info``                                                      (robotclient.CameraF
                                                             included; same log time and sequence as its image
 ``/<robot>/clock``              json (jsonschema)           the robot's clock against this PC's, at each
                                                             settled estimate (recording.clock)
+``/<robot>/status``             json (jsonschema)           the robot's status each time it changed, as the
+                                                            robot pushed it (RobotClient.latest_status():
+                                                            mode, state, errors, control holder, ...); log
+                                                            time = its arrival
+``/<robot>/events``             json (jsonschema)           what the recorder did to the robot: the gripper
+                                                            key ({event, target, position, speed, current,
+                                                            ok, error}); log time = when it was sent
 ==============================  ==========================  ==============================================
 
 Times: log time = when it HAPPENED, on this PC's clock in nanoseconds since 1970 (a packet: the robot's `timestamp`;
 a frame: the image's moment; both through the robot's clock mapping), so a viewer lines images and values up;
 publish time = when it ARRIVED at this PC (same clock). Metadata records: ``recording`` (at the start: this format's
-number, the recorder's and robots' versions, the sources) and ``episode`` (at the end: the task, the times, the counts).
+number, the recorder's and robots' versions, the sources, the operator, the recipe, the robots' error keys at the
+start) and ``episode`` (at the end: the task, the times, the counts, the checks and the failed ones, the action source,
+the camera's settings, and the operator's answers: success, note).
 Every metadata value is text (MCAP's rule); a structured one is JSON.
 """
 from __future__ import annotations
@@ -52,6 +61,11 @@ _INFO_SCHEMA = {"title": "rcb.CameraFrameInfo", "type": "object",
                 "description": "Every field of a camera frame's header (robotclient.CameraFrame) but the JPEG."}
 _CLOCK_SCHEMA = {"title": "rcb.RobotClock", "type": "object",
                  "description": "The robot's clock against the recording PC's (robotclient.recording.clock)."}
+_STATUS_SCHEMA = {"title": "rcb.RobotStatus", "type": "object",
+                  "description": "The robot's status each time it changed (robotclient RobotClient.latest_status())."}
+_EVENT_SCHEMA = {"title": "rcb.RecorderEvent", "type": "object",
+                 "description": "What the recorder did to the robot, e.g. the gripper key: "
+                                "{event, target, position, speed, current, ok, error}."}
 
 
 def missing() -> str | None:
@@ -152,6 +166,18 @@ def add_clock(ep: dict, robot: str, log_ns: int, sample: dict) -> None:
     """One settled estimate of the robot's clock (a dict: JSON)."""
     _add(ep, _json_channel(ep, f"/{robot}/clock", _CLOCK_SCHEMA), log_ns, log_ns,
          json.dumps(sample, separators=(",", ":")).encode(), 0)
+
+
+def add_status(ep: dict, robot: str, log_ns: int, status: dict) -> None:
+    """The robot's status as it pushed it (a dict: JSON; a value JSON cannot hold is written as text)."""
+    _add(ep, _json_channel(ep, f"/{robot}/status", _STATUS_SCHEMA), log_ns, log_ns,
+         json.dumps(status, separators=(",", ":"), default=str).encode(), 0)
+
+
+def add_event(ep: dict, robot: str, log_ns: int, event: dict) -> None:
+    """Something the recorder did to the robot (a dict: JSON), e.g. a press of the gripper key."""
+    _add(ep, _json_channel(ep, f"/{robot}/events", _EVENT_SCHEMA), log_ns, log_ns,
+         json.dumps(event, separators=(",", ":"), default=str).encode(), 0)
 
 
 def close_episode(ep: dict, meta: dict) -> str:
