@@ -4,6 +4,11 @@
     python -m robotclient.recording arm1=192.168.0.84 arm2=192.168.0.85 --task "pick up the red cube"
     python -m robotclient.recording 192.168.0.84 --out D:/recordings --no-camera
     python -m robotclient.recording 192.168.0.84 --episode-s 20 --reset-s 10 --operator anna
+    python -m robotclient.recording 192.168.0.84 --format mcap,lerobot
+    python -m robotclient.recording export recordings/2026-11-27_13-49-02 --out datasets/freedrive
+
+The `lerobot` format and `export` (episodes -> a LeRobot v3 dataset, robotclient/recording/export.py) need Python 3.12+
+and `pip install "lerobot[dataset]" mcap`.
 
 Each robot: `name=address`, or just the address (named arm1, arm2, ... in order). Needs `pip install mcap` for the
 default format. Each session is a folder in --out (its date and time); each episode a file in it (episode_001.mcap).
@@ -32,6 +37,8 @@ import threading
 import time
 
 from ..exceptions import RobotConnectionError, VersionMismatch
+from .export import CODECS, HEIGHT, WIDTH
+from .export import export as export_episodes
 from .recorder import DEFAULT_FORMAT, FORMATS, RECIPE, Recorder
 from .terminal import ENTER, close_keyboard, next_key, open_keyboard, read_text
 
@@ -229,7 +236,35 @@ def _arguments(argv):
     return ap.parse_args(argv)
 
 
+def _export_main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="python -m robotclient.recording export",
+                                 description="Export recorded episodes (.mcap) into a LeRobot dataset (v3).")
+    ap.add_argument("inputs", nargs="+", help="episode files (.mcap) and / or session folders (their episodes)")
+    ap.add_argument("--out", required=True, help="the dataset's folder: made, or appended to when it exists")
+    ap.add_argument("--robot", default=None, help="whose data (default: each recording's first robot)")
+    ap.add_argument("--width", type=int, default=WIDTH, help=f"the images' width (default {WIDTH})")
+    ap.add_argument("--height", type=int, default=HEIGHT, help=f"the images' height (default {HEIGHT})")
+    ap.add_argument("--codec", default="av1", choices=sorted(CODECS), help="the video codec (default av1)")
+    ap.add_argument("--include-failed", action="store_true", help="also the episodes whose checks failed")
+    ap.add_argument("--repo-id", default=None, help="the dataset's name for LeRobot (default local/<folder name>)")
+    args = ap.parse_args(argv)
+    try:
+        r = export_episodes(args.inputs, args.out, robot=args.robot, width=args.width, height=args.height,
+                            codec=args.codec, include_failed=args.include_failed, repo_id=args.repo_id,
+                            progress=lambda text: print(text, flush=True))
+    except (RuntimeError, ValueError) as e:
+        print(f"REFUSED: {e}")
+        return 2
+    print(f"{r['episodes']} episode(s), {r['rows']} rows -> {r['dataset']}"
+          + (f" ({'made' if r['created'] else 'appended to'})" if r["episodes"] else "")
+          + (f"; {len(r['skipped'])} skipped" if r["skipped"] else ""))
+    return 0
+
+
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["export"]:
+        return _export_main(argv[1:])
     args = _arguments(argv)
     try:
         rec = Recorder(parse_robots(args.robots), args.format, args.out, camera=not args.no_camera,

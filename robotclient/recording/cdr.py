@@ -75,6 +75,43 @@ def encode_image(stamp_ns: int, frame_id: str, image_format: str, data: bytes) -
     return b"".join(parts)
 
 
+def decode_image(data: bytes) -> tuple:
+    """A ``sensor_msgs/msg/CompressedImage`` from its CDR bytes -> (stamp_ns, frame_id, image_format, data): the
+    reverse of `encode_image` (the exporter takes the JPEG back out of a recording).
+
+    Raises:
+        ValueError: not a little-endian CDR message, or cut short / malformed.
+    """
+    if bytes(data[:4]) != ENCAPSULATION:
+        raise ValueError("not a little-endian CDR message")
+    body = bytes(data[4:])
+
+    def take(offset: int, align: int = 4) -> tuple:
+        offset += -offset % align
+        if offset + 4 > len(body):
+            raise ValueError("a CompressedImage cut short")
+        n = _U32.unpack_from(body, offset)[0]
+        if offset + 4 + n > len(body):
+            raise ValueError("a CompressedImage cut short")
+        return body[offset + 4:offset + 4 + n], offset + 4 + n
+
+    if len(body) < _STAMP.size:
+        raise ValueError("a CompressedImage cut short")
+    sec, nanosec = _STAMP.unpack_from(body, 0)
+    texts = []
+    offset = _STAMP.size
+    for _ in range(2):
+        raw, offset = take(offset)
+        if not raw.endswith(b"\0"):
+            raise ValueError("a CompressedImage string without its closing NUL")
+        try:
+            texts.append(raw[:-1].decode("utf-8"))
+        except UnicodeDecodeError as e:
+            raise ValueError(f"a CompressedImage string not UTF-8: {e}") from None
+    image, _ = take(offset)
+    return sec * 1_000_000_000 + nanosec, texts[0], texts[1], image
+
+
 _NOT_NAME = re.compile(r"[^a-z0-9]+")
 
 

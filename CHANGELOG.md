@@ -117,6 +117,12 @@ What changed in each version of the RCB runtime. The newest version is at the to
   Keys act without Enter; `g` opens or closes the gripper at any time (freedrive included; a foot pedal that types
   `g` works the same), `r` deletes the last episode to record it again, `--episode-s` / `--reset-s` time the
   episodes and the resets.
+- `python -m robotclient.recording export`: recorded episodes into a LeRobot dataset (format v3, through LeRobot's own
+  writer), and the `lerobot` recording format (`--format lerobot` or `mcap,lerobot`). One row per camera frame: the
+  image (640x360 by default), the state (the 6 joints at the image's moment, each on its own measurement time, and the
+  gripper 0..1), the action (freedrive: the next state; otherwise what was commanded), the frame's time and tick, the
+  operator's success and note. Episodes whose checks failed are left out unless asked. Needs Python 3.12+ and
+  `pip install "lerobot[dataset]" mcap` on the PC.
 
 ### Changed
 

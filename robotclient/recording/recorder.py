@@ -51,7 +51,7 @@ from ..telemetry import TelemetryClient, decode_packet
 from ..version import __version__
 from .clock import RobotClock, unix_minus_perf_ns
 
-FORMATS = {"mcap": "robotclient.recording.mcap_format"}
+FORMATS = {"mcap": "robotclient.recording.mcap_format", "lerobot": "robotclient.recording.lerobot_format"}
 DEFAULT_FORMAT = "mcap"
 RECIPE = "record"                 # every tag but the gains (data_recipe/record.xml)
 CAMERA = "wrist"                  # the name of each robot's own camera in a recording
@@ -409,14 +409,18 @@ class Recorder:
         episode before it stays. Returns its number.
 
         Raises:
-            RuntimeError: an episode is open or waits for `decide()`, or no kept episode to delete (none yet, or
-                deleted already).
+            RuntimeError: an episode is open or waits for `decide()`, no kept episode to delete (none yet, or
+                deleted already), or the episode went into a LeRobot dataset (``--format lerobot``: it cannot be
+                taken out of it here; nothing is deleted).
         """
         if self.recording or self.held:
             raise RuntimeError("end the episode first")
         last = self.last_kept
         if not last:
             raise RuntimeError("no kept episode to delete")
+        if any(os.path.isdir(path) for path in last.get("paths", [])):
+            raise RuntimeError("the last episode is in a LeRobot dataset (--format lerobot): it cannot be taken out "
+                               "here; nothing deleted")
         for path in last.get("paths", []):
             if os.path.exists(path):
                 os.remove(path)

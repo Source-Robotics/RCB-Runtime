@@ -97,7 +97,9 @@ distro==1.7.0                                    # Linux distro info (system_con
 # ── The PC recorder (robotclient/recording, 2026-11-27) ──────────────────────
 # It runs on the PC that records (python -m robotclient.recording); the robot itself never imports it. Pinned here
 # so the robot's nets (dummy_test_scripts/test_recording.py) and a recording on the Pi itself work. On a PC:
-# pip install mcap (it brings the other two).
+# pip install mcap (it brings the other two). The LeRobot export / `--format lerobot` (robotclient/recording/export.py)
+# run on the PC only: LeRobot 0.7 needs Python 3.12+ (this Pi has 3.11), `pip install "lerobot[dataset]" mcap` there;
+# not installed here (the net uses a stand-in for its writer).
 mcap==1.6.0                                      # MCAP files (mcap.dev): one per recorded episode
 zstandard==0.25.0                                # mcap's zstd chunk compression
 lz4==4.4.5                                       # mcap's other compression (imported by it)
