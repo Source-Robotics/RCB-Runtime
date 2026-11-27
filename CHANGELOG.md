@@ -120,9 +120,14 @@ What changed in each version of the RCB runtime. The newest version is at the to
 - `python -m robotclient.recording export`: recorded episodes into a LeRobot dataset (format v3, through LeRobot's own
   writer), and the `lerobot` recording format (`--format lerobot` or `mcap,lerobot`). One row per camera frame: the
   image (640x360 by default), the state (the 6 joints at the image's moment, each on its own measurement time, and the
-  gripper 0..1), the action (freedrive: the next state; otherwise what was commanded), the frame's time and tick, the
+  gripper 0..1; named `j1.pos` .. `j6.pos`, `gripper.pos`, LeRobot's convention), the action (freedrive: the next state; otherwise what was commanded), the frame's time and tick, the
   operator's success and note. Episodes whose checks failed are left out unless asked. Needs Python 3.12+ and
   `pip install "lerobot[dataset]" mcap` on the PC.
+- `lerobot_robot_par6`: the arm as a LeRobot robot (`--robot.type=par6`), so that LeRobot's programs drive it (a
+  policy, a dataset's replay). Observations: the 6 joints and the gripper at the wrist camera image's moment, and the
+  image, made as the export makes a dataset's rows; actions: joint position targets over SOFT_RTI, capped at 30 deg/s
+  by default (`max_speed_deg_s`), and the gripper's target. It never homes the arm; it enables a homed one and leaves
+  it holding, enabled. Installed on the PC next to `robotclient` with `pip install -e lerobot_robot_par6`.
 
 ### Changed
 

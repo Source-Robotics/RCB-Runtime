@@ -1,0 +1,21 @@
+# The PAR6 arm for LeRobot (2026-11-27). One editable install brings this plugin AND robotclient (the folder next to
+# this one), so LeRobot's programs can import both: `pip install -e lerobot_robot_par6`, in a Python 3.12+
+# environment with LeRobot. Tested with LeRobot 0.7.0.
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_par6"          # underscores: LeRobot imports a plugin by its distribution's name
+version = "0.1.0"
+description = "The PAR6 arm as a LeRobot robot (type par6)"
+requires-python = ">=3.12"
+license = "GPL-3.0-only"
+dependencies = ["lerobot>=0.7.0", "numpy", "Pillow"]
+
+[tool.setuptools]
+packages = ["lerobot_robot_par6", "robotclient", "robotclient.recording"]
+
+[tool.setuptools.package-dir]
+lerobot_robot_par6 = "lerobot_robot_par6"
+robotclient = "../robotclient"

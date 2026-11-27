@@ -14,9 +14,11 @@ One dataset row per camera frame, at the camera's rate (30 fps); LeRobot puts ea
 column                            dtype       what
 ================================  ==========  ===============================================================
 ``observation.images.wrist``      video       the frame, decoded and resized (default 640x360), RGB
-``observation.state``             float32 7   j1..j6 (rad) at the image's moment, each joint interpolated on its
-                                              own measurement times (j_rx: robotclient.joint_times), and the
-                                              gripper: g_p / 255 on g_rx (0 open, 1 closed)
+``observation.state``             float32 7   j1.pos .. j6.pos (rad) at the image's moment, each joint
+                                              interpolated on its own measurement times (j_rx:
+                                              robotclient.joint_times), and gripper.pos: g_p / 255 on g_rx (0 open,
+                                              1 closed). The names follow LeRobot's convention (``.pos``), which its
+                                              policy runner needs for the start pose and the hold.
 ``action``                        float32 7   by the episode's action source: freedrive (IDLE only) = the next
                                               row's state (the last frame has none: dropped); any other mode =
                                               what was commanded at that moment (j_pt, g_pt / 255)
@@ -34,6 +36,9 @@ Each row's task is the episode's task. A gap between two exposures longer than F
 splits the episode in two. Frames outside the joints' measured span are dropped (that happens only at the ends). An
 episode whose checks failed is left out unless `include_failed`. Next to LeRobot's files, ``meta/rcb_episodes.jsonl``
 gets one line per dataset episode: its MCAP file, the part of it, the recorder's metadata, the export's settings.
+
+`columns`, `state_at` and `image` are shared with the LeRobot plugin (lerobot_robot_par6), so that a policy's live
+observations are made exactly as its training rows were.
 """
 from __future__ import annotations
 
@@ -51,7 +56,9 @@ SPLIT_S = 0.2               # a gap longer than this (s) splits the episode
 FREEDRIVE_MODES = ("IDLE",)  # an episode only in these modes is freedrive: its action = the next row's state
 GRIP_SCALE = 255.0          # the gripper's own scale (g_p, g_pt): 0 open .. 255 closed
 JOINTS = 6
-NAMES = [f"j{i}" for i in range(1, JOINTS + 1)] + ["gripper"]
+NAMES = [f"j{i}.pos" for i in range(1, JOINTS + 1)] + ["gripper.pos"]   # LeRobot's convention (user 2026-11-27)
+TAGS = (("timestamp", 1), ("tick", 1), ("j_p", JOINTS), ("j_rx", JOINTS), ("j_pt", JOINTS), ("g_p", 1), ("g_rx", 1),
+        ("g_pt", 1))           # the packets' tags an export (and the plugin) reads, with their widths
 SIDECAR = os.path.join("meta", "rcb_episodes.jsonl")
 ROBOT_TYPE = "par6"
 _TEXT_KEYS = {"task", "note", "operator", "session", "recorder_version", "start_utc", "end_utc", "time_base"}
@@ -104,7 +111,6 @@ def read_episode(path: str, robot: str | None = None) -> dict:
     Raises:
         ValueError: no robot of that name in the file, or no packet of it.
     """
-    import numpy as np
     from mcap.reader import make_reader
 
     from ..telemetry import decode_packet
@@ -129,22 +135,54 @@ def read_episode(path: str, robot: str | None = None) -> dict:
     if not rows:
         raise ValueError(f"no packet of {robot} in {os.path.basename(path)}")
     rows.sort(key=lambda d: d.get("tick", 0.0))
-
-    def column(tag: str, n: int):
-        out = np.full((len(rows), n), np.nan)
-        for i, d in enumerate(rows):
-            v = d.get(tag)
-            if isinstance(v, (int, float)) and n == 1:
-                out[i, 0] = v
-            elif isinstance(v, (list, tuple)) and len(v) >= n:
-                out[i, :] = v[:n]
-        return out
-    packets = {tag: column(tag, n) for tag, n in (("timestamp", 1), ("tick", 1), ("j_p", JOINTS), ("j_rx", JOINTS),
-                                                    ("j_pt", JOINTS), ("g_p", 1), ("g_rx", 1), ("g_pt", 1))}
-    packets["mode"] = [d.get("mode") for d in rows]
+    packets = columns(rows)
     frames = sorted(({"info": infos[s], "jpeg": jpegs[s]} for s in infos if s in jpegs),
                     key=lambda fr: fr["info"].get("exposure_time", 0.0))
     return {"robot": robot, "path": path, "meta": meta, "packets": packets, "frames": frames}
+
+
+def columns(rows) -> dict:
+    """Decoded packets (dicts, in tick order) -> {tag: rows x width float array for each of TAGS (NaN where a packet
+    lacks the tag), "mode": [each packet's mode]}."""
+    import numpy as np
+    out: dict = {}
+    for tag, n in TAGS:
+        a = np.full((len(rows), n), np.nan)
+        for i, d in enumerate(rows):
+            v = d.get(tag)
+            if isinstance(v, (int, float)) and n == 1:
+                a[i, 0] = v
+            elif isinstance(v, (list, tuple)) and len(v) >= n:
+                a[i, :] = v[:n]
+        out[tag] = a
+    out["mode"] = [d.get("mode") for d in rows]
+    return out
+
+
+def state_at(times, p: dict):
+    """The state at each of `times` (the robot's clock, s) from `columns()`' arrays: j1..j6 (rad), each interpolated
+    on its own measurement times (robotclient.joint_times), and the gripper (g_p / 255 on g_rx); NaN outside a joint's
+    measured span. -> (len(times) x 7 array, {"joints": kind, "gripper": kind}): "measured", or "rows" when the
+    packets carried no reply times (the rows' timestamps then stand in)."""
+    import numpy as np
+
+    from ..joint_times import REPLY_AFTER_MEASURE_S, joint_at
+    jrx, kind_j = _reply_times(p, "j_rx", JOINTS)
+    grx, kind_g = _reply_times(p, "g_rx", 1)
+    # joint_at takes reply times: a row's timestamp is not one, so undo its measurement shift
+    shift_j = REPLY_AFTER_MEASURE_S if kind_j == "rows" else 0.0
+    shift_g = REPLY_AFTER_MEASURE_S if kind_g == "rows" else 0.0
+    joints = joint_at(times, jrx + shift_j, p["j_p"])
+    grip = joint_at(times, grx + shift_g, p["g_p"]) / GRIP_SCALE
+    return np.hstack([joints, grip]), {"joints": kind_j, "gripper": kind_g}
+
+
+def image(jpeg: bytes, width: int = WIDTH, height: int = HEIGHT):
+    """A camera frame's JPEG -> RGB uint8, height x width x 3, resized with Pillow's bilinear filter."""
+    import numpy as np
+    from PIL import Image
+    pic = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    return np.asarray(pic.resize((width, height), Image.Resampling.BILINEAR), dtype=np.uint8)
 
 
 def action_source(ep: dict) -> str:
@@ -171,8 +209,6 @@ def pair(ep: dict) -> dict:
     """The dataset rows of an episode: {"fps", "parts": [{"t", "tick", "calibrated", "filled", "frame", "state",
     "action"} arrays, one per part], "joint_times", "source"}. See the module's docstring for the rules."""
     import numpy as np
-
-    from ..joint_times import REPLY_AFTER_MEASURE_S, joint_at
     p, frames = ep["packets"], ep["frames"]
     if not frames:
         return {"fps": 0, "parts": [], "joint_times": None, "source": action_source(ep)}
@@ -190,22 +226,15 @@ def pair(ep: dict) -> dict:
                 k = int(round(gap / period)) - 1
                 groups[-1] += [(t[i - 1] + m * gap / (k + 1), i - 1, True) for m in range(1, k + 1)]
         groups[-1].append((t[i], i, False))
-    jrx, kind_j = _reply_times(p, "j_rx", JOINTS)
-    grx, kind_g = _reply_times(p, "g_rx", 1)
     stamps = p["timestamp"][:, 0]
     source = action_source(ep)
     parts = []
+    joint_times: dict = {}
     for group in groups:
         times = np.array([g[0] for g in group])
         idx = np.array([g[1] for g in group], dtype=int)
         filled = np.array([g[2] for g in group], dtype=bool)
-        if kind_j == "rows":                            # joint_at takes reply times: undo its measurement shift
-            jrx_use = jrx + REPLY_AFTER_MEASURE_S
-        else:
-            jrx_use = jrx
-        joints = joint_at(times, jrx_use, p["j_p"])
-        grip = joint_at(times, grx + (REPLY_AFTER_MEASURE_S if kind_g == "rows" else 0.0), p["g_p"]) / GRIP_SCALE
-        state = np.hstack([joints, grip])
+        state, joint_times = state_at(times, p)
         held = np.searchsorted(stamps, times, side="right") - 1          # the packet in force at each moment
         ok_held = held >= 0
         target = np.full_like(state, np.nan)
@@ -228,7 +257,7 @@ def pair(ep: dict) -> dict:
             sl = slice(0, 0)
         parts.append({"t": times[sl], "tick": tick[sl], "calibrated": calibrated[sl], "filled": filled[sl],
                       "frame": idx[sl], "state": state[sl], "action": action[sl]})
-    return {"fps": fps, "parts": parts, "joint_times": {"joints": kind_j, "gripper": kind_g}, "source": source}
+    return {"fps": fps, "parts": parts, "joint_times": joint_times, "source": source}
 
 
 def _files(paths) -> list:
@@ -282,7 +311,6 @@ def export(paths, out: str, robot: str | None = None, width: int = WIDTH, height
     import numpy as np
     from lerobot.configs import RGBEncoderConfig
     from lerobot.datasets import LeRobotDataset
-    from PIL import Image
     say = progress or (lambda text: None)
     encoder = RGBEncoderConfig(vcodec=CODECS[codec])
     ds = None
@@ -330,15 +358,14 @@ def export(paths, out: str, robot: str | None = None, width: int = WIDTH, height
                     continue
                 index = getattr(getattr(ds, "meta", None), "total_episodes", None)
                 t0 = float(part["t"][0])
-                last_frame, image = -1, None
+                last_frame, picture = -1, None
                 for r in range(n):
                     fi = int(part["frame"][r])
                     if fi != last_frame:
-                        pic = Image.open(io.BytesIO(ep["frames"][fi]["jpeg"])).convert("RGB")
-                        image = np.asarray(pic.resize((width, height), Image.Resampling.BILINEAR), dtype=np.uint8)
+                        picture = image(ep["frames"][fi]["jpeg"], width, height)
                         last_frame = fi
                     ds.add_frame({
-                        f"observation.images.{CAMERA}": image,
+                        f"observation.images.{CAMERA}": picture,
                         "observation.state": part["state"][r].astype(np.float32),
                         "action": part["action"][r].astype(np.float32),
                         "frame.time": np.array([float(part["t"][r]) - t0], dtype=np.float64),
