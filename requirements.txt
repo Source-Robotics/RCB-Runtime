@@ -1,6 +1,8 @@
 # RCB Control Runtime Python dependencies
-# Created: 2026-06-29 UTC; last reviewed: 2026-10-06 UTC (pinokin 0.1.6 -> 0.1.8: adds CollisionChecker for the
-#   self-collision tools; nothing in the runtime imports pinokin any more — motion/cartesian_paths.py uses spatialmath).
+# Created: 2026-06-29 UTC; last reviewed: 2026-11-27 UTC (+ mcap / zstandard / lz4: the PC recorder's MCAP files,
+#   robotclient/recording — see the last section). 2026-10-06 UTC: pinokin 0.1.6 -> 0.1.8: adds CollisionChecker for
+#   the self-collision tools; nothing in the runtime imports pinokin any more — motion/cartesian_paths.py uses
+#   spatialmath.
 #
 # 2026-08-08 — audited every third-party import in the tree against this file. Added
 #   `pinokin` (see below): it was imported by motion/cartesian_paths.py and installed in
@@ -91,3 +93,11 @@ pyserial==3.5                                    # imports as `serial`
 psutil==7.0.0                                    # process monitoring / CPU affinity
 joblib==1.5.3                                    # trajectory serialization / caching
 distro==1.7.0                                    # Linux distro info (system_config.py)
+
+# ── The PC recorder (robotclient/recording, 2026-11-27) ──────────────────────
+# It runs on the PC that records (python -m robotclient.recording); the robot itself never imports it. Pinned here
+# so the robot's nets (dummy_test_scripts/test_recording.py) and a recording on the Pi itself work. On a PC:
+# pip install mcap (it brings the other two).
+mcap==1.6.0                                      # MCAP files (mcap.dev): one per recorded episode
+zstandard==0.25.0                                # mcap's zstd chunk compression
+lz4==4.4.5                                       # mcap's other compression (imported by it)

@@ -104,6 +104,14 @@ What changed in each version of the RCB runtime. The newest version is at the to
   box's GPIO (`io`) and the control board's readings (`cb_vbus1` .. `cb_power`).
 - The `record` recipe: every tag but the drives' gains, for recording training data in the binary format.
 - `tools/show_packets.py`: the robot's packets live as readable lines, text or binary, over TCP or UDP.
+- The recorder, `python -m robotclient.recording`: records training data on a PC (Windows, Linux or macOS) from one
+  or more robots, episode by episode, started and ended with keys: every tick's packet over the recorder link and
+  every camera frame, each at its own moment on the PC's clock (each robot's clock is measured against the PC's from
+  its packets). The output format is chosen at the start (`--format`); `mcap`, the default, writes one MCAP file per
+  episode with every packet and JPEG exactly as received, plus a decoded copy of the values and the images as
+  standard types that MCAP viewers can show; the task, the robot's versions and each episode's counts are stored in
+  the file. It sets the robot's `record` recipe while it runs and puts the old one back. Needs `pip install mcap` on
+  the PC; `import robotclient` still needs nothing but Python.
 
 ### Changed
 
