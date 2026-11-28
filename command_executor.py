@@ -3570,7 +3570,7 @@ def current_status():
                             float(shared_data.rti["payload_com_z"][0])]},
         # The gripper (2026-10-24; None without a CAN gripper): its control mode ("motor" / "firmware"), whether the jaws
         # are calibrated, their position (0 open .. 255 closed) and the gripper's code (0 moving, 1 / 2 an object while
-        # opening / closing, 3 at the target).
+        # closing / opening since command protocol 3, 3 at the target).
         "gripper": _gripper_status() if _HAS_CAN_GRIPPER else None,
     }
     evt.update(_planner_status())

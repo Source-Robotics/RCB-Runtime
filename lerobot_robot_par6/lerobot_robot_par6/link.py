@@ -23,8 +23,10 @@ What it does:
   disabled). LeRobot's loops pause longer (saving an episode's video, a slow policy step), so a thread sends the
   target again (still capped, still walking towards the last action) whenever no action came for
   `KEEPALIVE_PERIODS` intervals.
-- **Close.** The stream ended with `rti_disconnect` (the arm comes to rest and holds in IDLE, ENABLED: never
-  disabled, J2 / J3 would sink), the recipe back, the connections closed. Never raises.
+- **Close.** The keep-alive stops and `RTIClient.release()` ends the claim: the robot brakes the arm to rest within
+  its real-time limits and holds it. `RELEASE_SETTLE_S` later the stream ends with `rti_disconnect` (IDLE, ENABLED:
+  never disabled, J2 / J3 would sink), the recipe goes back, the connections close. Never raises. (Runtime 4.0.0's
+  plugin called `rti_disconnect` alone, which does not brake: an arm still moving coasted in freedrive.)
 - **Clock.** Every time it measures is ``time.perf_counter()``, and its threads wait with ``time.sleep``: on Windows
   with Python <= 3.12 ``time.monotonic()`` advances only every 15.6 ms (and an ``Event.wait`` of 1 ms takes about as
   long). The cap's steps were sized with it on the first arm run (2026-11-27): 31.25 or 46.9 ms of travel for each
@@ -62,6 +64,9 @@ GRIP_DEADBAND = 2.0 / 255.0    # a gripper target that moved less than this is n
 GRIP_MIN_INTERVAL_S = 0.1      # at most 10 gripper targets a second
 STATUS_WAIT_S = 3.0            # how long connect() waits for the robot's first status
 POLL_S = 0.001                 # the packet reader's and the waits' poll
+RELEASE_SETTLE_S = 0.5         # after the release, before the stream ends: the robot brakes within its real-time
+                               # limits, at most ~0.15 s from any joint's top real-time speed (robots/PAR6.xml
+                               # <rti_limits>: J2 68.8 deg/s at 10 rad/s^2), ~0.05 s from the 30 deg/s cap
 
 
 def hard_errors(status: dict) -> list:
@@ -119,6 +124,7 @@ class Link:
         self._desired = np.zeros(JOINTS)   # the last action's joints: the sent target walks towards it
         self._last_send = 0.0              # time.perf_counter() of the last target sent
         self._streaming = False            # the stream was asked for (rti.connect): close() ends it
+        self._claimed = False              # control claimed (rti.claim): close() releases it, the keep-alive may send
         self._last_act = 0.0               # ... of the last act()
         self._grip_sent = 0.0              # the gripper target in force (0..1): the measured one until one is sent
         self._grip_desired: float | None = None
@@ -147,6 +153,7 @@ class Link:
     def _connect(self) -> None:
         self._stop.clear()
         self._failed = None
+        self._claimed = False
         self._packets.clear()
         self._last_send = 0.0
         rc = self._make_robot(name="lerobot")
@@ -209,7 +216,8 @@ class Link:
         self._grip_desired = None
         rti.claim()
         with self._lock:
-            self._send_locked(time.perf_counter(), keepalive=False)
+            self._claimed = True
+            self._send_locked(keepalive=False)
         self._last_act = time.perf_counter()
         for fn, name in ((self._reader, "par6 packets"), (self._keepalive, "par6 keep-alive")):
             t = threading.Thread(target=fn, name=name, daemon=True)
@@ -217,8 +225,17 @@ class Link:
             self._threads.append(t)
 
     def close(self) -> None:
-        """End the stream (the arm comes to rest and holds, ENABLED), put the recipe back, close everything.
-        Safe to call twice, and after a failed connect; never raises (problems are logged)."""
+        """Release the stream (the robot brakes the arm to rest and holds it), end it (IDLE, ENABLED), put the recipe
+        back, close everything. Safe to call twice, and after a failed connect; never raises (problems are logged)."""
+        with self._lock:
+            claimed, self._claimed = self._claimed, False      # from here on the keep-alive sends no target
+        released = False
+        if claimed and self.rti is not None:
+            try:
+                self.rti.release()          # brake to rest and hold: rti_disconnect alone does not brake
+                released = True
+            except Exception as e:  # noqa: BLE001  the stream is lost already, or the robot refused: end it anyway
+                log.warning("could not release the stream, so the robot does not brake the arm: %s", e)
         self._stop.set()
         for t in self._threads:
             t.join(timeout=2.0)
@@ -228,6 +245,8 @@ class Link:
         streaming, self._streaming = self._streaming, False
         steps = []
         if rc is not None and rti is not None and streaming:
+            if released:
+                steps.append(("let the arm come to rest", lambda: time.sleep(RELEASE_SETTLE_S)))
             steps.append(("end the stream", lambda: rc.rti_disconnect(wait=True)))
         if rti is not None:
             steps.append(("close the real-time link", rti.close))
@@ -270,11 +289,10 @@ class Link:
                 time.sleep(self.period / 2.0)       # not Event.wait (see Clock above)
                 if self._stop.is_set():
                     return
-                now = time.perf_counter()
-                with self._lock:
-                    if now - self._last_send >= KEEPALIVE_PERIODS * self.period:
-                        self._send_locked(now, keepalive=True)
-                self._gripper(now)
+                with self._lock:                    # the clock read INSIDE the lock (see _send_locked)
+                    if self._claimed and time.perf_counter() - self._last_send >= KEEPALIVE_PERIODS * self.period:
+                        self._send_locked(keepalive=True)
+                self._gripper(time.perf_counter())
         except Exception as e:  # noqa: BLE001
             self._fail(e)
 
@@ -284,8 +302,13 @@ class Link:
             log.error("the PAR6 link failed: %s", e)
 
     # ------------------------------------------------------------------ act
-    def _send_locked(self, now: float, keepalive: bool) -> None:
-        """Move the sent target towards the desired one (capped) and send it. Holds self._lock."""
+    def _send_locked(self, keepalive: bool) -> None:
+        """Move the sent target towards the desired one (capped) and send it. Holds self._lock.
+
+        The time is read here, inside the lock, right before the real-time client stamps the packet with its own send
+        time: a time read before the lock goes stale when the thread waits there, and the next send would count the
+        wait as travel time (two targets 0.1 ms apart a whole capped step apart: 2026-11-27, under load)."""
+        now = time.perf_counter()
         step = self._desired - self._sent
         if self.max_speed > 0.0:
             dt = min(max(now - self._last_send, 0.0), CAP_DT_PERIODS * self.period) if self._last_send else self.period
@@ -337,11 +360,11 @@ class Link:
         g = None if g is None else float(g)
         if not np.isfinite(q).all() or (g is not None and not math.isfinite(g)):
             raise ValueError(f"the action has a value that is not a finite number: {dict(action)}")
-        now = time.perf_counter()
         with self._lock:
             self._desired[:] = q
-            self._send_locked(now, keepalive=False)
+            self._send_locked(keepalive=False)
             sent = self._sent.copy()
+        now = time.perf_counter()
         self._last_act = now
         if g is not None:
             with self._grip_lock:

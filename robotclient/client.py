@@ -237,7 +237,7 @@ class RobotClient:
             >>> robot = RobotClient(name="pick_place")
             >>> robot.connect("192.168.0.84")
             >>> robot.protocols
-            {'commands': 2, 'rti': 1, 'telemetry': 1}
+            {'commands': 4, 'rti': 1, 'telemetry': 2, 'camera': 1}
         """
         self._conn.connect(ip, port)
         self._last_queued = self._last_gripper_queued = None     # an earlier connection's commands (2026-10-24)
@@ -2623,8 +2623,9 @@ class RobotClient:
         """Choose the telemetry recipe that the robot's data streams carry.
 
         A recipe is a file in the robot's `data_recipe/` folder that names the
-        values sent every control tick, both in the telemetry the robot broadcasts
-        on UDP port 30003 and in the state packets of a real-time stream. The
+        values sent every control tick: in the robot's UDP telemetry (port 30003,
+        sent where `set_telemetry_destination()` says), on its recorder link
+        (TCP port 30004), and in the state packets of a real-time stream. The
         robot switches on its next tick. The status field `recipe` names the
         recipe in use, and `recipes` lists the recipe files on the robot.
 
@@ -2634,7 +2635,9 @@ class RobotClient:
                 the mode, the loop period and the real-time link), `"minimal"`
                 (joint positions and the tick), `"commanded"` (measured, commanded
                 and target positions), `"diagnostics"` (the real-time link's
-                quality, the loop's timing, errors and external torques), `"full"`,
+                quality, the loop's timing, errors and external torques), `"record"`
+                (every value the robot has each tick but the drives' gains, for
+                recording training data), `"full"`,
                 and `"tracking"`, `"can_gaps"`, `"external_test"`, `"friction_id"`,
                 `"haptic_wall"` and `"monitor_baseline"` for the robot's own tests.
                 A recipe file added while the robot software runs needs

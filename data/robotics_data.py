@@ -189,7 +189,7 @@ TAGS = {
     # ================================================================
     # Gripper tags  (sourced from Gripper_data deque)
     # ================================================================
-    "g_p":          {"src": "gripper", "prec": 3, "desc": "gripper position (m)"},
+    "g_p":          {"src": "gripper", "prec": 3, "desc": "gripper position (0 open .. 255 closed)"},
     "g_c":          {"src": "gripper", "prec": 2, "desc": "gripper current (mA)"},
     "g_activated":  {"src": "gripper", "prec": 0, "desc": "gripper activated flag"},
     "g_action":     {"src": "gripper", "prec": 0, "desc": "gripper action status"},
