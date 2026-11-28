@@ -13,6 +13,21 @@ What changed in each version of the RCB runtime. The newest version is at the to
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-11-28
+
+### Fixed
+
+- `lerobot_robot_par6`: disconnecting brakes the arm. It ended the stream with `rti_disconnect` alone, which switches
+  to IDLE without braking, so an arm still moving when a LeRobot program ended coasted in freedrive until friction
+  stopped it. It now releases the stream first (the robot brakes the arm to rest within its real-time limits and holds
+  it) and ends the stream 0.5 s later.
+- `lerobot_robot_par6`: each target's step is sized with the time the target is sent at. A send delayed at the
+  plugin's lock counted the delay as travel time, so two targets a fraction of a millisecond apart could be a whole
+  capped step apart.
+- Texts the reference shows: `set_recipe()` names the `record` recipe and where the telemetry goes (it is not always
+  broadcast); `connect()`'s example shows the protocol numbers of today; the telemetry tag `g_p` is the gripper's
+  position from 0 (open) to 255 (closed), not metres.
+
 ## [4.0.0] - 2026-11-27
 
 ### Added
